@@ -160,3 +160,17 @@
   draws clip through SV_ClipDistance (o.zclip in VOut, zclips in the draw constants). Fixed function planes are kept
   but not applied (not used by this game so far).
 - Also learned: the car "shadow" stencil system (0x138DFC..0x138FA5) works as intended once defaults are applied.
+
+## Intro cutscene vs reference video (2026-11-01)
+
+- Reference: YouTube "True Crime: New York City Gameplay #1 (XBOX)" (Mjj585hinHs), intro from 2:05. Frames grabbed in the
+  browser pane by drawing the video into a canvas.
+- Replay: `XBE_PAD_RECORD` (launcher writes `pad_record.txt`) and `XBE_PAD_SCRIPT` replay the user's menu path (Load
+  Game, Intro Act save); `XBE_CAPTURE_AT` takes a list of times. Captures slow the game: start them after the inputs.
+- The black wedge shot (yellow car, ~2:08-2:12) now renders fully (skyline, trees, lamps, road) after the depth clip
+  plane fix. The dark alley shots (~3:06-3:20) match the video (mean ~12, ~73% near black in both).
+- Open: bright foggy street shots are ~2x brighter than the video (top third ~110 vs ~60). Video levels are close to
+  ours (bars ~8, white ~239). The game's gamma ramp (S-curve, 32->18, 128->148) is applied. Fog is off for nearly all
+  draws. Main suspect: the 49 additive lamp halo strips (vs B0101A61, tex 83723380 radial glow, SRCALPHA+ONE,
+  MODULATE2X) at the end of the scene, which add ~+13 mean in capture 160003.
+- Capture lines now include fog state; the gamma ramp is logged when set.

@@ -13,7 +13,7 @@ index 7e6507d..31232a7 100644
      va_list ap;
      va_start(ap, fmt);
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index fe65837..f571c89 100644
+index fe65837..d785229 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
 @@ -1674,7 +1674,19 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
@@ -47,17 +47,20 @@ index fe65837..f571c89 100644
      bool offset = OffsetsPolygons(s, Topology(k.topo));
      float units = offset ? Bits(SimpleState(s, kMDepthOffset)) : 0;
      if (s.rs[kRsZEnable] != kZUseW) {
-@@ -2519,6 +2534,9 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
+@@ -2519,6 +2534,12 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
              cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
              k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
              c.pc[0][2], c.pc[0][3]);
 +    if (k.sten)
 +        fprintf(cap_, " sten func %X ref %u mask %X wmask %X fail %X zfail %X pass %X", k.sfunc,
 +                SimpleState(s, kMStencilRef) & 0xFF, k.smask, k.swmask, k.sfail, k.szfail, k.spass);
++    if (s.rs[kRsFogEnable])
++        fprintf(cap_, " fog %08X mode %u %.3f %.3f %.4f", s.rs[kRsFogColor], s.rs[kRsFogTableMode], c.fog[0], c.fog[1],
++                c.fog[2]);
      CaptureTextures(s, stages);
  }
  
-@@ -2648,6 +2666,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+@@ -2648,6 +2669,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
  void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
      float bf[4];
      Color(SimpleState(s, kMBlendColor), bf);
@@ -73,7 +76,7 @@ index fe65837..f571c89 100644
      uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
      if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
      cl_->OMSetBlendFactor(bf);
-@@ -3659,6 +3686,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
+@@ -3659,6 +3689,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
  // the frame moves to another target: save the one it leaves
  void D3D12Backend::CapStep(const Surface& rt) {
      uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
@@ -301,7 +304,7 @@ index bec6e36..886f51b 100644
  
  // Exceptions dispatch like NT on x86: each handler of the fs:[0] chain is called (record, frame, context,
 diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
-index 975e977..cf1c57b 100644
+index 975e977..9d8d881 100644
 --- a/runtime/xdk/d3d8.cpp
 +++ b/runtime/xdk/d3d8.cpp
 @@ -11,10 +11,13 @@
@@ -341,10 +344,10 @@ index 975e977..cf1c57b 100644
          made = asked;
          g_buffer_count = asked[3];
          for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
-@@ -530,6 +547,34 @@ HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
+@@ -529,10 +546,40 @@ HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
+ }
  HLE_STDCALL(D3DDevice_FlushVertexCache, 0) { return 0; }
  
- // The library keeps the ramp in one of two device slots for GetGammaRamp: both get it, whichever one its index names
 +// (near, far, flags): depth clip planes in depth buffer units. Flags 1 sets the vertex program planes, 2 the fixed
 +// function ones, 3 and 4 return them to the default (the whole range). The library keeps them in the device, where
 +// GetDepthClipPlanes reads them; the renderer clips vertex program draws outside [near, far] of their screen z.
@@ -373,10 +376,16 @@ index 975e977..cf1c57b 100644
 +    return 0;
 +}
 +
+ // The library keeps the ramp in one of two device slots for GetGammaRamp: both get it, whichever one its index names
  HLE_STDCALL(D3DDevice_SetGammaRamp, 2) {
      uint8_t ramp[768];
      std::memcpy(ramp, HostPtr(a[1]), 768);
-@@ -601,6 +646,26 @@ std::atomic<uint32_t> g_presents{0};
++    LOG_FIRST(8, "d3d: gamma ramp flags %X, red at 32/64/128/192/255: %u %u %u %u %u", a[0], ramp[32], ramp[64], ramp[128],
++              ramp[192], ramp[255]);
+     if (XDK_CDevice_GammaRamps != xdk::kUnknown)
+         for (uint32_t slot = 0; slot < 2; slot++)
+             std::memcpy(HostPtr(kDevice + XDK_CDevice_GammaRamps + slot * sizeof(ramp)), ramp, sizeof(ramp));
+@@ -601,6 +648,26 @@ std::atomic<uint32_t> g_presents{0};
  }  // namespace
  
  HLE_STDCALL(D3DDevice_Swap, 1) {
@@ -403,7 +412,7 @@ index 975e977..cf1c57b 100644
      app::SplashFirstFrame();
      // handed over from the previous instance: the window opens on the second frame, the first picture with
      // anything drawn over it right after
-@@ -624,7 +689,13 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
+@@ -624,7 +691,13 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
          }
      }
      Walk(Dev(kDevPush));  // reports asked for at the end of the frame
@@ -418,7 +427,7 @@ index 975e977..cf1c57b 100644
      app::Pace();
      // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
      uint32_t last = g_buffers[g_buffer_count - 1], data = R32(last + 4), lk = R32(last + 8);
-@@ -637,6 +708,10 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
+@@ -637,6 +710,10 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
      g_state.rt = SurfaceOf(Dev(kDevRenderTarget));
      uint32_t n = Dev(kDevSwapCount) + 1;
      SetDev(kDevSwapCount, n);
@@ -429,7 +438,7 @@ index 975e977..cf1c57b 100644
      return n;
  }
  
-@@ -1272,7 +1347,43 @@ void EndPrimitive() {
+@@ -1272,7 +1349,43 @@ void EndPrimitive() {
      uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
      g_im_prim = 0;
      if (!prim || !count) return;
