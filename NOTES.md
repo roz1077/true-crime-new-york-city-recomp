@@ -222,3 +222,11 @@
 - Mirror pass skyline lit by c[186] = (1,1,1,0.65) vs (0.20,0.21,0.23,1) in the main pass: by design.
 - Next: decode the mirror building draws' packed positions (vs B01012C1/D1) to see whether they land in the mirror
   target at all (culled, off target, or drawn black). XBE_CAPTURE_INPUTS=1 dumps every draw's first vertices.
+- Found the mirror-pass difference: packed-position meshes (vs B01012C1, normalized short positions, decode checked:
+  the main view projects them on screen at scale 1) get a wrong matrix in the mirror pass. c[188..191] at draw 400
+  (mirror) has coefficients ~1 and translations 0.007/-1.46/-0.07, giving w ~0.1 and positions thousands of pixels
+  off the 256x256 target; the same mesh type in the main view (draw 476) has coefficients ~7 and translations
+  -4.1/0.25/19.0. Float-position meshes in the mirror pass are fine (draw 407: w ~14, on target).
+  So the CPU side that builds the mirror matrix for packed meshes (mirror transform x the object's dequantization
+  scale/offset) goes wrong in the recompiled code or an HLE it calls. Next: find where the game writes c[188] for the
+  mirror pass (SetVertexShaderConstant callers around the mirror render, 0x25F9xx) and trace the matrix math.
