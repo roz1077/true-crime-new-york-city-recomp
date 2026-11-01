@@ -1,0 +1,258 @@
+diff --git a/runtime/core/log.cpp b/runtime/core/log.cpp
+index 7e6507d..31232a7 100644
+--- a/runtime/core/log.cpp
++++ b/runtime/core/log.cpp
+@@ -52,7 +52,8 @@ void Init(const std::string& dir, const std::string& prefix, bool append) {
+ const std::string& Path() { return g_path; }
+ 
+ void Write(Level lv, const char* fmt, ...) {
+-    if (!kVerbose && lv < Level::Error) return;
++    static const bool env_verbose = std::getenv("XBE_VERBOSE") != nullptr;  // release: XBE_VERBOSE keeps every level
++    if (!kVerbose && !env_verbose && lv < Level::Error) return;
+     char msg[4096];
+     va_list ap;
+     va_start(ap, fmt);
+diff --git a/runtime/kernel/files.cpp b/runtime/kernel/files.cpp
+index 5644ea7..1677837 100644
+--- a/runtime/kernel/files.cpp
++++ b/runtime/kernel/files.cpp
+@@ -587,16 +587,17 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
+     return kSuccess;
+ }
+ 
+-KERNEL_EXPORT(218, NtQueryVolumeInformationFile, 5) {
+-    uint32_t iosb = a[1], out = a[2], len = a[3], cls = a[4];
++// fills a volume information class into out; returns the status and the byte count written
++static uint32_t QueryVolume(uint32_t out, uint32_t len, uint32_t cls, uint32_t& bytes, const char* who) {
+     std::memset(HostPtr(out), 0, len);
++    bytes = 0;
+     switch (cls) {
+         case 3:  // FileFsSizeInformation: 16 GiB total, 8 GiB free in 16 KiB units
+             W64(out, 0x100000);
+             W64(out + 8, 0x80000);
+             W32(out + 0x10, 32);
+             W32(out + 0x14, 512);
+-            IoStatus(iosb, kSuccess, 0x18);
++            bytes = 0x18;
+             return kSuccess;
+         case 7:  // FileFsFullSizeInformation
+             W64(out, 0x100000);
+@@ -604,25 +605,41 @@ KERNEL_EXPORT(218, NtQueryVolumeInformationFile, 5) {
+             W64(out + 0x10, 0x80000);
+             W32(out + 0x18, 32);
+             W32(out + 0x1C, 512);
+-            IoStatus(iosb, kSuccess, 0x20);
++            bytes = 0x20;
+             return kSuccess;
+         case 1:  // FileFsVolumeInformation
+             W32(out + 8, 0x12345678);  // VolumeSerialNumber
+-            IoStatus(iosb, kSuccess, 0x18);
++            bytes = 0x18;
+             return kSuccess;
+         case 5:  // FileFsAttributeInformation: attributes, max name, name length, "FATX"
+             W32(out, 0);
+             W32(out + 4, 42);
+             W32(out + 8, 4);
+             std::memcpy(HostPtr(out + 12), "FATX", 4);
+-            IoStatus(iosb, kSuccess, 16);
++            bytes = 16;
+             return kSuccess;
+         default:
+-            LOG_FIRST(8, "NtQueryVolumeInformationFile: class %u", cls);
++            LOG_FIRST(8, "%s: class %u", who, cls);
+             return kInvalidParameter;
+     }
+ }
+ 
++KERNEL_EXPORT(218, NtQueryVolumeInformationFile, 5) {
++    uint32_t iosb = a[1], out = a[2], len = a[3], cls = a[4], bytes;
++    uint32_t status = QueryVolume(out, len, cls, bytes, "NtQueryVolumeInformationFile");
++    if (status == kSuccess) IoStatus(iosb, kSuccess, bytes);
++    return status;
++}
++
++// (FileObject, FsInformationClass, Length, FsInformation, ReturnedLength): the same classes for a referenced file
++// object; every host volume answers alike. True Crime NYC asks for class 5 (XAPI 0x26381D).
++KERNEL_EXPORT(76, IoQueryVolumeInformation, 5) {
++    uint32_t cls = a[1], len = a[2], out = a[3], ret = a[4], bytes;
++    uint32_t status = QueryVolume(out, len, cls, bytes, "IoQueryVolumeInformation");
++    if (ret) W32(ret, bytes);
++    return status;
++}
++
+ KERNEL_EXPORT(207, NtQueryDirectoryFile, 10) {
+     uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], out = a[5], len = a[6], cls = a[7],
+              mask = a[8], restart = a[9];
+diff --git a/runtime/kernel/objects.cpp b/runtime/kernel/objects.cpp
+index 4974985..4a16d67 100644
+--- a/runtime/kernel/objects.cpp
++++ b/runtime/kernel/objects.cpp
+@@ -1,8 +1,11 @@
+ #include <algorithm>
+ #include <chrono>
++#include <cstdlib>
++#include <string>
+ #include <map>
+ #include <queue>
+ 
++#include "core/log.h"
+ #include "kernel/kernel.h"
+ 
+ namespace kernel {
+@@ -229,7 +232,19 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
+     int64_t deadline = infinite ? 0 : ToDeadline(timeout);
+     std::unique_lock<std::mutex> lock(g_dispatch);
+     Queued queued{objs};
++    // XBE_WAITLOG set: a wait still blocked after 3 s logs its objects and the guest stack once (diagnostic)
++    static const bool wait_log = std::getenv("XBE_WAITLOG") != nullptr;
++    auto wait_start = steady_clock::now();
++    bool wait_logged = false;
+     for (;;) {
++        if (wait_log && !wait_logged && steady_clock::now() - wait_start > seconds(3)) {
++            wait_logged = true;
++            std::string what;
++            for (auto& o : objs) what += o ? " type " + std::to_string(int(o->type)) + " signal " + std::to_string(o->signal) : " null";
++            LOGW("waitlog: thread %u waits %s%s (%zu objects:%s)", me, infinite ? "forever" : "with timeout",
++                alertable ? " alertable" : "", objs.size(), what.c_str());
++            if (self && self->ctx) LogGuestStack(*self->ctx, 96);
++        }
+         if (wait_all) {
+             bool all = std::all_of(objs.begin(), objs.end(), [&](const ObjectRef& o) { return o && Satisfied(*o, me); });
+             if (all) {
+diff --git a/runtime/kernel/xboxkrnl.cpp b/runtime/kernel/xboxkrnl.cpp
+index bec6e36..886f51b 100644
+--- a/runtime/kernel/xboxkrnl.cpp
++++ b/runtime/kernel/xboxkrnl.cpp
+@@ -986,8 +986,8 @@ KERNEL_EXPORT(269, RtlCompareMemoryUlong, 3) {
+     return n;
+ }
+ 
+-KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
+-    switch (a[0]) {
++static uint32_t DosError(uint32_t status) {
++    switch (status) {
+         case kSuccess: return 0;
+         case kPending: return 997;
+         case kTimeout: return 1460;
+@@ -1010,10 +1010,22 @@ KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
+         case kNotADirectory: return 267;
+         case 0xC000007F: return 112;  // disk full
+         case kDeviceNotConnected: return 1167;
+-        default: return (a[0] & 0xC0000000) ? 317 : 0;
++        default: return (status & 0xC0000000) ? 317 : 0;
+     }
+ }
+ 
++KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) { return DosError(a[0]); }
++
++// (ApcContext, IoStatusBlock, Reserved): the APC routine XAPI's ReadFileEx / WriteFileEx give the I/O calls. The
++// context is the LPOVERLAPPED_COMPLETION_ROUTINE, the status block is the OVERLAPPED's Internal field (offset 0),
++// so it is the OVERLAPPED itself: routine(error, bytes, overlapped), stdcall.
++KERNEL_EXPORT(232, NtUserIoApcDispatcher, 3) {
++    uint32_t routine = a[0], iosb = a[1];
++    uint32_t status = R32(iosb), error = (status & 0xC0000000) == 0xC0000000 ? DosError(status) : 0;
++    if (routine) CallGuest(ctx, routine, {error, R32(iosb + 4), iosb});
++    return 0;
++}
++
+ // exceptions, debug, shutdown
+ 
+ // Exceptions dispatch like NT on x86: each handler of the fs:[0] chain is called (record, frame, context,
+diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
+index 975e977..fda717f 100644
+--- a/runtime/xdk/d3d8.cpp
++++ b/runtime/xdk/d3d8.cpp
+@@ -271,7 +271,21 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
+     // surfaces of the same shape are kept: a title wraps their memory in textures of its own across a Reset
+     static std::array<uint32_t, 5> made{};
+     std::array<uint32_t, 5> asked{w, h, color_fmt, std::min<uint32_t>(count + 1, 3), zf};
+-    if (asked != made) {
++    // the title's own frame buffers: D3DPRESENT_PARAMETERS BufferSurfaces[3] (+0x34, front first) and
++    // DepthStencilSurface (+0x40). True Crime NYC keeps one object per buffer and finds the back buffer by its memory,
++    // so the device must draw into and present these surfaces, not ones of its own.
++    uint32_t own[3] = {R32(pp + 0x34), R32(pp + 0x38), R32(pp + 0x3C)}, own_depth = R32(pp + 0x40);
++    if (own[0]) {
++        uint32_t n = own[2] ? 3 : own[1] ? 2 : 1;
++        LOGI("d3d: %s uses the title's buffers %08X %08X %08X depth %08X", caller, own[0], own[1], own[2], own_depth);
++        g_buffer_count = std::max<uint32_t>(n, 2);
++        g_buffers[0] = own[0];
++        g_buffers[1] = n > 1 ? own[1] : own[0];
++        g_buffers[2] = n > 2 ? own[2] : 0;
++        if (own_depth) g_depth = own_depth;
++        else if (zf && !g_depth) g_depth = NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4);
++        made = {};  // a later Reset without own buffers makes the host's again
++    } else if (asked != made) {
+         made = asked;
+         g_buffer_count = asked[3];
+         for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
+@@ -624,7 +638,13 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
+         }
+     }
+     Walk(Dev(kDevPush));  // reports asked for at the end of the frame
+-    if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
++    // back buffer scale on (CDevice flag 0x4000, set by SetBackBufferScale with a scale other than 1): the library's
++    // Swap draws the device's back buffer (+BackBuffer, a title may point it at its own surface) as a texture onto
++    // the front buffer; present that surface instead of the host's own back buffer
++    uint32_t shown = g_buffers[1];
++    if (XDK_CDevice_Flags != xdk::kUnknown && (Dev(XDK_CDevice_Flags) & 0x4000) && Dev(kDevBackBuffer))
++        shown = Dev(kDevBackBuffer);
++    if (g_backend) g_backend->Present(SurfaceOf(shown));
+     app::Pace();
+     // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
+     uint32_t last = g_buffers[g_buffer_count - 1], data = R32(last + 4), lk = R32(last + 8);
+@@ -637,6 +657,10 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
+     g_state.rt = SurfaceOf(Dev(kDevRenderTarget));
+     uint32_t n = Dev(kDevSwapCount) + 1;
+     SetDev(kDevSwapCount, n);
++    // the console's present waits alertably for the vertical blank, so I/O completion routines (ReadFileEx) queued
++    // to the presenting thread run once a frame. The host paces with a plain sleep: run them here instead, or a
++    // title whose main thread issues streaming reads waits for their completions forever (True Crime NYC).
++    if (kernel::Thread* t = kernel::Current()) kernel::RunApcs(*t);
+     return n;
+ }
+ 
+@@ -1272,7 +1296,43 @@ void EndPrimitive() {
+     uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
+     g_im_prim = 0;
+     if (!prim || !count) return;
+-    if (!(handle & 1) && (handle & 0xE) == 4) LOG_FIRST(1, "d3d: pretransformed immediate mode vertices are not supported");
++    // pretransformed FVF (D3DFVF_XYZRHW, as front ends and movies draw their quads): pack the slots into the FVF's own
++    // layout and draw with the FVF handle, as DrawVerticesUP does, so the positions stay in screen space
++    if (!(handle & 1) && (handle & 0xE) == 4) {
++        gpu::VertexShader fvf;
++        gpu::FvfInputs(handle, fvf);
++        uint32_t stride = fvf.stream_stride[0];
++        static std::vector<uint8_t> bytes;
++        bytes.assign(size_t(count) * stride, 0);
++        bool ok = stride != 0;
++        for (uint32_t v = 0; ok && v < count; v++)
++            for (uint32_t s = 0; s < 16; s++) {
++                const auto& in = fvf.inputs[s];
++                if (in.stream < 0) continue;
++                const float* src = &g_im_vertices[size_t(v) * 64 + s * 4];
++                uint8_t* dst = &bytes[size_t(v) * stride + in.offset];
++                auto byte = [](float x) { return uint32_t(std::clamp(x, 0.0f, 1.0f) * 255.0f + 0.5f); };
++                switch (in.type) {
++                    case 0x12: std::memcpy(dst, src, 4); break;   // FLOAT1
++                    case 0x22: std::memcpy(dst, src, 8); break;   // FLOAT2
++                    case 0x32: std::memcpy(dst, src, 12); break;  // FLOAT3
++                    case 0x42: std::memcpy(dst, src, 16); break;  // FLOAT4
++                    case 0x40: {  // D3DCOLOR: the slot holds R G B A, memory is B G R A
++                        uint32_t c = byte(src[2]) | byte(src[1]) << 8 | byte(src[0]) << 16 | byte(src[3]) << 24;
++                        std::memcpy(dst, &c, 4);
++                        break;
++                    }
++                    default:
++                        LOG_FIRST(4, "d3d: pretransformed immediate mode input type %02X not packed", in.type);
++                        ok = false;
++                        break;
++                }
++            }
++        if (ok) {
++            DrawUp(prim, count, bytes.data(), stride);
++            return;
++        }
++    }
+     auto bound = g_state.vs, from = handle & 1 ? bound : nullptr;
+     Made& m = made[{from.get(), g_im_mask}];
+     if (!m.vs) {
