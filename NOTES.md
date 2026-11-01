@@ -259,3 +259,11 @@
 - Likely remaining cause: the road's wetness alpha (ps B016C050 mux chain over the t1/t2 maps) is too high and
   the light pool strength too low, so light lands on the road instead of the facades. Also the user reports a
   dark band across the road in 184218 that xemu does not have (far road just beyond the bright near road).
+
+## Fixed: thin dark line across the far road (2026-11-01)
+
+- User marked it in capture 184218 (xemu has none). One screen row dipped (alpha 99 vs ~115 already when the road
+  is drawn): the edge of the projected wetness map, where the earlier border-colour reads blended with 0.
+- Replaced the border workaround: for clamped reads of a render target through a swizzled A8R8G8B8 view, the
+  shader keeps uv on the second texel from each edge (DrawConstants::uvclamp, insetuv in the pixel shader), so the
+  unwritten outer ring is never read. Replay of the street shot: no dipped rows, far road continuous.

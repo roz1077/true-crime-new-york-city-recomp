@@ -13,7 +13,7 @@ index 7e6507d..31232a7 100644
      va_list ap;
      va_start(ap, fmt);
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index fe65837..a2781ca 100644
+index fe65837..96f5781 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
 @@ -565,6 +565,7 @@ private:
@@ -84,23 +84,31 @@ index fe65837..a2781ca 100644
  D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stages, bool clamp, uint32_t aniso) {
      D3D12_SAMPLER_DESC sd = {};
      const auto& t = s.tss[size_t(i)];
-@@ -1992,6 +2019,15 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
-     sd.AddressU = Address(clamp && t[kTssAddressU] == kTaddressWrap ? kTaddressClamp : t[kTssAddressU]);
-     sd.AddressV = Address(clamp && t[kTssAddressV] == kTaddressWrap ? kTaddressClamp : t[kTssAddressV]);
-     sd.AddressW = Address(t[kTssAddressW]);
-+    // a render target read through a swizzled A8R8G8B8 view, clamped: a projected map laid over the world (True
-+    // Crime's road wetness masks). The title renders into it under a scissor one pixel in from each edge, so its
-+    // border keeps whatever an earlier use of that memory left (a scene drawn opaque); reads past the map then give
-+    // full alpha and switch the effect off beyond a hard line. Past the edge reads the border color instead
-+    TextureDesc td;
-+    if (stages.rt[i] && s.textures[size_t(i)] && Describe(s.textures[size_t(i)], td) && td.format == kFmtA8R8G8B8Swizzled) {
-+        if (t[kTssAddressU] == kTaddressClamp) sd.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-+        if (t[kTssAddressV] == kTaddressClamp) sd.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-+    }
-     sd.MipLODBias = Bits(t[kTssMipLodBias]);
-     sd.MinLOD = float(t[kTssMaxMipLevel]);
-     sd.MaxLOD = mip ? D3D12_FLOAT32_MAX : sd.MinLOD;
-@@ -2421,6 +2457,10 @@ WRange DrawWRange(const State& s, bool program) {
+@@ -2259,7 +2286,22 @@ void D3D12Backend::FillTextureConstants(const State& s, const DrawShaders& sh, c
+                                         DrawConstants& c) {
+     for (int i = 0; i < 4; i++) {
+         TextureDesc d;
+-        if (s.textures[size_t(i)] && Describe(s.textures[size_t(i)], d)) FillTexelConstants(i, d, stages, c);
++        if (s.textures[size_t(i)] && Describe(s.textures[size_t(i)], d)) {
++            FillTexelConstants(i, d, stages, c);
++            // a render target read clamped through a swizzled A8R8G8B8 view: a projected map laid over the world
++            // (True Crime's road wetness masks). The title draws it under a scissor one pixel in from each edge, so
++            // its outer ring keeps what an earlier use of that memory left (an opaque scene: alpha 255). Reads past
++            // the map then switched the effect off behind a hard line, and border reads left a thin dark seam. The
++            // reads stay on the second texel from each edge, which the title did draw
++            const auto& ts = s.tss[size_t(i)];
++            if (stages.rt[i] && d.format == kFmtA8R8G8B8Swizzled && ts[kTssAddressU] == kTaddressClamp &&
++                ts[kTssAddressV] == kTaddressClamp && d.width > 2 && d.height > 2) {
++                c.uvclamp[i][0] = 1.5f / float(d.width);
++                c.uvclamp[i][1] = 1.5f / float(d.height);
++                c.uvclamp[i][2] = 1.0f - 1.5f / float(d.width);
++                c.uvclamp[i][3] = 1.0f - 1.5f / float(d.height);
++            }
++        }
+         if (stages.rt[i]) c.rtshift[i] = RenderTargetShift(s, sh);
+         const auto& t = s.tss[size_t(i)];
+         c.bump[i][0] = Bits(t[kTssBumpEnvMat00]);
+@@ -2421,6 +2463,10 @@ WRange DrawWRange(const State& s, bool program) {
  // ReversedDepthHlsl's zparams: x the w buffer's scale (0 for a z buffer), y its far w, z the polygon offset in units of
  // the clip w for a w buffer, of depth for a z buffer
  void D3D12Backend::FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const {
@@ -111,7 +119,7 @@ index fe65837..a2781ca 100644
      bool offset = OffsetsPolygons(s, Topology(k.topo));
      float units = offset ? Bits(SimpleState(s, kMDepthOffset)) : 0;
      if (s.rs[kRsZEnable] != kZUseW) {
-@@ -2450,6 +2490,8 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+@@ -2450,6 +2496,8 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
      FillSurfaceConstants(s, size, c);
      // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
      if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
@@ -120,7 +128,7 @@ index fe65837..a2781ca 100644
      FillFogConstants(s, sh.prog, c);
      FillCombinerConstants(s, c);
      if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vsc), c.ext, bound_rt_, k.blend ? k.src : 1);
-@@ -2477,8 +2519,10 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
+@@ -2477,8 +2525,10 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
          TextureDesc d;
          if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
          bool tg = targets_.count(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
@@ -133,7 +141,7 @@ index fe65837..a2781ca 100644
          if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
              cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
          }
-@@ -2498,6 +2542,22 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
+@@ -2498,6 +2548,22 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
          for (uint32_t k = 0; k < n * 4; k++) fprintf(cap_, " %g", a.vertices[v * n * 4 + k]);
          fprintf(cap_, " ]");
      }
@@ -156,7 +164,7 @@ index fe65837..a2781ca 100644
      for (int r = 0; r < kVsConstants; r++) {
          const auto& v = s.vsc[r];
          if (v[0] || v[1] || v[2] || v[3]) {
-@@ -2519,12 +2579,26 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
+@@ -2519,12 +2585,26 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
              cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
              k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
              c.pc[0][2], c.pc[0][3]);
@@ -184,7 +192,7 @@ index fe65837..a2781ca 100644
      fputc('\n', cap_);
  }
  
-@@ -2648,6 +2722,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+@@ -2648,6 +2728,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
  void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
      float bf[4];
      Color(SimpleState(s, kMBlendColor), bf);
@@ -200,7 +208,7 @@ index fe65837..a2781ca 100644
      uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
      if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
      cl_->OMSetBlendFactor(bf);
-@@ -3659,6 +3742,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
+@@ -3659,6 +3748,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
  // the frame moves to another target: save the one it leaves
  void D3D12Backend::CapStep(const Surface& rt) {
      uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
@@ -218,7 +226,7 @@ index fe65837..a2781ca 100644
      auto it = targets_.find(TargetMapKey(cap_rt_, false));
      if (cap_rt_ && it != targets_.end()) {
 diff --git a/runtime/gpu/shaders.cpp b/runtime/gpu/shaders.cpp
-index 6d263d6..6144205 100644
+index 6d263d6..233f437 100644
 --- a/runtime/gpu/shaders.cpp
 +++ b/runtime/gpu/shaders.cpp
 @@ -32,6 +32,7 @@ struct VOut {
@@ -229,16 +237,17 @@ index 6d263d6..6144205 100644
  };
  cbuffer VC : register(b0) { float4 c[192]; };
  cbuffer DC : register(b1) {
-@@ -55,6 +56,8 @@ const char* kCommonTail = R"(    float4 spread[4];
+@@ -55,6 +56,9 @@ const char* kCommonTail = R"(    float4 spread[4];
      float4 lt[56];
      float4 rtshift;
      float4 zparams;
 +    float4 zclips;
 +    float4 vdef[16];
++    float4 uvclamp[4];
  };
  )";
  
-@@ -133,7 +136,7 @@ std::string Src(const Tok& k, int which, uint16_t regs) {
+@@ -133,7 +137,7 @@ std::string Src(const Tok& k, int which, uint16_t regs) {
          base = reg == 12 ? "oPos" : F("R%u", reg);
      } else if (mux == 2) {
          uint32_t v = k.f(1, 9, 4);
@@ -247,7 +256,7 @@ index 6d263d6..6144205 100644
      } else {
          uint32_t cr = k.f(1, 13, 8);
          base = k.f(3, 1, 1) ? F("c[clamp(a0 + %u, 0, 191)]", cr) : F("c[%u]", cr);
-@@ -225,6 +228,9 @@ const char* kVsEpilogue = R"(
+@@ -225,6 +229,9 @@ const char* kVsEpilogue = R"(
      // full screen passes drawn half a pixel up-left for the console's integer pixel centers stop half a pixel short
      // of the far edges on D3D12's, which upscaled leaves the last host columns and rows undrawn
      // surf.w set: a point, which stays put since pulled out it would leave the target
@@ -257,7 +266,7 @@ index 6d263d6..6144205 100644
      if (surf.w == 0 && abs(p.x - (surf.x - 0.5)) < 1e-3) p.x = surf.x;
      if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;
      q.x = p.x * 2 / surf.x - 1;
-@@ -233,6 +239,8 @@ const char* kVsEpilogue = R"(
+@@ -233,6 +240,8 @@ const char* kVsEpilogue = R"(
      q.xyz *= p.w;
      q.w = p.w;
      o.pos = q;
@@ -266,7 +275,27 @@ index 6d263d6..6144205 100644
      o.d0 = saturate(oD0);
      o.d1 = saturate(oD1);
      o.b0 = saturate(oB0);
-@@ -848,6 +856,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
+@@ -405,7 +414,7 @@ std::string TexFetch(const PixelKey& k, int i) {
+     };
+     auto tex2d = [&](const std::string& uv) {
+         if (t.flags & kTexWide) return F("spreadtap(tex%d, smp%d, %s, spread[%d], %s)", i, i, uv.c_str(), i, Hooks().ReadScale(t).c_str());
+-        return F("tex%d.Sample(smp%d, %s)", i, i, uv.c_str());
++        return F("tex%d.Sample(smp%d, insetuv(%s, %d))", i, i, uv.c_str(), i);
+     };
+     auto cube = [&](const std::string& dir) {
+         std::string c = Hooks().Cube(t, i, dir);
+@@ -470,7 +479,9 @@ const char* kPsSbyte = R"(
+ // unorm to byte b, less lo under 128 or hi from 128, over d
+ float3 sbyte(float3 u, float lo, float hi, float d) { float3 b = u * 255; return (b - (b >= 128 ? hi : lo)) / d; }
+ )";
+-const char* kPsTail = R"(float4 spreadtap(Texture2D t, SamplerState s, float2 uv, float4 w, float m) {
++const char* kPsTail = R"(// FillTextureConstants' uvclamp: reads kept off a render target map's unwritten outer ring
++float2 insetuv(float2 uv, int i) { return uvclamp[i].z > 0 ? clamp(uv, uvclamp[i].xy, uvclamp[i].zw) : uv; }
++float4 spreadtap(Texture2D t, SamplerState s, float2 uv, float4 w, float m) {
+     float4 c = 0;
+     int n = (int)w.z;
+     for (int y = 0; y < n; y++)
+@@ -848,6 +859,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
      if (surf.w == 0 && abs(sp.x - (surf.x - 0.5)) < 1e-3) cp.x = cp.w;
      if (surf.w == 0 && abs(sp.y - (surf.y - 0.5)) < 1e-3) cp.y = -cp.w;
      o.pos = cp;
@@ -274,7 +303,16 @@ index 6d263d6..6144205 100644
      o.d0 = saturate(oD0);
      o.d1 = saturate(oD1);
      o.b0 = o.d0;
-@@ -995,6 +1004,29 @@ std::string ReversedDepthHlsl(std::string s) {
+@@ -929,7 +941,7 @@ std::string PixelHlsl(const PixelKey& k) {
+                         F(", tc%d.z / tc%d.w, %d, i.pos.xy, texsize[%d].xy);\n", i, i, t.shadow, i);
+             else if (t.kind == kTex2D && (t.flags & kTexWide))
+                 body += F("float4 t%d = spreadtap(tex%d, smp%d, %s, spread[%d], %s);\n", i, i, i, uv.c_str(), i, Hooks().ReadScale(t).c_str());
+-            else if (t.kind == kTex2D) body += F("float4 t%d = tex%d.Sample(smp%d, %s);\n", i, i, i, uv.c_str());
++            else if (t.kind == kTex2D) body += F("float4 t%d = tex%d.Sample(smp%d, insetuv(%s, %d));\n", i, i, i, uv.c_str(), i);
+             else if (t.kind == kTexCube && !(cube = Hooks().Cube(t, i, F("tc%d.xyz", i))).empty()) body += F("float4 t%d = %s;\n", i, cube.c_str());
+             else if (t.kind) body += F("float4 t%d = tex%d.Sample(smp%d, tc%d.xyz);\n", i, i, i, i);
+             else body += F("float4 t%d = float4(1,1,1,1);\n", i);
+@@ -995,6 +1007,29 @@ std::string ReversedDepthHlsl(std::string s) {
      return s;
  }
  
@@ -305,7 +343,7 @@ index 6d263d6..6144205 100644
  std::string PointHlsl() {
      return Common() + R"(
 diff --git a/runtime/gpu/shaders.h b/runtime/gpu/shaders.h
-index 08d9bff..ed5d3f8 100644
+index 08d9bff..79067c1 100644
 --- a/runtime/gpu/shaders.h
 +++ b/runtime/gpu/shaders.h
 @@ -62,6 +62,7 @@ std::string QuadHlsl(std::string s);
@@ -316,12 +354,13 @@ index 08d9bff..ed5d3f8 100644
  
  // HLSL a backend extension adds; the defaults write the console path
  struct ShaderHooks {
-@@ -105,6 +106,8 @@ struct DrawConstants {
+@@ -105,6 +106,9 @@ struct DrawConstants {
      float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
      float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
      float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
 +    float zclips[4];     // depth clip planes: near, far in screen z, 1 when on
 +    float vdef[16][4];   // vertex program inputs no stream feeds: State::vdef
++    float uvclamp[4][4]; // per stage: uv kept in [xy, zw] when z > 0 (render target maps with an unwritten ring)
  };
  
  }  // namespace gpu
