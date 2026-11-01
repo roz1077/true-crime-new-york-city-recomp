@@ -208,3 +208,9 @@
 - Replay caution: the first start after a rebuild relinks the game code and loads slower, so XBE_PAD_SCRIPT timings
   drift (twice it reached the New Game name screen; nothing was saved). Start the game once after a build before
   replaying, or make the script wait on screens instead of times.
+- User capture 174128 (split shot): video road is uniformly dark (~12-19 across); ours ~25-34 left, ~76-97 right.
+  The bright right comes from the mirror pass's skyline backdrop (draw 509, 544 verts, vs B0101A61) reflected.
+  Ruled out: depth clip planes (SetDepthClipPlanes HLE matches the library's flags 1-4, offsets 0x1C08-0x1C18;
+  GetDepthClipPlanes 0x2BADD0 reads them back with flags 10/11), and dropping triangles with a vertex at w < 0
+  (tested with NaN positions: the split stayed). Next: compare that draw's vertex colour/lighting constants in the
+  mirror pass against the main pass, and the reflection target's blur chain (8003/8004 constant alpha blends).
