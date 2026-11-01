@@ -13,10 +13,31 @@ index 7e6507d..31232a7 100644
      va_list ap;
      va_start(ap, fmt);
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index fe65837..38fbf93 100644
+index fe65837..fcfb104 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
-@@ -2519,6 +2519,9 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
+@@ -1674,7 +1674,19 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
+     if (k.topo == uint32_t(Topology::Points)) ExpandPoints(d, k.sprite);
+     ComPtr<ID3D12PipelineState> pso;
+     g_perf.psos++;
+-    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) LOGE("d3d12: pipeline creation failed");
++    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
++        const auto& b = d.BlendState.RenderTarget[0];
++        const auto& r = d.RasterizerState;
++        static int failed = 0;
++        if (failed++ < 16) LOGE("d3d12: pipeline creation failed: blend %d logic %d op %d src %d dst %d bop %d srcA %d dstA %d bopA %d "
++                      "mask %X | fill %d cull %d bias %d clamp %.3f slope %.3f | rt %d fmt %d ds %d samples %d | depth %d "
++                      "zfunc %d stencil %d sfunc %d",
++                  b.BlendEnable, b.LogicOpEnable, b.LogicOp, b.SrcBlend, b.DestBlend, b.BlendOp, b.SrcBlendAlpha,
++                  b.DestBlendAlpha, b.BlendOpAlpha, b.RenderTargetWriteMask, r.FillMode, r.CullMode, r.DepthBias,
++                  r.DepthBiasClamp, r.SlopeScaledDepthBias, d.NumRenderTargets, d.RTVFormats[0], d.DSVFormat,
++                  d.SampleDesc.Count, d.DepthStencilState.DepthEnable, d.DepthStencilState.DepthFunc,
++                  d.DepthStencilState.StencilEnable, d.DepthStencilState.FrontFace.StencilFunc);
++    }
+     psos_[h] = pso;
+     return pso.Get();
+ }
+@@ -2519,6 +2531,9 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
              cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
              k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
              c.pc[0][2], c.pc[0][3]);
@@ -26,7 +47,7 @@ index fe65837..38fbf93 100644
      CaptureTextures(s, stages);
  }
  
-@@ -2648,6 +2651,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+@@ -2648,6 +2663,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
  void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
      float bf[4];
      Color(SimpleState(s, kMBlendColor), bf);
@@ -42,7 +63,7 @@ index fe65837..38fbf93 100644
      uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
      if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
      cl_->OMSetBlendFactor(bf);
-@@ -3659,6 +3671,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
+@@ -3659,6 +3683,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
  // the frame moves to another target: save the one it leaves
  void D3D12Backend::CapStep(const Surface& rt) {
      uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;

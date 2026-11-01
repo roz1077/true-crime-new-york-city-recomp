@@ -132,3 +132,20 @@
   alpha (wetness) is set. Near road (puddle material) writes partial alpha; far paving (material writing t0.a) uses a
   DXT5 texture (0x81E70000 in capture 110327) whose alpha is ~3%, uploaded natively as BC3, so the light stops there.
   Game data, kept as original by the user's choice (2026-11-01).
+
+## Fixed: black areas in cutscenes and on the road (2026-11-01)
+
+- Root cause: **D3D_InitDefaultState was never found** (0 in config), so the Xbox default render states were never
+  applied; the host's simple states started at 0. Visible symptom: STENCILMASK/STENCILWRITEMASK 0 (Xbox default
+  0xFF), so a stencil-masked darkening quad (helper 0x2468F0: marks with stencil INCR, then a black quad with
+  LEQUAL ref 1) covered the whole screen and blacked out everything drawn before it (road, near geometry, the
+  "black wedge" in a cutscene). The earlier "fade-in" explanation for those frames was wrong.
+- Mapped D3D_InitDefaultState = 0x2BFAF0 (called by device init 0x2C058B). To let it run:
+  - all complex render state setters from its table 0x2C7BC8 (slot k = RS 136 + k), 18 newly mapped; ZBias (149)
+    has no SDK version and stays original;
+  - D3DDevice_SetTextureStageStateNotInline = 0x2BA2F0 with `[abi]` ecx stage, eax type, edx value;
+  - `[data] D3D_FvfShader = 0x2CC2B0` (device init stores it at CDevice+0x794; many D3D internals read it).
+- Result: menu/cutscene streets lit and wet, close to the Xbox screenshots. 120 s run: 60 fps, no errors.
+- One earlier run logged "pipeline creation failed" (347 keys) from 17.6 s; not reproduced since. Failures now log
+  their pipeline description at error level.
+- Launcher `Play True Crime NYC.cmd` sets XBE_CAPTURE_DIR so F3 always saves a capture.
