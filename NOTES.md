@@ -238,3 +238,10 @@
   Not yet known whether that B is what the console gets too (then the difference is elsewhere) or comes from data
   the port fills differently. Next: dump the same values on real hardware or in xemu, or trace where [ebp+8] of
   0x243EF0 is built for the mirror pass.
+- Mirror object path: 0x25FAF0 builds B = (scale from [obj+0x40] via 0x22BFF0, offset [obj+0x30]) x parent
+  [ebp+0x10], unless obj flag 0x40 (then B = parent). Logged in the cutscene: parents are rotation + translations
+  within ~10 units of the mirror camera, objects small (scales 0.05-1.7). Consistent data: the mirror pass reflects
+  nearby props with its own camera; the CPU-side matrices look as intended. With D3D12 they mostly fall outside
+  the 256x256 mirror target or behind the eye. Remaining open question is how the console rasterizes those
+  near/behind-eye triangles (both "keep |w|" and "drop w<0" were wrong). Best next step: compare the mirror
+  target (and the road) in xemu at this shot.
