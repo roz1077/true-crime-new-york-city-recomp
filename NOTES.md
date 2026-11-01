@@ -284,3 +284,9 @@
   buildings strongly without brightening the sky, so the difference is likely where they land or what masks them
   (depth or alpha), not only their colour. Next: capture those quads' vertices/positions and depth state and see
   which part of them covers sky.
+- Building lamp lighting (vs B01012E1/F1, evaluated in Python on captured inputs, scratchpad vseval.py):
+  lamp term = (n . L) / (1 + c169.w * d^2) - c170.w, clamped at 0, with c169.w 0.528 and c170.w 0.05: a lamp only
+  lights surfaces within ~6 units. Facades in the street shot are 10-14 units from the lamps, so they get only
+  ambient (~0.06-0.14). Inputs verified: lamp positions (correct inverse), normals (camera-facing walls +0.98),
+  dequant scales. So by the title's own maths these walls are not lamp lit; the xemu facade difference is not
+  explained yet (possibly a different moment or camera in the xemu shot).
