@@ -230,3 +230,11 @@
   So the CPU side that builds the mirror matrix for packed meshes (mirror transform x the object's dequantization
   scale/offset) goes wrong in the recompiled code or an HLE it calls. Next: find where the game writes c[188] for the
   mirror pass (SetVertexShaderConstant callers around the mirror render, 0x25F9xx) and trace the matrix math.
+- Traced the matrix: every write of c[188..191] goes through SetVertexShaderConstantNotInlineFast (0x2BBB60) from two
+  places, 0x244D2E (A = [esi+0x670], B = [esi+0x90]) and 0x243F7C (A = [[esi+0x20]], B = [ebp+8]); both multiply with
+  0x24C6E0 (checked by hand: R = transpose(B x A), correct) and transpose. Main view: A = projection only, B = world
+  x view (translations ~1e3). Mirror (256 viewport): A = a full mirror view-projection (entries ~1-10, shared by all
+  objects), B = per object with translations ~0.1 and scales ~0.2-0.9, giving w ~0.1 for the packed meshes.
+  Not yet known whether that B is what the console gets too (then the difference is elsewhere) or comes from data
+  the port fills differently. Next: dump the same values on real hardware or in xemu, or trace where [ebp+8] of
+  0x243EF0 is built for the mirror pass.
