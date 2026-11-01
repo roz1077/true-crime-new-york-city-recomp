@@ -174,3 +174,17 @@
   draws. Main suspect: the 49 additive lamp halo strips (vs B0101A61, tex 83723380 radial glow, SRCALPHA+ONE,
   MODULATE2X) at the end of the scene, which add ~+13 mean in capture 160003.
 - Capture lines now include fog state; the gamma ramp is logged when set.
+
+## Fixed: hard bright/dark line across the road (2026-11-01)
+
+- The road shader (ps B016C060) builds its wetness alpha from two projected 256x256 render-target maps (t1, t2),
+  sampled clamped through a swizzled A8R8G8B8 view. Light pools and the reflection add light weighted by that alpha.
+- The maps rotate between uses. The title draws into them under a scissor (1,1)-(w-1,h-1) (0x25F981), so their
+  1 pixel border keeps what an earlier opaque scene pass into the same memory left: alpha 255. Its own border lines
+  (black, alpha 0) fall under that scissor too. Reads past the map edge then switched the wetness off: the far road
+  stayed dark behind a hard line.
+- SDK: clamped reads of a render target through a swizzled A8R8G8B8 view use the border color (0) past the edge.
+  Verified by replay on the street shot: one even wet road to the horizon.
+- Also: lines are drawn one console pixel wide on upscaled targets (geometry shader LineHlsl) and on host pixel
+  centers; draws without a depth buffer skip depth clipping. Capture lines show address modes, filters, border,
+  viewport/scissor, alpha test; the raw vertices of small draws.

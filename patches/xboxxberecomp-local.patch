@@ -13,11 +13,49 @@ index 7e6507d..31232a7 100644
      va_list ap;
      va_start(ap, fmt);
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index fe65837..d785229 100644
+index fe65837..3899cc8 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
-@@ -1674,7 +1674,19 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
+@@ -565,6 +565,7 @@ private:
+     ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
+     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
+     void ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool sprite);
++    void ExpandLines(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d);
+     float TargetScale() const;  // host pixels per console pixel of the bound target
+     float RenderTargetShift(const State& s, const DrawShaders& sh) const;
+     void FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const;
+@@ -1607,7 +1608,9 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
+     d.RasterizerState.FrontCounterClockwise = k.ccw;
+     d.RasterizerState.DepthBias = k.zbias;
+     d.RasterizerState.SlopeScaledDepthBias = k.zslope;
+-    d.RasterizerState.DepthClipEnable = TRUE;
++    // with no depth buffer nothing clips on z: a title's lines at z 1 (the edge of the range) reach 0 or a rounding
++    // below in reversed depth, where D3D12 would drop them
++    d.RasterizerState.DepthClipEnable = k.has_ds ? TRUE : FALSE;
+     FillDepthStencilDesc(k, d.DepthStencilState);
+     d.PrimitiveTopologyType = TopologyType(k.topo);
+     d.NumRenderTargets = k.has_rt ? 1 : 0;
+@@ -1649,6 +1652,15 @@ void D3D12Backend::ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool spri
+     d.RasterizerState.FrontCounterClockwise = FALSE;
+ }
+ 
++void D3D12Backend::ExpandLines(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) {
++    uint64_t hash;
++    ID3DBlob* gs = Compile(LineHlsl(), "main", "gs_5_0", hash);
++    if (!gs) return;
++    d.GS = {gs->GetBufferPointer(), gs->GetBufferSize()};
++    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
++    d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++}
++
+ float D3D12Backend::TargetScale() const {
+     const Target* t = bound_rt_ ? bound_rt_ : bound_ds_;
+     if (!t || !t->gw) return 1;
+@@ -1672,9 +1684,22 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
+     d.InputLayout = {el, n};
+     FillPipelineDesc(k, vs, ps, d);
      if (k.topo == uint32_t(Topology::Points)) ExpandPoints(d, k.sprite);
++    else if (k.topo == uint32_t(Topology::Lines)) ExpandLines(d);
      ComPtr<ID3D12PipelineState> pso;
      g_perf.psos++;
 -    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) LOGE("d3d12: pipeline creation failed");
@@ -37,7 +75,32 @@ index fe65837..d785229 100644
      psos_[h] = pso;
      return pso.Get();
  }
-@@ -2421,6 +2433,9 @@ WRange DrawWRange(const State& s, bool program) {
+@@ -1969,6 +1994,8 @@ constexpr uint32_t kTexfAnisotropic = 3;
+ constexpr uint32_t kTaddressWrap = 1;
+ constexpr uint32_t kTaddressClamp = 3;
+ 
++constexpr uint32_t kFmtA8R8G8B8Swizzled = 0x06;
++
+ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stages, bool clamp, uint32_t aniso) {
+     D3D12_SAMPLER_DESC sd = {};
+     const auto& t = s.tss[size_t(i)];
+@@ -1992,6 +2019,15 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
+     sd.AddressU = Address(clamp && t[kTssAddressU] == kTaddressWrap ? kTaddressClamp : t[kTssAddressU]);
+     sd.AddressV = Address(clamp && t[kTssAddressV] == kTaddressWrap ? kTaddressClamp : t[kTssAddressV]);
+     sd.AddressW = Address(t[kTssAddressW]);
++    // a render target read through a swizzled A8R8G8B8 view, clamped: a projected map laid over the world (True
++    // Crime's road wetness masks). The title renders into it under a scissor one pixel in from each edge, so its
++    // border keeps whatever an earlier use of that memory left (a scene drawn opaque); reads past the map then give
++    // full alpha and switch the effect off beyond a hard line. Past the edge reads the border color instead
++    TextureDesc td;
++    if (stages.rt[i] && s.textures[size_t(i)] && Describe(s.textures[size_t(i)], td) && td.format == kFmtA8R8G8B8Swizzled) {
++        if (t[kTssAddressU] == kTaddressClamp) sd.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
++        if (t[kTssAddressV] == kTaddressClamp) sd.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
++    }
+     sd.MipLODBias = Bits(t[kTssMipLodBias]);
+     sd.MinLOD = float(t[kTssMaxMipLevel]);
+     sd.MaxLOD = mip ? D3D12_FLOAT32_MAX : sd.MinLOD;
+@@ -2421,6 +2457,9 @@ WRange DrawWRange(const State& s, bool program) {
  // ReversedDepthHlsl's zparams: x the w buffer's scale (0 for a z buffer), y its far w, z the polygon offset in units of
  // the clip w for a w buffer, of depth for a z buffer
  void D3D12Backend::FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const {
@@ -47,20 +110,70 @@ index fe65837..d785229 100644
      bool offset = OffsetsPolygons(s, Topology(k.topo));
      float units = offset ? Bits(SimpleState(s, kMDepthOffset)) : 0;
      if (s.rs[kRsZEnable] != kZUseW) {
-@@ -2519,6 +2534,12 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
+@@ -2450,6 +2489,8 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+     FillSurfaceConstants(s, size, c);
+     // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
+     if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
++    // lines: negative, half a pixel onto the host's pixel centers (the vertex epilogue), widened by LineHlsl
++    else if (k.topo == uint32_t(Topology::Lines)) c.surf[3] = -TargetScale();
+     FillFogConstants(s, sh.prog, c);
+     FillCombinerConstants(s, c);
+     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vsc), c.ext, bound_rt_, k.blend ? k.src : 1);
+@@ -2477,8 +2518,10 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
+         TextureDesc d;
+         if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
+         bool tg = targets_.count(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
+-        fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
+-                res ? "" : " unbound");
++        const auto& t = s.tss[size_t(i)];
++        fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s addr %u%u filt %u%u border %08X", i, d.data, d.format, d.width,
++                d.height, tg ? " target" : "", res ? "" : " unbound", t[kTssAddressU], t[kTssAddressV],
++                t[kTssMinFilter], t[kTssMagFilter], t[kTssBorderColor]);
+         if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
+             cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
+         }
+@@ -2498,6 +2541,22 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
+         for (uint32_t k = 0; k < n * 4; k++) fprintf(cap_, " %g", a.vertices[v * n * 4 + k]);
+         fprintf(cap_, " ]");
+     }
++    // the raw path: the first vertices of buffer 0 as dwords (floats shown as floats, colors in hex)
++    if (a.vertices.empty() && a.buffer_count && a.buffers[0].src && a.buffers[0].stride) {
++        const VertexBuffer& b = a.buffers[0];
++        for (uint32_t v = 0; v < std::min<uint32_t>(4, b.bytes / b.stride); v++) {
++            fprintf(cap_, " [");
++            for (uint32_t o = 0; o + 4 <= b.stride; o += 4) {
++                uint32_t d;
++                std::memcpy(&d, b.src + v * b.stride + o, 4);
++                float f;
++                std::memcpy(&f, &d, 4);
++                if (std::abs(f) < 1e7f && (std::abs(f) > 1e-6f || d == 0)) fprintf(cap_, " %g", f);
++                else fprintf(cap_, " %08X", d);
++            }
++            fprintf(cap_, " ]");
++        }
++    }
+     for (int r = 0; r < kVsConstants; r++) {
+         const auto& v = s.vsc[r];
+         if (v[0] || v[1] || v[2] || v[3]) {
+@@ -2519,6 +2578,17 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
              cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
              k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
              c.pc[0][2], c.pc[0][3]);
 +    if (k.sten)
 +        fprintf(cap_, " sten func %X ref %u mask %X wmask %X fail %X zfail %X pass %X", k.sfunc,
 +                SimpleState(s, kMStencilRef) & 0xFF, k.smask, k.swmask, k.sfail, k.szfail, k.spass);
++    if (s.scissor_count || s.viewport.x || s.viewport.y)
++        fprintf(cap_, " vp %u %u %u %u sc %u %u %u %u %u", s.viewport.x, s.viewport.y, s.viewport.w, s.viewport.h,
++                s.scissor_count, s.scissors[0], s.scissors[1], s.scissors[2], s.scissors[3]);
++    if (SimpleState(s, kMAlphaTestEnable))
++        fprintf(cap_, " atest func %.0f ref %.0f", c.misc[1], c.misc[0]);
 +    if (s.rs[kRsFogEnable])
 +        fprintf(cap_, " fog %08X mode %u %.3f %.3f %.4f", s.rs[kRsFogColor], s.rs[kRsFogTableMode], c.fog[0], c.fog[1],
 +                c.fog[2]);
      CaptureTextures(s, stages);
  }
  
-@@ -2648,6 +2669,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+@@ -2648,6 +2718,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
  void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
      float bf[4];
      Color(SimpleState(s, kMBlendColor), bf);
@@ -76,7 +189,7 @@ index fe65837..d785229 100644
      uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
      if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
      cl_->OMSetBlendFactor(bf);
-@@ -3659,6 +3689,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
+@@ -3659,6 +3738,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
  // the frame moves to another target: save the one it leaves
  void D3D12Backend::CapStep(const Surface& rt) {
      uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
@@ -94,7 +207,7 @@ index fe65837..d785229 100644
      auto it = targets_.find(TargetMapKey(cap_rt_, false));
      if (cap_rt_ && it != targets_.end()) {
 diff --git a/runtime/gpu/shaders.cpp b/runtime/gpu/shaders.cpp
-index 6d263d6..3d64d0d 100644
+index 6d263d6..388b8a5 100644
 --- a/runtime/gpu/shaders.cpp
 +++ b/runtime/gpu/shaders.cpp
 @@ -32,6 +32,7 @@ struct VOut {
@@ -113,7 +226,17 @@ index 6d263d6..3d64d0d 100644
  };
  )";
  
-@@ -233,6 +235,8 @@ const char* kVsEpilogue = R"(
+@@ -225,6 +227,9 @@ const char* kVsEpilogue = R"(
+     // full screen passes drawn half a pixel up-left for the console's integer pixel centers stop half a pixel short
+     // of the far edges on D3D12's, which upscaled leaves the last host columns and rows undrawn
+     // surf.w set: a point, which stays put since pulled out it would leave the target
++    // surf.w negative: a line. The console's pixel centers are on whole numbers, D3D12's half a pixel on, so a line along
++    // a target's first row or column (drawn to clear its edges) would light nothing: moved onto the host's centers
++    if (surf.w < 0) p.xy += 0.5;
+     if (surf.w == 0 && abs(p.x - (surf.x - 0.5)) < 1e-3) p.x = surf.x;
+     if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;
+     q.x = p.x * 2 / surf.x - 1;
+@@ -233,6 +238,8 @@ const char* kVsEpilogue = R"(
      q.xyz *= p.w;
      q.w = p.w;
      o.pos = q;
@@ -122,7 +245,7 @@ index 6d263d6..3d64d0d 100644
      o.d0 = saturate(oD0);
      o.d1 = saturate(oD1);
      o.b0 = saturate(oB0);
-@@ -848,6 +852,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
+@@ -848,6 +855,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
      if (surf.w == 0 && abs(sp.x - (surf.x - 0.5)) < 1e-3) cp.x = cp.w;
      if (surf.w == 0 && abs(sp.y - (surf.y - 0.5)) < 1e-3) cp.y = -cp.w;
      o.pos = cp;
@@ -130,11 +253,49 @@ index 6d263d6..3d64d0d 100644
      o.d0 = saturate(oD0);
      o.d1 = saturate(oD1);
      o.b0 = o.d0;
+@@ -995,6 +1003,29 @@ std::string ReversedDepthHlsl(std::string s) {
+     return s;
+ }
+ 
++// a line is a console pixel wide, several host pixels on an upscaled target, where a host line would leave most of
++// each console pixel undrawn (a title clearing a target's edges with lines keeps its edge texels): drawn as a quad
++// that covers the pixels the console lights, from the start up to the end, half a pixel to each side
++std::string LineHlsl() {
++    return Common() + R"(
++[maxvertexcount(4)]
++void main(line VOut v[2], inout TriangleStream<VOut> strip) {
++    float2 pixel = 2 / surf.xy;  // clip units per console pixel at w 1
++    float2 a = v[0].pos.xy / v[0].pos.w, b = v[1].pos.xy / v[1].pos.w;
++    float2 d = (b - a) / pixel;  // in console pixels
++    float len = length(d);
++    float2 dir = len > 0 ? d / len : float2(1, 0);
++    float2 side = float2(-dir.y, dir.x);
++    for (int i = 0; i < 4; i++) {
++        VOut o = v[(i & 1) ? 1 : 0];
++        float2 at = ((i & 1) ? b : a) + (-0.5 * dir + ((i & 2) ? 0.5 : -0.5) * side) * pixel;
++        o.pos.xy = at * o.pos.w;
++        strip.Append(o);
++    }
++}
++)";
++}
++
+ // a point covers its console pixel, several host pixels on an upscaled target: drawn as a quad of that size
+ std::string PointHlsl() {
+     return Common() + R"(
 diff --git a/runtime/gpu/shaders.h b/runtime/gpu/shaders.h
-index 08d9bff..09cba08 100644
+index 08d9bff..dba9ac3 100644
 --- a/runtime/gpu/shaders.h
 +++ b/runtime/gpu/shaders.h
-@@ -105,6 +105,7 @@ struct DrawConstants {
+@@ -62,6 +62,7 @@ std::string QuadHlsl(std::string s);
+ std::string ReversedDepthHlsl(std::string s);
+ // the geometry shader that draws a point as its console pixel
+ std::string PointHlsl();
++std::string LineHlsl();
+ 
+ // HLSL a backend extension adds; the defaults write the console path
+ struct ShaderHooks {
+@@ -105,6 +106,7 @@ struct DrawConstants {
      float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
      float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
      float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
@@ -304,7 +465,7 @@ index bec6e36..886f51b 100644
  
  // Exceptions dispatch like NT on x86: each handler of the fs:[0] chain is called (record, frame, context,
 diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
-index 975e977..9d8d881 100644
+index 975e977..aae1065 100644
 --- a/runtime/xdk/d3d8.cpp
 +++ b/runtime/xdk/d3d8.cpp
 @@ -11,10 +11,13 @@
@@ -438,7 +599,15 @@ index 975e977..9d8d881 100644
      return n;
  }
  
-@@ -1272,7 +1349,43 @@ void EndPrimitive() {
+@@ -675,6 +752,7 @@ HLE_STDCALL(D3DDevice_SetViewport, 1) {
+ 
+ HLE_STDCALL(D3DDevice_SetScissors, 3) {
+     std::lock_guard<std::recursive_mutex> lock(g_lock);
++    LOG_FIRST(12, "d3d: SetScissors count %u exclusive %u", a[0], a[1]);
+     g_state.scissor_count = std::min<uint32_t>(a[0], 8);
+     for (uint32_t i = 0; i < g_state.scissor_count * 4; i++) g_state.scissors[i] = R32(a[2] + i * 4);
+     return 0;
+@@ -1272,7 +1350,43 @@ void EndPrimitive() {
      uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
      g_im_prim = 0;
      if (!prim || !count) return;
