@@ -245,3 +245,17 @@
   the 256x256 mirror target or behind the eye. Remaining open question is how the console rasterizes those
   near/behind-eye triangles (both "keep |w|" and "drop w<0" were wrong). Best next step: compare the mirror
   target (and the road) in xemu at this shot.
+
+## xemu reference (user screenshots, 2026-11-01) vs ours (captures 184206, 184218)
+
+- Region means (xemu / ours now / ours before the vdef halo fix): sky 87/85/154, lamp-lit facade 62/37/63,
+  road left 12/25/70, road right 46/87/174, lamp glow 162/120/199. Sky now matches; facades too dark; road ~2x.
+- Proven correct on the CPU side: per-object lamp positions (c[169], written by 0x24515C through
+  SetVertexShaderConstant1 0x2BBB10, from 0x22D810 = a correct 4x4 inverse, checked err ~3e-5); the building
+  normals; the facade in question faces away from that lamp, so its light in xemu comes from the additive passes.
+- Unfed v3 per draw: the 47 haze strips (prim 5, 228 verts) are white either way; count-4 quads get the tints
+  (blend 302,1: 0.41 0.30 0.20 a 0.50; blend 304,1 light pools: 0.20 0.15 0.10 a 0.25 and 0.10 0.08 0.05 a 0.125).
+  The light pools add lamp light by dest alpha: facades have alpha 255, the road ~0.35.
+- Likely remaining cause: the road's wetness alpha (ps B016C050 mux chain over the t1/t2 maps) is too high and
+  the light pool strength too low, so light lands on the road instead of the facades. Also the user reports a
+  dark band across the road in 184218 that xemu does not have (far road just beyond the bright near road).
