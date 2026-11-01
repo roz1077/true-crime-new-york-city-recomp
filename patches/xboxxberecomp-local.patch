@@ -13,10 +13,20 @@ index 7e6507d..31232a7 100644
      va_list ap;
      va_start(ap, fmt);
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index fe65837..ac11ad0 100644
+index fe65837..38fbf93 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
-@@ -2648,6 +2648,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+@@ -2519,6 +2519,9 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
+             cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
+             k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
+             c.pc[0][2], c.pc[0][3]);
++    if (k.sten)
++        fprintf(cap_, " sten func %X ref %u mask %X wmask %X fail %X zfail %X pass %X", k.sfunc,
++                SimpleState(s, kMStencilRef) & 0xFF, k.smask, k.swmask, k.sfail, k.szfail, k.spass);
+     CaptureTextures(s, stages);
+ }
+ 
+@@ -2648,6 +2651,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
  void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
      float bf[4];
      Color(SimpleState(s, kMBlendColor), bf);
@@ -32,6 +42,23 @@ index fe65837..ac11ad0 100644
      uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
      if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
      cl_->OMSetBlendFactor(bf);
+@@ -3659,6 +3671,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
+ // the frame moves to another target: save the one it leaves
+ void D3D12Backend::CapStep(const Surface& rt) {
+     uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
++    // XBE_CAPTURE_EVERY=<n>: also save the current target every n draws, to find the draw that changes it
++    static const uint32_t every = [] { const char* v = std::getenv("XBE_CAPTURE_EVERY"); return v ? uint32_t(std::atoi(v)) : 0u; }();
++    if (every && d == cap_rt_ && cap_i_ && cap_i_ % every == 0) {
++        auto cur = targets_.find(TargetMapKey(cap_rt_, false));
++        if (cur != targets_.end()) {
++            char name[32];
++            snprintf(name, sizeof(name), "%04u_%08X_s", cap_i_, cap_rt_);
++            CapSave(cur->second, name);
++        }
++    }
+     if (d == cap_rt_) return;
+     auto it = targets_.find(TargetMapKey(cap_rt_, false));
+     if (cap_rt_ && it != targets_.end()) {
 diff --git a/runtime/kernel/files.cpp b/runtime/kernel/files.cpp
 index 5644ea7..1677837 100644
 --- a/runtime/kernel/files.cpp

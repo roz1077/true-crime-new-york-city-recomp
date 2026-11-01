@@ -121,5 +121,10 @@
   its vertex programs), the clock (menu scene is a rainy night at any time of day).
 - City material: ps B016C050, vs lighting from constants (ambient c[161] ~0.2, point lights c[169..176],
   oD0 = min(R0, c[179].y)). Reflection pass (rt 256x256, FFP texture-only) is dark because the facades are night art.
-- Still reported "very dark" by the user; only menu captures so far. Next: a gameplay capture
-  (`XBE_CAPTURE_AT=<s>` now captures without F3).
+- "Black road" captures (incl. the user's) were frames during a **fade-in**: helper 0x2468F0 draws a full-screen
+  black quad blended with CONSTANTALPHA/INVCONSTANTALPHA, amount from 0x1DC70A (0x2463E0(mode 2, amount)), counting
+  128 -> 0 after each menu camera cut (holds at 33 while the city loads). It sits mid-frame (after the street, before
+  objects) by design. Before the blend fix the fade never applied (factor came from the black RGB).
+- Debug captures: `XBE_CAPTURE_AT=<s>` (auto F3), `XBE_CAPTURE_EVERY=<n>` (save the target every n draws), stencil
+  state in frame.txt. Alpha is in the 32-bit BMPs (read the 4th byte; Pillow drops it).
+- Reference: Xbox screenshots (Bing image search) show night streets with grey wet asphalt and visible facades.
