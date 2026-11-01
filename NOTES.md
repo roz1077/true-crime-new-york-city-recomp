@@ -290,3 +290,10 @@
   ambient (~0.06-0.14). Inputs verified: lamp positions (correct inverse), normals (camera-facing walls +0.98),
   dequant scales. So by the title's own maths these walls are not lamp lit; the xemu facade difference is not
   explained yet (possibly a different moment or camera in the xemu shot).
+- xemu recording (user, Radeon ReLive, 21:12): best frame match 35.3 s to replay capture 205003. In xemu the lamp at
+  the upper left lights the facade beside it (warm brick, windows); ours stays dark.
+- Street shot with all inputs (out/build/release/street/t42.5): the big left facade draws 666/670 (B0101311) and 691
+  get lamps that project BEHIND the camera, ~190-285 units away (c73..c79 through the object's own WVP), none of
+  them the lamp next to the facade. Other objects get sensible lamps (866 -> on-screen lamp, 1134/1140 -> 11-13
+  units). The per-object lamp list (count [obj+0x418], positions from [obj+0x450], consumed at 0x245060) picks the
+  wrong lamps for some objects. Next: trace who fills that list (lamp selection by distance / spatial lookup).
