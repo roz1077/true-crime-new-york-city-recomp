@@ -267,3 +267,15 @@
 - Replaced the border workaround: for clamped reads of a render target through a swizzled A8R8G8B8 view, the
   shader keeps uv on the second texel from each edge (DrawConstants::uvclamp, insetuv in the pixel shader), so the
   unwritten outer ring is never read. Replay of the street shot: no dipped rows, far road continuous.
+
+## Light balance vs xemu (2026-11-01, open)
+
+- xemu screenshots include the console gamma ramp; captures do not. Applying the logged ramp (32->18, 64->57,
+  128->148, 192->223) to ours: sky 88 (xemu 87), road left 16 (12), road right 85 (46), lamp-lit facade 26 (62).
+- Light pools (B0101A61 count-4 quads, blend DESTALPHA+ONE, no v3 in the stream, positions a unit quad) take the
+  tint the title sets with SetVertexData. Experiment with them white (XBE_EXP_POOLWHITE, removed): facade stayed
+  ~17, road right went to 157. So they are not what lights the facade in xemu.
+- No unhandled vertex data methods in the push buffer (only 0x1710, unrelated).
+- Open: what brightens the lamp-side facades on the console (before the vdef change it measured 63 here, so one of
+  the draws whose unfed v3 changed from white to a tint is involved: the count-4 SRCALPHA+ONE quads with
+  0.41 0.30 0.20 a 0.50 are the remaining candidate), and why the right road is ~2x.
