@@ -13,7 +13,7 @@ index 7e6507d..31232a7 100644
      va_list ap;
      va_start(ap, fmt);
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index fe65837..3899cc8 100644
+index fe65837..0651e49 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
 @@ -565,6 +565,7 @@ private:
@@ -100,17 +100,18 @@ index fe65837..3899cc8 100644
      sd.MipLODBias = Bits(t[kTssMipLodBias]);
      sd.MinLOD = float(t[kTssMaxMipLevel]);
      sd.MaxLOD = mip ? D3D12_FLOAT32_MAX : sd.MinLOD;
-@@ -2421,6 +2457,9 @@ WRange DrawWRange(const State& s, bool program) {
+@@ -2421,6 +2457,10 @@ WRange DrawWRange(const State& s, bool program) {
  // ReversedDepthHlsl's zparams: x the w buffer's scale (0 for a z buffer), y its far w, z the polygon offset in units of
  // the clip w for a w buffer, of depth for a z buffer
  void D3D12Backend::FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const {
++    std::memcpy(c.vdef, s.vdef, sizeof(c.vdef));
 +    c.zclips[0] = s.zclip[0];
 +    c.zclips[1] = s.zclip[1];
 +    c.zclips[2] = s.zclip_on && sh.prog ? 1.0f : 0.0f;  // the vertex program planes
      bool offset = OffsetsPolygons(s, Topology(k.topo));
      float units = offset ? Bits(SimpleState(s, kMDepthOffset)) : 0;
      if (s.rs[kRsZEnable] != kZUseW) {
-@@ -2450,6 +2489,8 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+@@ -2450,6 +2490,8 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
      FillSurfaceConstants(s, size, c);
      // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
      if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
@@ -119,7 +120,7 @@ index fe65837..3899cc8 100644
      FillFogConstants(s, sh.prog, c);
      FillCombinerConstants(s, c);
      if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vsc), c.ext, bound_rt_, k.blend ? k.src : 1);
-@@ -2477,8 +2518,10 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
+@@ -2477,8 +2519,10 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
          TextureDesc d;
          if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
          bool tg = targets_.count(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
@@ -132,7 +133,7 @@ index fe65837..3899cc8 100644
          if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
              cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
          }
-@@ -2498,6 +2541,22 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
+@@ -2498,6 +2542,22 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
          for (uint32_t k = 0; k < n * 4; k++) fprintf(cap_, " %g", a.vertices[v * n * 4 + k]);
          fprintf(cap_, " ]");
      }
@@ -155,7 +156,7 @@ index fe65837..3899cc8 100644
      for (int r = 0; r < kVsConstants; r++) {
          const auto& v = s.vsc[r];
          if (v[0] || v[1] || v[2] || v[3]) {
-@@ -2519,6 +2578,17 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
+@@ -2519,6 +2579,17 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
              cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
              k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
              c.pc[0][2], c.pc[0][3]);
@@ -173,7 +174,7 @@ index fe65837..3899cc8 100644
      CaptureTextures(s, stages);
  }
  
-@@ -2648,6 +2718,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+@@ -2648,6 +2719,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
  void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
      float bf[4];
      Color(SimpleState(s, kMBlendColor), bf);
@@ -189,7 +190,7 @@ index fe65837..3899cc8 100644
      uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
      if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
      cl_->OMSetBlendFactor(bf);
-@@ -3659,6 +3738,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
+@@ -3659,6 +3739,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
  // the frame moves to another target: save the one it leaves
  void D3D12Backend::CapStep(const Surface& rt) {
      uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
@@ -207,7 +208,7 @@ index fe65837..3899cc8 100644
      auto it = targets_.find(TargetMapKey(cap_rt_, false));
      if (cap_rt_ && it != targets_.end()) {
 diff --git a/runtime/gpu/shaders.cpp b/runtime/gpu/shaders.cpp
-index 6d263d6..388b8a5 100644
+index 6d263d6..6144205 100644
 --- a/runtime/gpu/shaders.cpp
 +++ b/runtime/gpu/shaders.cpp
 @@ -32,6 +32,7 @@ struct VOut {
@@ -218,15 +219,25 @@ index 6d263d6..388b8a5 100644
  };
  cbuffer VC : register(b0) { float4 c[192]; };
  cbuffer DC : register(b1) {
-@@ -55,6 +56,7 @@ const char* kCommonTail = R"(    float4 spread[4];
+@@ -55,6 +56,8 @@ const char* kCommonTail = R"(    float4 spread[4];
      float4 lt[56];
      float4 rtshift;
      float4 zparams;
 +    float4 zclips;
++    float4 vdef[16];
  };
  )";
  
-@@ -225,6 +227,9 @@ const char* kVsEpilogue = R"(
+@@ -133,7 +136,7 @@ std::string Src(const Tok& k, int which, uint16_t regs) {
+         base = reg == 12 ? "oPos" : F("R%u", reg);
+     } else if (mux == 2) {
+         uint32_t v = k.f(1, 9, 4);
+-        base = (regs >> v) & 1 ? F("i.v%u", v) : (v == 3 ? "float4(1,1,1,1)" : "float4(0,0,0,1)");
++        base = (regs >> v) & 1 ? F("i.v%u", v) : F("vdef[%u]", v);
+     } else {
+         uint32_t cr = k.f(1, 13, 8);
+         base = k.f(3, 1, 1) ? F("c[clamp(a0 + %u, 0, 191)]", cr) : F("c[%u]", cr);
+@@ -225,6 +228,9 @@ const char* kVsEpilogue = R"(
      // full screen passes drawn half a pixel up-left for the console's integer pixel centers stop half a pixel short
      // of the far edges on D3D12's, which upscaled leaves the last host columns and rows undrawn
      // surf.w set: a point, which stays put since pulled out it would leave the target
@@ -236,7 +247,7 @@ index 6d263d6..388b8a5 100644
      if (surf.w == 0 && abs(p.x - (surf.x - 0.5)) < 1e-3) p.x = surf.x;
      if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;
      q.x = p.x * 2 / surf.x - 1;
-@@ -233,6 +238,8 @@ const char* kVsEpilogue = R"(
+@@ -233,6 +239,8 @@ const char* kVsEpilogue = R"(
      q.xyz *= p.w;
      q.w = p.w;
      o.pos = q;
@@ -245,7 +256,7 @@ index 6d263d6..388b8a5 100644
      o.d0 = saturate(oD0);
      o.d1 = saturate(oD1);
      o.b0 = saturate(oB0);
-@@ -848,6 +855,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
+@@ -848,6 +856,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
      if (surf.w == 0 && abs(sp.x - (surf.x - 0.5)) < 1e-3) cp.x = cp.w;
      if (surf.w == 0 && abs(sp.y - (surf.y - 0.5)) < 1e-3) cp.y = -cp.w;
      o.pos = cp;
@@ -253,7 +264,7 @@ index 6d263d6..388b8a5 100644
      o.d0 = saturate(oD0);
      o.d1 = saturate(oD1);
      o.b0 = o.d0;
-@@ -995,6 +1003,29 @@ std::string ReversedDepthHlsl(std::string s) {
+@@ -995,6 +1004,29 @@ std::string ReversedDepthHlsl(std::string s) {
      return s;
  }
  
@@ -284,7 +295,7 @@ index 6d263d6..388b8a5 100644
  std::string PointHlsl() {
      return Common() + R"(
 diff --git a/runtime/gpu/shaders.h b/runtime/gpu/shaders.h
-index 08d9bff..dba9ac3 100644
+index 08d9bff..ed5d3f8 100644
 --- a/runtime/gpu/shaders.h
 +++ b/runtime/gpu/shaders.h
 @@ -62,6 +62,7 @@ std::string QuadHlsl(std::string s);
@@ -295,19 +306,20 @@ index 08d9bff..dba9ac3 100644
  
  // HLSL a backend extension adds; the defaults write the console path
  struct ShaderHooks {
-@@ -105,6 +106,7 @@ struct DrawConstants {
+@@ -105,6 +106,8 @@ struct DrawConstants {
      float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
      float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
      float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
 +    float zclips[4];     // depth clip planes: near, far in screen z, 1 when on
++    float vdef[16][4];   // vertex program inputs no stream feeds: State::vdef
  };
  
  }  // namespace gpu
 diff --git a/runtime/gpu/state.h b/runtime/gpu/state.h
-index 2a57947..361c478 100644
+index 2a57947..850aea0 100644
 --- a/runtime/gpu/state.h
 +++ b/runtime/gpu/state.h
-@@ -185,6 +185,10 @@ struct State {
+@@ -185,6 +185,15 @@ struct State {
      uint32_t light_enable = 0;                         // bit per light
      float ss_offset_x = 0, ss_offset_y = 0;
      float zscale = 16777215.0f;  // depth buffer units per 1.0
@@ -315,6 +327,11 @@ index 2a57947..361c478 100644
 +    // [near, far] is clipped; off uses the whole range
 +    float zclip[2] = {0, 0};
 +    uint32_t zclip_on = 0;
++    // the value a vertex program input keeps when no stream feeds it: the last SetVertexData outside begin/end
++    // (vertex colour starts white, the rest 0 0 0 1)
++    float vdef[16][4] = {{0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {1, 1, 1, 1}, {0, 0, 0, 1}, {0, 0, 0, 1},
++                         {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1},
++                         {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}};
  };
  
  }  // namespace gpu
@@ -465,7 +482,7 @@ index bec6e36..886f51b 100644
  
  // Exceptions dispatch like NT on x86: each handler of the fs:[0] chain is called (record, frame, context,
 diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
-index 975e977..aae1065 100644
+index 975e977..451a41b 100644
 --- a/runtime/xdk/d3d8.cpp
 +++ b/runtime/xdk/d3d8.cpp
 @@ -11,10 +11,13 @@
@@ -607,6 +624,15 @@ index 975e977..aae1065 100644
      g_state.scissor_count = std::min<uint32_t>(a[0], 8);
      for (uint32_t i = 0; i < g_state.scissor_count * 4; i++) g_state.scissors[i] = R32(a[2] + i * 4);
      return 0;
+@@ -1248,7 +1326,7 @@ uint32_t g_push_begin = 0;
+ namespace d3d {
+ namespace {
+ uint32_t g_im_prim = 0, g_im_mask = 0;  // open primitive, slots it wrote
+-float g_im_attr[64];                    // 16 slots of x y z w
++float g_im_attr[64] = {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1};  // 16 slots of x y z w
+ std::vector<float> g_im_vertices;       // every slot per vertex
+ 
+ // visibility tests: depth passing pixels are counted while enabled, a report gets the count since the clear,
 @@ -1272,7 +1350,43 @@ void EndPrimitive() {
      uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
      g_im_prim = 0;
@@ -652,6 +678,18 @@ index 975e977..aae1065 100644
      auto bound = g_state.vs, from = handle & 1 ? bound : nullptr;
      Made& m = made[{from.get(), g_im_mask}];
      if (!m.vs) {
+@@ -1337,7 +1451,10 @@ bool ApplyImmediate(uint32_t m, uint32_t v) {
+     } else {
+         return false;
+     }
+-    if (!g_im_prim) return true;
++    if (!g_im_prim) {
++        if (last) std::memcpy(g_state.vdef[(a - g_im_attr) / 4], a, 16);
++        return true;
++    }
+     g_im_mask |= 1u << (a - g_im_attr) / 4;
+     if (a == g_im_attr && last) g_im_vertices.insert(g_im_vertices.end(), g_im_attr, g_im_attr + 64);
+     return true;
 diff --git a/runtime/xdk/layout.h b/runtime/xdk/layout.h
 index a98e822..2c75629 100644
 --- a/runtime/xdk/layout.h

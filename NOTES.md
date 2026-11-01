@@ -188,3 +188,16 @@
 - Also: lines are drawn one console pixel wide on upscaled targets (geometry shader LineHlsl) and on host pixel
   centers; draws without a depth buffer skip depth clipping. Capture lines show address modes, filters, border,
   viewport/scissor, alpha test; the raw vertices of small draws.
+
+## Fixed: lamp halos and fog far too bright (2026-11-01)
+
+- The halo strips (vs B0101A61, radial glow texture, SRCALPHA+ONE, MODULATE2X) read the vertex colour register v3,
+  which their stream does not feed. The title sets it just before with SetVertexData outside begin/end: warm, dim
+  values such as (0.20 0.15 0.10 a 0.25) and (0.10 0.08 0.05 a 0.125). The console keeps that value for unfed inputs;
+  the SDK used white. Now vertex programs read unfed inputs from State::vdef (the last value set; v3 starts white),
+  passed in the draw constants. Street shots: mean ~80 -> ~40-55, close to the video (~39-48).
+- Open: in some street shots the road is lit on the right and dark on the left with a straight edge. It comes from
+  the wet-road reflection (draw ~533 adds target 81C98000, the blurred mirror pass into 01528000, by dest alpha).
+  The mirror pass is mostly black; a reflected hillside wall on the right is cut along a straight vertical edge.
+  Not the depth clip planes (tested off). Next suspect: clipping of mirrored geometry with vertices behind the
+  camera (negative w; the console does not clip programs at w = 0 the way D3D12 does).
