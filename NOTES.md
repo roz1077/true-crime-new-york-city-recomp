@@ -304,3 +304,11 @@
   hold small coordinates such as (0.1 0.1 -0.1), (2.2 0.4 9.2), (9.7 2.2 1.0): a different space or stale data,
   a candidate for the facade's far-away lamps. Not yet tied to draws 666/670. Next: log set pointer per draw
   (CaptureDraw could print the renderer's light set) to see which set the facade uses, then find who fills it.
+- Facade light set traced (hooks, removed): the facade's object-space lamp (19.67 -0.31 5.94) comes from a set with
+  4 world lamps at x -172.7..-177.9, z 1895..1903, while the lamps near the camera in this shot are at x -153 / -162,
+  z ~1888-1890 (seen in other objects' sets). Sets are snapshots (0x2409F0, from env 0x36FE80 count +0x418, entries
+  +0x420, 64 bytes) taken when each draw is queued; the world env count is set to 4 by the frame code (0xA834E ->
+  SetLightCount 0x2446F0). The code that writes the env's 4 lamp entries per object is not found yet (many writers
+  of +0x420; a guest stack scan at the facade snapshot gave stale return addresses: 0x240DDF, 0x137E52, 0x137EC6,
+  0x13EF8C, 0x14B5B3, 0xA76C2, 0xA794B). Next: hook writes of the env's entries (find the function that stores
+  64-byte lamp records into 0x36FE80+0x420) and check its nearest-lamp choice for the facade object.
