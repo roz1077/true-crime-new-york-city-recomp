@@ -9,4 +9,6 @@ if not exist TrueCrimeNYC.exe (
     exit /b 1
 )
 set "XBE_CAPTURE_DIR=captures"
+rem also save the image every 25 draws inside a captured frame (makes F3 slower, helps find a bad draw)
+set "XBE_CAPTURE_EVERY=25"
 start "" "%CD%\TrueCrimeNYC.exe" %*
