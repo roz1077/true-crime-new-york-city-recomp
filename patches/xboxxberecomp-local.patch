@@ -301,10 +301,24 @@ index bec6e36..886f51b 100644
  
  // Exceptions dispatch like NT on x86: each handler of the fs:[0] chain is called (record, frame, context,
 diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
-index 975e977..c364b40 100644
+index 975e977..cf1c57b 100644
 --- a/runtime/xdk/d3d8.cpp
 +++ b/runtime/xdk/d3d8.cpp
-@@ -271,7 +271,21 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
+@@ -11,10 +11,13 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cstdlib>
++#include <functional>
+ #include <map>
+ #include <thread>
+ #include <unordered_map>
+ #include <unordered_set>
++#include <vector>
+ 
+ #include "app/app.h"
+ #include "core/diag.h"
+@@ -271,7 +274,21 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
      // surfaces of the same shape are kept: a title wraps their memory in textures of its own across a Reset
      static std::array<uint32_t, 5> made{};
      std::array<uint32_t, 5> asked{w, h, color_fmt, std::min<uint32_t>(count + 1, 3), zf};
@@ -327,7 +341,7 @@ index 975e977..c364b40 100644
          made = asked;
          g_buffer_count = asked[3];
          for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
-@@ -530,6 +544,34 @@ HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
+@@ -530,6 +547,34 @@ HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
  HLE_STDCALL(D3DDevice_FlushVertexCache, 0) { return 0; }
  
  // The library keeps the ramp in one of two device slots for GetGammaRamp: both get it, whichever one its index names
@@ -362,24 +376,34 @@ index 975e977..c364b40 100644
  HLE_STDCALL(D3DDevice_SetGammaRamp, 2) {
      uint8_t ramp[768];
      std::memcpy(ramp, HostPtr(a[1]), 768);
-@@ -601,6 +643,16 @@ std::atomic<uint32_t> g_presents{0};
+@@ -601,6 +646,26 @@ std::atomic<uint32_t> g_presents{0};
  }  // namespace
  
  HLE_STDCALL(D3DDevice_Swap, 1) {
-+    // XBE_CAPTURE_AT=<seconds>: one frame capture that long after the first present, as F3 takes one
++    // XBE_CAPTURE_AT=<seconds>[,<seconds>...]: frame captures that long after the first present, as F3 takes them
 +    {
-+        static const double at = [] { const char* v = std::getenv("XBE_CAPTURE_AT"); return v ? std::atof(v) : -1.0; }();
++        static std::vector<double> at = [] {
++            std::vector<double> t;
++            for (const char* v = std::getenv("XBE_CAPTURE_AT"); v && *v;) {
++                char* end;
++                double s = std::strtod(v, &end);
++                if (end == v) break;
++                t.push_back(s);
++                v = *end == ',' ? end + 1 : end;
++            }
++            std::sort(t.begin(), t.end(), std::greater<>());  // the next one last
++            return t;
++        }();
 +        static const auto start = std::chrono::steady_clock::now();
-+        static bool done = false;
-+        if (at >= 0 && !done && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= at) {
-+            done = true;
++        if (!at.empty() && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= at.back()) {
++            at.pop_back();
 +            gpu::g_capture = true;
 +        }
 +    }
      app::SplashFirstFrame();
      // handed over from the previous instance: the window opens on the second frame, the first picture with
      // anything drawn over it right after
-@@ -624,7 +676,13 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
+@@ -624,7 +689,13 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
          }
      }
      Walk(Dev(kDevPush));  // reports asked for at the end of the frame
@@ -394,7 +418,7 @@ index 975e977..c364b40 100644
      app::Pace();
      // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
      uint32_t last = g_buffers[g_buffer_count - 1], data = R32(last + 4), lk = R32(last + 8);
-@@ -637,6 +695,10 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
+@@ -637,6 +708,10 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
      g_state.rt = SurfaceOf(Dev(kDevRenderTarget));
      uint32_t n = Dev(kDevSwapCount) + 1;
      SetDev(kDevSwapCount, n);
@@ -405,7 +429,7 @@ index 975e977..c364b40 100644
      return n;
  }
  
-@@ -1272,7 +1334,43 @@ void EndPrimitive() {
+@@ -1272,7 +1347,43 @@ void EndPrimitive() {
      uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
      g_im_prim = 0;
      if (!prim || !count) return;
