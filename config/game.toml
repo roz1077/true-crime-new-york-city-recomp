@@ -97,6 +97,7 @@ D3DDevice_PersistDisplay                             = 0
 D3DDevice_Release                                    = 0
 D3DDevice_SelectVertexShader                         = 0x2BB190
 D3DDevice_SetFlickerFilter                           = 0
+D3DDevice_SetDepthClipPlanes                         = 0x2BAD20  # by hand: stdcall (near, far, flags), jump table 0x2BADB4
 D3DDevice_SetGammaRamp                               = 0x2B8600
 D3DDevice_SetIndices                                 = 0x2B8CA0
 D3DDevice_SetLight                                   = 0

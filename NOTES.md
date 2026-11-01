@@ -149,3 +149,14 @@
 - One earlier run logged "pipeline creation failed" (347 keys) from 17.6 s; not reproduced since. Failures now log
   their pipeline description at error level.
 - Launcher `Play True Crime NYC.cmd` sets XBE_CAPTURE_DIR so F3 always saves a capture.
+
+## Fixed: black wedge in cutscenes (2026-11-01)
+
+- Step images (`XBE_CAPTURE_EVERY`) pinned it to one draw: a 544-vertex immediate-mode backdrop mesh (vs B0101A61,
+  untextured, opaque, no z write; game code returning to 0x247A13) drawn with SetDepthClipPlanes(0, 70748) around
+  it. The game uses reversed screen z (near = large), so the console clipped the mesh's near part; the host ignored
+  the planes and drew it over the road and buildings.
+- SDK: D3DDevice_SetDepthClipPlanes (mapped 0x2BAD20, replaces the game hook) stores the planes; vertex program
+  draws clip through SV_ClipDistance (o.zclip in VOut, zclips in the draw constants). Fixed function planes are kept
+  but not applied (not used by this game so far).
+- Also learned: the car "shadow" stencil system (0x138DFC..0x138FA5) works as intended once defaults are applied.

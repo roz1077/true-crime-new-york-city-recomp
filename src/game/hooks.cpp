@@ -31,38 +31,6 @@ X86_FUNC(sub_0029366D) {
     ::kernel::Return(ctx, 0, 4);
 }
 
-// 0x2BAD20: D3DDevice_SetDepthClipPlanes(float Near, float Far, DWORD Flags), stdcall. The SDK has no host version.
-// Keeps the planes and mode bits where the library does (CDevice+0x1C08..0x1C18, read back by GetDepthClipPlanes
-// 0x2BADD0), then 0x2BA540 pushes clip constants from the hardware render target state, which reads near null on
-// the host (16 s). Jump table 0x2BADB4: 1 vertex program planes, 2 fixed function planes, 3 and 4 back to default.
-X86_FUNC(sub_002BAD20) {
-    constexpr uint32_t kDevice = 0x2C8F50;
-    uint32_t near_plane, far_plane, flags, mode;
-    std::memcpy(&near_plane, base + ctx.esp + 4, 4);
-    std::memcpy(&far_plane, base + ctx.esp + 8, 4);
-    std::memcpy(&flags, base + ctx.esp + 12, 4);
-    uint8_t* dev = base + kDevice;
-    std::memcpy(&mode, dev + 0x1C18, 4);
-    switch (flags) {
-        case 1:
-            std::memcpy(dev + 0x1C10, &near_plane, 4);
-            std::memcpy(dev + 0x1C14, &far_plane, 4);
-            mode |= 2;
-            break;
-        case 2:
-            std::memcpy(dev + 0x1C08, &near_plane, 4);
-            std::memcpy(dev + 0x1C0C, &far_plane, 4);
-            mode |= 1;
-            break;
-        case 3: mode &= ~2u; break;
-        case 4: mode &= ~1u; break;
-        default: break;
-    }
-    std::memcpy(dev + 0x1C18, &mode, 4);
-    LOG_FIRST(4, "tcnyc: SetDepthClipPlanes %08X %08X flags %u (not applied to rendering)", near_plane, far_plane, flags);
-    ::kernel::Return(ctx, 0, 3);
-}
-
 // 0x2BEDE0: D3DDevice_SetBackBufferScale(float x, float y), stdcall. Stores the scale at CDevice+0x96C/+0x970
 // (the 5849 layout's CDevice_BackBufferScale), then 0x2BA880 rebuilds the hardware render target state, which reads
 // surfaces the host never made (read near null at 5.7 s). The game calls it with (1.0, 1.0) at 0x241293; the host
