@@ -109,3 +109,17 @@
   `patches/xboxxberecomp-local.patch`. Re-export the patch after SDK commits:
   `git -C sdk diff f7b13fd tcnyc > patches/xboxxberecomp-local.patch`.
 - Fresh setup: put `default.xbe` + data in `assets/` (`python scripts/extract_xiso.py <iso> assets`), then `build.bat`.
+
+## Lighting / darkness investigation (2026-11-01)
+
+- **Fixed: constant-alpha blending.** D3DBLEND_CONSTANTALPHA/INVCONSTANTALPHA (0x8003/0x8004) were mapped to the D3D12
+  blend factor with the blend colour's RGB; they must use its alpha. The game's soft-shadow buffer (subtracted by the
+  city material: r0 = t0*v0 - t2) and its bloom chain (bright pass B0000C10 -> blur -> added with CONSTANTALPHA, ONE)
+  came out black. SDK commit on `tcnyc`.
+- Checked and fine: texture decoding (contact sheet of all 219 textures), combiner output scaling, gamma ramp (set
+  once: S-curve 0,18,57,148,223,255 for 0,32,64,128,192,255, applied by the SDK), D3D fog (disabled: the game fogs in
+  its vertex programs), the clock (menu scene is a rainy night at any time of day).
+- City material: ps B016C050, vs lighting from constants (ambient c[161] ~0.2, point lights c[169..176],
+  oD0 = min(R0, c[179].y)). Reflection pass (rt 256x256, FFP texture-only) is dark because the facades are night art.
+- Still reported "very dark" by the user; only menu captures so far. Next: a gameplay capture
+  (`XBE_CAPTURE_AT=<s>` now captures without F3).

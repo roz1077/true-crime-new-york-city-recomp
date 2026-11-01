@@ -12,6 +12,26 @@ index 7e6507d..31232a7 100644
      char msg[4096];
      va_list ap;
      va_start(ap, fmt);
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index fe65837..ac11ad0 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -2648,6 +2648,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+ void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
+     float bf[4];
+     Color(SimpleState(s, kMBlendColor), bf);
++    // D3D12 has one blend factor for both constant blends: CONSTANTALPHA (0x8003/0x8004) scales every channel by the
++    // blend colour's alpha, so broadcast it when no CONSTANTCOLOR (0x8001/0x8002) factor is in use. True Crime NYC's
++    // light buffer chain uses (0x8003, 0) and (0x8003, 0x8004) with a black blend colour: as colour it came out black.
++    if (SimpleState(s, kMBlendEnable)) {
++        auto alpha_only = [](uint32_t f) { return f == 0x8003 || f == 0x8004; };
++        auto colour = [](uint32_t f) { return f == 0x8001 || f == 0x8002; };
++        uint32_t src = SimpleState(s, kMSrcBlend), dst = SimpleState(s, kMDestBlend);
++        if ((alpha_only(src) || alpha_only(dst)) && !colour(src) && !colour(dst)) bf[0] = bf[1] = bf[2] = bf[3];
++    }
+     uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
+     if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
+     cl_->OMSetBlendFactor(bf);
 diff --git a/runtime/kernel/files.cpp b/runtime/kernel/files.cpp
 index 5644ea7..1677837 100644
 --- a/runtime/kernel/files.cpp
@@ -159,7 +179,7 @@ index bec6e36..886f51b 100644
  
  // Exceptions dispatch like NT on x86: each handler of the fs:[0] chain is called (record, frame, context,
 diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
-index 975e977..fda717f 100644
+index 975e977..5531190 100644
 --- a/runtime/xdk/d3d8.cpp
 +++ b/runtime/xdk/d3d8.cpp
 @@ -271,7 +271,21 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
@@ -185,7 +205,24 @@ index 975e977..fda717f 100644
          made = asked;
          g_buffer_count = asked[3];
          for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
-@@ -624,7 +638,13 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
+@@ -601,6 +615,16 @@ std::atomic<uint32_t> g_presents{0};
+ }  // namespace
+ 
+ HLE_STDCALL(D3DDevice_Swap, 1) {
++    // XBE_CAPTURE_AT=<seconds>: one frame capture that long after the first present, as F3 takes one
++    {
++        static const double at = [] { const char* v = std::getenv("XBE_CAPTURE_AT"); return v ? std::atof(v) : -1.0; }();
++        static const auto start = std::chrono::steady_clock::now();
++        static bool done = false;
++        if (at >= 0 && !done && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= at) {
++            done = true;
++            gpu::g_capture = true;
++        }
++    }
+     app::SplashFirstFrame();
+     // handed over from the previous instance: the window opens on the second frame, the first picture with
+     // anything drawn over it right after
+@@ -624,7 +648,13 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
          }
      }
      Walk(Dev(kDevPush));  // reports asked for at the end of the frame
@@ -200,7 +237,7 @@ index 975e977..fda717f 100644
      app::Pace();
      // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
      uint32_t last = g_buffers[g_buffer_count - 1], data = R32(last + 4), lk = R32(last + 8);
-@@ -637,6 +657,10 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
+@@ -637,6 +667,10 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
      g_state.rt = SurfaceOf(Dev(kDevRenderTarget));
      uint32_t n = Dev(kDevSwapCount) + 1;
      SetDev(kDevSwapCount, n);
@@ -211,7 +248,7 @@ index 975e977..fda717f 100644
      return n;
  }
  
-@@ -1272,7 +1296,43 @@ void EndPrimitive() {
+@@ -1272,7 +1306,43 @@ void EndPrimitive() {
      uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
      g_im_prim = 0;
      if (!prim || !count) return;
