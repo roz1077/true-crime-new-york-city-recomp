@@ -279,3 +279,8 @@
 - Open: what brightens the lamp-side facades on the console (before the vdef change it measured 63 here, so one of
   the draws whose unfed v3 changed from white to a tint is involved: the count-4 SRCALPHA+ONE quads with
   0.41 0.30 0.20 a 0.50 are the remaining candidate), and why the right road is ~2x.
+- Experiment XBE_EXP_302WHITE (removed): the count-4 SRCALPHA+ONE quads white -> facade 66 (xemu 62) but sky 161
+  (87), lamp 224 (162), road right 76 (46). These quads are what lights the facades; on the console they light the
+  buildings strongly without brightening the sky, so the difference is likely where they land or what masks them
+  (depth or alpha), not only their colour. Next: capture those quads' vertices/positions and depth state and see
+  which part of them covers sky.
