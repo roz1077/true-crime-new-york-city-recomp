@@ -312,3 +312,14 @@
   of +0x420; a guest stack scan at the facade snapshot gave stale return addresses: 0x240DDF, 0x137E52, 0x137EC6,
   0x13EF8C, 0x14B5B3, 0xA76C2, 0xA794B). Next: hook writes of the env's entries (find the function that stores
   64-byte lamp records into 0x36FE80+0x420) and check its nearest-lamp choice for the facade object.
+- Lamp choice chain (traced with a page-protection write watch on 0x36FE80+0x420.., llvm-symbolizer on the DLL):
+  world objects (e.g. 0x138888/0x138908) call 0x21B230 -> 0x21B170 -> picker 0x21AD60 every frame. The picker
+  (this = global active lamp list [0x3F50B0] = 0x3705C0, count word +0x1000, 64-byte lamps) skips lamps out of
+  (range + sphere radius) and keeps the top 4 by brightness / distance^2; its SSE (cmpeqss mask, movhlps sums) and
+  sse_cmp are recompiled correctly.
+- The active list is dynamic: 4 lamps near (-173..-178, 1895..1903) up to t~37 s, then (-173,1895) (-162,1888)
+  (-178,1895) (-153,1890) by the street shot (t~42). No picker call after t 40 returns the old lamps, yet the facade
+  (draws 666/670) is drawn at t 41.8 with a light set holding (-177.9,1902.9) and (-172.9,1903.4): the facade uses a
+  CACHED light set (pool objects 0x46xxxx-0x49xxxx built by 0x2409F0) that is not refreshed. Sets carry a version
+  word at +0x1C (from/to global 0x3F54CC, set from 0x136E70's return before queuing). Next: find what decides
+  to rebuild a cached set (version compare) and why it never triggers here.
