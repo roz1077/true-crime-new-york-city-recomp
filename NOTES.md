@@ -128,3 +128,7 @@
 - Debug captures: `XBE_CAPTURE_AT=<s>` (auto F3), `XBE_CAPTURE_EVERY=<n>` (save the target every n draws), stencil
   state in frame.txt. Alpha is in the 32-bit BMPs (read the 4th byte; Pillow drops it).
 - Reference: Xbox screenshots (Bing image search) show night streets with grey wet asphalt and visible facades.
+- Far-road "dark band" (user report): lamp light pools (blend DESTALPHA, ONE) only light pixels whose frame buffer
+  alpha (wetness) is set. Near road (puddle material) writes partial alpha; far paving (material writing t0.a) uses a
+  DXT5 texture (0x81E70000 in capture 110327) whose alpha is ~3%, uploaded natively as BC3, so the light stops there.
+  Game data, kept as original by the user's choice (2026-11-01).
