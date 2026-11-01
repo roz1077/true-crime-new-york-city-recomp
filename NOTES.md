@@ -297,3 +297,10 @@
   them the lamp next to the facade. Other objects get sensible lamps (866 -> on-screen lamp, 1134/1140 -> 11-13
   units). The per-object lamp list (count [obj+0x418], positions from [obj+0x450], consumed at 0x245060) picks the
   wrong lamps for some objects. Next: trace who fills that list (lamp selection by distance / spatial lookup).
+- Lamp list path: per-object light sets are global objects (0x42xxxx-0x48xxxx, count +0x70, 64-byte entries from
+  +0x80, lamp position in each entry's last row, attenuation in its second row) copied into the renderer by
+  0x240E70 (this = set, arg = renderer) to renderer+0x420.., then 0x245060 transforms each into object space.
+  During the street shot most sets hold world-space street lamps (around -153..-178, -5, 1888..1903), but some
+  hold small coordinates such as (0.1 0.1 -0.1), (2.2 0.4 9.2), (9.7 2.2 1.0): a different space or stale data,
+  a candidate for the facade's far-away lamps. Not yet tied to draws 666/670. Next: log set pointer per draw
+  (CaptureDraw could print the renderer's light set) to see which set the facade uses, then find who fills it.
