@@ -214,3 +214,11 @@
   GetDepthClipPlanes 0x2BADD0 reads them back with flags 10/11), and dropping triangles with a vertex at w < 0
   (tested with NaN positions: the split stayed). Next: compare that draw's vertex colour/lighting constants in the
   mirror pass against the main pass, and the reflection target's blur chain (8003/8004 constant alpha blends).
+- Video 2:21 (same shot as replay capture 175516): the Xbox road is lit evenly across its width (strips 49-64, wet
+  sparkle to ~210). So the reflection does work there, over the whole road. Ours only lights where the mirror image
+  has content; its left part (reflected buildings, draws ~475-484 into the mirror target) comes out black.
+- Checked and matching the console: the composite (XYZRHW|TEX1 quad, MODULATE2X, v3 is white then), blur chain
+  (8003/8004 with blend colours FF/7F/55/3F then 78, E6), skyline vertex colour (white), clip planes (full range).
+- Mirror pass skyline lit by c[186] = (1,1,1,0.65) vs (0.20,0.21,0.23,1) in the main pass: by design.
+- Next: decode the mirror building draws' packed positions (vs B01012C1/D1) to see whether they land in the mirror
+  target at all (culled, off target, or drawn black). XBE_CAPTURE_INPUTS=1 dumps every draw's first vertices.

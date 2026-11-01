@@ -13,7 +13,7 @@ index 7e6507d..31232a7 100644
      va_list ap;
      va_start(ap, fmt);
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index fe65837..0651e49 100644
+index fe65837..a2781ca 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
 @@ -565,6 +565,7 @@ private:
@@ -156,7 +156,7 @@ index fe65837..0651e49 100644
      for (int r = 0; r < kVsConstants; r++) {
          const auto& v = s.vsc[r];
          if (v[0] || v[1] || v[2] || v[3]) {
-@@ -2519,6 +2579,17 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
+@@ -2519,12 +2579,26 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
              cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
              k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
              c.pc[0][2], c.pc[0][3]);
@@ -166,6 +166,7 @@ index fe65837..0651e49 100644
 +    if (s.scissor_count || s.viewport.x || s.viewport.y)
 +        fprintf(cap_, " vp %u %u %u %u sc %u %u %u %u %u", s.viewport.x, s.viewport.y, s.viewport.w, s.viewport.h,
 +                s.scissor_count, s.scissors[0], s.scissors[1], s.scissors[2], s.scissors[3]);
++    fprintf(cap_, " v3 %.3f %.3f %.3f %.3f zclip %g %g %u bcol %08X", s.vdef[3][0], s.vdef[3][1], s.vdef[3][2], s.vdef[3][3], s.zclip[0], s.zclip[1], s.zclip_on, SimpleState(s, kMBlendColor));
 +    if (SimpleState(s, kMAlphaTestEnable))
 +        fprintf(cap_, " atest func %.0f ref %.0f", c.misc[1], c.misc[0]);
 +    if (s.rs[kRsFogEnable])
@@ -174,7 +175,16 @@ index fe65837..0651e49 100644
      CaptureTextures(s, stages);
  }
  
-@@ -2648,6 +2719,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+ // small draws: their inputs and constants; then ends the draw's line
+ void D3D12Backend::EndDrawCapture(const State& s, const Assembled& a, uint32_t count, const DrawConstants& c) {
+-    if (count <= kQuadVertices) CaptureInputs(s, a, c);
++    // XBE_CAPTURE_INPUTS: every draw's first vertices and constants, not only small ones
++    static const bool all_inputs = getenv("XBE_CAPTURE_INPUTS") != nullptr;
++    if (count <= kQuadVertices || all_inputs) CaptureInputs(s, a, c);
+     fputc('\n', cap_);
+ }
+ 
+@@ -2648,6 +2722,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
  void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
      float bf[4];
      Color(SimpleState(s, kMBlendColor), bf);
@@ -190,7 +200,7 @@ index fe65837..0651e49 100644
      uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
      if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
      cl_->OMSetBlendFactor(bf);
-@@ -3659,6 +3739,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
+@@ -3659,6 +3742,16 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
  // the frame moves to another target: save the one it leaves
  void D3D12Backend::CapStep(const Surface& rt) {
      uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
