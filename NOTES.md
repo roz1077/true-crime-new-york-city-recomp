@@ -201,3 +201,10 @@
   The mirror pass is mostly black; a reflected hillside wall on the right is cut along a straight vertical edge.
   Not the depth clip planes (tested off). Next suspect: clipping of mirrored geometry with vertices behind the
   camera (negative w; the console does not clip programs at w = 0 the way D3D12 does).
+- Split narrowed: the reflection's grey slab is draw ~508, the 544-vertex skyline backdrop (vs B0101A61) drawn into
+  the mirror target, cut along a straight vertical edge. Tried rebuilding clip space with |w| for every program draw:
+  it breaks normal scenes (teal shapes behind the menu), reverted. Unconfirmed whether the backdrop's vertices
+  really have negative w in the mirror pass (a debug run drifted off the replay path).
+- Replay caution: the first start after a rebuild relinks the game code and loads slower, so XBE_PAD_SCRIPT timings
+  drift (twice it reached the New Game name screen; nothing was saved). Start the game once after a build before
+  replaying, or make the script wait on screens instead of times.
