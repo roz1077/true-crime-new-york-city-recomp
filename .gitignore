@@ -18,6 +18,7 @@ settings.toml
 /logs/
 /hdd/
 /CrashDumps/
+/shader-cache/
 
 # editors
 .vs/
