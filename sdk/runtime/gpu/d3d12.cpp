@@ -26,6 +26,7 @@
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include <imgui.h>
 #include <backends/imgui_impl_dx12.h>
@@ -994,11 +995,8 @@ void D3D12Backend::CreateGammaLut() {
 }
 
 void D3D12Backend::LoadSettings() {
-    const char* override_msaa = std::getenv("XBE_EXPERIMENTAL_MSAA");
     requested_msaa_ = app::MsaaSamples();
-    msaa_ = requested_msaa_;
-    if (!msaa_ && override_msaa && std::strcmp(override_msaa, "4") == 0) msaa_ = 4;
-    msaa_ = SupportedMsaa(msaa_);
+    msaa_ = SupportedMsaa(requested_msaa_);
     scale_ = app::RenderScale(guest_h_);
     stretch_ = app::RenderStretch(guest_w_, guest_h_);
     texturedumper::Update();
@@ -1145,15 +1143,9 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
             td.SampleDesc.Count = msaa_;
             if (SUCCEEDED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.state, &cv,
                                                         IID_PPV_ARGS(&t.res)))) {
-                if (t.depth) {
-                    static bool reported = false;
-                    if (!reported) LOGR("d3d12: allocated %ux MSAA depth target", msaa_);
-                    reported = true;
-                } else {
-                    static bool reported = false;
-                    if (!reported) LOGR("d3d12: allocated %ux MSAA color target", msaa_);
-                    reported = true;
-                }
+                static bool reported[2] = {};  // colour, depth: the first of each
+                if (!std::exchange(reported[t.depth ? 1 : 0], true))
+                    LOGR("d3d12: allocated %ux MSAA %s target", msaa_, t.depth ? "depth" : "color");
                 return true;
             }
             td.SampleDesc.Count = 1;

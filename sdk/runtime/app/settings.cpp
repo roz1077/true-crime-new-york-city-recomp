@@ -67,6 +67,7 @@ void Load() {
     SetFrameCap(t["fps_cap"].value_or(FrameCap()));
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
+    // a sample count; older settings files stored msaa = true for 4x
     const auto samples = t["msaa"].value_or(t["msaa"].value_or(false) ? 4u : 0u);
     SetMsaaSamples(samples == 2 || samples == 4 || samples == 8 ? samples : 0);
     s.smaa = t["smaa"].value_or(s.smaa);

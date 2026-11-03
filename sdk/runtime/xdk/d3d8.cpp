@@ -771,7 +771,6 @@ HLE_STDCALL(D3DDevice_SetViewport, 1) {
 
 HLE_STDCALL(D3DDevice_SetScissors, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    LOG_FIRST(12, "d3d: SetScissors count %u exclusive %u", a[0], a[1]);
     g_state.scissor_count = std::min<uint32_t>(a[0], 8);
     for (uint32_t i = 0; i < g_state.scissor_count * 4; i++) g_state.scissors[i] = R32(a[2] + i * 4);
     return 0;
