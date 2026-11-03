@@ -2083,7 +2083,7 @@ void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::Pr
             {1, 279, 14, 15, {input::LetterKey(input::g_climb_key, 'E')}}, {37, 279, 13, 15, {input::LetterKey(input::g_use_key, 'G')}},
             {101, 256, 13, 18, "RMB"}, {19, 279, 13, 18, "LMB"},
             {101, 279, 22, 19, "TAB"}, {1, 301, 25, 20, "ESC"},
-            {53, 279, 26, 19, "C"}, {73, 233, 28, 19, "V"},
+            {53, 279, 26, 19, {input::kLeftStickClickKey}}, {73, 233, 28, 19, {input::kRightStickClickKey}},
         };
         for (const auto& key : keys) {
             for (int y = 0; y < key.h; ++y)
@@ -2125,16 +2125,15 @@ void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::Pr
                 }
             }
         }
-        // Right-stick movement glyphs use a mouse outline in keyboard mode.
-        for (int center : {111}) {
-            for (int y = -7; y <= 8; ++y) {
-                for (int x = -7; x <= 7; ++x) {
-                    const int dx = std::abs(x);
-                    const bool outline = (dx == 4 && y >= -4 && y <= 4) ||
-                                         (dx <= 3 && (y == -5 || y == 5)) ||
-                                         (x == 0 && y >= -4 && y <= 0);
-                    std::fill_n(pixel(center + x, 241 + y), 4, outline ? 255 : 0);
-                }
+        // Right-stick movement uses a mouse outline in keyboard mode.
+        constexpr int kMouseCenter = 111;
+        for (int y = -7; y <= 8; ++y) {
+            for (int x = -7; x <= 7; ++x) {
+                const int dx = std::abs(x);
+                const bool outline = (dx == 4 && y >= -4 && y <= 4) ||
+                                     (dx <= 3 && (y == -5 || y == 5)) ||
+                                     (x == 0 && y >= -4 && y <= 0);
+                std::fill_n(pixel(kMouseCenter + x, 241 + y), 4, outline ? 255 : 0);
             }
         }
         // The menu legend uses the neutral D-pad glyph for directional selection.

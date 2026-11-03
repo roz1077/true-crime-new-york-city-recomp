@@ -37,6 +37,19 @@ measurements in `PERFORMANCE.md`, and the build, checks and diagnostics in `DEVE
 - Verified with F3 captures of both menus (`captures/223700`, `captures/223707`) and the user
   confirmed both previews are centred on the ultrawide display.
 
+## Input handle and menu pointer hardening (2026-11-03)
+
+- XInput handles now carry a generation. `XInputGetState` and `XInputGetCapabilities` release
+  the port lock while polling, so a guest handle can be closed and its address reused during
+  that window; a generation mismatch now reports `ERROR_INVALID_HANDLE` instead of touching the
+  new handle. `XInputClose` only frees a handle it actually removed, and `XInputOpen` checks the
+  allocation.
+- `Pad` compares by value instead of `memcmp`, so padding bytes cannot make an unchanged report
+  look new and bump the XInput packet number.
+- The two stick-click keys are shared constants used by both the keyboard input map and the
+  keyboard-mouse prompt glyphs. Raw mouse input is discarded while the Graphics menu owns the
+  pointer, and focus transitions use an atomic edge so the log is emitted once.
+
 ## Mouse aim, keyboard movement and controller prompts (2026-11-03)
 
 - Mouse look is no longer folded into the right stick. `WM_INPUT` raw counts are applied directly

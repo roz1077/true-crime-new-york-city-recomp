@@ -5,6 +5,8 @@ namespace input {
 
 // the console controller's report, analog buttons are 0-255
 struct Pad {
+    // compare reports by value; padding is not part of the state
+    bool operator==(const Pad&) const = default;
     bool connected = false;
     uint16_t buttons = 0;  // dpad up/down/left/right, start, back, left thumb, right thumb
     uint8_t analog[8] = {};  // A B X Y black white left trigger right trigger
@@ -13,6 +15,10 @@ struct Pad {
 
 enum class PromptStyle { Original, PlayStation, Xbox, KeyboardMouse };
 PromptStyle ControllerPromptStyle();
+// keyboard keys that stand in for the two stick clicks, shared by input and
+// the keyboard-mouse prompt glyphs
+inline constexpr char kLeftStickClickKey = 'C';
+inline constexpr char kRightStickClickKey = 'V';
 inline char LetterKey(uint32_t value, char fallback) {
     return value >= 'A' && value <= 'Z' ? char(value) : fallback;
 }

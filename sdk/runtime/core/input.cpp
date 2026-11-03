@@ -70,21 +70,15 @@ uint64_t g_aim_at = 0; // last raw mouse event
 
 bool ReadKeyboardMouse(Pad& pad) {
     const auto window = static_cast<HWND>(app::Window());
-    static bool had_focus = true;
+    static std::atomic<bool> had_focus{true};
     const bool focused = window && GetForegroundWindow() == window;
+    if (had_focus.exchange(focused, std::memory_order_relaxed) != focused)
+        LOGR("input: game window %s focus", focused ? "regained" : "lost");
     if (!focused) {
-        if (had_focus) {
-            LOGR("input: game window lost focus, mouse and keyboard paused");
-            had_focus = false;
-        }
         std::lock_guard lock(g_mouse_lock);
         g_mouse_x = g_mouse_y = g_mouse_rx = g_mouse_ry = 0;
         g_aim_x = g_aim_y = 0;
         return false;
-    }
-    if (!had_focus) {
-        LOGR("input: game window has focus again");
-        had_focus = true;
     }
     auto held = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
     // Keyboard movement is digital, and a diagonal is normalized to the same
@@ -95,7 +89,8 @@ bool ReadKeyboardMouse(Pad& pad) {
     const int move_scale = move_x && move_y ? 23170 : 32767;
     pad.lx = int16_t(move_x * move_scale);
     pad.ly = int16_t(move_y * move_scale);
-    constexpr int digital[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_TAB, 'C', 'V'};
+    constexpr int digital[] = {VK_UP,     VK_DOWN,   VK_LEFT,          VK_RIGHT,
+                               VK_ESCAPE, VK_TAB,    kLeftStickClickKey, kRightStickClickKey};
     const int analog[] = {VK_SPACE, 'Q', LetterKey(g_reload_key, 'R'), LetterKey(g_heavy_attack_key, 'F'),
                           LetterKey(g_use_key, 'G'), LetterKey(g_climb_key, 'E'), VK_RBUTTON, VK_LBUTTON};
     for (int i = 0; i < 8; ++i) {
@@ -188,6 +183,8 @@ void ReadMouse(void* raw_input) {
             sizeof(input) ||
         input.header.dwType != RIM_TYPEMOUSE || (input.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE))
         return;
+    // the menu moves the pointer, not the camera: do not queue that motion
+    if (g_ui_active.load(std::memory_order_relaxed)) return;
     std::lock_guard lock(g_mouse_lock);
     const LONG dx = input.data.mouse.lLastX, dy = input.data.mouse.lLastY;
     // the stick path keeps its small clamp
@@ -208,6 +205,7 @@ void SetUiActive(bool active) {
     g_ui_active.store(active, std::memory_order_relaxed);
     if (!active) return;
     std::lock_guard lock(g_mouse_lock);
+    g_mouse_x = g_mouse_y = g_mouse_rx = g_mouse_ry = 0;
     g_aim_x = g_aim_y = 0; // the menu moved the pointer, not the camera
 }
 
