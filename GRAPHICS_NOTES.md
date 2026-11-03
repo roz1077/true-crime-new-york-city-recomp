@@ -50,6 +50,8 @@ than English (the added row text is English only).
 
 ## Current build
 
+The modified SDK renderer and runtime are tracked in this repository under `sdk/`. The release opens the ISO picker interface from `TrueCrimeNYC.exe` before starting the game.
+
 The shipped Graphics menu is an overlay drawn through the SDK's `GameInfo::ui` callback
 (`src/common/graphics_options.cpp`). It opens with F10 or Back + Start on controller 1 and is driven by the
 keyboard, the mouse, or controller 1 through `GameInfo::pad`. That path reads SDL, so PlayStation and Switch pads

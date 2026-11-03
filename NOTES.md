@@ -668,15 +668,11 @@
 - Unmapped D3D functions still running original code (judged safe): GetDesc/GetLevelDesc, GetSurfaceLevel2,
   LockRect, CreateVertexBuffer2, VB Lock2, SetVertexData*, SetVertexShaderConstant1 inline 0x2BBB10, Reset 0x2B81A0.
 
-## Repository (2026-11-01)
+## Repository
 
-- Git repo at the project root (branch `main`). Not committed: the ISO, `assets/`, `generated/`, `out/`, `logs/`,
-  `tools/` (Python venv, reference clone of SCDA-XBERecomp).
-- `sdk/` is a submodule (URL: upstream TGP482/XboxXBERecomp) checked out on local branch `tcnyc` (upstream `f7b13fd` +
-  our fixes). That commit exists only on this PC: on a fresh clone, check out `f7b13fd` and apply
-  `patches/xboxxberecomp-local.patch`. Re-export the patch after SDK commits:
-  `git -C sdk diff f7b13fd tcnyc > patches/xboxxberecomp-local.patch`.
-- Fresh setup: put `default.xbe` + data in `assets/` (`python scripts/extract_xiso.py <iso> assets`), then `build.bat`.
+- The project and its modified XboxXBERecomp SDK are tracked together on `main`. The SDK snapshot in `sdk/` comes from the former local SDK commit `ff08e632` and includes the graphics and runtime fixes.
+- The ISO, extracted assets, generated code, build output, logs and local reference tools stay outside Git.
+- For a fresh build, put your own `default.xbe` and game data in `assets/`, then run `build.bat`. Run `release.bat` to package the combined launcher and game executable.
 
 ## Lighting / darkness investigation (2026-11-01)
 

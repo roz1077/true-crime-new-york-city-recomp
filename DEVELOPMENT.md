@@ -13,7 +13,7 @@ The title-specific C++ code is kept small:
   Options page, row, focus and input.
 - `src/game/options_trace.cpp`: read-only tracing of the Options tab renderer, also under
   `XBE_TRACE_OPTIONS_PAGE=1`.
-- `sdk/runtime`: shared runtime; local fixes are also exported in `patches/xboxxberecomp-local.patch`.
+- `sdk/runtime`: shared runtime tracked in this repository.
 
 `NOTES.md` contains the investigation history. Its newer entries supersede earlier hypotheses. Captures,
 crash dumps, replay recordings and one-off analysis scripts under `.local/`, `out/` and `logs/` are local
@@ -45,13 +45,7 @@ That helper reads the configured partition count and library name; use the norma
 changes to the original image, recompiler configuration or generated partitions. Python 3.11+ is required
 for the helper's TOML reader. The repository's local venv is a convenience, not a shipped dependency.
 
-Export SDK edits before distributing this checkout. Preserve the exact bytes of
-`git -C sdk diff --no-ext-diff f7b13fd --` in `patches/xboxxberecomp-local.patch`, then verify:
-
-```powershell
-git -C sdk diff --check
-git -C sdk apply --check --reverse ../patches/xboxxberecomp-local.patch
-```
+Commit SDK edits from the project root alongside the game changes that depend on them.
 
 ## Optional diagnostics
 
