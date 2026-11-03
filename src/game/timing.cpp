@@ -1,6 +1,10 @@
 // Cutscene sample clock and opt-in deterministic replay for default.xbe.
 
+#include <algorithm>
 #include <chrono>
+#include <thread>
+
+#include "app/app.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -118,10 +122,126 @@ X86_FUNC(sub_00229D50) {
     __imp__sub_00229D50(ctx, base);
 }
 
+namespace {
+constexpr uint32_t kLastVblank = 0x363D38;
+constexpr uint32_t kVblank = 0x420468;
+constexpr uint32_t kAudioClockMode = 0x360E0C;
+constexpr uint32_t kPreviousAudioClockMode = 0x360DE0;
+constexpr uint32_t kCutsceneClockStart = 0x360DD0;
+constexpr uint32_t kCutsceneState = 0x348E10;
+
+// Shared by this main-loop iteration's simulation and rendering calls.
+thread_local bool fast_gameplay = false;
+thread_local bool fast_cutscene = false;
+thread_local bool cutscene_tick_not_due = false;
+thread_local bool use_sampled_vblank = false;
+thread_local uint32_t sampled_vblank = 0;
+thread_local uint32_t frame_ticks = 0;
+thread_local bool fast_present = false;
+
+void TraceFrame(uint32_t ticks, bool audio_clock, uint32_t steps) {
+    static const bool enabled = std::getenv("XBE_TRACE_FRAME_TIMING") != nullptr;
+    if (!enabled) return;
+    using clock = std::chrono::steady_clock;
+    static auto start = clock::now();
+    static uint32_t frames = 0, start_ticks = ticks, zero_tick_frames = 0;
+    static bool previous_audio_clock = audio_clock;
+    const auto now = clock::now();
+    if (audio_clock != previous_audio_clock || ticks < start_ticks) {
+        if (audio_clock != previous_audio_clock)
+            LOGR("tcnyc: %s", audio_clock ? "entered audio-clock cutscene" : "left audio-clock cutscene");
+        start = now;
+        start_ticks = ticks;
+        frames = 0;
+        zero_tick_frames = 0;
+        previous_audio_clock = audio_clock;
+    }
+    const double seconds = std::chrono::duration<double>(now - start).count();
+    if (seconds >= 2) {
+        LOGR("tcnyc: %s %.1f frames/s, %.1f ticks/s, %u zero-tick frames",
+             audio_clock ? "cutscene" : "gameplay", frames / seconds, (ticks - start_ticks) / seconds,
+             zero_tick_frames);
+        start = now;
+        start_ticks = ticks;
+        frames = 0;
+        zero_tick_frames = 0;
+    }
+    ++frames;
+    if (!steps) ++zero_tick_frames;
+}
+}
+
+namespace game {
+uint32_t MainLoopSwapInterval(uint32_t interval) {
+    return fast_present && interval == 2 ? 1 : interval;
+}
+}
+
+X86_EXTERN_FUNC(__imp__sub_000A5200);
+X86_FUNC(sub_000A5200) {
+    if (X86_MEM32(ctx.esp) != 0xA7910) return __imp__sub_000A5200(ctx, base);
+    const uint32_t arg = ctx.esp + 4;
+    const uint32_t original_ticks = X86_MEM32(arg);
+    frame_ticks = original_ticks;
+    if (fast_gameplay) {
+        const uint32_t last = X86_MEM32(kLastVblank);
+        const uint32_t elapsed = sampled_vblank - last;
+        frame_ticks = std::clamp(elapsed, 1u, 4u);
+        use_sampled_vblank = elapsed != 0;
+    } else if (fast_cutscene && cutscene_tick_not_due && original_ticks == 1) {
+        frame_ticks = 0;
+    }
+    TraceFrame(X86_MEM32(0x363D0C), X86_MEM8(kAudioClockMode) != 0, frame_ticks);
+    X86_MEM32(arg) = frame_ticks;
+    __imp__sub_000A5200(ctx, base);
+    use_sampled_vblank = false;
+    X86_MEM32(arg) = original_ticks;
+}
+
+X86_EXTERN_FUNC(__imp__sub_000A73F0);
+X86_FUNC(sub_000A73F0) {
+    if (X86_MEM32(ctx.esp) != 0xA794B || (!fast_gameplay && !fast_cutscene))
+        return __imp__sub_000A73F0(ctx, base);
+    const uint32_t arg = ctx.esp + 4;
+    const uint32_t original_ticks = X86_MEM32(arg);
+    X86_MEM32(arg) = frame_ticks;
+    __imp__sub_000A73F0(ctx, base);
+    X86_MEM32(arg) = original_ticks;
+}
+
+// The main loop presents after its render function returns.
+X86_EXTERN_FUNC(__imp__sub_00242F30);
+X86_FUNC(sub_00242F30) {
+    if (X86_MEM32(ctx.esp) != 0xA7952 || (!fast_gameplay && !fast_cutscene))
+        return __imp__sub_00242F30(ctx, base);
+    fast_present = true;
+    __imp__sub_00242F30(ctx, base);
+    fast_present = false;
+}
+
 X86_EXTERN_FUNC(__imp__sub_00243000);
 X86_FUNC(sub_00243000) {
     uint32_t ret;
     std::memcpy(&ret, base + ctx.esp, 4);
+    if (ret == 0xA5221 && use_sampled_vblank) {
+        ::kernel::Return(ctx, sampled_vblank, 0);
+        return;
+    }
+    if (ret == 0xA78BD) {
+        fast_gameplay = !X86_MEM8(kAudioClockMode) && app::FrameCap() == 60 && !timing::Enabled();
+        if (fast_gameplay) {
+            const uint32_t last = X86_MEM32(kLastVblank);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+            sampled_vblank = X86_MEM32(kVblank);
+            // A frame can arrive before the next guest vblank on a fast host.
+            while (sampled_vblank == last && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                sampled_vblank = X86_MEM32(kVblank);
+            }
+            ::kernel::Return(ctx, sampled_vblank, 0);
+            return;
+        }
+    }
     if (!timing::Enabled() || ret != 0xA78BD) {
         __imp__sub_00243000(ctx, base);
         return;
@@ -153,6 +273,20 @@ X86_FUNC(sub_002914D2) {
     uint32_t value = uint32_t(samples);
     uint32_t ret;
     std::memcpy(&ret, base + ctx.esp, 4);
+    if (ret == 0xA786F) {
+        fast_gameplay = false;
+        fast_cutscene = X86_MEM8(kAudioClockMode) && app::FrameCap() == 60 && !timing::Enabled();
+        cutscene_tick_not_due = false;
+        // Only the steady audio-clock branch forces a tick when the scene is
+        // already caught up. Leave the entry and clock rebase paths alone.
+        if (fast_cutscene && X86_MEM8(kPreviousAudioClockMode) && !X86_MEM8(ctx.esp + 0x1E)) {
+            const uint32_t start_sample = X86_MEM32(kCutsceneClockStart);
+            const uint32_t elapsed = value - start_sample - uint32_t(value < start_sample);
+            const float due = float(int32_t(elapsed)) * -X86_MEMF32(0x2D5DC8);
+            const uint32_t state = X86_MEM32(kCutsceneState);
+            cutscene_tick_not_due = state && int32_t(due) <= int32_t(X86_MEM32(state + 0x9C));
+        }
+    }
     if (timing::Enabled() && ret == 0xA786F) { // the main loop's call
         timing::Load();
         static uint32_t last_real = value, last_value = value;
