@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "app/app.h"
 #include "common/graphics_menu.h"
@@ -48,21 +49,45 @@ bool Tracing() {
     return on;
 }
 
+// the resolution row's choice before A applies it, and the sizes it steps through; menu thread only
+uint64_t g_pending_size = 0;
+bool g_pending = false;
+std::vector<uint64_t> g_sizes;
+
 Values Current() {
     const app::Settings &s = app::Get();
-    return {s.render_percent, game::g_fov_percent, s.aniso, s.fps_cap, s.vsync, s.smaa};
+    const uint64_t applied = Size(s.width, s.height);
+    return {s.render_percent, game::g_fov_percent, s.aniso, app::FrameCap(), s.aspect, app::MsaaSamples(),
+            s.vsync, s.smaa, game::ShowFps(),
+            g_pending ? g_pending_size : applied, applied};
 }
 
-// guest thread; the renderer reads these each frame and app::Pace each Swap (aligned 32-bit stores)
+// guest thread; the renderer reads these each frame and app::Pace each Swap (aligned 32-bit stores). The
+// resolution only changes through ApplySize.
 void Apply(const Values &v) {
     app::Settings &s = app::Get();
     s.render_percent = v.render_percent;
     game::g_fov_percent = v.fov_percent;
     s.aniso = v.aniso;
-    s.fps_cap = v.fps_cap;
+    app::SetFrameCap(v.fps_cap);
+    s.aspect = v.aspect;
     s.vsync = v.vsync;
+    app::SetMsaaSamples(v.msaa);
     s.smaa = v.smaa;
+    game::SetShowFps(v.show_fps);
     app::Save();
+}
+
+// sets the output resolution and has the window thread apply it, as the overlay's Apply does
+void ApplySize(uint64_t size) {
+    g_pending = false;
+    app::Settings &s = app::Get();
+    const uint32_t w = uint32_t(size >> 32), h = uint32_t(size);
+    if (s.width == w && s.height == h) return;
+    s.width = w;
+    s.height = h;
+    app::Save();
+    app::ApplyDisplay();
 }
 
 // guest buffers for the row texts, one per added row
@@ -85,9 +110,13 @@ uint32_t g_first = 0;
 X86_EXTERN_FUNC(__imp__sub_000B13C0);
 X86_FUNC(sub_000B13C0) {
     __imp__sub_000B13C0(ctx, base);
+    g_pending = false;
     g_on_entry = Current();
     g_entered = true;
     g_first = 0;
+    g_sizes.clear();
+    for (const app::Mode m : game::DisplayModes())
+        g_sizes.push_back(Size(m.width, m.height));
 }
 
 // 0xB14F0: Display tab cancel (thiscall; Back in the row list): restores the
@@ -95,7 +124,10 @@ X86_FUNC(sub_000B13C0) {
 X86_EXTERN_FUNC(__imp__sub_000B14F0);
 X86_FUNC(sub_000B14F0) {
     __imp__sub_000B14F0(ctx, base);
-    if (g_entered) Apply(g_on_entry);
+    if (g_entered) {
+        Apply(g_on_entry);
+        ApplySize(g_on_entry.applied);
+    }
     g_first = 0;
 }
 
@@ -157,15 +189,22 @@ X86_FUNC(sub_000CB400) {
     }
     if (event == kInputEvent && page == kDisplayPage && X86_MEM32(self + kFocus) == kRowListFocus) {
         const Step step = Input(g_first + X86_MEM32(self + kRow), input);
-        if (step.handled) {
+        if (step.handled && (!step.apply || g_pending)) {
             g_first = Scroll(step.row, g_first);
             X86_MEM32(self + kRow) = step.row - g_first;
             X86_MEM32(self + kFocus) = step.focus;
             if (step.change) {
                 Values v = Current();
-                Change(v, kOptions[step.row - kNativeRows], step.change);
-                Apply(v);
+                const Option option = OptionAt(step.row);
+                Change(v, option, step.change, g_sizes);
+                if (option == Option::Resolution) {
+                    g_pending_size = v.size;
+                    g_pending = v.size != v.applied;
+                } else {
+                    Apply(v);
+                }
             }
+            if (step.apply) ApplySize(g_pending_size);
             ::kernel::Return(ctx, 0, 3);
             return;
         }

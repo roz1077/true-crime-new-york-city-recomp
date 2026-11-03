@@ -2,6 +2,10 @@
 #include "graphics_menu.h"
 #include "pad_tools.h"
 
+namespace game {
+uint32_t MainLoopSwapInterval(uint32_t interval);
+}
+
 namespace {
 
 // scripted or replayed input first, so the Graphics menu sees what the game would
@@ -33,4 +37,5 @@ const app::GameInfo app::kGame = {
     .ui = game::DrawGraphicsMenu,                // ImGui drawing each frame: the Graphics menu (F10)
     .pad = FilterPad,                            // changes a polled pad
     .rumble = nullptr,                           // changes a rumble before it is set
+    .swap_interval = game::MainLoopSwapInterval,
 };

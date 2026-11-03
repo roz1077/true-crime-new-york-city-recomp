@@ -14,11 +14,27 @@ inline constexpr uint32_t kMinRenderPercent = 20, kMaxRenderPercent = 200;
 inline constexpr uint32_t kAnisoLevels[] = {0, 2, 4, 8, 16}; // 0: as the game asks
 // The game's Swap limits pacing to 60 / presentation interval (d3d8.cpp), so
 // higher caps have no effect and are not offered.
+inline constexpr uint32_t kMsaaSamples[] = {0, 2, 4, 8};
 inline constexpr uint32_t kFrameCaps[] = {30, 60};
 inline constexpr uint32_t kGameFrameLimit = 60;
 // Field of view, as a percentage of the gameplay camera's tan(fov / 2): 100 is the game's own.
 inline constexpr uint32_t kFovPercents[] = {80, 90, 100, 110, 120, 130, 140, 150};
 inline constexpr uint32_t kMinFovPercent = 50, kMaxFovPercent = 200;
+// Frame shapes, width / height x 1000 (app::Settings::aspect): 0 matches the display, then 4:3, 16:10, 16:9, 21:9
+// (64:27) and 32:9. 3D widens to the shape; HUD, menus and movies stay 16:9 in the middle.
+inline constexpr uint32_t kAspects[] = {0, 1333, 1600, 1778, 2370, 3556};
+
+// "4:3" and so on for a listed shape, "" for others
+inline const char *AspectName(uint32_t aspect) {
+    switch (aspect) {
+    case 1333: return "4:3";
+    case 1600: return "16:10";
+    case 1778: return "16:9";
+    case 2370: return "21:9";
+    case 3556: return "32:9";
+    default: return "";
+    }
+}
 
 // The value one step from current in a sorted list. A current value between
 // entries (hand-edited settings file) steps to its neighbour in that

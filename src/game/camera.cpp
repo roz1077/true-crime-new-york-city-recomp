@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "app/app.h"
 #include "common/graphics_choices.h"
 #include "common/graphics_menu.h"
 #include "core/log.h"
@@ -72,16 +73,33 @@ void AdjustProjection(X86Context &ctx, uint8_t *base, const char *which) {
     std::memcpy(base + arg, &scaled, 4); // the caller's pushed argument
 }
 
+// Temporarily widen the gameplay projection. Other users of the renderer's
+// horizontal scale, including the HUD and picture-in-picture, see the guest value.
+void RunProjection(X86Context &ctx, uint8_t *base, const char *which,
+                   void (*original)(X86Context &, uint8_t *)) {
+    const uint32_t ret = X86_MEM32(ctx.esp);
+    const bool gameplay = ctx.ecx == kRenderer &&
+                          (ret == kGameplayProjection[0] || ret == kGameplayProjection[1]);
+    const float previous = gameplay ? F32(base, kRenderer + kScaleX) : 0.0f;
+    constexpr float kWideAspect = 16.0f / 9.0f;
+    const bool adjust = gameplay && previous == 0.75f;
+    if (adjust) {
+        const float scale = previous * kWideAspect / app::AspectRatio();
+        std::memcpy(base + kRenderer + kScaleX, &scale, sizeof(scale));
+    }
+    AdjustProjection(ctx, base, which);
+    original(ctx, base);
+    if (adjust) std::memcpy(base + kRenderer + kScaleX, &previous, sizeof(previous));
+}
+
 } // namespace
 
 X86_EXTERN_FUNC(__imp__sub_00245BB0);
 X86_FUNC(sub_00245BB0) {
-    AdjustProjection(ctx, base, "projection");
-    __imp__sub_00245BB0(ctx, base);
+    RunProjection(ctx, base, "projection", __imp__sub_00245BB0);
 }
 
 X86_EXTERN_FUNC(__imp__sub_00245CE0);
 X86_FUNC(sub_00245CE0) {
-    AdjustProjection(ctx, base, "infinite projection");
-    __imp__sub_00245CE0(ctx, base);
+    RunProjection(ctx, base, "infinite projection", __imp__sub_00245CE0);
 }

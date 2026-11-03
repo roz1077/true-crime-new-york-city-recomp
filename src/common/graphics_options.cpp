@@ -29,6 +29,14 @@
 namespace game {
 
 bool g_show_fps = false;
+
+bool ShowFps() {
+    return std::atomic_ref(g_show_fps).load(std::memory_order_relaxed);
+}
+
+void SetShowFps(bool show) {
+    std::atomic_ref(g_show_fps).store(show, std::memory_order_relaxed);
+}
 uint32_t g_fov_percent = 100;
 std::atomic<float> g_camera_fov_degrees{0};
 
@@ -46,9 +54,11 @@ enum class Row {
     DisplayMode,
     Resolution,
     ApplyDisplay,
+    AspectRatio,
     RenderScale,
     FieldOfView,
     Anisotropic,
+    Msaa,
     Smaa,
     VSync,
     FrameCap,
@@ -60,8 +70,9 @@ enum class Row {
     Close,
 };
 constexpr Row kRows[] = {
-    Row::DisplayMode,        Row::Resolution,     Row::ApplyDisplay, Row::RenderScale, Row::FieldOfView,
-    Row::Anisotropic,        Row::Smaa,           Row::VSync,        Row::FrameCap,    Row::ShowFps,
+    Row::DisplayMode,        Row::Resolution,     Row::ApplyDisplay, Row::AspectRatio, Row::RenderScale,
+    Row::FieldOfView,
+    Row::Anisotropic,        Row::Msaa,           Row::Smaa,           Row::VSync,        Row::FrameCap,    Row::ShowFps,
     Row::TextureReplacement, Row::TextureDumping, Row::DumpFormat,   Row::Defaults,    Row::Close};
 constexpr int kRowCount = int(std::size(kRows));
 
@@ -82,7 +93,11 @@ struct Menu {
 
 bool SameMode(app::Mode a, app::Mode b) { return a.width == b.width && a.height == b.height; }
 
-std::vector<app::Mode> MonitorModes() {
+std::vector<app::Mode> MonitorModes() { return DisplayModes(); }
+
+} // namespace
+
+std::vector<app::Mode> DisplayModes() {
     std::vector<app::Mode> modes{{0, 0}};
     MONITORINFOEXW monitor{};
     monitor.cbSize = sizeof(monitor);
@@ -99,6 +114,8 @@ std::vector<app::Mode> MonitorModes() {
               [](app::Mode a, app::Mode b) { return std::pair{a.width, a.height} < std::pair{b.width, b.height}; });
     return modes;
 }
+
+namespace {
 
 bool DisplayPending() {
     const app::Settings &s = app::Get();
@@ -141,14 +158,16 @@ void RestoreDefaults() {
     const app::Settings d;
     app::Settings &s = app::Get();
     s.render_percent = d.render_percent;
-    s.fps_cap = d.fps_cap;
+    s.aspect = d.aspect;
+    app::SetFrameCap(d.fps_cap);
     s.vsync = d.vsync;
     s.aniso = d.aniso;
+    app::SetMsaaSamples(d.msaa);
     s.smaa = d.smaa;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
     s.texture_dump_format = d.texture_dump_format;
-    g_show_fps = false;
+    SetShowFps(false);
     g_fov_percent = 100;
     g_menu.mode = d.display_mode; // display changes still wait for Apply
     g_menu.resolution = {d.width, d.height};
@@ -159,11 +178,13 @@ Kind KindOf(Row row) {
     switch (row) {
     case Row::DisplayMode:
     case Row::Resolution:
+    case Row::AspectRatio:
     case Row::RenderScale:
     case Row::FieldOfView:
     case Row::Anisotropic:
     case Row::FrameCap:
     case Row::DumpFormat:
+    case Row::Msaa:
         return Kind::Choice;
     case Row::Smaa:
     case Row::VSync:
@@ -190,12 +211,16 @@ const char *Label(Row row) {
         return "Resolution";
     case Row::ApplyDisplay:
         return "Apply display changes";
+    case Row::AspectRatio:
+        return "Aspect ratio";
     case Row::RenderScale:
         return "Render scale";
     case Row::FieldOfView:
         return "Field of view";
     case Row::Anisotropic:
         return "Anisotropic filtering";
+    case Row::Msaa:
+        return "MSAA";
     case Row::Smaa:
         return "SMAA";
     case Row::VSync:
@@ -244,6 +269,9 @@ const char *Help(Row row) {
                "for render scale. Takes effect with Apply display changes.";
     case Row::ApplyDisplay:
         return "Applies the display mode and resolution above.";
+    case Row::AspectRatio:
+        return "The picture's shape; Auto matches the display. The 3D view widens to it, while HUD, menus "
+               "and movies stay 16:9 in the middle. 4:3 and the wide shapes switch after a restart.";
     case Row::RenderScale:
         return "Internal resolution relative to the output height. Above 100% renders more pixels for a "
                "sharper image; below 100% is faster.";
@@ -253,12 +281,14 @@ const char *Help(Row row) {
     case Row::Anisotropic:
         return "Keeps textures sharp at glancing angles, such as roads into the distance. Game default uses "
                "the filtering the game asks for.";
+    case Row::Msaa:
+        return "Smooths geometry edges. Higher counts require more GPU memory.";
     case Row::Smaa:
         return "Smooths jagged edges on the finished frame (SMAA 1x). The HUD is smoothed with it.";
     case Row::VSync:
         return "Waits for the monitor's refresh before showing a frame, which prevents tearing.";
     case Row::FrameCap:
-        return "The game's timing is built for at most 60 FPS, so higher limits are not offered.";
+        return "Sets the frame limit for gameplay and real-time cutscenes.";
     case Row::ShowFps:
         return "Shows the frame rate in the top-left corner.";
     case Row::TextureReplacement:
@@ -292,6 +322,16 @@ std::string Value(Row row) {
         else
             std::snprintf(text, sizeof(text), "%u x %u", g_menu.resolution.width, g_menu.resolution.height);
         return text;
+    case Row::AspectRatio:
+        if (!s.aspect) {
+            const app::Mode o = app::Output();
+            std::snprintf(text, sizeof(text), "Auto (%.2f:1)", o.height ? float(o.width) / float(o.height) : 0.0f);
+        } else if (*choices::AspectName(s.aspect)) {
+            std::snprintf(text, sizeof(text), "%s", choices::AspectName(s.aspect));
+        } else {
+            std::snprintf(text, sizeof(text), "%.2f:1", float(s.aspect) / 1000.0f);
+        }
+        return text;
     case Row::RenderScale:
         std::snprintf(text, sizeof(text), "%u%% (%up)", s.render_percent,
                       choices::RenderHeight(g_menu.output_height, s.render_percent));
@@ -310,16 +350,20 @@ std::string Value(Row row) {
         std::snprintf(text, sizeof(text), "%ux", s.aniso);
         return text;
     case Row::FrameCap:
-        std::snprintf(text, sizeof(text), "%u FPS", choices::EffectiveFrameCap(s.fps_cap));
+        std::snprintf(text, sizeof(text), "%u FPS", choices::EffectiveFrameCap(app::FrameCap()));
         return text;
     case Row::DumpFormat:
         return s.texture_dump_format ? "DDS" : "PNG";
+    case Row::Msaa: {
+        const auto samples = app::MsaaSamples();
+        return samples ? std::to_string(samples) + "x" : "Off";
+    }
     case Row::Smaa:
         return s.smaa ? "On" : "Off";
     case Row::VSync:
         return s.vsync ? "On" : "Off";
     case Row::ShowFps:
-        return g_show_fps ? "On" : "Off";
+        return ShowFps() ? "On" : "Off";
     case Row::TextureReplacement:
         return s.custom_textures ? "On" : "Off";
     case Row::TextureDumping:
@@ -359,6 +403,10 @@ bool Change(Row row, int direction) {
             set(s.render_percent,
                 choices::ClampRenderPercent(choices::Step(choices::kRenderPercents, s.render_percent, direction)));
         break;
+    case Row::AspectRatio:
+        // read by the renderer and the camera hook each frame: a single aligned 32-bit store
+        changed = set(s.aspect, choices::Step(choices::kAspects, s.aspect, direction));
+        break;
     case Row::FieldOfView:
         // read by the camera hooks on the game thread: a single aligned 32-bit store
         changed = set(g_fov_percent,
@@ -367,10 +415,20 @@ bool Change(Row row, int direction) {
     case Row::Anisotropic:
         changed = set(s.aniso, choices::Step(choices::kAnisoLevels, s.aniso, direction));
         break;
-    case Row::FrameCap:
-        // read by app::Pace on the game thread: a single aligned 32-bit store
-        changed = set(s.fps_cap, choices::Step(choices::kFrameCaps, choices::EffectiveFrameCap(s.fps_cap), direction));
+    case Row::Msaa: {
+        const auto current = app::MsaaSamples();
+        const auto next = choices::Step(choices::kMsaaSamples, current, direction);
+        changed = current != next;
+        if (changed) app::SetMsaaSamples(next);
         break;
+    }
+    case Row::FrameCap: {
+        const auto current = app::FrameCap();
+        const auto next = choices::Step(choices::kFrameCaps, choices::EffectiveFrameCap(current), direction);
+        changed = current != next;
+        if (changed) app::SetFrameCap(next);
+        break;
+    }
     case Row::DumpFormat:
         changed = set(s.texture_dump_format, direction > 0 ? 1u : 0u);
         break;
@@ -400,7 +458,7 @@ void Activate(Row row) {
             s.vsync = !s.vsync;
             break;
         case Row::ShowFps:
-            g_show_fps = !g_show_fps;
+            SetShowFps(!ShowFps());
             break;
         case Row::TextureReplacement:
             s.custom_textures = !s.custom_textures;
@@ -601,7 +659,7 @@ void DrawGraphicsMenu(double fps) {
     }
     if (g_menu.open)
         DrawMenu(fps);
-    else if (g_show_fps)
+    else if (ShowFps())
         DrawFpsCounter(fps);
 }
 
