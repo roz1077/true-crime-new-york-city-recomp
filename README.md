@@ -15,10 +15,19 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 
 ## Features
 
-### Display
+### Graphics menu
+Press **F10**, or **Back + Start** on controller 1, at any time. Use the arrow keys or D-pad to move and change
+values, Enter or A to select, and Esc or B to close. The mouse works too. The game receives no controller input
+while the menu is open, so pause the game first during play. Settings are saved to `settings.toml` when the menu
+closes.
 
-
-### Graphics
+- **Display mode** - Fullscreen, Borderless or Windowed.
+- **Resolution** - Desktop or any mode the monitor lists. Display mode and resolution take effect with *Apply display changes*.
+- **Render scale** - 25% to 200% of the output height.
+- **Anisotropic filtering** - Game default, 2x, 4x, 8x or 16x.
+- **V-Sync** and **Frame rate limit** (30 or 60 FPS; the game's timing is built for at most 60).
+- **FPS counter**.
+- **Texture replacement**, **texture dumping** and **dump format** (PNG or DDS).
 
 ### Controller
 Supports Xbox, PlayStation and Switch controllers, with hot plugging and rumble.
