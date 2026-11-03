@@ -2,15 +2,18 @@
 
 ## Native Display rows (2026-11-03)
 
-The native Options > Display tab now carries Graphics rows under SUBTITLES: render scale, field of
-view, anisotropic filtering, SMAA, V-Sync and frame limit. The tab's frame holds five rows, so the list
+The native Options > Display tab now carries Graphics rows under SUBTITLES: resolution, aspect ratio,
+render scale, field of view, anisotropic filtering, SMAA, V-Sync and frame limit. The tab's frame holds five rows, so the list
 scrolls: the game's row field (`+0x34`) keeps the slot on screen, which its highlight frame follows, and
 `native_graphics.cpp` keeps the window's first row (`src/game/native_graphics.cpp`, rules in
 `src/game/display_rows.h`, checked by `scripts/test_display_rows.py`). They look and behave like the
 game's own rows. D-pad up and down move between rows, and left and right change a value live. Back
 restores what the tab had on entry, A keeps the changes, and settings are saved to `settings.toml`. A
-scripted controller verified each of these in-game. The F10 overlay still offers every option,
-including display mode and resolution.
+scripted controller verified this flow for the original six graphics rows. Resolution changes are staged
+with left and right. A applies a pending resolution, and otherwise passes through to the native menu.
+Back restores the entry resolution and aspect ratio along with the other settings. The F10 overlay
+offers the same settings and also controls display mode. The new resolution and aspect controls still
+need an in-game pass.
 
 How the tab works, from the menu data and the getter:
 
@@ -56,8 +59,17 @@ because the renderer re-reads render scale, anisotropy, V-Sync and texture setti
 re-reads the frame cap. Display mode and resolution wait for an explicit Apply. The settings file is written when
 the menu closes. F10's `WM_SYSKEY*` messages are swallowed, so Windows does not enter menu mode on its release.
 
-Only options with working host paths are offered. The frame cap offers 30 and 60 because the guest Swap limits
-pacing to 60 / presentation interval (`d3d8.cpp`). Higher caps would do nothing.
+The frame limit offers 30 and 60 FPS. In 60 FPS mode, the gameplay loop uses the elapsed 60 Hz
+vblank count for simulation and rendering, and its Swap uses interval one. Real-time cutscenes
+also use interval one at 60 FPS. They keep the 48 kHz sample clock and can render a frame without
+advancing the scene when no tick is due. `XBE_TRACE_FRAME_TIMING=1` logs frame and tick rates.
+The manual cutscene run on 2026-11-03 held roughly 60 FPS and 60 ticks per second through the
+scene and back into gameplay. The audio-clock interval lasted 158.096 seconds at 60 FPS and
+158.139 seconds in the 30 FPS replay. Both runs held 60 simulation ticks per second in steady
+playback and exited cleanly. Logs are `cutscene-manual-60.log` and `cutscene-baseline-30.log`
+under `out/build/release/logs`.
+The 2026-11-03 controller replay reached 60 frames and 60 simulation ticks per second in steady
+gameplay. The timing trace is in `out/build/release/logs/frame-timing-60.log`.
 
 Verified on 2026-11-03 with a scripted controller (`XBE_PAD_SCRIPT`). Back + Start opened the menu. Navigation
 changed render scale to 75% and anisotropy to 8x live. B closed the menu, saved both values, and the intro
@@ -113,14 +125,33 @@ The view that changes with aiming is the infinite projection (`0x245CE0`), so th
 limit how far the city is drawn. The `.def` distance names found so far belong to pedestrians
 (`exteriorDistRemoval*` in `NPCTune`), character LOD (`lod`, `uLODStart`), AI sight (`defaultViewDist`)
 and depth of field (`DepthDef` near 10, far 200). The city streams from one `City\Brick_NYC` set with
-`.idx`, `.exm`, `.exp`, `.ext` and an `.occ` occlusion file. Draw distance is therefore most likely the
-brick streaming radius or occlusion data, which is not yet located.
+`.idx`, `.exm`, `.exp`, `.ext` and an `.occ` occlusion file.
+
+The city update at `0x147C40` runs three spatial caches. The first, `0x146FC0`,
+selects seven of nine mesh cells on a 174-unit grid. The cache constructor
+`0x1480B0` allocates nine entries at stride `0x9C`, and its loader `0x137890`
+opens `!CITY!\%d_%d.XB2`. The 70-unit cache at `0x146CA0` loads `.g` files
+through `0x1378F0`. The third path at `0x1472E0` uses a 256-unit grid, with
+the occlusion file opened at `0x13819F`.
+
+The seven-to-nine mesh experiment was removed after it showed no visible benefit.
+An expanded grid needs independently allocated mesh slots. In the stock
+city object the nine mesh entries start at `+0x4FA4` and use stride `0x9C`.
+The selection scratch list begins at `+0x5520` and the next spatial cache
+begins at `+0x55B0`, so increasing the stock loop bound would overwrite
+both. Extra slots would need to participate in the async load and eviction
+state machine at `0x137600` and unregister their render list entries before
+the city object is reset or destroyed. The relevant attach and detach
+callbacks are `0x13C240` and `0x13C1D0`.
+The 2026-11-03 replay confirmed 7/7 resident meshes at stock and 9/9 with
+the experiment enabled. The first two additional meshes were `-2_-4.XB2`
+and `-2_-6.XB2`. See `mesh-residency-replay-7.log` and
+`mesh-residency-replay-9.log` under `out/build/release/logs`.
 
 ## Outstanding work
 
 A fifth native tab is no longer needed for the main options, because the Display tab takes
-extra rows. Display mode and resolution stay in the overlay: they need an explicit Apply, which the
-native rows do not have. MSAA, ambient occlusion and HDR still need renderer work, and draw distance
+extra rows. Display mode stays in the overlay. MSAA, ambient occlusion and HDR still need renderer work, and draw distance
 needs the city streaming radius or occlusion data located (see above).
 
 SMAA 1x (high preset) runs on the finished frame in `D3D12Backend::ApplySmaa`, from the reference
@@ -165,9 +196,9 @@ readback share `PrepareCopySource`; presentation and guest copies also have
 their own resolve call sites. Depth reads and copies need an explicit
 strategy because color resolves do not cover depth surfaces.
 
-Frame cap already exists in SDK settings. The guest Swap path calls
-`app::Pace` with an interval-derived maximum. A cap control needs to account
-for that maximum and safely publish changes to the thread that runs Pace.
+The guest Swap path calls `app::Pace` with an interval-derived maximum.
+The title's 60 FPS override applies only to the main loop's interval-two
+Swap. Frame limit changes are published atomically to the thread that runs Pace.
 Display mode, resolution, render scale, V-Sync, anisotropic filtering and
 texture controls already have host paths. SMAA, ambient occlusion and HDR
 need renderer implementations. FOV, viewmodel FOV and draw distance

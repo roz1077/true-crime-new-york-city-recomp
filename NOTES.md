@@ -930,3 +930,23 @@
   never fired, so it is not slot reuse either. It always follows "no ready head" at ~429.8 s (scripted moment).
   Added a trace ("tcnyc: body N ...") of allocate / load service 0xDBA10 / set up 0x21BD50 / clear 0x21BFF0 /
   release 0xDB860 on entries 28..39.
+## Traffic variety and Copland
+
+The Xbox glitch guide reports that ordinary traffic can dwindle to cruisers
+and parked sedans after returning to free roam. The cause has not been
+reproduced in this port. See the [Xbox glitch guide](https://gamefaqs.gamespot.com/xbox/925118-true-crime-new-york-city/faqs/40332).
+
+`XBE_TRACE_TRAFFIC=1` enables the read-only hooks in `src/game/traffic_trace.cpp`.
+The selector at `0x158F0` scans 16 references at world `+0x2660` with stride
+`0x14`. The trace records changes to the candidate pool, the per-reference
+exclusion bits, selected models, and the resource and vehicle model IDs at
+the `0x823C0` and `0x7DD80` spawn paths. Guest model IDs 7, 62, 63 and 89
+identify Crownwig, police sedan, taxi and training police sedan respectively.
+A resource with no data pointer can still produce a vehicle in a healthy run,
+so a zero residency field alone does not establish a spawn failure.
+
+The 30 FPS spawn baseline and 60 FPS selector baseline are saved as
+`traffic-baseline.log` and `traffic-selector-baseline.log` under
+`out/build/release/logs`. A failing trace should cover the transition from
+varied traffic to the affected state and be copied before relaunch.
+
