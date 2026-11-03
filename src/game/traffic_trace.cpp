@@ -27,10 +27,10 @@ struct SpawnRequest {
     int model = -1;
     uint32_t flags = 0;
     bool has_data = false;
-    bool operator==(const SpawnRequest&) const = default;
+    bool operator==(const SpawnRequest &) const = default;
 };
 
-SpawnRequest ReadResource(uint8_t* base, uint32_t resource) {
+SpawnRequest ReadResource(uint8_t *base, uint32_t resource) {
     SpawnRequest request;
     if (!resource) return request;
     request.slot = int16_t(X86_MEM16(resource + 6));
@@ -42,30 +42,35 @@ SpawnRequest ReadResource(uint8_t* base, uint32_t resource) {
     return request;
 }
 
-SpawnRequest ReadRequest(X86Context& ctx, uint8_t* base) {
+SpawnRequest ReadRequest(X86Context &ctx, uint8_t *base) {
     auto request = ReadResource(base, X86_MEM32(ctx.esp + 8));
     request.caller = X86_MEM32(ctx.esp);
     return request;
 }
 
-const char* ModelKind(int model) {
+const char *ModelKind(int model) {
     switch (model) {
-    case 7: return "crownwig";
-    case 62: return "police";
-    case 63: return "taxi";
-    case 89: return "training-police";
-    default: return "other";
+    case 7:
+        return "crownwig";
+    case 62:
+        return "police";
+    case 63:
+        return "taxi";
+    case 89:
+        return "training-police";
+    default:
+        return "other";
     }
 }
 
-void TraceSpawn(const char* path, X86Context& ctx, uint8_t* base, const SpawnRequest& request) {
+void TraceSpawn(const char *path, X86Context &ctx, uint8_t *base, const SpawnRequest &request) {
     const int model = ctx.eax ? int16_t(X86_MEM16(ctx.eax + 0x448)) + 1 : -1;
-    LOGR("traffic: %s caller=%08X slot=%d requested=%d flags=%04X resident=%u actual=%d kind=%s vehicle=%08X",
-         path, request.caller, request.slot, request.model, request.flags, unsigned(request.has_data),
-         model, ModelKind(model), ctx.eax);
+    LOGR("traffic: %s caller=%08X slot=%d requested=%d flags=%04X resident=%u actual=%d kind=%s vehicle=%08X", path,
+         request.caller, request.slot, request.model, request.flags, unsigned(request.has_data), model,
+         ModelKind(model), ctx.eax);
 }
 
-void TraceSelection(uint8_t* base, uint32_t caller, int selected) {
+void TraceSelection(uint8_t *base, uint32_t caller, int selected) {
     const uint32_t world = X86_MEM32(kWorld);
     if (!world) return;
     using Pool = std::array<SpawnRequest, kTrafficRefCount>;
@@ -82,9 +87,9 @@ void TraceSelection(uint8_t* base, uint32_t caller, int selected) {
     if (world != previous_world || pool != previous || excluded != previous_excluded) {
         LOGR("traffic: candidate pool world=%08X excluded=%04X", world, excluded);
         for (uint32_t i = 0; i < pool.size(); ++i) {
-            const auto& entry = pool[i];
-            LOGR("traffic: candidate=%u slot=%d model=%d flags=%04X resident=%u",
-                 i, entry.slot, entry.model, entry.flags, unsigned(entry.has_data));
+            const auto &entry = pool[i];
+            LOGR("traffic: candidate=%u slot=%d model=%d flags=%04X resident=%u", i, entry.slot, entry.model,
+                 entry.flags, unsigned(entry.has_data));
         }
         previous_world = world;
         previous = pool;
@@ -93,8 +98,7 @@ void TraceSelection(uint8_t* base, uint32_t caller, int selected) {
     }
     if (selected != previous_selection) {
         const int model = selected >= 0 && selected < int(pool.size()) ? pool[selected].model : -1;
-        LOGR("traffic: selection caller=%08X candidate=%d model=%d kind=%s",
-             caller, selected, model, ModelKind(model));
+        LOGR("traffic: selection caller=%08X candidate=%d model=%d kind=%s", caller, selected, model, ModelKind(model));
         previous_selection = selected;
     }
 }

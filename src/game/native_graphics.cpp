@@ -57,9 +57,12 @@ std::vector<uint64_t> g_sizes;
 Values Current() {
     const app::Settings &s = app::Get();
     const uint64_t applied = Size(s.width, s.height);
-    return {s.render_percent, game::g_fov_percent, s.aniso, app::FrameCap(), s.aspect, app::MsaaSamples(),
-            s.vsync, s.smaa, game::ShowFps(),
-            g_pending ? g_pending_size : applied, applied};
+    return {s.render_percent, game::g_fov_percent,
+            s.aniso,          app::FrameCap(),
+            s.aspect,         app::MsaaSamples(),
+            s.vsync,          s.smaa,
+            game::ShowFps(),  g_pending ? g_pending_size : applied,
+            applied};
 }
 
 // guest thread; the renderer reads these each frame and app::Pace each Swap (aligned 32-bit stores). The

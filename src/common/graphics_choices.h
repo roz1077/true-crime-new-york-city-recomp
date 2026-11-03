@@ -12,9 +12,9 @@ namespace game::choices {
 inline constexpr uint32_t kRenderPercents[] = {25, 50, 67, 75, 100, 125, 150, 175, 200};
 inline constexpr uint32_t kMinRenderPercent = 20, kMaxRenderPercent = 200;
 inline constexpr uint32_t kAnisoLevels[] = {0, 2, 4, 8, 16}; // 0: as the game asks
+inline constexpr uint32_t kMsaaSamples[] = {0, 2, 4, 8};     // 0: off
 // The game's Swap limits pacing to 60 / presentation interval (d3d8.cpp), so
 // higher caps have no effect and are not offered.
-inline constexpr uint32_t kMsaaSamples[] = {0, 2, 4, 8};
 inline constexpr uint32_t kFrameCaps[] = {30, 60};
 inline constexpr uint32_t kGameFrameLimit = 60;
 // Field of view, as a percentage of the gameplay camera's tan(fov / 2): 100 is the game's own.
@@ -27,12 +27,18 @@ inline constexpr uint32_t kAspects[] = {0, 1333, 1600, 1778, 2370, 3556};
 // "4:3" and so on for a listed shape, "" for others
 inline const char *AspectName(uint32_t aspect) {
     switch (aspect) {
-    case 1333: return "4:3";
-    case 1600: return "16:10";
-    case 1778: return "16:9";
-    case 2370: return "21:9";
-    case 3556: return "32:9";
-    default: return "";
+    case 1333:
+        return "4:3";
+    case 1600:
+        return "16:10";
+    case 1778:
+        return "16:9";
+    case 2370:
+        return "21:9";
+    case 3556:
+        return "32:9";
+    default:
+        return "";
     }
 }
 

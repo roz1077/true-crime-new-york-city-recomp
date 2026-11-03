@@ -1,3 +1,6 @@
+// The window TrueCrimeNYC.exe shows before the game: pick an ISO, which is copied into the assets folder beside the
+// executable, then start the game (RecompMain, the SDK's wWinMain renamed in CMakeLists.txt).
+
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -9,12 +12,14 @@
 
 namespace fs = std::filesystem;
 
-int Error(const wchar_t* message) {
+namespace {
+
+int Error(const wchar_t *message) {
     MessageBoxW(nullptr, message, L"True Crime NYC Launcher", MB_OK | MB_ICONERROR);
     return 1;
 }
 
-int InstallIso(const fs::path& source) {
+int InstallIso(const fs::path &source) {
     if (source.empty()) return 0;
     std::vector<wchar_t> path(32768);
     const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
@@ -31,7 +36,7 @@ int InstallIso(const fs::path& source) {
             return Error(L"Move the extracted game files out of the local assets folder before launching an ISO.");
         }
         bool alreadyInstalled = false;
-        for (const auto& entry : fs::directory_iterator(assets)) {
+        for (const auto &entry : fs::directory_iterator(assets)) {
             if (!entry.is_regular_file() || _wcsicmp(entry.path().extension().c_str(), L".iso") != 0) continue;
             if (!fs::equivalent(entry.path(), source)) {
                 return Error(L"Move the other ISO out of the local assets folder before selecting a different ISO.");
@@ -42,7 +47,8 @@ int InstallIso(const fs::path& source) {
             const auto staged = assets / L"launcher-import.tmp";
             const auto destination = assets / source.filename();
             if (!CopyFileW(source.c_str(), staged.c_str(), TRUE)) {
-                return Error(L"Could not copy the ISO. Check free space and write access, and remove any leftover launcher-import.tmp from assets.");
+                return Error(L"Could not copy the ISO. Check free space and write access, and remove any leftover "
+                             L"launcher-import.tmp from assets.");
             }
             if (!MoveFileW(staged.c_str(), destination.c_str())) {
                 DeleteFileW(staged.c_str());
@@ -51,12 +57,10 @@ int InstallIso(const fs::path& source) {
         }
 
         return 0;
-    } catch (const fs::filesystem_error&) {
+    } catch (const fs::filesystem_error &) {
         return Error(L"Could not access the selected ISO or the local assets folder.");
     }
 }
-
-namespace {
 
 constexpr int kBrowse = 101;
 constexpr int kLaunch = 102;
@@ -84,45 +88,43 @@ void Browse(HWND window) {
     }
 }
 
-HWND AddControl(HWND parent, const wchar_t* type, const wchar_t* text, DWORD style,
-                int x, int y, int width, int height, int id = 0) {
-    HWND control = CreateWindowW(type, text, WS_CHILD | WS_VISIBLE | style, x, y, width, height,
-                                 parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
+HWND AddControl(HWND parent, const wchar_t *type, const wchar_t *text, DWORD style, int x, int y, int width, int height,
+                int id = 0) {
+    HWND control = CreateWindowW(type, text, WS_CHILD | WS_VISIBLE | style, x, y, width, height, parent,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
     SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     return control;
 }
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
-        case WM_CREATE:
-            AddControl(window, L"STATIC", L"Select your original Xbox disc image (.iso).", 0, 16, 16, 440, 20);
-            isoField = AddControl(window, L"EDIT", L"", WS_BORDER | ES_READONLY | ES_AUTOHSCROLL,
-                                  16, 44, 350, 25);
-            AddControl(window, L"BUTTON", L"&Browse...", WS_TABSTOP, 376, 43, 80, 27, kBrowse);
-            AddControl(window, L"STATIC", L"Launch uses assets if no ISO is selected.", 0, 16, 84, 330, 20);
-            AddControl(window, L"BUTTON", L"&Launch", WS_TABSTOP,
-                                      376, 79, 80, 29, kLaunch);
-            return 0;
-        case WM_COMMAND:
-            if (LOWORD(wParam) == kBrowse) Browse(window);
-            if (LOWORD(wParam) == kLaunch) {
-                HCURSOR previous = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-                const int result = InstallIso(selectedIso);
-                SetCursor(previous);
-                if (result == 0) {
-                    launchRequested = true;
-                    DestroyWindow(window);
-                }
+    case WM_CREATE:
+        AddControl(window, L"STATIC", L"Select your original Xbox disc image (.iso).", 0, 16, 16, 440, 20);
+        isoField = AddControl(window, L"EDIT", L"", WS_BORDER | ES_READONLY | ES_AUTOHSCROLL, 16, 44, 350, 25);
+        AddControl(window, L"BUTTON", L"&Browse...", WS_TABSTOP, 376, 43, 80, 27, kBrowse);
+        AddControl(window, L"STATIC", L"Launch uses assets if no ISO is selected.", 0, 16, 84, 330, 20);
+        AddControl(window, L"BUTTON", L"&Launch", WS_TABSTOP, 376, 79, 80, 29, kLaunch);
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wParam) == kBrowse) Browse(window);
+        if (LOWORD(wParam) == kLaunch) {
+            HCURSOR previous = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+            const int result = InstallIso(selectedIso);
+            SetCursor(previous);
+            if (result == 0) {
+                launchRequested = true;
+                DestroyWindow(window);
             }
-            return 0;
-        case WM_DESTROY:
-            PostQuitMessage(0);
-            return 0;
+        }
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
     }
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-}  // namespace
+} // namespace
 
 extern "C" int WINAPI RecompMain(HINSTANCE, HINSTANCE, PWSTR, int);
 
@@ -138,9 +140,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
     constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     RECT bounds{0, 0, 472, 125};
     AdjustWindowRect(&bounds, style, FALSE);
-    HWND window = CreateWindowW(windowClass.lpszClassName, L"True Crime NYC Launcher", style,
-                                CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left,
-                                bounds.bottom - bounds.top, nullptr, nullptr, instance, nullptr);
+    HWND window =
+        CreateWindowW(windowClass.lpszClassName, L"True Crime NYC Launcher", style, CW_USEDEFAULT, CW_USEDEFAULT,
+                      bounds.right - bounds.left, bounds.bottom - bounds.top, nullptr, nullptr, instance, nullptr);
     if (!window) return Error(L"Could not open the launcher window.");
 
     ShowWindow(window, show);

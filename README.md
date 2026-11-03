@@ -25,16 +25,18 @@ closes.
 
 - **Display mode** - Fullscreen, Borderless or Windowed.
 - **Resolution** - Desktop or any mode the monitor lists. Display mode and resolution take effect with *Apply display changes*.
+- **Aspect ratio** - Auto (the display's shape), 4:3, 16:10, 16:9, 21:9 or 32:9. The 3D view widens; HUD, menus and movies stay 16:9 in the middle.
 - **Render scale** - 25% to 200% of the output height.
 - **Field of view** - 80% to 150% of the game's view, gameplay camera only; aiming still zooms.
 - **Anisotropic filtering** - Game default, 2x, 4x, 8x or 16x.
+- **MSAA** - Off, 2x, 4x or 8x multisample anti-aliasing.
 - **SMAA** - SMAA 1x anti-aliasing on the finished frame.
 - **V-Sync** and **Frame rate limit** (30 or 60 FPS; the game's timing is built for at most 60).
 - **FPS counter**.
 - **Texture replacement**, **texture dumping** and **dump format** (PNG or DDS).
 
-The game's own **Options > Display** tab also has rows for render scale, field of view, anisotropic filtering,
-SMAA, V-Sync and frame limit; the list scrolls. Left and right change them; Back cancels and A keeps the changes, as with the game's own options.
+The game's own **Options > Display** tab also has rows for resolution, aspect ratio, render scale, field of view,
+anisotropic filtering, MSAA, SMAA, V-Sync, frame limit and the FPS counter; the list scrolls. Left and right change them; Back cancels and A keeps the changes, as with the game's own options.
 
 ### Controller
 Supports Xbox, PlayStation and Switch controllers, with hot plugging and rumble.

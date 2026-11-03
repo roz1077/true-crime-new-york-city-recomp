@@ -3,7 +3,7 @@
 ## Native Display rows (2026-11-03)
 
 The native Options > Display tab now carries Graphics rows under SUBTITLES: resolution, aspect ratio,
-render scale, field of view, anisotropic filtering, SMAA, V-Sync and frame limit. The tab's frame holds five rows, so the list
+render scale, field of view, anisotropic filtering, MSAA, SMAA, V-Sync, frame limit and FPS counter. The tab's frame holds five rows, so the list
 scrolls: the game's row field (`+0x34`) keeps the slot on screen, which its highlight frame follows, and
 `native_graphics.cpp` keeps the window's first row (`src/game/native_graphics.cpp`, rules in
 `src/game/display_rows.h`, checked by `scripts/test_display_rows.py`). They look and behave like the
@@ -98,7 +98,7 @@ Addresses are guest virtual addresses in the US Xbox executable and its generate
 | `0x0025278E` | References `controlNum` (`0xB0F1EBB0`), reads it via `0x0025D2D0`, and stores the result at object offset `+0x2C` during construction. |
 | `0x00250215`, `0x00250314` | The tab renderer reads and updates `numTabs` (`0xEF15D709`) at renderer object offset `+0xA8`. The Options renderer instance has yet to be identified. |
 
-Read-only wrappers in `src/game/hooks.cpp` call the original SDK exports. The launcher sets `XBE_TRACE_OPTIONS_PAGE=1`, and output goes to `out/build/release/logs/tcnyc.log`. A live session verified page queries cycling 0 through 3 and back to 0. Dispatcher event 9 with argument `0x08` advances and `0x04` goes backward. Arguments `0x01`, `0x02`, and `0x100` were observed, but their meanings were not verified. Events 0 and 10 recur during ordinary menu updates. The hooks observe the existing menu and do not add controls.
+The tracing wrappers, now in `src/game/native_graphics.cpp` and `src/game/options_trace.cpp`, call the original functions. Set `XBE_TRACE_OPTIONS_PAGE=1` by hand; output goes to `out/build/release/logs/tcnyc.log`. A live session verified page queries cycling 0 through 3 and back to 0. Dispatcher event 9 with argument `0x08` advances and `0x04` goes backward. Arguments `0x01`, `0x02`, and `0x100` were observed, but their meanings were not verified. Events 0 and 10 recur during ordinary menu updates. The hooks observe the existing menu and do not add controls.
 
 ## Native menu assets
 
@@ -153,7 +153,7 @@ and `-2_-6.XB2`. See `mesh-residency-replay-7.log` and
 ## Outstanding work
 
 A fifth native tab is no longer needed for the main options, because the Display tab takes
-extra rows. Display mode stays in the overlay. MSAA, ambient occlusion and HDR still need renderer work, and draw distance
+extra rows. Display mode stays in the overlay. Ambient occlusion and HDR still need renderer work, and draw distance
 needs the city streaming radius or occlusion data located (see above).
 
 SMAA 1x (high preset) runs on the finished frame in `D3D12Backend::ApplySmaa`, from the reference
@@ -161,7 +161,11 @@ implementation in `sdk/third_party/smaa` (iryoku/smaa 71c806a8, MIT): luma edges
 neighbourhood blending through the existing full-screen `Pass`, before the gamma ramp blit. The HUD is
 part of that frame and is smoothed with it.
 
-MSAA is also outstanding. The current D3D12 renderer creates single-sample targets and pipelines. MSAA needs compatible color and depth targets, matching pipeline sample counts, and resolves where the guest samples or copies rendered surfaces.
+MSAA (2x, 4x or 8x, `msaa` in `settings.toml`) is implemented in `sdk/runtime/gpu/d3d12.cpp`. Render targets,
+depth buffers and every pipeline that draws into them use the chosen sample count. `ResolveColor` resolves a
+colour target once per change for presentation, SMAA, guest copies, readback and sampling; `ResolveDepth` keeps
+the nearest sample (reversed depth) for depth reads and copies. Changing the setting recreates the targets live.
+A sample count the adapter does not support for the target formats falls back to one sample.
 
 ## Batched controller trace
 
@@ -187,7 +191,7 @@ This narrows the tab-count source to the property binding on that menu
 object. The specific Options layout binding and a free native page ID
 are still unverified.
 
-MSAA needs to cover more than presentation. In `sdk/runtime/gpu/d3d12.cpp`,
+The MSAA plan, as implemented above: MSAA needs to cover more than presentation. In `sdk/runtime/gpu/d3d12.cpp`,
 trace target allocation from `FindTarget`, target selection for draws, and
 pipeline sample counts together. A multisampled render surface needs a
 single-sample representation for presentation, guest surface copies and
@@ -202,9 +206,10 @@ The guest Swap path calls `app::Pace` with an interval-derived maximum.
 The title's 60 FPS override applies only to the main loop's interval-two
 Swap. Frame limit changes are published atomically to the thread that runs Pace.
 Display mode, resolution, render scale, V-Sync, anisotropic filtering and
-texture controls already have host paths. SMAA, ambient occlusion and HDR
-need renderer implementations. FOV, viewmodel FOV and draw distance
-need title-specific work. Reload blur is a BLACK-specific option.
+texture controls already have host paths. SMAA and MSAA have since been
+added; ambient occlusion and HDR need renderer implementations. FOV is
+done; viewmodel FOV and draw distance need title-specific work. Reload
+blur is a BLACK-specific option.
 
 ## Destination port binding
 

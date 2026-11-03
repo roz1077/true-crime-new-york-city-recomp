@@ -13,10 +13,12 @@
 // that is divides k, at those two sites only, so aiming still zooms relative
 // to it. XBE_TRACE_CAMERA=1 logs each change. See GRAPHICS_NOTES.md.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 
 #include "app/app.h"
 #include "common/graphics_choices.h"
@@ -47,14 +49,16 @@ float F32(uint8_t *base, uint32_t address) {
 // the field of view for a projection scale (cot of the half angle)
 float Degrees(float scale) { return scale > 0 ? std::atan(1.0f / scale) * 360.0f / 3.14159265358979f : 0.0f; }
 
+// a projection call on the shared renderer from one of the gameplay camera's sites
+bool GameplayProjection(X86Context &ctx, uint8_t *base) {
+    const uint32_t ret = X86_MEM32(ctx.esp);
+    return ctx.ecx == kRenderer && std::ranges::find(kGameplayProjection, ret) != std::end(kGameplayProjection);
+}
+
 // Applies fov_percent to the k argument of a projection call from the gameplay camera.
-void AdjustProjection(X86Context &ctx, uint8_t *base, const char *which) {
+void AdjustProjection(X86Context &ctx, uint8_t *base, const char *which, bool gameplay) {
     const uint32_t self = ctx.ecx, ret = X86_MEM32(ctx.esp), arg = ctx.esp + 4;
     if (self != kRenderer) return;
-    bool gameplay = false;
-    for (uint32_t site : kGameplayProjection)
-        gameplay |= ret == site;
-
     const float k = F32(base, arg), scale_x = F32(base, self + kScaleX), scale_y = F32(base, self + kScaleY);
     if (gameplay) game::g_camera_fov_degrees.store(Degrees(k * scale_x));
     if (Tracing()) {
@@ -73,21 +77,19 @@ void AdjustProjection(X86Context &ctx, uint8_t *base, const char *which) {
     std::memcpy(base + arg, &scaled, 4); // the caller's pushed argument
 }
 
-// Temporarily widen the gameplay projection. Other users of the renderer's
+// Temporarily widen the gameplay projection to the frame's aspect ratio. Other users of the renderer's
 // horizontal scale, including the HUD and picture-in-picture, see the guest value.
-void RunProjection(X86Context &ctx, uint8_t *base, const char *which,
-                   void (*original)(X86Context &, uint8_t *)) {
-    const uint32_t ret = X86_MEM32(ctx.esp);
-    const bool gameplay = ctx.ecx == kRenderer &&
-                          (ret == kGameplayProjection[0] || ret == kGameplayProjection[1]);
+void RunProjection(X86Context &ctx, uint8_t *base, const char *which, void (*original)(X86Context &, uint8_t *)) {
+    const bool gameplay = GameplayProjection(ctx, base);
     const float previous = gameplay ? F32(base, kRenderer + kScaleX) : 0.0f;
     constexpr float kWideAspect = 16.0f / 9.0f;
+    // 0.75 is the game's x scale for a 16:9 picture; other set-ups keep the game's own
     const bool adjust = gameplay && previous == 0.75f;
     if (adjust) {
         const float scale = previous * kWideAspect / app::AspectRatio();
         std::memcpy(base + kRenderer + kScaleX, &scale, sizeof(scale));
     }
-    AdjustProjection(ctx, base, which);
+    AdjustProjection(ctx, base, which, gameplay);
     original(ctx, base);
     if (adjust) std::memcpy(base + kRenderer + kScaleX, &previous, sizeof(previous));
 }
@@ -95,11 +97,7 @@ void RunProjection(X86Context &ctx, uint8_t *base, const char *which,
 } // namespace
 
 X86_EXTERN_FUNC(__imp__sub_00245BB0);
-X86_FUNC(sub_00245BB0) {
-    RunProjection(ctx, base, "projection", __imp__sub_00245BB0);
-}
+X86_FUNC(sub_00245BB0) { RunProjection(ctx, base, "projection", __imp__sub_00245BB0); }
 
 X86_EXTERN_FUNC(__imp__sub_00245CE0);
-X86_FUNC(sub_00245CE0) {
-    RunProjection(ctx, base, "infinite projection", __imp__sub_00245CE0);
-}
+X86_FUNC(sub_00245CE0) { RunProjection(ctx, base, "infinite projection", __imp__sub_00245CE0); }

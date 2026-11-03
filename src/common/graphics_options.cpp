@@ -29,16 +29,12 @@
 namespace game {
 
 bool g_show_fps = false;
-
-bool ShowFps() {
-    return std::atomic_ref(g_show_fps).load(std::memory_order_relaxed);
-}
-
-void SetShowFps(bool show) {
-    std::atomic_ref(g_show_fps).store(show, std::memory_order_relaxed);
-}
 uint32_t g_fov_percent = 100;
 std::atomic<float> g_camera_fov_degrees{0};
+
+bool ShowFps() { return std::atomic_ref(g_show_fps).load(std::memory_order_relaxed); }
+
+void SetShowFps(bool show) { std::atomic_ref(g_show_fps).store(show, std::memory_order_relaxed); }
 
 namespace {
 
@@ -69,11 +65,23 @@ enum class Row {
     Defaults,
     Close,
 };
-constexpr Row kRows[] = {
-    Row::DisplayMode,        Row::Resolution,     Row::ApplyDisplay, Row::AspectRatio, Row::RenderScale,
-    Row::FieldOfView,
-    Row::Anisotropic,        Row::Msaa,           Row::Smaa,           Row::VSync,        Row::FrameCap,    Row::ShowFps,
-    Row::TextureReplacement, Row::TextureDumping, Row::DumpFormat,   Row::Defaults,    Row::Close};
+constexpr Row kRows[] = {Row::DisplayMode,
+                         Row::Resolution,
+                         Row::ApplyDisplay,
+                         Row::AspectRatio,
+                         Row::RenderScale,
+                         Row::FieldOfView,
+                         Row::Anisotropic,
+                         Row::Msaa,
+                         Row::Smaa,
+                         Row::VSync,
+                         Row::FrameCap,
+                         Row::ShowFps,
+                         Row::TextureReplacement,
+                         Row::TextureDumping,
+                         Row::DumpFormat,
+                         Row::Defaults,
+                         Row::Close};
 constexpr int kRowCount = int(std::size(kRows));
 
 enum class Kind { Choice, Toggle, Action };
@@ -92,8 +100,6 @@ struct Menu {
 } g_menu;
 
 bool SameMode(app::Mode a, app::Mode b) { return a.width == b.width && a.height == b.height; }
-
-std::vector<app::Mode> MonitorModes() { return DisplayModes(); }
 
 } // namespace
 
@@ -128,7 +134,7 @@ void OpenMenu() {
     g_menu.dirty = false;
     g_menu.mode = s.display_mode;
     g_menu.resolution = {s.width, s.height};
-    g_menu.resolutions = MonitorModes();
+    g_menu.resolutions = DisplayModes();
     if (std::ranges::none_of(g_menu.resolutions, [](app::Mode m) { return SameMode(m, g_menu.resolution); }))
         g_menu.resolutions.push_back(g_menu.resolution); // a size the monitor no longer lists stays selectable
     g_menu.desktop = app::Desktop();

@@ -1,34 +1,57 @@
-// Cutscene sample clock and opt-in deterministic replay for default.xbe.
+// Cutscene sample clock, 60 FPS main-loop timing and opt-in deterministic replay
+// for default.xbe.
+//
+// 0x2914D2: DirectSoundGetSampleTime reads the APU's free-running 48 kHz
+// counter at FE80200C after checking the original DirectSound singleton. HLE
+// sound creates neither that singleton nor the MMIO counter, so the original
+// always returned zero. The main loop at 0xA7810 uses this clock during
+// cutscenes (60 / 48000 ticks per sample); with a stopped clock it falls back
+// to one update per present instead of catching up to audio.
+//
+// Replay timing: the main loop runs "vblanks since the last frame" ticks
+// (0x243000, the vblank counter 0x420468, called at 0xA78B8) and, in cutscenes,
+// ticks from the audio sample clock (0x2914D2, called at 0xA786A); both are
+// real time, so a replay of the same inputs drifted. With
+// XBE_DETERMINISTIC_REPLAY enabled, XBE_PAD_RECORD=<file> writes the steps in
+// call order to <file>.timing ("v <vblank step>", "s <sample step>"); with
+// XBE_PAD_REPLAY=<file> the main loop gets those steps back in the same order
+// (real time again once the file runs out).
 
 #include <algorithm>
 #include <chrono>
-#include <thread>
-
-#include "app/app.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "app/app.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
 #include "xdk/hle.h"
 
-// 0x2914D2: DirectSoundGetSampleTime reads the APU's free-running 48 kHz
-// counter at FE80200C after checking the original DirectSound singleton. HLE
-// sound creates neither that singleton nor the MMIO counter, so the original
-// always returned zero. The main loop at A7810 uses this clock during cutscenes
-// (60 / 48000 ticks per sample); with a stopped clock it falls back to one
-// update per present instead of catching up to audio. Replay timing. The main
-// loop 0xA7810 runs "vblanks since the last frame" ticks (0x243000, the vblank
-// counter 0x420468, called at 0xA78B8) and, in cutscenes, ticks from the audio
-// sample clock (0x2914D2, called at 0xA786A); both are real time, so a replay
-// of the same inputs drifted. With XBE_DETERMINISTIC_REPLAY enabled,
-// XBE_PAD_RECORD=<file> writes the steps in call order to <file>.timing
-// ("v <vblank step>", "s <sample step>"); with XBE_PAD_REPLAY=<file> the
-// main loop gets those steps back in the same order (real time again once the
-// file runs out).
+namespace {
+// guest data
+constexpr uint32_t kRandomState = 0x3376C8; // 8 bytes
+constexpr uint32_t kSimTicks = 0x363D0C;
+constexpr uint32_t kLastVblank = 0x363D38;
+constexpr uint32_t kVblank = 0x420468;
+constexpr uint32_t kAudioClockMode = 0x360E0C;
+constexpr uint32_t kPreviousAudioClockMode = 0x360DE0;
+constexpr uint32_t kCutsceneClockStart = 0x360DD0;
+constexpr uint32_t kCutsceneState = 0x348E10;
+constexpr uint32_t kTicksPerSample = 0x2D5DC8; // float, -60 / 48000
+
+// return addresses of the main loop's calls
+constexpr uint32_t kMainLoopSampleTime = 0xA786F;
+constexpr uint32_t kMainLoopVblank = 0xA78BD;
+constexpr uint32_t kMainLoopSimulate = 0xA7910;
+constexpr uint32_t kMainLoopRender = 0xA794B;
+constexpr uint32_t kMainLoopPresent = 0xA7952;
+constexpr uint32_t kSimulateVblank = 0xA5221; // the simulation's own vblank read
+} // namespace
+
 namespace timing {
 // Clock/seed overrides and RNG isolation change title behavior. They are useful
 // for controlled replay experiments, but ordinary input recording must not turn
@@ -84,9 +107,9 @@ X86_FUNC(sub_00240CC0) {
         return;
     }
     uint8_t saved[8];
-    std::memcpy(saved, base + 0x3376C8, 8);
+    std::memcpy(saved, base + kRandomState, 8);
     __imp__sub_00240CC0(ctx, base);
-    std::memcpy(base + 0x3376C8, saved, 8);
+    std::memcpy(base + kRandomState, saved, 8);
 }
 
 // srand: the game seeds its random numbers from a timer, so a replay records
@@ -123,13 +146,6 @@ X86_FUNC(sub_00229D50) {
 }
 
 namespace {
-constexpr uint32_t kLastVblank = 0x363D38;
-constexpr uint32_t kVblank = 0x420468;
-constexpr uint32_t kAudioClockMode = 0x360E0C;
-constexpr uint32_t kPreviousAudioClockMode = 0x360DE0;
-constexpr uint32_t kCutsceneClockStart = 0x360DD0;
-constexpr uint32_t kCutsceneState = 0x348E10;
-
 // Shared by this main-loop iteration's simulation and rendering calls.
 thread_local bool fast_gameplay = false;
 thread_local bool fast_cutscene = false;
@@ -158,9 +174,8 @@ void TraceFrame(uint32_t ticks, bool audio_clock, uint32_t steps) {
     }
     const double seconds = std::chrono::duration<double>(now - start).count();
     if (seconds >= 2) {
-        LOGR("tcnyc: %s %.1f frames/s, %.1f ticks/s, %u zero-tick frames",
-             audio_clock ? "cutscene" : "gameplay", frames / seconds, (ticks - start_ticks) / seconds,
-             zero_tick_frames);
+        LOGR("tcnyc: %s %.1f frames/s, %.1f ticks/s, %u zero-tick frames", audio_clock ? "cutscene" : "gameplay",
+             frames / seconds, (ticks - start_ticks) / seconds, zero_tick_frames);
         start = now;
         start_ticks = ticks;
         frames = 0;
@@ -169,17 +184,17 @@ void TraceFrame(uint32_t ticks, bool audio_clock, uint32_t steps) {
     ++frames;
     if (!steps) ++zero_tick_frames;
 }
-}
+} // namespace
 
 namespace game {
-uint32_t MainLoopSwapInterval(uint32_t interval) {
-    return fast_present && interval == 2 ? 1 : interval;
-}
-}
+uint32_t MainLoopSwapInterval(uint32_t interval) { return fast_present && interval == 2 ? 1 : interval; }
+} // namespace game
 
+// The main loop's simulation step (ticks argument): at 60 FPS, the vblanks
+// elapsed since the last frame; in a caught-up cutscene, none.
 X86_EXTERN_FUNC(__imp__sub_000A5200);
 X86_FUNC(sub_000A5200) {
-    if (X86_MEM32(ctx.esp) != 0xA7910) return __imp__sub_000A5200(ctx, base);
+    if (X86_MEM32(ctx.esp) != kMainLoopSimulate) return __imp__sub_000A5200(ctx, base);
     const uint32_t arg = ctx.esp + 4;
     const uint32_t original_ticks = X86_MEM32(arg);
     frame_ticks = original_ticks;
@@ -191,16 +206,17 @@ X86_FUNC(sub_000A5200) {
     } else if (fast_cutscene && cutscene_tick_not_due && original_ticks == 1) {
         frame_ticks = 0;
     }
-    TraceFrame(X86_MEM32(0x363D0C), X86_MEM8(kAudioClockMode) != 0, frame_ticks);
+    TraceFrame(X86_MEM32(kSimTicks), X86_MEM8(kAudioClockMode) != 0, frame_ticks);
     X86_MEM32(arg) = frame_ticks;
     __imp__sub_000A5200(ctx, base);
     use_sampled_vblank = false;
     X86_MEM32(arg) = original_ticks;
 }
 
+// The main loop's render step gets the same tick count as the simulation.
 X86_EXTERN_FUNC(__imp__sub_000A73F0);
 X86_FUNC(sub_000A73F0) {
-    if (X86_MEM32(ctx.esp) != 0xA794B || (!fast_gameplay && !fast_cutscene))
+    if (X86_MEM32(ctx.esp) != kMainLoopRender || (!fast_gameplay && !fast_cutscene))
         return __imp__sub_000A73F0(ctx, base);
     const uint32_t arg = ctx.esp + 4;
     const uint32_t original_ticks = X86_MEM32(arg);
@@ -212,22 +228,23 @@ X86_FUNC(sub_000A73F0) {
 // The main loop presents after its render function returns.
 X86_EXTERN_FUNC(__imp__sub_00242F30);
 X86_FUNC(sub_00242F30) {
-    if (X86_MEM32(ctx.esp) != 0xA7952 || (!fast_gameplay && !fast_cutscene))
+    if (X86_MEM32(ctx.esp) != kMainLoopPresent || (!fast_gameplay && !fast_cutscene))
         return __imp__sub_00242F30(ctx, base);
     fast_present = true;
     __imp__sub_00242F30(ctx, base);
     fast_present = false;
 }
 
+// The vblank counter read.
 X86_EXTERN_FUNC(__imp__sub_00243000);
 X86_FUNC(sub_00243000) {
     uint32_t ret;
     std::memcpy(&ret, base + ctx.esp, 4);
-    if (ret == 0xA5221 && use_sampled_vblank) {
+    if (ret == kSimulateVblank && use_sampled_vblank) {
         ::kernel::Return(ctx, sampled_vblank, 0);
         return;
     }
-    if (ret == 0xA78BD) {
+    if (ret == kMainLoopVblank) {
         fast_gameplay = !X86_MEM8(kAudioClockMode) && app::FrameCap() == 60 && !timing::Enabled();
         if (fast_gameplay) {
             const uint32_t last = X86_MEM32(kLastVblank);
@@ -242,23 +259,23 @@ X86_FUNC(sub_00243000) {
             return;
         }
     }
-    if (!timing::Enabled() || ret != 0xA78BD) {
+    if (!timing::Enabled() || ret != kMainLoopVblank) {
         __imp__sub_00243000(ctx, base);
         return;
     }
     timing::Load();
     uint32_t last, real;
-    std::memcpy(&last, base + 0x363D38, 4);
-    std::memcpy(&real, base + 0x420468, 4);
+    std::memcpy(&last, base + kLastVblank, 4);
+    std::memcpy(&real, base + kVblank, 4);
     static int64_t offset = 0; // replayed counter minus real counter
     const int64_t step = timing::Next(0);
     uint32_t value = step >= 0 ? last + uint32_t(step) : uint32_t(real + offset);
     if (step >= 0) offset = int64_t(value) - int64_t(real);
     timing::Write('v', value - last);
-    uint32_t rng, ticks; // check line (not replayed): random state and sim tick
-                         // count, to find where two runs part
-    std::memcpy(&rng, base + 0x3376C8, 4);
-    std::memcpy(&ticks, base + 0x363D0C, 4);
+    // check line (not replayed): random state and sim tick count, to find where two runs part
+    uint32_t rng, ticks;
+    std::memcpy(&rng, base + kRandomState, 4);
+    std::memcpy(&ticks, base + kSimTicks, 4);
     timing::Write('c', rng ^ (ticks * 2654435761u));
     ::kernel::Return(ctx, value, 0);
 }
@@ -267,13 +284,12 @@ X86_FUNC(sub_002914D2) {
     using clock = std::chrono::steady_clock;
     static const auto start = clock::now();
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
-    // Split whole seconds to keep the multiplication safe, including uint32_t
-    // wrap.
+    // Split whole seconds to keep the multiplication safe, including uint32_t wrap.
     const uint64_t samples = uint64_t(ns / 1000000000) * 48000 + uint64_t(ns % 1000000000) * 48000 / 1000000000;
     uint32_t value = uint32_t(samples);
     uint32_t ret;
     std::memcpy(&ret, base + ctx.esp, 4);
-    if (ret == 0xA786F) {
+    if (ret == kMainLoopSampleTime) {
         fast_gameplay = false;
         fast_cutscene = X86_MEM8(kAudioClockMode) && app::FrameCap() == 60 && !timing::Enabled();
         cutscene_tick_not_due = false;
@@ -282,12 +298,12 @@ X86_FUNC(sub_002914D2) {
         if (fast_cutscene && X86_MEM8(kPreviousAudioClockMode) && !X86_MEM8(ctx.esp + 0x1E)) {
             const uint32_t start_sample = X86_MEM32(kCutsceneClockStart);
             const uint32_t elapsed = value - start_sample - uint32_t(value < start_sample);
-            const float due = float(int32_t(elapsed)) * -X86_MEMF32(0x2D5DC8);
+            const float due = float(int32_t(elapsed)) * -X86_MEMF32(kTicksPerSample);
             const uint32_t state = X86_MEM32(kCutsceneState);
             cutscene_tick_not_due = state && int32_t(due) <= int32_t(X86_MEM32(state + 0x9C));
         }
     }
-    if (timing::Enabled() && ret == 0xA786F) { // the main loop's call
+    if (timing::Enabled() && ret == kMainLoopSampleTime) {
         timing::Load();
         static uint32_t last_real = value, last_value = value;
         static bool first = true;

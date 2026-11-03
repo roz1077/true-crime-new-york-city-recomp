@@ -18,10 +18,9 @@ inline constexpr uint32_t kTabBarFocus = 1, kRowListFocus = 4;
 inline constexpr uint32_t kUp = 0x01, kDown = 0x02, kLeft = 0x04, kRight = 0x08, kAccept = 0x100;
 
 enum class Option { Resolution, Aspect, RenderScale, FieldOfView, Anisotropic, Msaa, Smaa, VSync, FrameCap, ShowFps };
-inline constexpr Option kOptions[] = {Option::Resolution,  Option::Aspect,      Option::RenderScale,
-                                      Option::FieldOfView, Option::Anisotropic, Option::Msaa,
-                                      Option::Smaa,
-                                      Option::VSync,       Option::FrameCap,    Option::ShowFps};
+inline constexpr Option kOptions[] = {Option::Resolution,  Option::Aspect, Option::RenderScale, Option::FieldOfView,
+                                      Option::Anisotropic, Option::Msaa,   Option::Smaa,        Option::VSync,
+                                      Option::FrameCap,    Option::ShowFps};
 inline constexpr uint32_t kNativeRows = 1; // SUBTITLES, the game's own row
 inline constexpr uint32_t kExtraRows = uint32_t(std::size(kOptions));
 inline constexpr uint32_t kRows = kNativeRows + kExtraRows;

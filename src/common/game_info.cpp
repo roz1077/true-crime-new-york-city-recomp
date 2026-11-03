@@ -28,14 +28,14 @@ const app::GameInfo app::kGame = {
                L"default.xbe with its folders beside it.",
     .images = {{"default.xbe", "TrueCrimeNYC"}}, // image and executable for title launches
     .options = {{"show_fps", &game::g_show_fps, nullptr}, {"fov_percent", nullptr, &game::g_fov_percent}},
-    .load = nullptr,                             // reads more from the settings file's toml::table
-    .save = nullptr,                             // writes more into it
-    .init = nullptr,                             // after the settings load, before the window and boot
-    .loaded = nullptr,                           // image in memory, before its entry point runs
-    .window = nullptr,                           // the game window is up
-    .message = game::GraphicsMenuMessage,        // window messages first; true takes one
-    .ui = game::DrawGraphicsMenu,                // ImGui drawing each frame: the Graphics menu (F10)
-    .pad = FilterPad,                            // changes a polled pad
-    .rumble = nullptr,                           // changes a rumble before it is set
+    .load = nullptr,                      // reads more from the settings file's toml::table
+    .save = nullptr,                      // writes more into it
+    .init = nullptr,                      // after the settings load, before the window and boot
+    .loaded = nullptr,                    // image in memory, before its entry point runs
+    .window = nullptr,                    // the game window is up
+    .message = game::GraphicsMenuMessage, // window messages first; true takes one
+    .ui = game::DrawGraphicsMenu,         // ImGui drawing each frame: the Graphics menu (F10)
+    .pad = FilterPad,                     // changes a polled pad
+    .rumble = nullptr,                    // changes a rumble before it is set
     .swap_interval = game::MainLoopSwapInterval,
 };

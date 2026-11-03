@@ -11,7 +11,7 @@
 
 namespace game {
 
-extern bool g_show_fps;        // settings file: show_fps
+extern bool g_show_fps; // settings file: show_fps
 bool ShowFps();
 void SetShowFps(bool show);
 extern uint32_t g_fov_percent; // settings file: fov_percent, see graphics_choices.h
