@@ -12,8 +12,8 @@ restores what the tab had on entry, A keeps the changes, and settings are saved 
 scripted controller verified this flow for the original six graphics rows. Resolution changes are staged
 with left and right. A applies a pending resolution, and otherwise passes through to the native menu.
 Back restores the entry resolution and aspect ratio along with the other settings. The F10 overlay
-offers the same settings and also controls display mode. The new resolution and aspect controls still
-need an in-game pass.
+offers the same settings and also controls display mode. The user verified the resolution and aspect controls,
+ultrawide gameplay, HUD and movies in-game on 2026-11-03.
 
 How the tab works, from the menu data and the getter:
 
