@@ -29,6 +29,8 @@
 namespace game {
 
 bool g_show_fps = false;
+uint32_t g_fov_percent = 100;
+std::atomic<float> g_camera_fov_degrees{0};
 
 namespace {
 
@@ -45,7 +47,9 @@ enum class Row {
     Resolution,
     ApplyDisplay,
     RenderScale,
+    FieldOfView,
     Anisotropic,
+    Smaa,
     VSync,
     FrameCap,
     ShowFps,
@@ -55,10 +59,10 @@ enum class Row {
     Defaults,
     Close,
 };
-constexpr Row kRows[] = {Row::DisplayMode,    Row::Resolution,         Row::ApplyDisplay,   Row::RenderScale,
-                         Row::Anisotropic,    Row::VSync,              Row::FrameCap,       Row::ShowFps,
-                         Row::TextureReplacement, Row::TextureDumping, Row::DumpFormat,     Row::Defaults,
-                         Row::Close};
+constexpr Row kRows[] = {
+    Row::DisplayMode,        Row::Resolution,     Row::ApplyDisplay, Row::RenderScale, Row::FieldOfView,
+    Row::Anisotropic,        Row::Smaa,           Row::VSync,        Row::FrameCap,    Row::ShowFps,
+    Row::TextureReplacement, Row::TextureDumping, Row::DumpFormat,   Row::Defaults,    Row::Close};
 constexpr int kRowCount = int(std::size(kRows));
 
 enum class Kind { Choice, Toggle, Action };
@@ -91,9 +95,8 @@ std::vector<app::Mode> MonitorModes() {
         if (m.width < 640 || m.height < 480) continue;
         if (std::ranges::none_of(modes, [&](app::Mode e) { return SameMode(e, m); })) modes.push_back(m);
     }
-    std::sort(modes.begin() + 1, modes.end(), [](app::Mode a, app::Mode b) {
-        return std::pair{a.width, a.height} < std::pair{b.width, b.height};
-    });
+    std::sort(modes.begin() + 1, modes.end(),
+              [](app::Mode a, app::Mode b) { return std::pair{a.width, a.height} < std::pair{b.width, b.height}; });
     return modes;
 }
 
@@ -141,10 +144,12 @@ void RestoreDefaults() {
     s.fps_cap = d.fps_cap;
     s.vsync = d.vsync;
     s.aniso = d.aniso;
+    s.smaa = d.smaa;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
     s.texture_dump_format = d.texture_dump_format;
     g_show_fps = false;
+    g_fov_percent = 100;
     g_menu.mode = d.display_mode; // display changes still wait for Apply
     g_menu.resolution = {d.width, d.height};
     g_menu.dirty = true;
@@ -155,10 +160,12 @@ Kind KindOf(Row row) {
     case Row::DisplayMode:
     case Row::Resolution:
     case Row::RenderScale:
+    case Row::FieldOfView:
     case Row::Anisotropic:
     case Row::FrameCap:
     case Row::DumpFormat:
         return Kind::Choice;
+    case Row::Smaa:
     case Row::VSync:
     case Row::ShowFps:
     case Row::TextureReplacement:
@@ -177,19 +184,36 @@ bool Enabled(Row row) {
 
 const char *Label(Row row) {
     switch (row) {
-    case Row::DisplayMode: return "Display mode";
-    case Row::Resolution: return "Resolution";
-    case Row::ApplyDisplay: return "Apply display changes";
-    case Row::RenderScale: return "Render scale";
-    case Row::Anisotropic: return "Anisotropic filtering";
-    case Row::VSync: return "V-Sync";
-    case Row::FrameCap: return "Frame rate limit";
-    case Row::ShowFps: return "FPS counter";
-    case Row::TextureReplacement: return "Texture replacement";
-    case Row::TextureDumping: return "Texture dumping";
-    case Row::DumpFormat: return "Dump format";
-    case Row::Defaults: return "Restore defaults";
-    case Row::Close: return "Close";
+    case Row::DisplayMode:
+        return "Display mode";
+    case Row::Resolution:
+        return "Resolution";
+    case Row::ApplyDisplay:
+        return "Apply display changes";
+    case Row::RenderScale:
+        return "Render scale";
+    case Row::FieldOfView:
+        return "Field of view";
+    case Row::Anisotropic:
+        return "Anisotropic filtering";
+    case Row::Smaa:
+        return "SMAA";
+    case Row::VSync:
+        return "V-Sync";
+    case Row::FrameCap:
+        return "Frame rate limit";
+    case Row::ShowFps:
+        return "FPS counter";
+    case Row::TextureReplacement:
+        return "Texture replacement";
+    case Row::TextureDumping:
+        return "Texture dumping";
+    case Row::DumpFormat:
+        return "Dump format";
+    case Row::Defaults:
+        return "Restore defaults";
+    case Row::Close:
+        return "Close";
     }
     return "";
 }
@@ -197,11 +221,16 @@ const char *Label(Row row) {
 // a heading drawn above the row; "" draws a plain separator
 const char *Section(Row row) {
     switch (row) {
-    case Row::DisplayMode: return "Display";
-    case Row::RenderScale: return "Rendering";
-    case Row::TextureReplacement: return "Textures";
-    case Row::Defaults: return "";
-    default: return nullptr;
+    case Row::DisplayMode:
+        return "Display";
+    case Row::RenderScale:
+        return "Rendering";
+    case Row::TextureReplacement:
+        return "Textures";
+    case Row::Defaults:
+        return "";
+    default:
+        return nullptr;
     }
 }
 
@@ -213,23 +242,34 @@ const char *Help(Row row) {
     case Row::Resolution:
         return "Output resolution. In Borderless the window always fills the desktop and this sets the base "
                "for render scale. Takes effect with Apply display changes.";
-    case Row::ApplyDisplay: return "Applies the display mode and resolution above.";
+    case Row::ApplyDisplay:
+        return "Applies the display mode and resolution above.";
     case Row::RenderScale:
         return "Internal resolution relative to the output height. Above 100% renders more pixels for a "
                "sharper image; below 100% is faster.";
+    case Row::FieldOfView:
+        return "Widens or narrows the gameplay camera. 100% is the game's own view; aiming still zooms "
+               "relative to it. Menus and cutscene previews are unchanged.";
     case Row::Anisotropic:
         return "Keeps textures sharp at glancing angles, such as roads into the distance. Game default uses "
                "the filtering the game asks for.";
-    case Row::VSync: return "Waits for the monitor's refresh before showing a frame, which prevents tearing.";
-    case Row::FrameCap: return "The game's timing is built for at most 60 FPS, so higher limits are not offered.";
-    case Row::ShowFps: return "Shows the frame rate in the top-left corner.";
+    case Row::Smaa:
+        return "Smooths jagged edges on the finished frame (SMAA 1x). The HUD is smoothed with it.";
+    case Row::VSync:
+        return "Waits for the monitor's refresh before showing a frame, which prevents tearing.";
+    case Row::FrameCap:
+        return "The game's timing is built for at most 60 FPS, so higher limits are not offered.";
+    case Row::ShowFps:
+        return "Shows the frame rate in the top-left corner.";
     case Row::TextureReplacement:
         return "Uses images in textures\\replacement beside the exe in place of the game's textures.";
     case Row::TextureDumping:
         return "Saves each texture the game uses into textures\\dumps beside the exe, once. Slows loading "
                "while on.";
-    case Row::DumpFormat: return "File format for dumped textures.";
-    case Row::Defaults: return "Resets every option in this menu. Display changes still need Apply.";
+    case Row::DumpFormat:
+        return "File format for dumped textures.";
+    case Row::Defaults:
+        return "Resets every option in this menu. Display changes still need Apply.";
     case Row::Close:
         return DisplayPending() ? "Saves the settings and closes the menu. Unapplied display changes are "
                                   "discarded."
@@ -256,6 +296,15 @@ std::string Value(Row row) {
         std::snprintf(text, sizeof(text), "%u%% (%up)", s.render_percent,
                       choices::RenderHeight(g_menu.output_height, s.render_percent));
         return text;
+    case Row::FieldOfView: {
+        const float base = g_camera_fov_degrees.load();
+        if (base > 0)
+            std::snprintf(text, sizeof(text), "%u%% (%.0f deg)", g_fov_percent,
+                          choices::ScaledFovDegrees(base, g_fov_percent));
+        else
+            std::snprintf(text, sizeof(text), "%u%%", g_fov_percent);
+        return text;
+    }
     case Row::Anisotropic:
         if (!s.aniso) return "Game default";
         std::snprintf(text, sizeof(text), "%ux", s.aniso);
@@ -263,12 +312,20 @@ std::string Value(Row row) {
     case Row::FrameCap:
         std::snprintf(text, sizeof(text), "%u FPS", choices::EffectiveFrameCap(s.fps_cap));
         return text;
-    case Row::DumpFormat: return s.texture_dump_format ? "DDS" : "PNG";
-    case Row::VSync: return s.vsync ? "On" : "Off";
-    case Row::ShowFps: return g_show_fps ? "On" : "Off";
-    case Row::TextureReplacement: return s.custom_textures ? "On" : "Off";
-    case Row::TextureDumping: return s.dump_textures ? "On" : "Off";
-    default: return "";
+    case Row::DumpFormat:
+        return s.texture_dump_format ? "DDS" : "PNG";
+    case Row::Smaa:
+        return s.smaa ? "On" : "Off";
+    case Row::VSync:
+        return s.vsync ? "On" : "Off";
+    case Row::ShowFps:
+        return g_show_fps ? "On" : "Off";
+    case Row::TextureReplacement:
+        return s.custom_textures ? "On" : "Off";
+    case Row::TextureDumping:
+        return s.dump_textures ? "On" : "Off";
+    default:
+        return "";
     }
 }
 
@@ -298,8 +355,14 @@ bool Change(Row row, int direction) {
     }
     case Row::RenderScale:
         // the renderer picks up the new scale after the frame (D3D12Backend::ApplySettings)
-        changed = set(s.render_percent, choices::ClampRenderPercent(
-                                            choices::Step(choices::kRenderPercents, s.render_percent, direction)));
+        changed =
+            set(s.render_percent,
+                choices::ClampRenderPercent(choices::Step(choices::kRenderPercents, s.render_percent, direction)));
+        break;
+    case Row::FieldOfView:
+        // read by the camera hooks on the game thread: a single aligned 32-bit store
+        changed = set(g_fov_percent,
+                      choices::ClampFovPercent(choices::Step(choices::kFovPercents, g_fov_percent, direction)));
         break;
     case Row::Anisotropic:
         changed = set(s.aniso, choices::Step(choices::kAnisoLevels, s.aniso, direction));
@@ -330,18 +393,33 @@ void Activate(Row row) {
         return;
     case Kind::Toggle:
         switch (row) {
-        case Row::VSync: s.vsync = !s.vsync; break;
-        case Row::ShowFps: g_show_fps = !g_show_fps; break;
-        case Row::TextureReplacement: s.custom_textures = !s.custom_textures; break;
-        case Row::TextureDumping: s.dump_textures = !s.dump_textures; break;
-        default: break;
+        case Row::Smaa:
+            s.smaa = !s.smaa;
+            break;
+        case Row::VSync:
+            s.vsync = !s.vsync;
+            break;
+        case Row::ShowFps:
+            g_show_fps = !g_show_fps;
+            break;
+        case Row::TextureReplacement:
+            s.custom_textures = !s.custom_textures;
+            break;
+        case Row::TextureDumping:
+            s.dump_textures = !s.dump_textures;
+            break;
+        default:
+            break;
         }
         g_menu.dirty = true;
         return;
     case Kind::Action:
-        if (row == Row::ApplyDisplay) ApplyDisplayChanges();
-        else if (row == Row::Defaults) RestoreDefaults();
-        else if (row == Row::Close) CloseMenu();
+        if (row == Row::ApplyDisplay)
+            ApplyDisplayChanges();
+        else if (row == Row::Defaults)
+            RestoreDefaults();
+        else if (row == Row::Close)
+            CloseMenu();
         return;
     }
 }
@@ -369,8 +447,7 @@ uint32_t NavPresses() {
     if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
         ImGui::IsKeyPressed(ImGuiKey_Space, false))
         pressed |= kAccept;
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_Backspace, false))
-        pressed |= kBack;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) pressed |= kBack;
     return pressed;
 }
 
@@ -428,8 +505,10 @@ void DrawRows(float scale) {
         const Row row = kRows[i];
         if (const char *section = Section(row)) {
             ImGui::Spacing();
-            if (*section) ImGui::SeparatorText(section);
-            else ImGui::Separator();
+            if (*section)
+                ImGui::SeparatorText(section);
+            else
+                ImGui::Separator();
         }
         const bool enabled = Enabled(row);
         const Kind kind = KindOf(row);
@@ -513,13 +592,17 @@ void DrawMenu(double fps) {
 void DrawGraphicsMenu(double fps) {
     const bool toggle = g_toggle.exchange(false) || ImGui::IsKeyPressed(ImGuiKey_F10, false);
     if (toggle) {
-        if (g_menu.open) CloseMenu();
-        else OpenMenu();
+        if (g_menu.open)
+            CloseMenu();
+        else
+            OpenMenu();
     } else if (g_menu.open) {
         HandleNavigation();
     }
-    if (g_menu.open) DrawMenu(fps);
-    else if (g_show_fps) DrawFpsCounter(fps);
+    if (g_menu.open)
+        DrawMenu(fps);
+    else if (g_show_fps)
+        DrawFpsCounter(fps);
 }
 
 void FilterMenuPad(int port, input::Pad &pad) {

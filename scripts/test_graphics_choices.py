@@ -27,6 +27,10 @@ extern "C" __declspec(dllexport) int run() {
  if (choices::EffectiveFrameCap(144) != 60 || choices::EffectiveFrameCap(30) != 30) return 11;
  if (choices::ClampRenderPercent(5) != 20 || choices::ClampRenderPercent(500) != 200) return 12;
  if (choices::RenderHeight(1440, 50) != 720) return 13;
+ // field of view: 100% is unchanged; 200% of a 90 degree view doubles tan(45) to 2
+ auto near = [](float a, float b) { return a > b - 0.01f && a < b + 0.01f; };
+ if (!near(choices::ScaledFovDegrees(70, 100), 70) || !near(choices::ScaledFovDegrees(90, 200), 126.87f)) return 14;
+ if (choices::ClampFovPercent(10) != 50 || choices::Step(choices::kFovPercents, 100, 1) != 110) return 15;
 
  // navigation from dpad, stick and face buttons
  input::Pad p; p.connected = true;
@@ -73,4 +77,4 @@ extern "C" __declspec(dllexport) int run() {
 '''
 rc = run_native(source, prefix="tcnyc-graphics_choices-", needs_crt=True, compiler_flags=includes)
 assert rc == 0, f"Graphics menu regression {rc}"
-print('PASS: option stepping, frame cap mapping, controller navigation, input gating and repeat')
+print('PASS: option stepping, frame cap mapping, field of view, controller navigation, input gating and repeat')

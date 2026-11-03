@@ -37,9 +37,7 @@ inline uint32_t NavBits(const input::Pad &p) {
     return bits;
 }
 
-inline bool OpenChord(const input::Pad &p) {
-    return (p.buttons & (kStart | kBackButton)) == (kStart | kBackButton);
-}
+inline bool OpenChord(const input::Pad &p) { return (p.buttons & (kStart | kBackButton)) == (kStart | kBackButton); }
 
 inline bool Neutral(const input::Pad &p) {
     if (p.buttons) return false;

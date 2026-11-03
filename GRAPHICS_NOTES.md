@@ -2,8 +2,10 @@
 
 ## Native Display rows (2026-11-03)
 
-The native Options > Display tab now carries four Graphics rows under SUBTITLES: render scale,
-anisotropic filtering, V-Sync and frame limit (`src/game/native_graphics.cpp`, rules in
+The native Options > Display tab now carries Graphics rows under SUBTITLES: render scale, field of
+view, anisotropic filtering, SMAA, V-Sync and frame limit. The tab's frame holds five rows, so the list
+scrolls: the game's row field (`+0x34`) keeps the slot on screen, which its highlight frame follows, and
+`native_graphics.cpp` keeps the window's first row (`src/game/native_graphics.cpp`, rules in
 `src/game/display_rows.h`, checked by `scripts/test_display_rows.py`). They look and behave like the
 game's own rows. D-pad up and down move between rows, and left and right change a value live. Back
 restores what the tab had on entry, A keeps the changes, and settings are saved to `settings.toml`. A
@@ -93,12 +95,38 @@ Read-only wrappers in `src/game/hooks.cpp` call the original SDK exports. The la
 - The `pages` field at `0x41118` references an eight-entry list at `0x464C4`. Its signed offsets resolve from base `0x464C8` to junctions at `0x41148`, `0x41EB0`, `0x42930`, `0x431F4`, `0x43EE0`, `0x441E4`, `0x449C4`, and `0x45BB4`. They are distributed across existing Options and Audio submenu records. This list is not the four visible tabs.
 - No literal `numTabs = 4` was found using the encoding seen in other shell tags. The native setter supports a dynamic count, but its Options-specific caller or data binding remains unverified.
 
+## Field of view and draw distance (2026-11-03)
+
+The renderer is the global object `0x36FE80`. `0x245830` builds the viewport (0, width, 0, height, 0, 1) and
+`0x244970` stores near and far at `+0x1C` and `+0x20`. The projection comes from `0x245BB0` (finite far,
+`0x22CFD0`) or `0x245CE0` (infinite far, `0x22D0D0`). Both are thiscall with one float, k, the focal scale
+cot(fov / 2), and the matrix's x and y scales are k times `+0x08` and `+0x10` (0.75 and 1.333 at 16:9).
+`0x2459C0` stores the matrix at `+0x340` and its inverse at `+0x380`. The gameplay camera passes its own k
+(camera `+0x184`, near at `+0x188`) from `0x7E1B5` and `0xA7553`, with far hard-coded to 2000. A traced
+session (`XBE_TRACE_CAMERA=1`) showed k = 1.6 on foot, about 80 x 50 degrees, and 2.414 while aiming.
+Menus and previews pass constants (1.5556, 1.0) or use stack-local renderers.
+
+`src/game/camera.cpp` divides k by `fov_percent / 100` at the two gameplay sites only. The user first saw
+the view narrow as the value rose; k is a focal scale, not a width, and the hook now divides.
+
+The view that changes with aiming is the infinite projection (`0x245CE0`), so the 2000 far plane does not
+limit how far the city is drawn. The `.def` distance names found so far belong to pedestrians
+(`exteriorDistRemoval*` in `NPCTune`), character LOD (`lod`, `uLODStart`), AI sight (`defaultViewDist`)
+and depth of field (`DepthDef` near 10, far 200). The city streams from one `City\Brick_NYC` set with
+`.idx`, `.exm`, `.exp`, `.ext` and an `.occ` occlusion file. Draw distance is therefore most likely the
+brick streaming radius or occlusion data, which is not yet located.
+
 ## Outstanding work
 
 A fifth native tab is no longer needed for the main options, because the Display tab takes
 extra rows. Display mode and resolution stay in the overlay: they need an explicit Apply, which the
-native rows do not have. MSAA, SMAA, ambient occlusion and HDR still need renderer work. FOV and
-draw distance need their own verified guest hooks.
+native rows do not have. MSAA, ambient occlusion and HDR still need renderer work, and draw distance
+needs the city streaming radius or occlusion data located (see above).
+
+SMAA 1x (high preset) runs on the finished frame in `D3D12Backend::ApplySmaa`, from the reference
+implementation in `sdk/third_party/smaa` (iryoku/smaa 71c806a8, MIT): luma edges, blending weights and
+neighbourhood blending through the existing full-screen `Pass`, before the gamma ramp blit. The HUD is
+part of that frame and is smoothed with it.
 
 MSAA is also outstanding. The current D3D12 renderer creates single-sample targets and pipelines. MSAA needs compatible color and depth targets, matching pipeline sample counts, and resolves where the guest samples or copies rendered surfaces.
 

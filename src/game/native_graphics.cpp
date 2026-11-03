@@ -7,6 +7,10 @@
 // SUBTITLES. This reports rows after it, answers their ports, moves the cursor
 // over them in the event dispatcher (0xCB400), whose row counts are fixed per
 // tab, and follows the tab's cancel (Back restores what the tab had on entry).
+// The tab's frame holds five rows, so with more the slots show a window of the
+// rows that scrolls with the cursor. The game's row field (+0x34) keeps the
+// slot, 0 to 4, which its highlight frame follows; the logical row is
+// g_first + slot.
 // The rules are in display_rows.h; GRAPHICS_NOTES.md has the research.
 
 #include <cstdint>
@@ -14,6 +18,7 @@
 #include <cstring>
 
 #include "app/app.h"
+#include "common/graphics_menu.h"
 #include "core/log.h"
 #include "display_rows.h"
 #include "kernel/kernel.h"
@@ -45,16 +50,18 @@ bool Tracing() {
 
 Values Current() {
     const app::Settings &s = app::Get();
-    return {s.render_percent, s.aniso, s.fps_cap, s.vsync};
+    return {s.render_percent, game::g_fov_percent, s.aniso, s.fps_cap, s.vsync, s.smaa};
 }
 
 // guest thread; the renderer reads these each frame and app::Pace each Swap (aligned 32-bit stores)
 void Apply(const Values &v) {
     app::Settings &s = app::Get();
     s.render_percent = v.render_percent;
+    game::g_fov_percent = v.fov_percent;
     s.aniso = v.aniso;
     s.fps_cap = v.fps_cap;
     s.vsync = v.vsync;
+    s.smaa = v.smaa;
     app::Save();
 }
 
@@ -67,6 +74,9 @@ uint32_t TextBuffer(uint32_t index) {
 // what the rows had when the Display tab was entered, for cancel; menu thread only
 Values g_on_entry{};
 bool g_entered = false;
+// the logical row shown in the top slot (display_rows.h Scroll); menu thread only. Reset
+// where the game resets the row: entering the tab and cancel.
+uint32_t g_first = 0;
 
 } // namespace
 
@@ -77,6 +87,7 @@ X86_FUNC(sub_000B13C0) {
     __imp__sub_000B13C0(ctx, base);
     g_on_entry = Current();
     g_entered = true;
+    g_first = 0;
 }
 
 // 0xB14F0: Display tab cancel (thiscall; Back in the row list): restores the
@@ -85,33 +96,40 @@ X86_EXTERN_FUNC(__imp__sub_000B14F0);
 X86_FUNC(sub_000B14F0) {
     __imp__sub_000B14F0(ctx, base);
     if (g_entered) Apply(g_on_entry);
+    g_first = 0;
 }
 
 X86_EXTERN_FUNC(__imp__sub_000C7B80);
 X86_FUNC(sub_000C7B80) {
     const uint32_t self = ctx.ecx, out = X86_MEM32(ctx.esp + 4), port = X86_MEM32(ctx.esp + 8);
-    if (out && port >= kDisplayText + kNativeRows && port < kDisplayText + kRows) {
-        const uint32_t index = port - kDisplayText - kNativeRows;
-        char text[kTextBytes];
-        Text(Current(), kOptions[index], text);
-        const uint32_t buffer = TextBuffer(index);
-        std::memcpy(base + buffer, text, std::strlen(text) + 1);
-        X86_MEM32(out) = buffer;
-        ::kernel::Return(ctx, 0, 2);
-        return;
-    }
-    if (out && port >= kDisplayColour + kNativeRows && port < kDisplayColour + kRows) {
-        const bool selected =
-            X86_MEM32(self + kRow) == port - kDisplayColour && X86_MEM32(self + kFocus) == kRowListFocus;
-        X86_MEM32(out) = selected ? kColourSelected : kColourNormal;
-        ::kernel::Return(ctx, 0, 2);
-        return;
+    const bool text = port >= kDisplayText && port < kDisplayText + kShownRows;
+    const bool colour = port >= kDisplayColour && port < kDisplayColour + kShownRows;
+    if (out && (text || colour)) {
+        // slot on screen -> logical row
+        const uint32_t slot = port - (text ? kDisplayText : kDisplayColour), row = g_first + slot;
+        if (colour) {
+            const bool lit = slot == X86_MEM32(self + kRow) && X86_MEM32(self + kFocus) == kRowListFocus;
+            X86_MEM32(out) = lit ? kColourSelected : kColourNormal;
+            ::kernel::Return(ctx, 0, 2);
+            return;
+        }
+        if (row >= kNativeRows) {
+            const uint32_t index = row - kNativeRows;
+            char buffer_text[kTextBytes];
+            Text(Current(), kOptions[index], buffer_text);
+            const uint32_t buffer = TextBuffer(index);
+            std::memcpy(base + buffer, buffer_text, std::strlen(buffer_text) + 1);
+            X86_MEM32(out) = buffer;
+            ::kernel::Return(ctx, 0, 2);
+            return;
+        }
+        // SUBTITLES in the top slot: the game's own text for that port
     }
 
     __imp__sub_000C7B80(ctx, base);
 
     if (ctx.eax != 0 || !out) return;
-    if (port == kDisplayCount) X86_MEM32(out) = kRows;
+    if (port == kDisplayCount) X86_MEM32(out) = kShownRows;
     if (Tracing() && port == kOptionsPage) {
         static thread_local uint32_t last_page = UINT32_MAX;
         const uint32_t page = X86_MEM32(out);
@@ -138,9 +156,10 @@ X86_FUNC(sub_000CB400) {
         }
     }
     if (event == kInputEvent && page == kDisplayPage && X86_MEM32(self + kFocus) == kRowListFocus) {
-        const Step step = Input(X86_MEM32(self + kRow), input);
+        const Step step = Input(g_first + X86_MEM32(self + kRow), input);
         if (step.handled) {
-            X86_MEM32(self + kRow) = step.row;
+            g_first = Scroll(step.row, g_first);
+            X86_MEM32(self + kRow) = step.row - g_first;
             X86_MEM32(self + kFocus) = step.focus;
             if (step.change) {
                 Values v = Current();

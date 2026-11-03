@@ -2,6 +2,7 @@
 // ImGui dependencies, so scripts/test_graphics_choices.py can compile it alone.
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -15,6 +16,9 @@ inline constexpr uint32_t kAnisoLevels[] = {0, 2, 4, 8, 16}; // 0: as the game a
 // higher caps have no effect and are not offered.
 inline constexpr uint32_t kFrameCaps[] = {30, 60};
 inline constexpr uint32_t kGameFrameLimit = 60;
+// Field of view, as a percentage of the gameplay camera's tan(fov / 2): 100 is the game's own.
+inline constexpr uint32_t kFovPercents[] = {80, 90, 100, 110, 120, 130, 140, 150};
+inline constexpr uint32_t kMinFovPercent = 50, kMaxFovPercent = 200;
 
 // The value one step from current in a sorted list. A current value between
 // entries (hand-edited settings file) steps to its neighbour in that
@@ -37,6 +41,19 @@ inline uint32_t Step(std::span<const uint32_t> values, uint32_t current, int dir
 inline uint32_t EffectiveFrameCap(uint32_t stored) {
     if (stored <= 1 || stored > kGameFrameLimit) return kGameFrameLimit;
     return stored;
+}
+
+inline uint32_t ClampFovPercent(uint32_t percent) {
+    if (percent < kMinFovPercent) return kMinFovPercent;
+    if (percent > kMaxFovPercent) return kMaxFovPercent;
+    return percent;
+}
+
+// The field of view in degrees when a camera of base_degrees has its tan(fov / 2) scaled by percent.
+inline float ScaledFovDegrees(float base_degrees, uint32_t percent) {
+    constexpr float kPi = 3.14159265358979f;
+    const float half = std::tan(base_degrees * kPi / 360.0f) * float(percent) / 100.0f;
+    return std::atan(half) * 360.0f / kPi;
 }
 
 inline uint32_t ClampRenderPercent(uint32_t percent) {
