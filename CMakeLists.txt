@@ -37,3 +37,6 @@ endif()
 
 # target name = GAME_EXE in build.bat, xbe = GAME_XBE
 add_xbe_image(TrueCrimeNYC default.xbe game.toml ${GAME_PARTITIONS} game)
+
+add_executable(TrueCrimeNYCLauncher WIN32 launcher/launcher.cpp)
+target_link_libraries(TrueCrimeNYCLauncher PRIVATE comdlg32 gdi32 user32)
