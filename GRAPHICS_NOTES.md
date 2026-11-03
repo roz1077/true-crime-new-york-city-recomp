@@ -1,0 +1,163 @@
+# Graphics options investigation
+
+## Native Display rows (2026-11-03)
+
+The native Options > Display tab now carries four Graphics rows under SUBTITLES: render scale,
+anisotropic filtering, V-Sync and frame limit (`src/game/native_graphics.cpp`, rules in
+`src/game/display_rows.h`, checked by `scripts/test_display_rows.py`). They look and behave like the
+game's own rows. D-pad up and down move between rows, and left and right change a value live. Back
+restores what the tab had on entry, A keeps the changes, and settings are saved to `settings.toml`. A
+scripted controller verified each of these in-game. The F10 overlay still offers every option,
+including display mode and resolution.
+
+How the tab works, from the menu data and the getter:
+
+- Shell names are CRC-32 hashes of the case-sensitive name (`zlib.crc32`), which is how the `.def`
+  files map them. Language strings are hashed the same way in `data/Lang/<lang>/LangTable.dat`:
+  a count, then `(hash, offset)` pairs, then NUL-terminated strings.
+- A `.tag` object is a field count and class hash, then fields of
+  `(type hash, name hash, count << 16 | kind, value)`. Kind 0 is an inline value, 1 a self-relative
+  pointer, 3 an embedded object and 7 an array.
+- Text and colour reach the menu elements through ports on the shared `MenuPauseInterface`
+  (`0xCDEB6BFB`). The port number is a property hash the C++ getter `0xC7B80` answers:
+  `thiscall get(uint32_t* out, uint32_t port)`, which returns 0, or -1 when the port is unknown. With
+  `offsetPorts` or `offsetPort` set, a duplicated row asks for `port + row`.
+- The `pages` junctions are Controls (`0x41148`, text `0x043E9964` + row, count `0x44EAB429` = 5),
+  Audio (`0x41EB0`), Display (`0x42930`) and Credits (`0x431F4`). The Display duplicator
+  (`0x42A44`) lays rows out by `start` and `step` boxes, not fixed slots, so it shows as many rows as
+  `0x08015D89` reports. The game reports 1. Row text is `0xDBCC9F60` + row, where row 0 is
+  "SUBTITLES %s" from byte `+0xFF2` of the game object. Row colour is `0xA471F488` + row:
+  `0x80808080` when `row == [+0x34]` and `[+0x7C] == 4`, else `0x60606060`.
+- `MenuPauseInterface` fields: `+0x30` is the page (`0x0F` Controls, `0x10` Audio, `0x11` Display,
+  `0x12` Credits), `+0x34` the selected row, and `+0x7C` the focus (1 tab bar, 4 row list).
+- The dispatcher `0xCB400` receives event 9 with an input mask: 1 up, 2 down, 4 left, 8 right,
+  `0x20` Back, `0x100` A, `0x200` B. Row counts for up and down come from a per-page jump table
+  (`0xCD1D4` index, `0xCD1B8` targets): Display and Audio have 1, Controls 5. Left and right call
+  `0xB1140`, which toggles the page's setting without a direction. Back in the row list calls the
+  tab's restore (`0xB14F0` for Display), and `0xB13C0` takes the copy on opening Options and on
+  entering the tab.
+
+The hooks answer the count, text and colour ports for the added rows, handle up, down, left and
+right in the Display row list (the game still handles SUBTITLES' toggle, A and Back), and extend
+`0xB13C0` and `0xB14F0` to the added settings. Not yet exercised: the in-game pause menu path (the
+replays use the title-screen Options, which runs the same controller and tag) and languages other
+than English (the added row text is English only).
+
+## Current build
+
+The shipped Graphics menu is an overlay drawn through the SDK's `GameInfo::ui` callback
+(`src/common/graphics_options.cpp`). It opens with F10 or Back + Start on controller 1 and is driven by the
+keyboard, the mouse, or controller 1 through `GameInfo::pad`. That path reads SDL, so PlayStation and Switch pads
+work too; ImGui's own gamepad navigation only reads XInput. While the menu is open, the game gets a connected pad
+with nothing pressed. After the menu closes, input is held back until the pad is released. Options apply live,
+because the renderer re-reads render scale, anisotropy, V-Sync and texture settings every frame and `app::Pace`
+re-reads the frame cap. Display mode and resolution wait for an explicit Apply. The settings file is written when
+the menu closes. F10's `WM_SYSKEY*` messages are swallowed, so Windows does not enter menu mode on its release.
+
+Only options with working host paths are offered. The frame cap offers 30 and 60 because the guest Swap limits
+pacing to 60 / presentation interval (`d3d8.cpp`). Higher caps would do nothing.
+
+Verified on 2026-11-03 with a scripted controller (`XBE_PAD_SCRIPT`). Back + Start opened the menu. Navigation
+changed render scale to 75% and anisotropy to 8x live. B closed the menu, saved both values, and the intro
+carried on. `scripts/test_graphics_choices.py` covers value stepping, frame-cap mapping, pad gating and repeat.
+Mouse use and the display-mode Apply path have not been exercised in-game yet.
+
+The native Options tracing hooks moved to `src/game/options_trace.cpp`. The launcher no longer sets
+`XBE_TRACE_OPTIONS_PAGE`, so set it by hand to trace.
+
+Reference projects are [BLACK](https://github.com/TGP482/BLACK-XBERecomp), [From Russia with Love](https://github.com/TGP482/007FRWL-XBERecomp), and [Nightfire](https://github.com/TGP482/007Nightfire-XBERecomp). They offer native menu integration and an F10 overlay. Their documented graphics options include monitor selection, display mode, resolution, render resolution, frame cap, V-Sync, HDR, FPS counter, FMV scaling, colour-blind modes, MSAA, SMAA, ambient occlusion, anisotropic filtering, and texture tools. FOV, viewmodel FOV, draw distance, and reload blur vary by title.
+
+## Native Options code
+
+Addresses are guest virtual addresses in the US Xbox executable and its generated C++.
+
+| Address | Finding |
+| --- | --- |
+| `0x000B64C7` | References the `OptionsWrapper` identifier `0x7BA0A5FA`. |
+| `0x000C7B80` | Reads menu values. The `OptionsPageController` request `0x6ADBF5A0` branches at `0x000C8813` to `0x000C88BB`. It returns the value at menu object offset `+0x30` minus `0x0F` through the output argument. |
+| `0x000C2B00` | Checks for native page `0x12` before handling a page-specific request. |
+| `0x000CDC60` | Forwards an event selector and two arguments to `0x000CB400`. |
+| `0x000CB400` | Dispatches selectors 0 through 13. Page writes at `0x000CC48C` and `0x000CC5F5` cycle backward and forward over `0x0F–0x12`. The code wraps at both ends and performs page-specific setup. |
+| `0x000B1370`, `0x000B13C0` | Setup for pages `0x0F` and `0x11`, respectively. Copies existing game settings into menu object fields. The other two pages initialize fields directly. No common registration call was found. |
+| `0x0025278E` | References `controlNum` (`0xB0F1EBB0`), reads it via `0x0025D2D0`, and stores the result at object offset `+0x2C` during construction. |
+| `0x00250215`, `0x00250314` | The tab renderer reads and updates `numTabs` (`0xEF15D709`) at renderer object offset `+0xA8`. The Options renderer instance has yet to be identified. |
+
+Read-only wrappers in `src/game/hooks.cpp` call the original SDK exports. The launcher sets `XBE_TRACE_OPTIONS_PAGE=1`, and output goes to `out/build/release/logs/tcnyc.log`. A live session verified page queries cycling 0 through 3 and back to 0. Dispatcher event 9 with argument `0x08` advances and `0x04` goes backward. Arguments `0x01`, `0x02`, and `0x100` were observed, but their meanings were not verified. Events 0 and 10 recur during ordinary menu updates. The hooks observe the existing menu and do not add controls.
+
+## Native menu assets
+
+- `assets/data/Shell/PauseMenu.def` maps IDs to names. `PauseMenu.tag` contains the native layout and control graph. `menushell.def` names the wrappers, and `menuscript.def` identifies other pause-menu states.
+- The tag begins with a count of 420, then 16-byte records. The second word is the named identifier, and the fourth word points into the payload. Display entries run from record offsets `0x14B4` through `0x1524`. The Display row duplicator points to `0x41590`, and its text renderer points to `0x41AE8`.
+- The Display row data includes `MenuJunction`, `portnumber`, and `controlNum`. The Select/Accept/Cancel data references `MenuPauseInterface`, `MenuButtonJunction`, `MenuSystemPageController`, `pages`, `triggers`, and `numTabs`.
+- The `OptionsPageController` table record at `0x1164` points to a region filled with `0xAD`. A separate reference at `0x46504` sits near relative references to shared and Audio records.
+- The `pages` field at `0x41118` references an eight-entry list at `0x464C4`. Its signed offsets resolve from base `0x464C8` to junctions at `0x41148`, `0x41EB0`, `0x42930`, `0x431F4`, `0x43EE0`, `0x441E4`, `0x449C4`, and `0x45BB4`. They are distributed across existing Options and Audio submenu records. This list is not the four visible tabs.
+- No literal `numTabs = 4` was found using the encoding seen in other shell tags. The native setter supports a dynamic count, but its Options-specific caller or data binding remains unverified.
+
+## Outstanding work
+
+A fifth native tab is no longer needed for the main options, because the Display tab takes
+extra rows. Display mode and resolution stay in the overlay: they need an explicit Apply, which the
+native rows do not have. MSAA, SMAA, ambient occlusion and HDR still need renderer work. FOV and
+draw distance need their own verified guest hooks.
+
+MSAA is also outstanding. The current D3D12 renderer creates single-sample targets and pipelines. MSAA needs compatible color and depth targets, matching pipeline sample counts, and resolves where the guest samples or copies rendered surfaces.
+
+## Batched controller trace
+
+The latest live session exited normally. The page query produced
+`0 → 1 → 6 → 1 → 2 → 3 → 0 → 4 → 0`. Values 4 and 6 are already used by native
+menu states, even though horizontal cycling covers only 0 through 3. Guest page
+`0x13` therefore cannot be assigned to Graphics as an unused fifth page.
+
+The session captured renderer object `0x006F3010` with a tab count of 4.
+The observed return chain was `0x00251138 → 0x00250E7F → 0x0025346F`.
+At `0x0025346A`, function `0x00253360` calls the generic dispatcher
+`0x00250E10` with selector `0x0B`. The dispatcher calls through the target
+object's function pointer at `+0x04`. This identifies the property update
+path. It does not yet identify the Options tag record supplying the value.
+Object addresses are session-specific.
+
+## Property dispatch and renderer audit
+
+The call at `0x0025346A` gets a value through `0x0025D020` using
+the object field at `+0x54`, then passes it to the target selected through
+`+0x1C`. Nearby code dispatches selector `0x0A` through the same target.
+This narrows the tab-count source to the property binding on that menu
+object. The specific Options layout binding and a free native page ID
+are still unverified.
+
+MSAA needs to cover more than presentation. In `sdk/runtime/gpu/d3d12.cpp`,
+trace target allocation from `FindTarget`, target selection for draws, and
+pipeline sample counts together. A multisampled render surface needs a
+single-sample representation for presentation, guest surface copies and
+readback, and any render-to-texture sampling that expects a regular SRV.
+The existing `Resolve(Target&)` only invokes an extension for a non-unit
+target range. That call is not a hardware multisample resolve. Copy and
+readback share `PrepareCopySource`; presentation and guest copies also have
+their own resolve call sites. Depth reads and copies need an explicit
+strategy because color resolves do not cover depth surfaces.
+
+Frame cap already exists in SDK settings. The guest Swap path calls
+`app::Pace` with an interval-derived maximum. A cap control needs to account
+for that maximum and safely publish changes to the thread that runs Pace.
+Display mode, resolution, render scale, V-Sync, anisotropic filtering and
+texture controls already have host paths. SMAA, ambient occlusion and HDR
+need renderer implementations. FOV, viewmodel FOV and draw distance
+need title-specific work. Reload blur is a BLACK-specific option.
+
+## Destination port binding
+
+The live return chain reached `0x00253360`, which calls the generic
+dispatcher with selector `0x0B`. The call at `0x002578F7` reaches
+`0x00253360`. Its setup path reads field `0x93FD92F6` via
+`0x0025D600` and copies a three-word binding to object offset `+0x54`.
+Both `PauseMenu.def` and `menuscript.def` name this field `destPortNums`.
+
+This corrects the earlier interpretation of `+0x54` as the source of
+the tab count. It is a destination port binding. The count source and
+the mapping from the top-level Options pages to their native layouts
+remain unverified. Nearby functions also reference `inmessage`,
+`outmessage`, `nextstate`, and `states`, but those references alone
+do not establish that the Options tab count originates in that state
+machine. No new executable or controller capture was needed for this
+finding.

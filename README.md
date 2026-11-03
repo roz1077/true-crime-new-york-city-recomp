@@ -29,12 +29,12 @@ closes.
 - **FPS counter**.
 - **Texture replacement**, **texture dumping** and **dump format** (PNG or DDS).
 
+The game's own **Options > Display** tab also has rows for render scale, anisotropic filtering, V-Sync and
+frame limit. Left and right change them; Back cancels and A keeps the changes, as with the game's own options.
+
 ### Controller
 Supports Xbox, PlayStation and Switch controllers, with hot plugging and rumble.
 
-### General
-
-### Miscellaneous
 - **Boot Splash** - Place a `splash.png` (or `.bmp`) beside the exe to display a splash screen at launch.
 
 ## System Requirements
@@ -57,6 +57,9 @@ Install Visual Studio 2022 with **Desktop development with C++**, **C++ Clang to
 
 ### 4. Build the Project
 Run `build.bat`. The first build recompiles the game and takes a while. The exe is written to `out\build\release`.
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for the source layout, regression checks, diagnostics and host-only
+relink workflow. [OPTIMISATIONS.md](OPTIMISATIONS.md) lists performance candidates and how to validate them.
 
 ## Credits
 

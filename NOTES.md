@@ -1,5 +1,573 @@
 # True Crime: New York City (original Xbox) — static recompilation to PC
 
+## Follow-up performance review and user-driven street profile (2026-11-02)
+
+- User reported “All good” after the requested first-pass street/ramp/locker validation, then authorised
+  continued optimisation. No game was running at the start of the follow-up. Backed up the current15 save
+  files under `.local/perf-pass2/saves/hdd` before automated runs, preserving the user's later progress.
+- Added CreatePipeline wrapper timing and complete PSO counts in d3d12.cpp, including blit/clear/depth
+  pipelines. The automated horizon input replay actually reaches the precinct elevator, not a busy street.
+  Capture before: `captures/perf-pass2-before/220810/final.bmp`; after: `perf-pass2-after/221659/final.bmp`.
+  Logs under `logs/perf-pass2-before` / `after`. Largest startup pipeline one-second average0.820ms/frame;
+  settled pipeline creation0. No extra pipeline cache implemented based on those small measured costs.
+- Found/corrected conservative shader-cache invalidation: &D3DCompile can point at an executable import thunk,
+  so the old fingerprint changed with every executable rebuild. ShaderCompilerFingerprint now resolves
+  GetModuleHandleW(D3DCOMPILER_DLL_W), hashes the actual compiler DLL and flags. Unit test compares against
+  an independent DLL hash; --baseline-fingerprint restores the old lookup and fails regression15.
+- Evaluated removing AssembleConverted's temporary index-sequence vector. Prototype and complete actual
+  assembly oracle matched320 cases; eliminated one allocation per converted draw. Three O2 microbenchmarks
+  (7 alternating pairs of50000 draws) ratios0.9595,0.9546,0.9584. But40..70s live replay assembly medians
+  were1.85ms before /1.95ms after, renderer4.02/4.33ms, draws870/868. No proven in-game improvement.
+  **Reverted the vertex experiment**, confirmed vertex.cpp/.h byte-for-byte against pre-experiment copies.
+  Candidate/test retained in `.local/perf-pass2`, not in the build. Do not report the microbenchmark as a
+  game-wide gain or quietly reapply that candidate. Standard test count remains7.
+- Builds `logs/codex-pipeline-profile-build.log`, `codex-vertex-assembly-build.log`, final
+  `codex-perf-pass2-final-build.log`; relink and SDK patch export/reverse-check completed. All7 maintained
+  regression checks pass after the fingerprint fix. Extended scripts/summarize_perf.py with assembly,
+  pipeline and draw-count medians plus --until for a bounded comparison window.
+- User agreed to drive a busy street for~2 minutes and press F3. Launched normal-controls profiling build
+  PID25328 (`.local/perf-pass2/live-street.pid`), XBE_PERF=1/XBE_VERBOSE=1, F3 enabled every25 draws,
+  no scripted/replayed/recorded input or deterministic overrides. Logs `logs/perf-live-street/stderr.log`.
+  Original15 files were restored and verified BEFORE this manual session. **Do not restore that backup
+  again over the user's real driving progress.** User controls the game; don't close it to rebuild unasked.
+  Awaiting the user's F3/done signal, then inspect the street workload before choosing another optimisation.
+
+## First optimisation pass: profiling gates, audio scratch, shader cache (2026-11-02)
+
+- User accepted the proposed measured first pass after the cleanup. No port was running when measurements
+  began. Preserved the prior executable/DLL under `logs/perf-baseline`, controller input under
+  `.local/perf-pass/benchmark-pad.txt`, and all15 save files under `.local/perf-pass/save-baseline/hdd`.
+- Baseline125 seconds, then cold/warm70-second runs, with XBE_PERF/XBE_VERBOSE and ordinary frame-indexed
+  input replay. No captures, input recording or deterministic clock/RNG overrides. Benchmark processes were
+  owned/bounded by the scripts and stopped individually; user save contents restored after benchmarking.
+- `render_thread.cpp`: skip diagnostic Clock::now and atomic counter updates when profiling is disabled,
+  including Draw/Clear/Copy/Present recording, waits and readback cause counters. Actual rendering commands,
+  lock/wait/submit behavior and completion order are unchanged. `d3d12.cpp`: existing PerfScope now gates
+  texture signature, frame-fence wait and swap timers too. Actual texture hashing/upload decisions are unchanged.
+- `dsound.cpp`: AudibleLanes fills a bounded320-entry stack array and returns a span instead of allocating
+  a vector per audible voice/mix block. Same iteration order, gains and ramp steps; no output-rate change.
+- `d3d12.cpp`: persistent DXBC cache under the executable's shader-cache/v1/compiler-fingerprint directory.
+  Source+entry+profile keys, compiler DLL content+flags fingerprint; header/size/key/checksum/DXBC validation
+  and D3DReflect on load. Normal compilation fallback on miss/corruption. PID-specific temporary writes and
+  MoveFileEx replacement; failed IO does not prevent compilation/rendering. XBE_SHADER_CACHE=0 disables it.
+  Only bytecode cached, not adapter/driver-dependent PSOs. Added cache-hit counts to performance log lines.
+- Added meaningful native regressions `test_perf_gating.py`, `test_audio_lanes.py`, `test_shader_cache.py`.
+  Old Draw fails disabled-profiler check; corrected path passes with zero clock reads/counter changes.
+  Audio lane construction allocates nothing and matches old lanes/ramped output byte-for-byte across64
+  scenarios. Cache test uses real D3DCompile output and covers corrupt/truncated/oversized/key mismatch,
+  IO failure and atomic replacement recovery. All7 current regression checks pass.
+- Builds: `logs/codex-perf-pass-build.log`, `logs/codex-shader-cache-build.log`; maintained relink helper passes.
+  SDK patch re-exported and reverse-apply check passes. `scripts/summarize_perf.py` added for reproducible
+  log summaries; DEVELOPMENT.md documents cache control. Full results and limitations in PERFORMANCE.md.
+- Reported shader counts: baseline79 compiled; cold74 compiled/0 hits; warm9 compiled/74 hits. Cache after
+  both runs83 files/525100 bytes. All steady medians30fps, no audio-starvation messages. Replay's scene/draw
+  workloads differ; **do not claim5.01ms ->1.52ms as a speedup**, or compile averages as frame-time percentiles.
+  The baseline settled view had no readback waits/overflow and ~0.1ms texture checking, so those riskier
+  changes remain measurement-driven candidates. Manual street/ramp/locker verification remains outstanding
+  after these performance edits. Game timing/quality/scene content have not been intentionally altered.
+- Verified all15 original save files restored byte-for-byte with SHA256. Launched normal interactive
+  optimised build PID10232 (`.local/perf-pass/interactive.pid`), responsive with no startup error. Profiling,
+  verbose logging, input record/replay/script and deterministic overrides are off; shader cache defaults on.
+  F3 capture remains available every25 draws. User now has control for the manual compatibility check.
+
+## Code cleanup and optimisation review (2026-11-02)
+
+- User requested a codebase cleanup and a list of possible optimisations, then authorised additional
+  improvements within that cleanup. Reviewed title source, local SDK changes and rendering/audio/streaming
+  paths. Kept the verified timing, file-lifetime, APC, retained-attribute and scissor fixes.
+- Removed obsolete negative-head ramp diagnostics and body-entry lifecycle wrappers from `src/game/hooks.cpp`.
+  Those wrappers only logged and delegated to the original functions. The original guest functions now run
+  directly; no readiness, allocation or release behavior was changed. Earlier logs/dumps remain preserved.
+- Separated the48 kHz sample clock and opt-in replay/RNG/timing hooks into `src/game/timing.cpp`; removed an
+  unused replay frame counter and unused headers. Compatibility hooks, including the established callback-ring
+  extension, remain in hooks.cpp. No normal-play RNG or clock override was enabled.
+- Moved controller scripts and frame-indexed recording/replay into `src/common/pad_tools.cpp` / `.h`.
+  `game_info.cpp` now holds metadata and callback wiring. Controller recording/replay behavior is unchanged.
+- Removed a duplicate256-byte current-attribute copy inside ApplyImmediate's Begin branch: the same copy already
+  runs at function entry. Retained-attribute regression passes. Exported that SDK change into the local patch.
+- Added `.clang-format` for consistent title-source formatting. Removed empty README feature sections;
+  `DEVELOPMENT.md` documents source layout, diagnostics, regression checks and compatibility constraints.
+- Added `scripts/native_test.py` shared compiler/DLL harness: CRT-based tests discover Visual Studio through
+  vswhere rather than a fixed VS18 path. All four regression scripts use it. `scripts/run_checks.py` runs them
+  and reports failures. `scripts/relink_game.py` promotes the previous ignored local helper into maintained
+  source, reads partition/library settings from game.toml, validates inputs and updates the runtime build stamp.
+- Validation: all4 checks pass (APC context,1100 balanced file cycles/reference ownership, retained attributes,
+  viewport/scissor). Full build and DLL link succeed (`logs/codex-cleanup-build.log`); maintained relink helper
+  succeeds; whitespace and SDK patch reverse-apply checks pass. Started cleaned build (PID15692, recorded in
+  `.local/cleanup-test.pid`); startup/guest loading succeeds, process responsive, no logged error on smoke check.
+  This was a startup check, not another full parking-ramp/locker playthrough. User had closed the port for building.
+- `OPTIMISATIONS.md` ranks8 source-based candidates with constraints and measurement plans. First candidates:
+  gate unused profiling timers/counters, persist shader/PSO caches, reduce texture-change checks with correct
+  invalidation, reuse audio scratch storage, improve render-state dirty tracking, investigate measured readback
+  waits, cache immutable vertex-layout work, and pool uploads if overflow is observed. No unmeasured speedup
+  claims or speculative performance/quality/game-speed changes were made in this cleanup.
+- The cleaned game is left running for the user, with F3 capture every25 draws and no record/replay/script
+  overrides. The normal launcher retains its existing diagnostic capture/controller-recording settings.
+
+## Locker preview cutoff: explicit scissor incorrectly intersected with viewport (2026-11-02)
+
+- User resumed the locker investigation after accepting the xemu-like distant skyline. New capture
+  `out/build/release/captures/211746` confirms the same head/upper-torso cutoff as old capture130045.
+- **Confirmed cause:** preview draws497..501 use viewport(358,216,244,264) and explicitly set scissor
+  (0,0,639,479). Model geometry is present; the cutoff lies exactly at viewport y216. The D3D12 backend
+  intersected that larger explicit scissor with the viewport, incorrectly discarding everything above216.
+- Verified the actual XDK5849 implementation: SetViewport0x2B89C2 calls SetScissors(0,0,null).
+  SetScissors0x2B8ED0 chooses viewport bounds only for count0 (0x2B8F0F..0x2B8FC5). For count1,
+  non-exclusive, it uses the supplied rectangle directly (0x2B8FC7..0x2B9040), then writes surface clip
+  0x200/0x204. It does **not** intersect the explicit clip with viewport bounds.
+- Corrected `D3D12Backend::SetViewportScissor`: an explicit scissor replaces the viewport clip; no-scissor
+  draws retain the viewport clip, and the result remains scaled/clamped to the target. No locker-specific
+  coordinates or mesh/head-loading changes. Existing scissor coordinate conventions otherwise unchanged.
+- Added `scripts/test_viewport_scissor.py`, compiling the actual method with a recording command-list stub.
+  `--baseline` restores the old intersection and fails regression2 (locker cutoff). Corrected code passes
+  default viewport clip, larger and smaller explicit clips, cache reuse,2x scaling, target clamp and reset.
+  Retained-attribute regression also passes; SDK diff check and exported-patch reverse check pass.
+- Built successfully (`logs/codex-locker-scissor-build.log`), relinked guest DLL and re-exported SDK patch.
+  Launched `.local/launch_locker_test.ps1` for user-controlled visual validation (capture every25 draws,
+  all vertex inputs enabled, separate `locker_pad_record.txt`).
+- **Visually verified fixed:** user confirmed "done and its fixed"; inspected fresh capture
+  `out/build/release/captures/212132/final.bmp`. The complete head, upper torso, hands, legs and shoes render,
+  and the model remains inside the right-hand Street Flack preview panel without visible spill. The locker
+  cutoff is resolved in the current build; the earlier missing-head/resource-loading hypothesis did not
+  explain this rendering issue.
+
+## Pale horizon blocks: both captures inspected (2026-11-02)
+
+- **New xemu reference checked:** latest snapshot `vm-20261102211116` (2026-11-02,21:11:16),
+  Mulberry St looking down the long billboard-lined street. Copied its QCOW2 disk read-only from the live
+  installation into `.local/horizon-reference/snapshot-disk.qcow2`, then extracted VM/RAM/front buffers
+  into that directory, preserving the earlier reference artifacts. No emulator UI control or original-disk edits.
+- Recovered front buffers `xemu-front-1.png` and `xemu-front-2.png` show **pale block-shaped distant
+  skyline silhouettes too**, clearly visible at the end of the street. This establishes that this visual motif
+  also occurs in xemu. Combined with the matching texture structure and verified port shader math below,
+  there is no demonstrated port-specific skybox defect requiring a skyline suppression/recolour/fog hack.
+  Exact colour/brightness equality is not established: the user explicitly notes different time of day.
+- Broader visual review of that xemu view against port captures204458,204506,205809: no additional clear
+  structural fault identified in visible world geometry/building surfaces, character model/materials,
+  character ground shadow, road/lane markings, foliage cutouts, street props/vehicles, billboard transparency,
+  or HUD placement/alpha. Clouds and distant silhouettes are present in both. These are different camera
+  positions/locations, so this is a visual sanity check, **not pixel-exact or complete rendering parity**.
+  Do not infer lighting accuracy from these unmatched scenes. The locker model clipping remains a separate,
+  deferred issue and was not validated by these street snapshots; timing/audio cannot be validated by a still.
+- No runtime rendering change made for the horizon report. User indicated that matching xemu's pale backdrop
+  is acceptable. Normal launcher still captures every25 draws; the diagnostic session captures every draw.
+
+- Follow-up detailed capture: `out/build/release/captures/205809`, Broadway/W46th, different location/time
+  but user confirms the same visible issue. Launched unchanged clean build with every-draw images and full
+  input capture (`.local/launch_horizon_capture.ps1`, PID10912). Original two captures remain preserved.
+- **Exact writer identified:** draw1381, a22-vertex distant-city silhouette strip (VS B0000C21,
+  texture82B8FB80, linear ARGB128x66), after sky draw1370. The city texture has white RGB and a skyline
+  in alpha. Draw1380 is its colour-disabled depth/alpha prepass;1381 supplies the visible blended colour.
+  This is distant backdrop geometry, not the cloud mesh failing to render.
+- White RGB alone is **not evidence of a missing texture**. Scanned the saved offline xemu RAM:
+  nine comparable linear128-wide skyline textures have the same white RGB / skyline-alpha structure.
+  Comparison sheet `.local/xemu-horizon-textures.png`; port RGB/alpha sheet `.local/horizon-texture-alpha.png`.
+- Checked the actual captured shader calculation numerically. For the backdrop's front z=-1 face,
+  solving the captured projection at pixel(320,205) gives modelposition(0.27481,0.61211,-1), clipw214.198,
+  vertex fogfactor0.184694. White diffuse blended with captured fogRGB(49,51,54) predicts(87,89,91),
+  exactly the observed pre-postprocess pixel. At(330,210), factor0.190568 predicts(88,90,92), also exact;
+  (320,210) and(330,215) match too. This supports the identified writer and expected current shader math;
+  it does not establish that all source state matches xemu or that the visual complaint is resolved.
+- No brightness multiplier, texture recolour, backdrop suppression or fog-distance workaround applied.
+  Requested a saved xemu snapshot looking toward a distant skyline to establish whether its rendered
+  backdrop differs. Exact location/time is optional; existing offline cutscene reference is obstructed
+  by nearby buildings and cannot validate this distant skyline's appearance.
+
+- User clarified that the issue is the pale building-shaped blocks near the horizon, rather than the clouds.
+  Inspected both F3 captures: `out/build/release/captures/204458` and `204506`, including their final images,
+  intermediate render targets, translated shaders and draw logs. They face opposite directions; both exhibit
+  the pale distant silhouettes. No rendering fix is established yet.
+- First capture: the affected pixel at (309,202) changes from (36,38,42) before draw1125 to (142,144,149)
+  by draw1150, then (156,158,163) after final processing. Sky draw1131 (544 vertices, VS B0101A61) and
+  distant-city draws1132..1139 (VS B0000C31) lie between the intermediate saves. Second capture has the
+  corresponding distant-city draws around1370. Current 25-draw capture spacing cannot distinguish the exact writer.
+- Investigated a possible missing vertex-fog mode conversion: **already handled** by `FillFogConstants` for
+  programmable vertex shaders with FogTableMode NONE. It supplies identity factor parameters (1,0,0,3).
+  Do not change fog mode based solely on the original mode0 printed in frame.txt. This is not an established cause.
+- Existing captures omit the large draws' vertex inputs/constants. Prepared `.local/launch_horizon_capture.ps1`
+  to use the existing executable with XBE_CAPTURE_EVERY=1 and XBE_CAPTURE_INPUTS=1. It refuses to launch while
+  the current port is running. A fresh F3 capture will distinguish sky versus city draws and expose their inputs.
+  No shader, brightness, fog or game-behavior changes made for this investigation.
+- Live run continues past25 minutes with frames advancing and8..9 active CRT streams (limit512), after the
+  user's confirmed passage beyond the old ramp failure point. Current user-controlled process remains open.
+
+## Confirmed live failure: file-object references leak CRT streams (2026-11-02)
+
+- User took control of the port and requested live failure monitoring. No input replay/clock/RNG overrides were
+  enabled. Used `.local/watch_resources.py` with hardware data breakpoints, following body hash912C89FE and the
+  primary descriptor's mapped head. In this run those were body35 (0x375918) and head8/absolute48 (0x375EFC), not
+  the slots from the old replay. Frame/tick heartbeats detect possible stalls; thread-name exceptions0x406D1388
+  and an initial frame0 while booting are not game failures.
+- A frame stall was captured at frame10860, sim tick494, session elapsed~381 s. Artifacts are preserved in
+  `logs/live-resource-failure/`: full memory dump, thread samples, original log, pointer trace, controller recording.
+  The watched body35 was cleared by **original** `0xDB860` called from bulk release `0xDB8C0` (return0xDB8E4),
+  from transition0x8EA88. There were no pending spawn-list states in the captured dump. Do not equate that ordinary
+  transition cleanup with the earlier unproven "resource released while spawns need it" hypothesis.
+- **Actual stall in this capture:** thread samples show repeated NtCreateFile/XAPI open activity for
+  `D:\Data\Shell\MissionMenu.tag`, not the old spawn wait. Guest NtCreateFile status was0xC0000022 (access denied).
+  The host asset exists (`assets/data/Shell/MissionMenu.tag`,117248 bytes).
+- Examined the captured UCRT DLL's own `_getmaxstdio` / `_setmaxstdio` instructions and its stream table: all
+  **512 of512 streams were in use**. UCRT build-specific diagnostic globals: DLLbase+0x138D48 = stream limit;
+  DLLbase+0x139800 = stream-pointer table; FILE flags+0x14, allocated bit0x2000. This is diagnostic-only knowledge
+  in `.local/watch_resources.py`, not hard-coded into the game/runtime fix.
+- **Ownership defect:** ObReferenceObjectByHandle allocates/binds a guest object body. `Bind` kept an unconditional
+  strong shared_ptr in the pointer registry, and ObfDereferenceObject was a no-op. XAPI CancelIo0x263A88 references
+  and dereferences the file during cleanup; NtClose erased the guest handle, but the registry still owned the File
+  and its FILE*. Repeated streaming opens therefore retained host streams until fopen could not allocate another.
+  Kernel file-open code maps such failures to access denied; no user permission problem or missing asset was shown.
+- **Runtime fix:** file pointer bindings are now weak address lookups; handles and counted explicit Ob references
+  own files. ObReferenceObjectByHandle / ObReferenceObjectByPointer / ObfReferenceObject add explicit ownership;
+  ObfDereferenceObject releases it. Final release happens outside the pointer-map lock. File destruction closes
+  the CRT stream, unregisters its guest address, and frees its host-allocated guest body. Guest-owned dispatcher
+  objects retain their existing host-state ownership. No file-stream limit increase or artificial loader readiness.
+- Added `scripts/test_file_references.py`, compiling actual binding/handle/reference functions and actual File
+  class. Before: regression4, closed file retained by its binding. After: duplicate handles and multiple pointer
+  references preserve the file until the last owner, weak lookup works while a handle remains, and **1100 balanced
+  file cycles** complete with all object bodies reclaimed. APC and retained-attribute regressions also pass.
+- Removed the unproven behavioral guards from `src/game/hooks.cpp`: skipped head attachment; patched path/grid
+  coordinates; altered allocator eligibility; suppressed resource release; cutscene-mode changes in destructor
+  and sample-clock hook. Original guest functions now execute. Read-only head/lifecycle diagnostics remain.
+  Backup for comparison: `.local/hooks-before-file-lifetime-cleanup.cpp`.
+- Built/relinked: `logs/codex-file-reference-build.log`, then `logs/codex-file-reference-clean-build.log` after
+  removing guards. Reopened normal interactive port for the user, with recording/captures enabled and replay
+  disabled. Passive monitor: `.local/clean-file-watch.jsonl`, tool session56068, PID recorded in
+  `.local/clean-file-test.pid`. It also records active CRT streams (10-second samples).
+- Initial live check after the fix:9 active streams, peak18 during boot/menu/world loading, limit still512.
+- Follow-up live monitoring: beyond9 minutes, frames and simulation still advance, active streams remain8..10
+  (peak18), with no post-boot exception or stalled-frame event. The watched body was released during transition
+  while rendering continued. Monitoring is still active on the user-controlled run; asked the user to confirm
+  passage through the original parking-ramp failure spot. Partial clean log: `logs/codex-file-reference-clean-live.log`.
+  **User confirmed passage beyond the original parking-ramp failure point in the clean build (2026-11-02).**
+  This validates that route with the file-lifetime fix and unproven guards removed. Locker rendering remains open.
+  User next reports the skybox looks wrong; requested an F3 capture of the affected sky for diagnosis.
+
+## Resource watch replay interrupted for user control (2026-11-02)
+
+- Began the approved lifecycle investigation using `.local/watch_resources.py`: Windows hardware write
+  watchpoints on body28 data0x3755EC and head7/absolute47 data0x375E88, installed on all replay threads. The tool
+  records writer function, thread, new/old pointer, entry bytes, recovered guest registers and stack in
+  `.local/resource-watch.jsonl`. It changes debug registers, not guest instructions or loader behavior.
+- Replayed `logs/lockup-194849/pad_record.txt` with `XBE_DETERMINISTIC_REPLAY=1` solely to try reproducing the old
+  experimental run. Initial loads and releases were captured; no ramp root cause established before interruption.
+  Old run PID13256. Save backup: `.local/resource-watch-save-backup/` (contents of the original hdd directory).
+- User asked to take control. Stopped only that replay process, preserved its log as
+  `logs/resource-watch-interrupted.log`, restored the backed-up saves by copying them back over hdd, and launched
+  a normal interactive port (PID24516). Replay/script/deterministic environment overrides were cleared. Captures
+  enabled, ordinary controller recording to `pad_record.txt`. User now controls the game. Do not close it or rebuild
+  locked binaries while the user is playing. The earlier ramp/locker objectives remain active.
+
+## Fresh review: runtime defects versus symptom guards (2026-11-02)
+
+- This section supersedes earlier "real cause" claims about entry release/reuse below. The resource-loading root
+  cause is **still unproven**. Several later guards prevented one failure only to expose another; menu smoke tests
+  did not validate the parking-ramp sequence. User asked for a cleaner solution instead of accumulating workarounds.
+- Confirmed symptom guards in `src/game/hooks.cpp`: skipping missing-head attachment (`0x8C3A0`); replacing invalid
+  path coordinates (`0x2600A0`); skipping grid updates (`0x14CF70`); suppressing body release based on spawn state
+  (`0xDB860`); changing the slot allocator (`0xDB4B0`); turning off cutscene mode from the destructor/sample clock
+  (`0x48F80` / `0x2914D2`). These change title behavior and must not be called established root-cause fixes.
+  They remain present for now; this review did not silently remove all guards or claim the ramp is fixed.
+- **Concrete runtime defect reproduced and corrected:** `kernel::RunApcs` used `CallGuest`, which restores only
+  EAX/ECX/EDX/EBX/ESI/EDI/EBP/ESP. An I/O completion callback could leave x87 values/top/control state, SIMD
+  registers, MXCSR and flags changed on the interrupted thread. `RunApcs` now snapshots/restores the complete
+  `X86Context` around each normally returning callback. Ordinary synchronous `CallGuest` behavior is unchanged.
+  This is a runtime boundary fix, not a title-specific head/position/resource exemption. Its connection to the
+  particular ramp resource failure remains a hypothesis until a controlled gameplay reproduction verifies it.
+- Added `scripts/test_apc_context.py`, compiling the actual `RunApcs` and `CallGuest` implementations with a stub
+  callback that deliberately clobbers processor state. Before the fix: fails with regression3 (interrupted context
+  corrupted). After: passes, including two callbacks (one queued by another), callback argument delivery, empty
+  queue behavior, and preservation of guest-memory side effects. Queue/lock stubs mean this is not a concurrency test.
+- **Replay experiment leaked into normal gameplay:** `sub_00240CC0` unconditionally restored RNG state around
+  world rendering, changing the game's original random sequence even without replay. Such an altered recording
+  is not a faithful baseline for the original game. Intrusive RNG/clock/seed replay hooks now require the explicit
+  environment variable `XBE_DETERMINISTIC_REPLAY`. Normal play and ordinary `XBE_PAD_RECORD` use the original RNG
+  and vblank reader and the continuous 48 kHz sample clock. Input recording itself remains available normally.
+  To reproduce the old intrusive experiments, set that variable for BOTH recording and replay; old timing files
+  must not be interpreted as evidence of unmodified game behavior. Async streaming still limits determinism.
+- Evidence corrections: a loaded marker (-2), zero data and a relocated buffer do not by themselves establish
+  who cleared or invalidated the resource. `0x21BFF0` clears decoded fields from+4 onward, **not the data pointer
+  at+0**; its presence on a path is not proof of the pointer's writer. No "kept" or "still loading" lines fired in
+  the cited later failures, so the release/allocator hypotheses were not confirmed by those replays.
+- Cleaner next step: use the existing entry-lifetime trace (allocate, setup, clear, release) and identify the exact
+  first write that takes body28/head7 from a valid data pointer to zero, with its call stack, thread, request/job
+  state and pending callback state. Correct that lifecycle/dispatch violation, then remove the matching guards
+  and validate the complete ramp progression with original RNG behavior. Avoid additional guessed waits,
+  thresholds, coordinate substitutions, selective retention or forced "ready" flags.
+- Retain the earlier evidence-based compatibility fixes: viewport/scissor restoration, retained vertex attributes,
+  fixed-function current-colour fallback, presentation interval and missing 48 kHz sample counter. The 1024-node
+  callback-ring extension is a proven overflow mitigation from initial bring-up, but still a title-specific capacity
+  workaround; a bounded completion queue/backpressure design is the longer-term replacement, not another size increase.
+- Built/relinked with these two scoped corrections: `logs/codex-clean-review-build.log`. APC regression and retained
+  attribute checks pass. The full ramp/crash/locker outcomes have NOT been revalidated by this review.
+- Brief smoke test: `logs/codex-clean-review-smoke.log`, 70 seconds, menu/world rendering and resource turnover,
+  no error or symptom-guard messages. Stopped only the test process we launched. This is not a ramp regression test.
+- Trace limitation found during review: current body trace stops after400 events and covers only entries28..39;
+  it may exhaust before the ramp and misses head7 (absolute entry47). The next lifecycle trace must include both
+  affected entries and retain recent events through the first failure, rather than logging only early startup.
+
+## Resume checkpoint before ramp replay (2026-11-02)
+
+- Current priority: investigate and fix the parking-ramp crash first. The user explicitly deferred the locker
+  preview issue until afterward. Neither new issue is fixed yet. The user asked to save this checkpoint before
+  performing the requested diagnostic replay.
+- Current runnable diagnostic build: `out/build/release/TrueCrimeNYC.exe` (built 12:17:49) and
+  `out/build/release/TrueCrimeNYC.dll` (relinked 12:17:55), 2026-11-02. Build log:
+  `logs/codex-ramp-diagnostic-build.log`. Launch normally, repeat the drive out of the parking area and up the
+  ramp, then report the crash. No F3 capture or special environment variables are needed for this diagnostic.
+- The temporary hook in `src/game/hooks.cpp`, `sub_0008C3A0`, logs negative head indices and writes
+  `out/build/release/logs/ramp-state.bin` once per run before executing the original failing function. It records
+  committed pages from guest0x10000 up to0x08000000. It collects evidence; it does not prevent the crash.
+- After the replay, preserve `logs/tcnyc.log`, `logs/ramp-state.bin` (both beneath the executable directory),
+  and the newest `CrashDumps/*.dmp` before launching another session. Run:
+  `tools/venv/Scripts/python.exe .local/read_ramp_state.py` from the repository root. This reconstructs
+  `.local/ramp-low-ram.bin` and reports the head candidates, mappings, resource entries and async job states.
+- Distinguish observation from inference: the old dump directly proves that the head argument is -1 and that
+  the following resource lookup returns null. The preceding selector's empty result is inferred from the
+  disassembly; its exact resource/readiness state is not in the old dump and is what the replay must establish.
+- Useful layout: world pointer0x360E00; primary character descriptor world+0x27A0, candidate mask at descriptor+4;
+  head mapping rows world+0x2958, stride12, signed slot byte at+0. Head resource entries start0x375B5C, stride0x74;
+  parent resource entries start0x37493C with the same stride. Resource data at+0, loaded marker at+0x5E,
+  parent index at+0x66, async job handle at+0x3C. Job table0x4D3720, stride48, indexed by handle&255.
+- Keep the completed graphics and timing fixes while investigating. The final timing fix combines a working
+  48 kHz DirectSound sample clock with the requested presentation interval; the rejected cap-only experiment
+  must not be restored on its own. Evidence and validation are recorded below.
+- Locker screenshot: `C:/Users/user/Pictures/Screenshots/Screenshot 2026-11-02 120919.png`. The right-hand
+  Street Flack preview has a sharp horizontal cutoff removing the head and upper torso. Clipping/depth state
+  is only an initial hypothesis; no locker frame capture has been collected. Request that capture after the crash.
+- Build/relink workflow: set `CI=1`, run `build.bat` with output redirected to a log, then run
+  `tools/venv/Scripts/python.exe .local/relink_game.py` to link the precompiled guest partitions against the new
+  executable and update its build stamp. Close the port before rebuilding if it locks either binary.
+- SDK changes are exported to `patches/xboxxberecomp-local.patch` using
+  `git -C sdk diff --no-ext-diff f7b13fd --` (write stdout as bytes). The current temporary diagnostic and audio
+  clock title hooks live in the root repository, not in that SDK patch. No commit has been requested or made.
+
+## Parking-ramp crash and locker preview (2026-11-02) — both fixed, see sections at the top
+
+- User reports the locker preview loses the character's upper half (screenshot 120919), and a crash while driving
+  out of the parking area and up the ramp. **User requested the crash be fixed first; locker investigation is deferred.**
+- Latest crash: `out/build/release/CrashDumps/TrueCrimeNYC.2026.11.02_12.09.43.dmp`, session 11:54:26, elapsed917.103 s.
+  Preserved the original log in `logs/codex-ramp-crash-original.log` and pad input in `.local/ramp-input-original.txt`.
+- Parsed the minidump's module list and mapped fault DLL RVA0x19145D to `__imp__sub_0008C3A0+0x7D` using exports.
+  Original Xbox instruction is `0x8C3C1: movsx ecx, word ptr [edi+0x2C]`; EDI is zero, producing the read at guest0x2C.
+- Guest stack confirms `0x8C3A0(actor=0x644440, descriptor=0x519CE0, head=-1)`, called at0x8C57A. World0x517540;
+  descriptor is world+0x27A0. Body resource0x37598C is present; head selection0x7E800 returns -1 (no candidates),
+  then caller0x8C4C0 forwards it without checking. Head attachment asks0xDB450 for slot39 (-1+40), gets null and
+  dereferences it. Caller chain includes mission event0x1FF0A0 at0x1FF811, spawning a character at ramp progression.
+- This is not a D3D/graphics fault. Need establish why no usable head is available (loader state, mappings,
+  resource readiness), rather than merely suppressing the null dereference and leaving an incomplete actor.
+- Prepared a **temporary diagnostic build, not a crash fix**: hook0x8C3A0 saves committed guest pages below128 MiB
+  into `out/build/release/logs/ramp-state.bin` (RAMP magic, repeated uint32VA/size + bytes) before the negative-head
+  failure. The normal minidump excludes this resource memory. Build and DLL relink complete.
+- Asked the user to replay the ramp crash with that build. Awaiting capture. Analysis tools (ignored):
+  `.local/analyze_latest_crash.py`, `.local/read_ramp_state.py`, `.local/disasm.py`.
+- Remove the temporary diagnostic hook after resolving and validating the cause. Do not mark either new issue fixed.
+- Diagnostic replay check (2026-11-02, session 12:52:24, 712 s): **no crash**, clean `Exit (0)`. The hook never saw
+  a negative head (no "ramp diagnostic" line, no `ramp-state.bin`), no new dump (newest still 12:09). The only event
+  is an F3 capture at 500 s (`captures/130045`) = the locker screen (Street Flack preview missing head/upper body).
+- Static reading: head selector 0x7E800 picks randomly from 0x7E730's candidates (descriptor mask bits, mapping
+  rows world+0x2958 stride 12). A head counts when its entry (0x375B5C + i*0x74) has marker +0x5E == -2, data +0 set,
+  and its async job (+0x3C) passes 0x228F30 (true) and 0x228F40 (false), or when its parent entry (+0x66 -> 0x37493C)
+  passes 0x1C810. So "no candidates" = every head of that character not ready. The locker preview also lacks the head:
+  possibly the same root cause (unverified).
+- Second replay (session ~13:10, crash at 431.891 s, dump `logs/ramp-crash-2/`): hook fired, `attach head -1, actor
+  00646D40, descriptor 00519CE0, world 00517540, caller 0008C57F`, same fault. `ramp-state.bin` was NOT written
+  (fopen of the relative path failed; no file anywhere). The minidump has no guest resource memory.
+- Readiness rules (disassembled): job slot 0x4D3720 + (handle & 255) * 48 must hold the handle; +4 state != 0 means a
+  tracked job; 0x248C50 "done" = state 3 or 5. A head is a candidate if marker -2, data != 0 and (no tracked job or
+  job done), else if its parent entry passes the same test (0x1C810).
+- Diagnostic hook rewritten (build 2026-11-02 afternoon, log `logs/codex-ramp-diagnostic-build2.log`): on a negative
+  head it logs to tcnyc.log the descriptor mask and, per mask bit, the mapping slot, head entry data/marker/job
+  handle/slot/state and the parent entry's same fields (first 3 occurrences). No memory dump any more.
+- Lockup session (`logs/ramp-lockup-1.log`): game froze at the same point (F3 at 432.6 s vs crash at 431.9 s);
+  F3's capture never completed; stack words 0x22EC10/0x24FB77/0x2601B7 are game maths, not a wait. Not conclusive.
+- **Second crash type (2026-11-02 13:52, 650.8 s, `logs/ramp-crash-3/`), head diagnostic did not fire:** fault in
+  main loop 0xA7810 at 0xA796D `mov esi,[ecx+0x9C]`, ecx = [0x348E10] = 0. That is the audio-clock cutscene branch
+  (mode flag 0x360E0C, previous 0x360DE0): ticks = audio samples * -0.00125 vs the timing object's +0x9C counter.
+  Start 0xA5760 (from cutscene start 0x815F0, which also creates the object via 0x49260 -> [0x348E10]); stop 0xA5780
+  (from end path 0x48600 -> 0x7EB37). The object's destructor 0x48F80 (called from its message handler 0x49120) clears
+  [0x348E10] but not the mode. **Safeguard added** (hooks.cpp sub_00048F80): when the current object is destroyed with
+  the mode on, the mode is turned off (logged "cutscene timing object ... destroyed with audio-clock mode on").
+  Root cause of the ordering not proven (might be timing from host audio/streams). Smoke test: boots and runs 100 s.
+- **Lockup caught live (2026-11-02 14:05, `logs/ramp-lockup-2/`: thread samples `logs/ramp-lockup-sample.txt`, full
+  memory dump `frozen-full.dmp`, reader `.local/read_frozen.py`, guest base 0x100000000):** the game thread spins 100%
+  in 0x260101 (loop of 0x2600A0, closest point on a path; called from 0x405C4 in an actor update, chain 0x8F240 <
+  0xFFA70 < 0x44090 < 0xFD220 < 0x40590). Frame: target = (-83.3, **1e37**, -750.5) = an actor position
+  ([actor+0xB4]+0x70) with the "no height" placeholder; best distance = inf. The search keeps every not-worse step
+  and exits only on a worse step with |step| < eps, so with all distances inf it never ends.
+- Same dump: the ramp descriptor's only head (mask 1, head 7) **is** ready there (marker -2, data 0x82122000, no job)
+  -> at the crash it was simply not loaded yet. Both symptoms = the ramp spawn running before its head / ground
+  collision were available.
+- Ruled out by measurement: read throughput (0x24C080 completions up to 602/s, not capped per frame) and game speed
+  (0x363D0C exactly 60 ticks/s outside cutscenes, like xemu). Root cause of the late resources still unknown.
+- **Safeguards added (hooks.cpp):** sub_0008C3A0 with a negative head now returns like the caller's own "no head"
+  branch (0x8C581; actor+0x148 stays -1), logged "no ready head ... attach skipped"; sub_002600A0 replaces a
+  non-finite or >= 1e30 target coordinate (caller's copy) with the path's first point's, logged "path search target
+  had an invalid coordinate". The negative-head readiness log stays (first 3). Build 14:18+, smoke test 200 s clean.
+- **New lockup (2026-11-02 afternoon, `logs/lockup-3/`: sample.txt, tcnyc.log, frozen-full.dmp, reader
+  `.local/read_lock3.py`):** game thread spins in 0x1E720 `while (!0x1E370(list)) 0xDBE60(loader 0x374938, 1, 0)`,
+  called from mission code (0x7FA90 < 0x1FDAC0 < 0x83C40 < 0x25D070). 0x1E370 runs up to 4 character spawn requests
+  (state 1..4); state 3 waits for 0x7E570(descriptor world+0x27A0+k*20) = body resource ready (head readiness is
+  computed but ignored). Body entry 0x37493C + idx*0x74, idx = byte+2 +0x10 (flag bit 0) or mapping(world+(b+0x368)*12)
+  +0x1C. No load job pending in the dump; all head/parent entries 0..63 marked loaded. Several descriptors' body
+  entries (idx 16, 28, 29, 31, 32) are marked loaded (-2) with **data 0**, so they can never become ready and nothing
+  re-requests them. Not yet established which descriptor the frozen request waits on (spawn list object = ecx of
+  0x1E720, not recoverable from the stack yet) or why marked-loaded entries have no data (freed/evicted?).
+- Lockup-3 follow-up: spawn list [world+0x1B4] = 0x51A140, entries from +0xC, stride 0x20 (state +0, descriptor -4):
+  four requests in state 3 for descriptors 1-4, all needing **body entry 28 (0x3755EC): mark -2, data 0**; its
+  +0x50 buffer 0x82BEB000, +0x58 size 0x2DF00, +0x4C callback 0xDBD40 (post-read relocate), +0x60 0x01FF, +0x68 2.
+  Callback ring empty; no disc requests queued or in flight; scheduler idle. Loader 0x374938: pump 0xDBE60 services
+  loading entries (mark = disc slot) via 0xDBA10 (mark -> -2, publish via 0x21BD50); releases entries flagged 0x10
+  after > 2 frames unused (frame counter 0x4C6294 via 0x243080) with 0xDB860, which nulls +0 but leaves the mark -2.
+  So entry 28 looks released while four spawns still wait for it; nothing re-requests a "loaded" entry.
+- Ruled out: frame counter rate (30 frames/s vs 60 ticks/s in gameplay = xemu's ratio; cutscenes 61-69 ticks/s).
+  Next: find which path freed entry 28 (0xDB860 callers, flag 0x10 set) while requests were pending.
+- **Release guard (hooks.cpp sub_000DB860):** before the loader frees an entry, if a spawn request in state 2/3 needs
+  it as its body (same index rule as 0x7E570), the free is skipped and logged "loader wanted to release entry ...
+  kept" with the caller. Smoke-tested (menus, no errors). Waiting for a gameplay session to see whether it triggers.
+- **Replay inputs rewritten (user: replays not working):** the old recorder kept only button-press moments, replayed
+  as 0.2 s taps (holds lost, sticks/triggers never recorded) and timed in wall seconds (load-time drift). New
+  (`src/common/game_info.cpp`): `XBE_PAD_RECORD=<file>` writes "pad2" + a line per change of controller 1:
+  `<picture> <buttons hex> <8 analog> <lx> <ly> <rx> <ry>`, timed by presented pictures (new `d3d::PresentCount()`
+  in the SDK); `XBE_PAD_REPLAY=<file>` plays it back holding each state until the next line, real controller ignored
+  until 2 s past the last line. The recording holds what the game received (scripted presses included).
+  `XBE_PAD_SCRIPT` taps unchanged. Round trip checked: scripted run recorded, replay lands on the same screen.
+  Launcher still records to pad_record.txt (now pad2). Old recordings (button lists) cannot be replayed with it.
+- User also reports buildings on both sides of the road disappearing (new captures in captures/, not yet reviewed).
+- Checked and ruled unlikely: stream read ordering. 0x24BD40 is a C-SCAN elevator over (file disc sector from
+  0x26381D << 11) + request offset, priority +0x34 first; our 0x26381D hook returns 0 for every file (the original
+  returns the GDFX file's start sector, FsContext[0]), but host reads finish at once, so the queue rarely holds more
+  than one request and the scan wraps constantly. Not changed. No "callback is lost" errors in the crash log.
+
+## Fixed: gameplay speed and the yellow-car cutscene's missing audio clock (2026-11-02)
+
+- The earlier blanket 30 fps experiment was reverted after the user correctly reported that it made the
+  yellow-car cutscene too slow. There were **two interacting timing defects**, not just an incorrect fps cap.
+- Compared the user's three new xemu snapshots, working only from a copy of the QCOW2 disk. Guest times were
+  144.707790 / 151.337741 / 172.487941 seconds; SwapCount 3688 / 3887 / 4522; simulation ticks at `0x363D0C`
+  were 576 / 976 / 2246. Thus xemu presents ~30 fps while advancing simulation ~60 ticks per second. All three
+  snapshots have the audio-clock cutscene mode (`0x360E0C`) enabled. Snapshot-menu pauses are excluded by using
+  guest time rather than the snapshots' wall-clock dates. Analysis artifacts are under `.local/` (ignored).
+- **Missing audio sample clock:** original function `0x2914D2` (DirectSoundGetSampleTime) checks the original
+  DirectSound singleton at `0x29EB60`, then reads APU register `0xFE80200C`. Host audio replaces the singleton,
+  so the original function returned zero forever. A runtime trace confirmed the singleton is zero in the port.
+- Main loop `0xA7810` uses that sample clock for cutscenes: `(samples - start) * (60 / 48000)` determines how many
+  simulation ticks to run, with the scale stored as -0.00125 at `0x2D5DC8`. A frozen counter makes it fall back to
+  one tick per present. Ordinary gameplay uses at least two ticks per present. This explains both observations:
+  at 60 fps gameplay ran too fast while the cutscene advanced 60 ticks/s; at 30 fps gameplay corrected but the
+  cutscene dropped to 30 ticks/s, while audio continued normally.
+- Added a title hook for `0x2914D2` supplying the free-running 48 kHz counter from steady elapsed time, including
+  natural 32-bit wrap. This counter is independent of render rate and voice pitch. Audio resampling, sample
+  formats, buffer playback rates and the CPU/kernel clocks are unchanged.
+- Restored presentation-interval handling **together with the sample-clock fix**: preserve the interval from
+  CreateDevice/Reset, read deferred changes at Swap, and cap pacing to 60/interval while respecting a lower user
+  cap. The title requests interval TWO (2), confirmed in xemu render state `0x2CB408 + 127*4` and CreateDevice.
+- Runtime verification (`logs/codex-audio-clock-verification.log`): presents ~30 fps; cutscene ticks advance from
+  177 to 2697 over exactly 42 seconds (60 ticks/s), then switch out of audio-clock mode. Following that transition,
+  ticks advance 2756 to 3056 over 5 seconds (60 ticks/s). The run exits normally with code 0. Temporary simulation
+  tracing was removed after validation. This checks game speed as well as presentation rate.
+- Reference: xemu's APU implementation reads XGSCNT from its processed audio-frame/sample counter:
+  https://github.com/xemu-project/xemu/blob/master/hw/xbox/mcpx/apu/apu.c (`mcpx_apu_read`).
+- Release executable rebuilt, game DLL relinked, retained-attribute regression checks pass, SDK patch re-exported.
+
+## Fixed: excessive reflection on one side of the road (2026-11-02)
+
+- The user's xemu snapshot supplied the missing evidence. Worked from a copy of its QCOW2 disk, extracted the
+  VM state and RAM, found the guest page directory at physical 0xF000, and resolved the title's surface objects.
+  Recovered raw 640x480 front buffers and the 256x256 reflection at physical 0x03454000. Local analysis artifacts
+  and scripts are in `.local/` (ignored); the original emulator disk was not modified.
+- Reflection images match closely: a uniform region at (150,190)-(230,240) has RGB means
+  66.0/67.6/73.1 in xemu vs 68.4/69.8/75.4 in the port. The final road alpha sample also matches (~138 in both).
+  Therefore the reflection rendering/blur and wetness alpha did not explain the excess brightness.
+- **Root cause: fixed-function vertex shaders substituted white for absent diffuse inputs**, ignoring the
+  current vertex attribute. The reflection composite uses XYZRHW|TEX1 (no diffuse stream), MODULATE2X and
+  DESTALPHA+ONE. The title sets current v3 to (0.451,0.451,0.451,0.502); the port multiplied by white instead.
+- Fixed non-lit fixed-function diffuse/specular fallback to read `vdef[3]`/`vdef[4]`, matching programmable draws.
+  Also implemented the original SetVertexShader default-colour writes for absent inputs 3/4/7/8, so an FVF or
+  declaration bind resets the current colour before a subsequent explicit SetVertexData override. Original 5849
+  code at 0x2BBA57..0x2BBAA7 writes methods 0x194C/0x1950/0x195C/0x1960 with white/zero/white/zero respectively.
+  Pending inline vertex-data writes are consumed before changing the shader.
+- Verified capture `out/build/release/codex-reflection-fixed/104939/final.bmp`; prior capture
+  `codex-road-final/101542/final.bmp`. Raw road RGB averages at (400,350)-(500,400): xemu 55.6/54.7/57.1,
+  prior port 92.3/91.6/95.3, fixed port 59.9/58.7/60.2. These are pre-gamma pixels; the camera/particles differ
+  slightly, so this is a close visual/region comparison rather than an exact frame match.
+- No manual reflection brightness factor was introduced. The dark-patch scissor fix remains. Temporary camera
+  capture trigger removed; release executable rebuilt, game DLL relinked, SDK patch updated.
+
+## Fixed: camera-following dark patch up the road (Codex, 2026-11-02)
+
+- **Root cause: regular SetRenderTarget did not reset the host scissor.** The title initially clips a 256x256
+  projected mask to (1,1)-(255,255). Each subsequent target bind should restore the full surface clip, but the
+  SDK kept that rectangle across the 256/96-pixel blur chain and the final border-clearing lines. An old opaque
+  outer ring survived and blurred inward. The road's second projected mask then returned alpha 199/255 at its
+  inner edge; the shader inverted it to 56/255, producing the camera-following dark band.
+- Proven against original 5849 code: SetRenderTarget calls 0x2BA880 at 0x2B8576; that helper tail-calls SetViewport
+  at 0x2BABD7; SetViewport calls SetScissors(0,0,0) at 0x2B89C2..0x2B89C8. SDK SetViewport already cleared the host
+  scissor; SDK SetRenderTarget rebuilt its viewport directly but omitted that reset.
+- Fix: clear `g_state.scissor_count` with the regular SetRenderTarget viewport reset. SetRenderTargetFast keeps
+  its existing behavior. Removed the previous global `uvclamp` / `insetuv` workaround and its draw constants:
+  normal texture-edge sampling now works because the title's own border-clearing operations execute correctly.
+- Controlled matched-camera captures (all under `out/build/release/`):
+  `codex-road-auto-baseline/100809`; first-mask neutralization `codex-road-auto-mask1/100923` (band unchanged);
+  second-mask neutralization `codex-road-auto-mask2/101021` (band disappears);
+  scissor fix `codex-road-scissor-fix/101329`; final fix without UV workaround `codex-road-final/101542`.
+  No mask neutralization, texture-mip override, or special camera trigger remains in the normal executable.
+- Wetness alpha means across x=380..519 before reflection composition: rows 325/330/335/340 were
+  54.8/53.9/52.8/54.1; now 71.4/75.7/78.2/84.5. Row 345 remains 82.0; rows 350/355/360 remain 85.4/86.6/87.0.
+  The flat artificial strip is gone, without suppressing either projected map. The mask's top/left border is
+  now zero instead of 255, with no 199-alpha halo leaking into the interior.
+- Ruled out mip filtering: forcing the road texture to mip zero retained the band; the identified road texture's
+  five mip alpha averages were 72.67/72.29/71.92/71.50/71.33. Sampling its proper mip chain is restored.
+- Release build and retained-attribute regression checks pass. SDK patch re-exported. The separate overall
+  right-road reflection brightness comparison against xemu remains open; this fix addresses the moving patch.
+
+## Fresh graphics review (Codex, 2026-11-01)
+
+- **Earlier investigation, superseded by the fix above; screenshot 224525 / F3 capture 224517:** a broad dark patch extends up the road and its
+  boundary follows the approaching camera. Distinct from the earlier single-row seam. In capture 224517 the
+  discontinuity is already present in framebuffer alpha at `0433_83ED0000.bmp`, before mirror composition.
+  Alpha at x=450 is flat 56 on rows 325/330/335 and returns to detailed values farther down (126 at row 350,
+  82 at 355, 108 at 360). Mirror composite draw 492 uses DESTALPHA+ONE, so it amplifies the discontinuity;
+  it does not originate solely in the mirror target. The road shader B016C060 derives alpha through the
+  t0/t1/t2 mux chain; investigate texture LOD/mips and projected masks separately. **No visual fix established.**
+  Capture texture lines now include mip count/filter, LOD bias and max mip, which were missing from the evidence.
+  A timed replay attempt reached a different scene; do not use `codex-road/225122` as a matched comparison.
+  A live texture read taken before the intended scene loaded was also not a valid road-texture sample.
+
+- **Implemented and replay-tested: retained vertex attributes were incomplete.** The earlier `vdef` fix only
+  remembered setters outside Begin/End. NV2A also retains immediate setters inside Begin/End and streamed vertex
+  attributes. A streamed mesh carrying white diffuse colour therefore replaces a previous lamp tint before a
+  subsequent shader reads unfed v3. The SDK instead kept the tint indefinitely across those meshes.
+- `gpu::RetainVertexAttributes` now decodes the last submitted vertex with the existing vertex converter after
+  DrawVertices, DrawIndexedVertices and DrawUp. Indexed draws include base_vertex. Immediate setters retain every
+  component write and synchronize with current streamed attributes, including partial updates.
+- Reference behavior checked against xemu's implementation, without copying its code:
+  https://github.com/xemu-project/xemu/blob/master/hw/xbox/nv2a/pgraph/gl/vertex.c
+  (`pgraph_gl_bind_vertex_attributes`, updates retained attributes from the submitted vertex), and
+  https://github.com/xemu-project/xemu/blob/master/hw/xbox/nv2a/pgraph/pgraph.c (immediate setters).
+- Replay captures: `out/build/release/codex-graphics/223813` = immediate-only correction;
+  `224118` = streamed + immediate carryover; comparison baseline `street/t42.5`. The final small follow-up
+  synchronizing partial setters with streamed attributes is regression-tested and rebuilt, rather than captured.
+- Raw BMP luminance means, same fixed sample rectangles (640x480; bounds right/bottom exclusive):
+
+  | Sample rectangle | Baseline | Immediate only | Streamed + immediate |
+  | --- | ---: | ---: | ---: |
+  | Facade (95,150)-(215,290) | 27.3 | 24.4 | 52.8 |
+  | Sky (250,80)-(370,150) | 71.7 | 72.5 | 73.1 |
+  | Road left (130,345)-(270,390) | 29.0 | 27.1 | 28.1 |
+  | Road right (400,345)-(540,390) | 90.2 | 90.6 | 90.4 |
+
+  The camera/particles have small replay timing differences. These are raw port-capture comparisons, not
+  gamma-corrected xemu measurements. Nevertheless the facade becomes substantially brighter without doubling the
+  sky, unlike the earlier forced-white experiment. **The overbright right road remains unresolved.**
+- **Correction to the cache theory below:** disassembly of 0x136E70 shows that 0x3F54CC is assembled from bitfields,
+  lookup tables and comparison flags, not a monotonically increasing version. 0x2409F0 snapshots render state and
+  light records; 0x240250 queues the snapshot in a depth bucket; 0x240E70 restores it when drawing. Unchanged
+  +0x1C does not demonstrate stale lighting or a failed cache invalidation. No forced refresh/picker hook was added.
+- Validation: `scripts/test_immediate_attributes.py` compiles the actual SDK function bodies in an isolated DLL
+  and checks immediate/streamed carryover, partial setters, implicit z/w, index order, base vertex and empty draws.
+  Full release build passed. SDK changes are included in `patches/xboxxberecomp-local.patch`.
+- Next investigation should isolate road reflection colour and road destination alpha separately. Do not infer
+  another CPU lighting-cache bug from the old facade measurements, or compensate by globally whitening quads.
+
 ## Tool choice (2026-11-01)
 
 - **XboxXBERecomp** (https://github.com/TGP482/XboxXBERecomp, MIT, cloned at `f7b13fd`, 2026-10-31) — x86 XBE ->
@@ -323,3 +891,42 @@
   CACHED light set (pool objects 0x46xxxx-0x49xxxx built by 0x2409F0) that is not refreshed. Sets carry a version
   word at +0x1C (from/to global 0x3F54CC, set from 0x136E70's return before queuing). Next: find what decides
   to rebuild a cached set (version compare) and why it never triggers here.
+
+### Replay determinism (2026-11-02)
+- `XBE_PAD_RECORD=<f>` now also writes `<f>.timing`: per main-loop frame `v` (vblank step), `s` (audio sample step),
+  `c` (check: random state ^ sim ticks, not replayed), plus `r` for every timer-based srand seed (`0x229D50`).
+  Seed sites that repeat by themselves (positions / saved random restores: 0x16E2A 0x173D5 0x240D22 0x240E62 0x240F74
+  0x240F8E) are skipped; they run thousands of times a frame.
+- `XBE_PAD_REPLAY=<f>` reads `<f>.timing` too. Record + replay of 90 s: every `c` line and the present count per frame
+  are identical. Setting both (replay + record to another file) and diffing the `c` lines finds the first frame two
+  runs part.
+- Captures at `p<N>` of the title menu still differ a little between runs: its background movie plays in real time
+  and does not touch game state.
+- Drift found 2026-11-02: `0x240CC0` (world object drawing, called from 0xA837C) draws one random number per drawn
+  object. The number drawn follows streaming (real time), so the game's random state depended on timing. The hook now
+  saves/restores the random state (`0x3376C8`, 8 bytes) around it. After that a 736-frame record+replay matched.
+- Recordings made before this change cannot replay (user's lockup-4 recording parts at frame 5).
+- Lockup 4 (logs/lockup-4: sample, full dump, recording): stuck again in the spawn wait loop 0x1E720.
+
+### Lockup 5 (logs/lockup-184705, 2026-11-02) — cause found
+- Stuck in spawn wait 0x1E720; spawn requests 1..7 in state 3, all on body slot rows world+0x28E4..0x2934 -> entry 28
+  (hash 912C89FE). No disc jobs pending, callback ring empty.
+- Entry 28: data and +4..+0x44 zero, job 0, mark -2, but buffer 82BEB000 holds the loaded, relocated file. So it was
+  released (0xDB860 -> 0x21BFF0 clears the fields) while its load was still running: the read finished into the buffer,
+  but nothing set the entry up again, and 0x7D780 (lookup by hash) keeps returning it.
+- The 0xDB860 guard only protected entries with data set; it now also protects entries still loading.
+- Lockup 6 (logs/lockup-185948): identical state (entry 28, 7 spawns), no "kept" line, so not 0xDB860. Real cause:
+  allocator 0xDB4B0 (loader 0x374938, entries 28..39 for bodies) treats any entry with data 0 and no parent as free,
+  including one still loading. A second request reset entry 28 mid-load. Hook now also skips entries with a disc slot
+  (+0x5E >= 0) or a job (+0x3C), logging "loader slot N is still loading; not reused".
+- Run after the allocator fix (logs/exit-191134): no lockup, but no "still loading; not reused" line either, so the fix
+  is not proven yet. Crash at 471.9 s in 0x14CF70 (same as crash 4): grid cells come from the position at 0x370000;
+  a garbage position overflows cvttss2si and indexes outside 0x386760. 3.7 s earlier the path-target guard fired.
+  Hook now skips the grid update when that position is not finite or > 1e6 and logs the values.
+- Run logs/exit-193829: crash at 429.7 s, null read at 0xA796D (main loop reads [0x348E10]+0x9C with audio-clock mode
+  on but the object gone). 0.1 s before: "no ready head ... attach skipped". The sample-clock hook (called at 0xA786A,
+  just before the mode check) now turns the mode off when the object is null.
+- Lockup 7 (logs/lockup-194849): cutscene-mode fix worked at 429.8 s, then the same entry-28 lockup; allocator guard
+  never fired, so it is not slot reuse either. It always follows "no ready head" at ~429.8 s (scripted moment).
+  Added a trace ("tcnyc: body N ...") of allocate / load service 0xDBA10 / set up 0x21BD50 / clear 0x21BFF0 /
+  release 0xDB860 on entries 28..39.
