@@ -141,12 +141,16 @@ void OpenMenu() {
     g_menu.output_height = app::Output().height;
     g_menu.repeater = {};
     g_open.store(true);
+    input::SetUiActive(true);
+    app::CaptureMouse(false); // the menu needs the pointer
 }
 
 void CloseMenu() {
     if (g_menu.dirty) app::Save();
     g_menu.open = false;
     g_open.store(false);
+    input::SetUiActive(false);
+    app::CaptureMouse(true);
 }
 
 void ApplyDisplayChanges() {

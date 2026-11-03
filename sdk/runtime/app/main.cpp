@@ -32,9 +32,50 @@ namespace app {
 namespace {
 
 HWND g_hwnd = nullptr;
-constexpr UINT kApplyDisplay = WM_APP + 1, kOpenWindow = WM_APP + 2;
+constexpr UINT kApplyDisplay = WM_APP + 1, kOpenWindow = WM_APP + 2, kCaptureMouse = WM_APP + 3;
 bool g_mode_changed = false;
 bool g_apply_posted = false;  // a display apply is waiting in the queue or running
+bool g_capture_wanted = true; // gameplay wants the pointer hidden and confined
+bool g_captured = false;
+bool g_cursor_hidden = false;
+
+void ShowPointer(bool show) {
+    if (show == !g_cursor_hidden) return;
+    if (show) {
+        while (ShowCursor(TRUE) < 0) {
+        }
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    } else {
+        while (ShowCursor(FALSE) >= 0) {
+        }
+        SetCursor(nullptr);
+    }
+    g_cursor_hidden = !show;
+}
+
+void ConfinePointer(HWND hwnd) {
+    RECT client{};
+    if (!GetClientRect(hwnd, &client)) return;
+    POINT top_left{client.left, client.top}, bottom_right{client.right, client.bottom};
+    ClientToScreen(hwnd, &top_left);
+    ClientToScreen(hwnd, &bottom_right);
+    const RECT clip{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
+    ClipCursor(&clip);
+}
+
+// acquire or release the pointer; `active` is the window's activation state
+void ApplyCapture(HWND hwnd, bool active) {
+    const bool capture = g_capture_wanted && active && IsWindowVisible(hwnd) && !IsIconic(hwnd);
+    if (capture) {
+        ConfinePointer(hwnd);
+        ShowPointer(false);
+        g_captured = true;
+    } else {
+        if (g_captured) ClipCursor(nullptr);
+        ShowPointer(true);
+        g_captured = false;
+    }
+}
 
 // crash dump in CrashDumps beside the exe
 LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
@@ -126,10 +167,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (intptr_t result = 0; kGame.message && kGame.message(hwnd, msg, wp, lp, &result)) return result;
     switch (msg) {
+        case WM_INPUT:
+            input::ReadMouse(reinterpret_cast<void*>(lp));
+            break;
         case WM_KEYDOWN:
             if (wp == VK_F3) DumpThreads();
             return 0;
+        case WM_SETCURSOR:
+            if (g_captured && LOWORD(lp) == HTCLIENT) {
+                SetCursor(nullptr);
+                return TRUE;
+            }
+            break;
+        case WM_SIZE:
+        case WM_MOVE:
+            if (g_captured) ConfinePointer(hwnd);
+            break;
+        case kCaptureMouse:
+            g_capture_wanted = wp != 0;
+            ApplyCapture(hwnd, GetForegroundWindow() == hwnd);
+            return 0;
         case WM_ACTIVATE:
+            ApplyCapture(hwnd, LOWORD(wp) != WA_INACTIVE);
             if (LOWORD(wp) == WA_INACTIVE) {
                 // a changed display mode steps aside for the desktop, minimized, and comes back on return; not while
                 // handing over to the next instance, which runs in the same mode
@@ -160,11 +219,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp) ApplyNow();
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
+            BringWindowToTop(hwnd);
+            SetActiveWindow(hwnd);
+            SetFocus(hwnd);
+            ApplyCapture(hwnd, GetForegroundWindow() == hwnd);
             return 0;
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
+            ClipCursor(nullptr);
+            ShowPointer(true);
             PostQuitMessage(0);
             return 0;
     }
@@ -196,6 +261,9 @@ std::recursive_mutex& UiLock() {
 
 void ApplyDisplay() { PostMessageW(g_hwnd, kApplyDisplay, 0, 0); }
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
+void CaptureMouse(bool capture) {
+    if (g_hwnd) PostMessageW(g_hwnd, kCaptureMouse, capture ? 1 : 0, 0);
+}
 
 namespace {
 
@@ -277,6 +345,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     } else if (!splash) {
         app::ApplyNow();
         ShowWindow(app::g_hwnd, SW_SHOW);
+        SetForegroundWindow(app::g_hwnd);
+        SetActiveWindow(app::g_hwnd);
+        SetFocus(app::g_hwnd);
+        app::ApplyCapture(app::g_hwnd, GetForegroundWindow() == app::g_hwnd);
     }
 
     IMGUI_CHECKVERSION();
@@ -286,6 +358,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     ImGui_ImplWin32_Init(app::g_hwnd);
 
+    input::RegisterMouse(app::Window());
     input::Init();
     if (app::kGame.window) app::kGame.window(app::g_hwnd);
     std::wstring hdd = app::Instance() > 1 ? L"hdd" + std::to_wstring(app::Instance()) : L"hdd";

@@ -16,7 +16,35 @@ measurements in `PERFORMANCE.md`, and the build, checks and diagnostics in `DEVE
 - The modified SDK is tracked in this repository under `sdk/`. `patches/xboxxberecomp-local.patch` is the same
   change set as a diff against upstream XboxXBERecomp `f7b13fd` (see `DEVELOPMENT.md`).
 - Ten regression checks (`scripts/run_checks.py`) cover the runtime fixes and the menu rules.
+- Mouse and keyboard play is supported: raw mouse aim on foot and in vehicles, rebindable
+  keyboard actions, digital WASD with normalized diagonals, and automatic Xbox/PlayStation/
+  keyboard-mouse prompts (see the 2026-11-03 mouse aim section).
 - Open: traffic variety after free roam (below), draw distance, HDR and ambient occlusion.
+
+## Mouse aim, keyboard movement and controller prompts (2026-11-03)
+
+- Mouse look is no longer folded into the right stick. `WM_INPUT` raw counts are applied directly
+  to the gameplay camera's yaw/pitch accumulators (`0x348B20` / `0x348A80`) at the PC
+  WidescreenFix scale (`fMouseSens 4.0 * RawInputMouse 1.0 / 1000 = 0.004 rad/count`), with the
+  game's invert-X/invert-Y options and the new `mouse_sensitivity_percent` /
+  `mouse_vertical_sensitivity_percent` settings.
+- Camera modes follow the PC enum: on foot `sub_000205A0` (modes 0/6/11) and `sub_00025910`
+  (mode 5), in vehicle `sub_00024040` (mode 13). On foot the PC pitch range is -89..+60 degrees;
+  in vehicle it is -89..+10. `sub_0001FD40` is the shared orientation builder for the vehicle
+  path and negates the pitch accumulator, so that path keeps its own sign and clamp. The look
+  controller's own pitch limits are widened only for the direct update and restored afterwards.
+- The vehicle path holds absolute yaw/pitch while the mouse is active and hands back to the
+  game's chase camera after 5 s without a sample, matching the PC fix. If the look controller
+  stops running, input falls back to the right stick after 250 ms.
+- The cursor is hidden and confined to the focused game window; it is released while the F10
+  Graphics menu owns the pointer and on focus loss.
+- Keyboard movement is digital full-speed WASD with normalized diagonals; a real controller keeps
+  its analog movement. Use, climb, reload and heavy attack are rebindable in `settings.toml`.
+- Inline controller glyphs switch automatically between Xbox, PlayStation and keyboard/mouse
+  styles; `Capture Controller Prompts.cmd` records the prompt atlases for checking.
+- The named-object/child-node table detaches both `[record+0xA8]` and `[child+0xC0]` at world
+  reset and table rebuild (`scene_nodes.cpp`), fixing the crash that followed the earlier mouse
+  work.
 
 ## Traffic variety and Copland (2026-11-03)
 

@@ -41,6 +41,14 @@ anisotropic filtering, MSAA, SMAA, V-Sync, frame limit and the FPS counter; the 
 ### Controller
 Supports Xbox, PlayStation and Switch controllers, with hot plugging and rumble.
 
+### Keyboard and mouse
+Mouse look uses raw input and applies the PC version's camera scale on foot and in vehicles. WASD
+is digital full-speed movement with normalized diagonals; use, climb, reload and heavy attack
+are rebindable in `settings.toml`. Mouse sensitivity and a separate vertical sensitivity are in
+the F10 Graphics menu. Inline controller glyphs switch automatically between Xbox, PlayStation
+and keyboard/mouse prompts. The cursor is confined to the game while focused and released for
+the F10 menu.
+
 - **Boot Splash** - Place a `splash.png` (or `.bmp`) beside the exe to display a splash screen at launch.
 
 ## System Requirements

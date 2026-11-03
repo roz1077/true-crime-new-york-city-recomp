@@ -38,6 +38,7 @@
 #include "../../third_party/smaa/SMAAShader.h"
 #include "../../third_party/smaa/SearchTex.h"
 #include "core/diag.h"
+#include "core/input.h"
 #include "core/log.h"
 #include "gpu/backend.h"
 #include "gpu/ext.h"
@@ -344,6 +345,7 @@ bool LatchCpuWrite(Target& t) {
 }
 
 struct Tex {
+    input::PromptStyle prompt_style = input::PromptStyle::Original;
     ComPtr<ID3D12Resource> res;
     TextureDesc d;
     DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
@@ -2039,6 +2041,162 @@ void D3D12Backend::UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std
     cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
 }
 
+// The game's inline button glyphs share a linear font atlas with regular text.
+bool IsPromptAtlas(const TextureDesc& d) {
+    return d.format == 0x1D && d.width == 128 && d.height == 448 && d.levels == 1 && !d.cube && d.depth == 1;
+}
+
+void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::PromptStyle style) {
+    auto pixel = [&](int x, int y) { return px.data() + y * pitch + x * 4; };
+    // Match the four colored glyphs before editing a texture with this layout.
+    const uint8_t colors[][3] = {{102, 238, 119}, {51, 153, 238}, {51, 51, 238}, {238, 102, 68}};
+    const int centers[] = {8, 26, 44, 62};
+    for (int i = 0; i < 4; ++i) {
+        if (!std::equal(std::begin(colors[i]), std::end(colors[i]), pixel(centers[i] - 6, 240))) return;
+    }
+    if (style == input::PromptStyle::KeyboardMouse) {
+        // Compact keycap labels fit the original glyph advance and UVs.
+        constexpr struct { char key; uint8_t rows[5]; } alphabet[] = {
+            {'A', {2, 5, 7, 5, 5}}, {'B', {6, 5, 6, 5, 6}}, {'C', {7, 4, 4, 4, 7}}, {'E', {7, 4, 6, 4, 7}}, {'F', {7, 4, 6, 4, 4}},
+            {'G', {7, 4, 5, 5, 7}}, {'L', {4, 4, 4, 4, 7}}, {'M', {5, 7, 7, 5, 5}},
+            {'P', {6, 5, 6, 4, 4}}, {'Q', {7, 5, 5, 7, 1}}, {'R', {6, 5, 6, 5, 5}},
+            {'S', {7, 4, 7, 1, 7}}, {'T', {7, 2, 2, 2, 2}},
+            {'D', {6, 5, 5, 5, 6}}, {'H', {5, 5, 7, 5, 5}}, {'I', {7, 2, 2, 2, 7}},
+            {'J', {1, 1, 1, 5, 7}}, {'K', {5, 5, 6, 5, 5}}, {'N', {5, 7, 7, 7, 5}},
+            {'O', {7, 5, 5, 5, 7}}, {'U', {5, 5, 5, 5, 7}}, {'V', {5, 5, 5, 5, 2}},
+            {'W', {5, 5, 7, 7, 5}}, {'X', {5, 5, 2, 5, 5}}, {'Y', {5, 5, 2, 2, 2}},
+            {'Z', {7, 1, 2, 4, 7}},
+        };
+        const struct { int x, y, w, h; char text[4]; } keys[] = {
+            {19, 234, 15, 14, {input::LetterKey(input::g_heavy_attack_key, 'F')}},
+            {37, 234, 15, 14, "Q"}, {55, 234, 15, 14, {input::LetterKey(input::g_reload_key, 'R')}},
+            {1, 279, 14, 15, {input::LetterKey(input::g_climb_key, 'E')}}, {37, 279, 13, 15, {input::LetterKey(input::g_use_key, 'G')}},
+            {101, 256, 13, 18, "RMB"}, {19, 279, 13, 18, "LMB"},
+            {101, 279, 22, 19, "TAB"}, {1, 301, 25, 20, "ESC"},
+            {53, 279, 26, 19, "C"}, {73, 233, 28, 19, "V"},
+        };
+        for (const auto& key : keys) {
+            for (int y = 0; y < key.h; ++y)
+                for (int x = 0; x < key.w; ++x)
+                    std::fill_n(pixel(key.x + x, key.y + y), 4, 0);
+            const int count = int(std::strlen(key.text));
+            const int left = key.x + (key.w - (4 * count - 1)) / 2;
+            const int top = key.y + (key.h - 10) / 2;
+            for (int i = 0; i < count; ++i) {
+                for (const auto& glyph : alphabet) {
+                    if (glyph.key != key.text[i]) continue;
+                    for (int y = 0; y < 10; ++y)
+                        for (int x = 0; x < 3; ++x)
+                            if (glyph.rows[y / 2] & (4 >> x))
+                                std::fill_n(pixel(left + 4 * i + x, top + y), 4, 255);
+                }
+            }
+        }
+        // Spacebar symbol centered inside the original A glyph's sampled area.
+        for (int y = 234; y <= 247; ++y) {
+            for (int x = 1; x <= 15; ++x) {
+                const bool bar = x >= 4 && x <= 12 && y >= 238 && y <= 243 &&
+                                 (y >= 242 || x == 4 || x == 12);
+                std::fill_n(pixel(x, y), 4, bar ? 255 : 0);
+            }
+        }
+        // The individual D-pad slots become keyboard arrows.
+        for (int direction = 0; direction < 4; ++direction) {
+            const int center = 9 + direction * 20;
+            for (int y = -8; y <= 9; ++y) {
+                for (int x = -8; x <= 8; ++x) {
+                    const bool vertical = direction < 2;
+                    const int along = vertical ? y : x;
+                    const int across = std::abs(vertical ? x : y);
+                    const int forward = direction % 2 == 0 ? -along : along;
+                    const bool arrow = (std::abs(along) <= 5 && across <= 1) ||
+                                       (forward >= 0 && forward <= 5 && std::abs(forward + across - 5) <= 1);
+                    std::fill_n(pixel(center + x, 264 + y), 4, arrow ? 255 : 0);
+                }
+            }
+        }
+        // Right-stick movement glyphs use a mouse outline in keyboard mode.
+        for (int center : {111}) {
+            for (int y = -7; y <= 8; ++y) {
+                for (int x = -7; x <= 7; ++x) {
+                    const int dx = std::abs(x);
+                    const bool outline = (dx == 4 && y >= -4 && y <= 4) ||
+                                         (dx <= 3 && (y == -5 || y == 5)) ||
+                                         (x == 0 && y >= -4 && y <= 0);
+                    std::fill_n(pixel(center + x, 241 + y), 4, outline ? 255 : 0);
+                }
+            }
+        }
+        // The menu legend uses the neutral D-pad glyph for directional selection.
+        for (int y = 256; y < 274; ++y) {
+            for (int x = 81; x < 98; ++x) {
+                const int dx = std::abs(x - 89);
+                const int dy = std::abs(y - 264);
+                const bool arrow = (dx <= 1 && dy <= 6) || (dy <= 1 && dx <= 6) ||
+                                   (dx >= 4 && dx + dy <= 7) || (dy >= 4 && dx + dy <= 7);
+                std::fill_n(pixel(x, y), 4, arrow ? 255 : 0);
+            }
+        }
+        return;
+    }
+    constexpr const char* glyphs[][9] = {
+        {"##.....##", "###...###", ".###.###.", "..#####..", "...###...", "..#####..", ".###.###.", "###...###", "##.....##"},
+        {"....#....", "...###...", "...#.#...", "..##.##..", "..#...#..", ".##...##.", ".#.....#.", "#########", "#########"},
+        {"..#####..", ".##...##.", "##.....##", "#.......#", "#.......#", "#.......#", "##.....##", ".##...##.", "..#####.."},
+        {"#########", "#########", "##.....##", "##.....##", "##.....##", "##.....##", "##.....##", "#########", "#########"},
+    };
+    constexpr uint8_t ink[][3] = {{255, 195, 162}, {183, 243, 125}, {157, 161, 255}, {255, 176, 240}};
+    if (style == input::PromptStyle::PlayStation) {
+        for (int i = 0; i < 4; ++i) {
+            for (int y = 234; y <= 247; ++y) {
+                for (int x = -7; x <= 7; ++x) {
+                    auto* p = pixel(centers[i] + x, y);
+                    const int dy = y - 240;
+                    const bool symbol = dy >= -4 && dy <= 4 && x >= -4 && x <= 4 &&
+                                        glyphs[i][dy + 4][x + 4] == '#';
+                    if (symbol) {
+                        std::copy_n(ink[i], 3, p);
+                        p[3] = 255;
+                    } else {
+                        std::fill_n(p, 3, 28);
+                    }
+                }
+            }
+        }
+
+    }
+    // Xbox White/Black are the left/right shoulders. The boxed L/R are triggers.
+    constexpr const char* letters[][7] = {
+        {"#..", "#..", "#..", "#..", "#..", "#..", "###"},
+        {"##.", "#.#", "#.#", "##.", "#.#", "#.#", "#.#"},
+    };
+    constexpr const char* suffixes[][7] = {
+        {".#.", "##.", ".#.", ".#.", ".#.", ".#.", "###"},
+        {"###", "..#", "..#", "###", "#..", "#..", "###"},
+        {"##.", "#.#", "#.#", "##.", "#.#", "#.#", "##."},
+        {"###", ".#.", ".#.", ".#.", ".#.", ".#.", ".#."},
+    };
+    constexpr struct { int x, y, w, h, side, trigger; } labels[] = {
+        {1, 279, 14, 15, 0, 0}, {37, 279, 13, 15, 1, 0},
+        {101, 256, 13, 18, 0, 1}, {19, 279, 13, 18, 1, 1},
+    };
+    const int suffix_offset = style == input::PromptStyle::Xbox ? 2 : 0;
+    for (const auto& label : labels) {
+        for (int y = 0; y < label.h; ++y) {
+            for (int x = 0; x < label.w; ++x) {
+                const int row = y - (label.h - 7) / 2;
+                const int column = x - (label.w - 7) / 2;
+                const bool in_text = row >= 0 && row < 7 && column >= 0 && column < 7;
+                const bool ink = in_text &&
+                                 (column < 3 ? letters[label.side][row][column] == '#' :
+                                  column > 3 && suffixes[suffix_offset + label.trigger][row][column - 4] == '#');
+                auto* p = pixel(label.x + x, label.y + y);
+                std::fill_n(p, 4, ink ? 255 : 0);
+            }
+        }
+    }
+}
+
 void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p,
                                  const uint32_t* colours, bool same) {
     D3D12_RESOURCE_STATES st = same ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_DEST;
@@ -2050,6 +2208,7 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
             uint32_t pitch;
             DecodeLevel(d, l, f, p, colours, px, pitch);
             if (ext_) ext_->Decoded(d, fi, f, l, px, pitch, tx.flags);
+            if (tx.prompt_style != input::PromptStyle::Original) ReplaceControllerGlyphs(px, pitch, tx.prompt_style);
             UploadTextureLevel(tx, f, l, px, pitch);
         }
     }
@@ -2103,7 +2262,8 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
     bool same = SameTexture(tx, d);
     if (!same && !CreateTexture(tx, d, fi, key)) return nullptr;
     // cheap change check once per frame: lock epochs plus a sample of the bytes
-    if (tx.frame != presents_ + 1 || !same || tx.palette != palette.hash) {
+    const auto prompt_style = IsPromptAtlas(d) ? input::ControllerPromptStyle() : input::PromptStyle::Original;
+    if (tx.frame != presents_ + 1 || !same || tx.palette != palette.hash || tx.prompt_style != prompt_style) {
         const uint32_t total = TotalSize(d);
         tx.frame = presents_ + 1;
         tx.palette = palette.hash;
@@ -2113,7 +2273,8 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
             PerfScope perf_sig{g_perf.sig};
             sig = MemSig(d.data, total) ^ DirtyEpoch(d.data) ^ palette.hash;
         }
-        if (sig != tx.sig || !same) {
+        if (sig != tx.sig || !same || tx.prompt_style != prompt_style) {
+            tx.prompt_style = prompt_style;
             PerfScope perf_up{g_perf.texup};
             g_perf.texups++;
             g_perf.texup_bytes += total;
