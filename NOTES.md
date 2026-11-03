@@ -21,6 +21,22 @@ measurements in `PERFORMANCE.md`, and the build, checks and diagnostics in `DEVE
   keyboard-mouse prompts (see the 2026-11-03 mouse aim section).
 - Open: traffic variety after free roam (below), draw distance, HDR and ambient occlusion.
 
+## Menu previews follow the centred UI (2026-11-03)
+
+- The character outfit (Street Flack) and car selection previews are 3D draws into a
+  sub-viewport of the main target: `358 216 244 264` in the locker and `260 170 380 271` in
+  the garage (640x480 guest frame). The surrounding 2D panel was squeezed into the centred
+  16:9 region on a wider frame, but the 3D pass kept its guest viewport, so the model drifted
+  to the right of its panel.
+- `D3D12Backend::UiSqueeze` now returns the centred-UI squeeze for a non-pretransformed draw
+  when the bound target is the main guest target and the viewport is smaller than the frame in
+  both dimensions. `SetViewportScissor` already applies that squeeze to the viewport and
+  scissor, so the preview and its 2D panel share the same transform. Full-screen 3D (gameplay
+  and menu backgrounds) stays unsqueezed, and the 256x256 preview textures keep their own
+  layout because they are composited through a squeezed 2D quad.
+- Verified with F3 captures of both menus (`captures/223700`, `captures/223707`) and the user
+  confirmed both previews are centred on the ultrawide display.
+
 ## Mouse aim, keyboard movement and controller prompts (2026-11-03)
 
 - Mouse look is no longer folded into the right stick. `WM_INPUT` raw counts are applied directly

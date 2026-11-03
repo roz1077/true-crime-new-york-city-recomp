@@ -586,7 +586,7 @@ private:
     void ExpandLines(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d);
     float TargetScale() const;   // host pixels per console pixel of the bound target, along x
     float TargetScaleY() const;  // and along y: less than TargetScale on a frame wider than the console's
-    float UiSqueeze(const Assembled& a, const DrawTextures& stages) const;
+    float UiSqueeze(const State& s, const Assembled& a, const DrawTextures& stages) const;
     float RenderTargetShift(const State& s, const DrawShaders& sh) const;
     void FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const;
     uint8_t* UploadVertexConstants(const State& s);
@@ -1848,13 +1848,23 @@ float D3D12Backend::TargetScaleY() const {
 // would stretch, so it is drawn at 16:9 in the middle. Draws that span the whole width are pictures (a texture:
 // movies, legal and loading screens), kept at 16:9 too, or passes, which still cover the frame: fades and letterbox
 // bars (no texture) and composites of the title's own targets (bloom, blur).
-float D3D12Backend::UiSqueeze(const Assembled& a, const DrawTextures& stages) const {
+float D3D12Backend::UiSqueeze(const State& s, const Assembled& a, const DrawTextures& stages) const {
     constexpr float kUiAspect = 16.0f / 9.0f;
-    if (!a.pretransformed || !bound_rt_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_) return 1;
+    if (!bound_rt_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_) return 1;
     if (bound_rt_->cpu && !bound_rt_->scene) return 1;  // over a CPU picture: the whole frame is shown at 16:9
     const float aspect = app::AspectRatio();
     if (aspect <= kUiAspect + 1e-3f) return 1;
     const float squeeze = kUiAspect / aspect;
+    if (!a.pretransformed) {
+        // A 3D draw into a sub-rectangle of the main target is a menu preview
+        // (locker, garage, character and car select), not the full-screen
+        // world. The panel around it is 2D and moves with the centred UI, so
+        // the preview has to move with it or it ends up off centre on a wider
+        // frame. Full-width and full-height viewports stay unsqueezed.
+        const bool preview = s.viewport.w > 0 && s.viewport.h > 0 && s.viewport.w < guest_w_ - 1 &&
+                             s.viewport.h < guest_h_ - 1;
+        return preview ? squeeze : 1.0f;
+    }
     // the horizontal extent of the positions (register 0), from the converted vertices or the stream
     float lo = 1e30f, hi = -1e30f;
     if (!a.vertices.empty()) {
@@ -3324,7 +3334,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     DrawConstants c{};
     c.tscale[0] = TargetScale();
     c.tscale[1] = TargetScaleY();
-    c.tscale[2] = UiSqueeze(a, stages);
+    c.tscale[2] = UiSqueeze(s, a, stages);
     if (bound_rt_ && !a.pretransformed) bound_rt_->scene = true;
     UploadConstants(s, sh, k, stages, size, c);
     if (ext_) binds_ = {};

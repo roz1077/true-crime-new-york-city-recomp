@@ -120,6 +120,13 @@ cot(fov / 2), and the matrix's x and y scales are k times `+0x08` and `+0x10` (0
 session (`XBE_TRACE_CAMERA=1`) showed k = 1.6 on foot, about 80 x 50 degrees, and 2.414 while aiming.
 Menus and previews pass constants (1.5556, 1.0) or use stack-local renderers.
 
+Menu previews that draw 3D into a sub-viewport of the main target belong to the 16:9 UI layer.
+`D3D12Backend::UiSqueeze` applies the same horizontal squeeze as the surrounding 2D panel when
+the bound target is the main guest target and the viewport is smaller than the frame in both
+directions; full-screen world draws and offscreen preview textures keep their own layout. The
+locker preview uses viewport `358 216 244 264` and the garage car preview `260 170 380 271` in
+the 640x480 guest frame.
+
 `src/game/camera.cpp` divides k by `fov_percent / 100` at the two gameplay sites only. The user first saw
 the view narrow as the value rose; k is a focal scale, not a width, and the hook now divides.
 
