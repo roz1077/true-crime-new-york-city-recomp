@@ -38,5 +38,7 @@ endif()
 # target name = GAME_EXE in build.bat, xbe = GAME_XBE
 add_xbe_image(TrueCrimeNYC default.xbe game.toml ${GAME_PARTITIONS} game)
 
-add_executable(TrueCrimeNYCLauncher WIN32 launcher/launcher.cpp)
-target_link_libraries(TrueCrimeNYCLauncher PRIVATE comdlg32 gdi32 user32)
+# Keep the SDK startup intact and invoke it after the launcher closes.
+set_property(SOURCE "${SDK}/runtime/app/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS wWinMain=RecompMain)
+target_sources(TrueCrimeNYC PRIVATE launcher/launcher.cpp)
+target_link_libraries(TrueCrimeNYC PRIVATE comdlg32 gdi32 user32)

@@ -20,9 +20,7 @@ try {
     $zip = [IO.Compression.ZipFile]::Open($temp, 'Create')
     try {
         $zip.CreateEntry('assets/') | Out-Null
-        foreach ($name in 'TrueCrimeNYC.exe', 'TrueCrimeNYCLauncher.exe') {
-            Add-ReleaseFile (Join-Path $BuildDir $name) $name
-        }
+        Add-ReleaseFile (Join-Path $BuildDir 'TrueCrimeNYC.exe') 'TrueCrimeNYC.exe'
         Add-ReleaseFile (Join-Path $root 'README.md') 'README.md'
         Add-ReleaseFile (Join-Path $SdkDir 'THIRD_PARTY.txt') 'THIRD_PARTY.txt'
 

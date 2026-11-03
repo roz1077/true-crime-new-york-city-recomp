@@ -12,6 +12,6 @@ rem the configure step writes where the SDK is
 if not exist "%OUT%\sdk_dir.txt" cmake --preset release >nul || exit /b 1
 if not exist "%OUT%\sdk_dir.txt" echo %OUT%\sdk_dir.txt was not written, update the SDK. && exit /b 1
 set /p SDK=<out\build\release\sdk_dir.txt
-cmake --build "%OUT%" --target TrueCrimeNYCLauncher || exit /b 1
+cmake --build "%OUT%" --target TrueCrimeNYC || exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\package-release.ps1" -BuildDir "%OUT%" -SdkDir "%SDK%" -RuntimeDir "%VCRUNTIME%"
 exit /b %errorlevel%

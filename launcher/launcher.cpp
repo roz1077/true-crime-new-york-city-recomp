@@ -1,4 +1,6 @@
+#ifndef UNICODE
 #define UNICODE
+#endif
 #include <windows.h>
 #include <commdlg.h>
 
@@ -12,18 +14,16 @@ int Error(const wchar_t* message) {
     return 1;
 }
 
-int Launch(const fs::path& source) {
+int InstallIso(const fs::path& source) {
+    if (source.empty()) return 0;
     std::vector<wchar_t> path(32768);
     const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
     if (!length || length == path.size()) return Error(L"Could not locate the launcher folder.");
     const auto folder = fs::path(path.data()).parent_path();
-    const auto game = folder / L"TrueCrimeNYC.exe";
+
     const auto assets = folder / L"assets";
 
     try {
-        if (!fs::is_regular_file(game)) return Error(L"Place the launcher beside TrueCrimeNYC.exe.");
-
-        const fs::path source(path.data());
         if (_wcsicmp(source.extension().c_str(), L".iso") != 0) return Error(L"Select an .iso file.");
 
         fs::create_directories(assets);
@@ -50,15 +50,6 @@ int Launch(const fs::path& source) {
             }
         }
 
-        STARTUPINFOW startup{};
-        startup.cb = sizeof(startup);
-        PROCESS_INFORMATION process{};
-        if (!CreateProcessW(game.c_str(), nullptr, nullptr, nullptr, FALSE, 0, nullptr,
-                            folder.c_str(), &startup, &process)) {
-            return Error(L"Windows could not start TrueCrimeNYC.exe.");
-        }
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
         return 0;
     } catch (const fs::filesystem_error&) {
         return Error(L"Could not access the selected ISO or the local assets folder.");
@@ -70,8 +61,9 @@ namespace {
 constexpr int kBrowse = 101;
 constexpr int kLaunch = 102;
 HWND isoField;
-HWND launchButton;
+
 fs::path selectedIso;
+bool launchRequested = false;
 
 void Browse(HWND window) {
     std::vector<wchar_t> path(32768);
@@ -86,7 +78,7 @@ void Browse(HWND window) {
     if (GetOpenFileNameW(&picker)) {
         selectedIso = path.data();
         SetWindowTextW(isoField, selectedIso.c_str());
-        EnableWindow(launchButton, TRUE);
+
     } else if (CommDlgExtendedError()) {
         Error(L"Could not open the ISO picker.");
     }
@@ -107,17 +99,20 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             isoField = AddControl(window, L"EDIT", L"", WS_BORDER | ES_READONLY | ES_AUTOHSCROLL,
                                   16, 44, 350, 25);
             AddControl(window, L"BUTTON", L"&Browse...", WS_TABSTOP, 376, 43, 80, 27, kBrowse);
-            AddControl(window, L"STATIC", L"Launch copies the ISO to assets if needed.", 0, 16, 84, 330, 20);
-            launchButton = AddControl(window, L"BUTTON", L"&Launch", WS_TABSTOP | WS_DISABLED,
+            AddControl(window, L"STATIC", L"Launch uses assets if no ISO is selected.", 0, 16, 84, 330, 20);
+            AddControl(window, L"BUTTON", L"&Launch", WS_TABSTOP,
                                       376, 79, 80, 29, kLaunch);
             return 0;
         case WM_COMMAND:
             if (LOWORD(wParam) == kBrowse) Browse(window);
-            if (LOWORD(wParam) == kLaunch && !selectedIso.empty()) {
+            if (LOWORD(wParam) == kLaunch) {
                 HCURSOR previous = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-                const int result = Launch(selectedIso);
+                const int result = InstallIso(selectedIso);
                 SetCursor(previous);
-                if (result == 0) DestroyWindow(window);
+                if (result == 0) {
+                    launchRequested = true;
+                    DestroyWindow(window);
+                }
             }
             return 0;
         case WM_DESTROY:
@@ -129,7 +124,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 
 }  // namespace
 
-int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
+extern "C" int WINAPI RecompMain(HINSTANCE, HINSTANCE, PWSTR, int);
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show) {
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
@@ -155,5 +152,5 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
             DispatchMessageW(&message);
         }
     }
-    return static_cast<int>(message.wParam);
+    return launchRequested ? RecompMain(instance, previous, args, show) : 0;
 }

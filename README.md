@@ -9,19 +9,11 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 
 ## Installation
 
-- Put your game files in the `assets` folder. This can be an ISO, or the extracted data files.
-- Run `TrueCrimeNYC.exe`. The first start compiles the game's code for your PC, this only happens once.
-- Recomp settings can be adjusted in `settings.toml` beside the exe.
+1. Extract the Windows release to a folder you can write to and open **TrueCrimeNYC.exe**.
+2. Click **Browse** and choose your own dumped original Xbox True Crime NYC ISO. Use the game release that matches the recomp.
+3. Click **Launch**. The game copies the ISO to the local `assets` folder, so allow enough space for one copy. The first start compiles the game code.
 
-### Launch from an Xbox ISO
-
-1. Extract the Windows release to a folder you can write to. Keep `TrueCrimeNYCLauncher.exe` beside `TrueCrimeNYC.exe`.
-2. Open `TrueCrimeNYCLauncher.exe` click **Browse**, and select your own dumped original Xbox True Crime NYC ISO. Use the game release that matches the recomp.
-3. Click **Launch**. The launcher copies the ISO into the local `assets` folder and starts the recomp. Allow enough free disk space for one copy. The first game start may take longer while it compiles the game code.
-
-For later sessions, open `TrueCrimeNYC.exe` directly or select the installed ISO in `assets` with the launcher. To switch dumps, move the previous ISO or extracted game files out of the local `assets` folder first.
-
-If you are building from source, run `cmake --build out/build/release --target TrueCrimeNYCLauncher` after configuring the release build. The launcher executable appears in `out/build/release`.
+If an ISO or extracted game files are already in `assets`, click **Launch** without browsing. To switch dumps, move the previous ISO or extracted files out of `assets` first. Recomp settings are stored in `settings.toml` beside the executable.
 
 ## Features
 
