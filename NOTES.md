@@ -27,11 +27,21 @@ measurements in `PERFORMANCE.md`, and the build, checks and diagnostics in `DEVE
   `.wma` files were opened and read, and the WMA decoder produced non-zero PCM, so neither the
   file nor the decoder was at fault.
 - The title's voice-over slots are mono **3D** `CDirectSoundStream`s. The host positional mixer
-  attenuated them to silence because a scripted voice has no useful world position. The same
-  PCM was already being submitted to the stream (`RMS 800..900` in the audio trace).
-- `DirectSoundCreateStream` now treats mono streams as non-positional: voice-over plays
-  centred, while buffers and stereo streams keep their 3D/mix behaviour. The radio still ducks
+  attenuated them to silence because the scripted voice never set a usable minimum distance.
+  The PCM was already being submitted to the stream (`RMS 800..900` in the audio trace).
+- The PC build uses FMOD 3.74, which attenuates a 3D sound by `minDistance / distance` and
+  plays it at full volume inside the minimum distance. The PC title also clamps the values it
+  passes to `FSOUND_3D_SetMinMaxDistance`: the minimum is lifted to at least `1.0` and the
+  maximum held near `1e9` (`tcnyc.exe` `0x64EDDC..0x64EE5A`). Without that clamp a stream with
+  `min = 0` computes `0 / distance`, which is the silence heard here.
+- `Attenuation` now applies the same PC clamp and `min / distance` law to **every** 3D voice,
+  buffer or stream, mono or stereo. The console-only DS3D rolloff curve
+  (`IDirectSoundBuffer_SetRolloffCurve`, a 7-point curve the Xbox build sets on the buffer)
+  has no PC equivalent and no longer changes the level. The radio still ducks
   `0.75 -> 0.19` during the line and returns to `0.75` afterwards.
+- The unmodified Xbox release leaves the scripted stream's minimum distance at 0, so the same
+  `min / distance` law silences the line there as well; the PC build's clamp is what keeps it
+  audible. This fixes that official-release bug on the port.
 - PC reference: `Data\NPCVO\INT_M4\M4_CarTalk_A.WMA` is bit-identical between the Xbox assets
   and the PC install; the PC `Cine` tracks are about 1 dB louder than the Xbox ones. The
   remaining level difference is mix/bus gain, not the asset. The temporary host-side

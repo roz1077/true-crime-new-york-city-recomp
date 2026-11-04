@@ -150,7 +150,6 @@ struct Voice {
     float volume = 1, headroom = 1;
     uint8_t nbins = 0, bin[8] = {};
     int32_t bin_mb[32] = {};  // by mix bin
-    std::vector<float> curve;  // rolloff
     bool is3d = false;
     uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
     float p[3] = {}, min_dist = 1, max_dist = 1e9f;
@@ -392,16 +391,21 @@ void ShareCentre(Place& at) {
     at.front *= 1 - 0.5f * both * both;
 }
 
-// distance attenuation, 1.0 inside the min distance: min / distance, or the voice's rolloff curve
+// FMOD 3, which the PC build uses, attenuates a 3D sound by min / distance and
+// plays it at full volume inside the minimum distance. The PC title clamps the
+// values it hands FMOD: the minimum is lifted to 1.0 and the maximum held near
+// 1e9, so a sound that never set a usable distance is not divided away. Use
+// that model for every 3D voice, buffer or stream, mono or stereo. The console's
+// DS3D rolloff curve has no PC equivalent, so it does not affect the level.
 float Attenuation(const Voice& v, float dist) {
-    if (dist <= v.min_dist) return 1;
-    if (v.curve.empty()) return v.min_dist / std::min(dist, v.max_dist);
-    if (v.max_dist <= v.min_dist) return 1;
-    // points spread evenly from min to max distance, 1.0 at min
-    float at = (std::min(dist, v.max_dist) - v.min_dist) / (v.max_dist - v.min_dist) * v.curve.size();
-    size_t i = std::min(size_t(at), v.curve.size() - 1);
-    float from = i ? v.curve[i - 1] : 1.0f;
-    return from + (v.curve[i] - from) * (at - i);
+    float min_dist = std::isfinite(v.min_dist) ? std::clamp(v.min_dist, 1.0f, 1e8f) : 1.0f;
+    float max_dist = std::isfinite(v.max_dist) ? std::clamp(v.max_dist, 9e8f, 1e9f) : 1e9f;
+    if (!(min_dist < max_dist)) {
+        min_dist = 1.0f;
+        max_dist = 2.0f;
+    }
+    if (!(dist > min_dist)) return 1.0f;
+    return min_dist / std::min(dist, max_dist);
 }
 
 Place Locate(const Voice& v) {
@@ -1085,10 +1089,10 @@ BUFFER(SetAllParameters, 3) {
     v.mode = R32(a[1] + 0x3C);
     return 0;
 }
-// (this, points, count, apply)
+// (this, points, count, apply): the PC build's FMOD has no rolloff curve, so
+// the level follows min / distance there; accept the call and ignore the points.
 BUFFER(SetRolloffCurve, 4) {
-    v.curve.clear();
-    for (uint32_t i = 0; a[1] && i < std::min<uint32_t>(a[2], 64); i++) v.curve.push_back(F32(R32(a[1] + i * 4)));
+    (void)v;
     return 0;
 }
 BUFFER(SetOutputBuffer, 2) { return 0; }  // the voice keeps its own mix bins
@@ -1120,10 +1124,7 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     v.callback = R32(desc + 12);
     v.context = R32(desc + 16);
     SetBins(v, R32(desc + 20));
-    // Mono streams are the title's voice-over channels. The host's positional
-    // mixer attenuates them to silence when the scripted voice has no useful
-    // world position; play them centred instead. Buffers keep their 3D sound.
-    v.is3d = (flags & 0x10) && !(v.stream && v.channels == 1);
+    v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
     v.headroom = DefaultHeadroom(flags);
     W32(a[1], obj);
     return 0;
