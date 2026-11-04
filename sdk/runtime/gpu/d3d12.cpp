@@ -201,10 +201,10 @@ float3 PcContrast(float3 c) {
     float l2 = pivot + (l - pivot) * 1.35;
     // After the Xbox gamma ramp the intro steps are already close to black. Lift that range while
     // anchoring black and the original contrast pivot. A square root has unbounded gain near
-    // black and turns dark reflections into visible streaks; this toe caps the lift at about 3x.
+    // black and turns dark reflections into visible streaks; this toe caps the lift at about 2x.
     if (l < pivot) {
         const float t = saturate(l / pivot);
-        const float k = 3.0;
+        const float k = 1.5936;  // k / (1 - exp(-k)) = 2
         l2 = pivot * (1.0 - exp(-k * t)) / (1.0 - exp(-k));
     }
     float over = max(l2 - 0.80, 0.0);
