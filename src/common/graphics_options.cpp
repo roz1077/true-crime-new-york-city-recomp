@@ -56,6 +56,7 @@ enum class Row {
     Anisotropic,
     Msaa,
     Smaa,
+    CityShadowFill,
     Bloom,
     DepthOfField,
     PcContrast,
@@ -77,6 +78,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::Anisotropic,
                          Row::Msaa,
                          Row::Smaa,
+                         Row::CityShadowFill,
                          Row::Bloom,
                          Row::DepthOfField,
                          Row::PcContrast,
@@ -180,6 +182,7 @@ void RestoreDefaults() {
     s.aniso = d.aniso;
     app::SetMsaaSamples(d.msaa);
     s.smaa = d.smaa;
+    s.city_shadow_fill = d.city_shadow_fill;
     s.bloom = d.bloom;
     s.dof = d.dof;
     s.pc_contrast = d.pc_contrast;
@@ -206,6 +209,7 @@ Kind KindOf(Row row) {
     case Row::Msaa:
         return Kind::Choice;
     case Row::Smaa:
+    case Row::CityShadowFill:
     case Row::Bloom:
     case Row::DepthOfField:
     case Row::PcContrast:
@@ -245,6 +249,8 @@ const char *Label(Row row) {
         return "MSAA";
     case Row::Smaa:
         return "SMAA";
+    case Row::CityShadowFill:
+        return "City shadow fill";
     case Row::Bloom:
         return "Bloom";
     case Row::DepthOfField:
@@ -313,13 +319,14 @@ const char *Help(Row row) {
         return "Smooths geometry edges. Higher counts require more GPU memory.";
     case Row::Smaa:
         return "Smooths jagged edges on the finished frame (SMAA 1x). The HUD is smoothed with it.";
+    case Row::CityShadowFill:
+        return "Lifts dark city walls while retaining the game's lights and shadows.";
     case Row::Bloom:
-        return "Adds the PC release's bright-pass bloom to the finished frame.";
+        return "Adds extra bright-pass bloom over the game's own lighting.";
     case Row::DepthOfField:
-        return "Blurs distant objects with the PC release's depth-driven distance blur.";
+        return "Adds distance blur to the finished 3D frame when MSAA is enabled.";
     case Row::PcContrast:
-        return "Matches the PC version's contrast on the finished frame: same average brightness with "
-               "deeper shadows and brighter highlights.";
+        return "Applies a PC-inspired contrast curve to the finished 3D frame.";
     case Row::VSync:
         return "Waits for the monitor's refresh before showing a frame, which prevents tearing.";
     case Row::FrameCap:
@@ -395,6 +402,8 @@ std::string Value(Row row) {
     }
     case Row::Smaa:
         return s.smaa ? "On" : "Off";
+    case Row::CityShadowFill:
+        return s.city_shadow_fill ? "On" : "Off";
     case Row::Bloom:
         return s.bloom ? "On" : "Off";
     case Row::DepthOfField:
@@ -494,6 +503,9 @@ void Activate(Row row) {
         switch (row) {
         case Row::Smaa:
             s.smaa = !s.smaa;
+            break;
+        case Row::CityShadowFill:
+            s.city_shadow_fill = !s.city_shadow_fill;
             break;
         case Row::Bloom:
             s.bloom = !s.bloom;

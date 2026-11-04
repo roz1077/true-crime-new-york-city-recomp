@@ -235,36 +235,78 @@ do not establish that the Options tab count originates in that state
 machine. No new executable or controller capture was needed for this
 finding.
 
-## City lighting and PC contrast (2026-11-04)
+## City lighting and presentation effects (2026-11-04)
 
-The final look came from disassembling the PC build's D3D8 vertex shaders, not from a global filter.
-The PC `SinglePrelit` shader adds the ambient constant directly; the Xbox guest city shaders instead
-multiply it by `vdef[4]`, which is `(0,0,0,1)` on these meshes, so the ambient was being zeroed. The
-Xbox city normals are also opposite the light directions, so the lamp dot products were negative and
-the walls received no direct light.
+The PC shader comparison led to
+two experiments: first replacing ambient and flipping normals, then applying a fixed light to
+opaque walls based on previously seen shader and texture IDs. The second experiment made
+shading depend on draw history and guest address reuse. The PC shaders establish how the PC
+release lights its assets. The Xbox shaders and captures are the reference for this port.
 
-`VertexHlsl` (sdk/runtime/gpu/d3d12.cpp) now corrects every prelit city shader:
+The Xbox soft-shadow and bloom passes use the game's own targets, sampling and blending.
+A trial high-resolution shadow option treated any 256x256 render target sampled on texture
+stage 2 as a shadow buffer. The city also samples projected road masks on that stage.
+The trial also resized only the colour surface, which could leave an incompatible depth
+attachment. The option was removed.
 
-- ambient `c186` is added directly instead of through `vdef[4]`
-- the normal is flipped so the lamps hit the facades
-- the gain is shadow-weighted: dark walls and stoops get up to about 2.2x, already-bright background
-  buildings get close to 1x, which keeps them from glowing
+PC contrast defaults on and applies after the Xbox gamma ramp, excluding movie and legal-screen
+frames. The original comparison used a 1.35 contrast slope around 0.114 luminance and a soft
+shoulder above 0.80. The original toe (0.5 * luminance + 0.004) darkened the intro staircase
+after the Xbox gamma ramp. Below the pivot the curve now uses a square-root lift anchored
+at black and 0.114. Extra bloom and distance blur are optional F10 effects and default off.
+Distance blur uses a full-size multisampled depth target from the current frame and clears its
+reference before target reuse or destruction. The blit always binds valid descriptors for its
+texture reads, including a null depth view when blur is disabled.
 
-The final-frame **PC contrast** pass is a toggle in the F10 Graphics menu (on by default; movies and
-legal screens keep their own look). It matches the PC release's tone: contrast 1.35 about 0.114
-with a soft shoulder and a shadow toe (`max(l2, l * 0.5 + 0.004)`). The toe keeps stairs and shadow
-detail visible instead of crushing them to black.
+A Windows release build and all ten regression checks passed. The 8x MSAA replay captured the
+city with the original wall shader (including vertex key `A7C64CECC5C46C51`) and exited cleanly.
+The captures in `out/lighting-before/lighting` and `out/lighting-replay/lighting` are guest-target
+captures before the final gamma and presentation effects. The isolated profile reached a save
+prompt, so these captures confirm shader selection but do not establish Xbox visual parity in
+the opening cutscene or free roam. The earlier `captures-intro5` and `shots/ps2-opening4` pairs
+remain historical references for the opening. See NOTES.md for the open Xbox light-balance
+comparison and the verified blend, retained-attribute and scissor fixes.
 
-**Bloom** is a single-pass bright-pass in the same presentation shader (`kBlitHlsl`): source texels
-above 0.90 are sampled in eight directions at an 8-texel radius, averaged, and added at 1.5x before
-the contrast pass. It approximates the PC release's half-resolution 4-pass bloom without extra render
-targets. The F10 Graphics menu has a **Bloom** toggle, on by default; movies and legal screens are
-excluded.
+### Precinct shadow fill
 
-Measured on the same doorway frame, the PC reference is mean 29.0 / std 25.0; the corrected Xbox
-frame with the contrast pass is mean 30.5 / std 24.9, with the 5th percentile lifted to about 5.
+The wall variants observed in the precinct exterior use a capped ambient fill after the
+guest diffuse calculation. The fill is weighted by the actual ambient mask, including streamed
+vertex attribute 4 on the facade and stair variants identified in capture 183857.
+It falls off with increasing vertex brightness and outside the ambient range observed in the
+exterior. It leaves diffuse alpha, fog, and the original light terms intact. The initial selection used captured program and declaration keys and required a textured, opaque,
+depth-writing draw on a full-size target. It does not learn from texture addresses or include the separate additive
+light passes. City shadow fill defaults on and can be switched live in F10.
 
-The earlier one-second-interval capture pair (captures-intro5, shots/ps2-opening4) remains the
-reference set. Xbox captures use BMP at the guest 640x480; PS2 captures use PPM at 3x the 640x448 guest
-resolution. Frames are matched by content score, not by timestamp, because the two runs start at
-different points in the cutscene.
+The first pass was too subtle in the live precinct test. Capture 183857 confirmed the fill ran
+on its three selected variants, while opaque draws around the entrance also used shader keys
+AB7F16AFF7B98886, 8BCD20F6A1BB8B05 and 4DFD3329F274D76B with a streamed ambient mask.
+
+The flicker pair (184219 and 184225) shows the same 504-vertex precinct frieze using texture
+8284B000 in both frames. Draw 1153 in the dark frame used key 71F35A5AB47530F9 without fill.
+Draw 1208 in the bright frame used key 8BCD20F6A1BB8B05 with fill. Both programs read the
+streamed ambient mask, and both now receive the same treatment for opaque wall draws.
+
+The second flicker pair (184519 and 184545) exposed two more variants in the dark frame.
+The 504-vertex frieze used FD91B234BC0B4FA9 and the surrounding stone used 7A05371AA7B57460.
+Both omitted the fill. Matching the captured texture contents across the precinct captures
+confirmed that the wall and frieze variants seen so far are now covered.
+
+The storefront pair (184802 and 184807) confirmed the same coverage gap beyond the precinct.
+For example, draws 0765 and 1148 use the same 738-vertex mesh and texture 82580180, with the
+fill in the first capture and without it in the second. The renderer now recognizes the
+prelit program family by the ambient mask multiply, normal and texture scale used by the
+translated shader. This check runs on shader generation and accepts both retained and streamed
+ambient masks across light-count variants. The existing opaque, depth-writing, full-size-target
+draw gate and the ambient range are still required.
+
+### W 47th St facade
+
+Capture 191443 shows the facade go from absent to flat-coloured between draws 875 and 900,
+while the billboard textures are already visible. The draws in that range bind real city textures
+and the capture dumps show their texel detail. A captured draw in the facade batch (0888) has
+guest constant c83.z = 3.32995e38. The city shader multiplies its input texture coordinates by
+that constant. The same value (0x7F7A8486) is in the mesh transform record at 0x65D31C in
+Brick_NYC.exm. The extracted file was compared byte for byte with the original Xbox ISO.
+The title copies the transform's scale to the constant through 0x245EF0 and 0x244C80.
+There is no evidence that the port dropped a texture or generated this UV scale.
+The exact appearance on Xbox hardware has not been compared for this camera position.

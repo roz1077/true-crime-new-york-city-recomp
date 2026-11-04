@@ -197,11 +197,11 @@ float3 DistanceBlur(float2 uv, float3 color) {
 float3 PcContrast(float3 c) {
     const float3 L = float3(0.2126, 0.7152, 0.0722);
     float l = dot(c, L);
-    // Match the PC version's tone: same average level as the Xbox frame, with its higher contrast.
-    float l2 = 0.114 + (l - 0.114) * 1.35;
-    // Do not crush the darkest values: stoops, stairs and shadow detail keep a floor instead of
-    // going to black. The toe leaves the PC contrast in the midtones and highlights intact.
-    l2 = max(l2, l * 0.5 + 0.004);
+    const float pivot = 0.114;
+    float l2 = pivot + (l - pivot) * 1.35;
+    // After the Xbox gamma ramp the intro steps are already close to black.
+    // Lift that range while anchoring black and the original contrast pivot.
+    if (l < pivot) l2 = pivot * sqrt(saturate(l / pivot));
     float over = max(l2 - 0.80, 0.0);
     l2 = l2 > 0.80 ? 0.80 + over / (1.0 + over * 2.0) : l2;
     l2 = saturate(l2);
@@ -538,8 +538,8 @@ struct DrawShaders {
     bool prog = false;  // a vertex program, else the fixed function pipeline
     bool quad = false;
     bool fixed_transform = false;  // fixed function on untransformed vertices: the shader reads matrices and lights
+    bool city_shadow_fill = false;  // ambient fill variant of an opaque city wall program
     bool sprite = false;           // a program's points drawn as point sprites (SpriteHlsl)
-    bool wall = false;             // a city-wall draw on a known wall texture, gets stable shading
     FixedKey fk;
     uint64_t vkey = 0;
     uint64_t vh = 0;
@@ -857,9 +857,6 @@ private:
     uint32_t cap_rt_ = 0;
     std::unordered_set<uint32_t> cap_seen_;
     std::unordered_set<uint64_t> cap_sh_;
-    // wall textures seen so far: any shader variant that draws one gets the stable wall shade,
-    // so a new city-wall variant does not need its own key
-    std::unordered_set<uint32_t> wall_textures_;
     struct CapTex {
         ComPtr<ID3D12Resource> res;
         DXGI_FORMAT fmt;
@@ -889,11 +886,9 @@ private:
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
     Target* draw_ds_ = nullptr;
     Target* scene_depth_ = nullptr;  // the last full-size 3D depth target, for distance blur
-    uint32_t scene_depth_data_ = 0;
     float scene_near_ = 0.1f, scene_far_ = 1000.0f;
     ID3D12Resource* dof_depth_ = nullptr;  // this frame's readable depth, set at present
     float dof_near_ = 0.1f, dof_far_ = 1000.0f;
-    bool dof_msaa_ = false;
     uint32_t guest_w_ = 640;
     uint32_t guest_h_ = 480;
     uint32_t bb_w_ = 0;
@@ -1206,6 +1201,7 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
 
 // a resized target gives back its view and its resources
 void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
+    if (scene_depth_ == &it->second) scene_depth_ = nullptr;
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) bound_rt_ = bound_ds_ = nullptr;
     (it->second.depth ? free_dsv_ : free_rtv_).push_back(it->second.view);
     CurrentFrame().garbage.push_back(it->second.res);
@@ -1562,8 +1558,9 @@ void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_AD
 }
 
 void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o) {
-    const uint32_t slots = o.depth ? 4 : 2;
-    uint32_t slot = AllocSrvSlots(slots);
+    // a single sampled resource cannot back a Texture2DMS view
+    ID3D12Resource* depth = o.depth && o.depth->GetDesc().SampleDesc.Count > 1 ? o.depth : nullptr;
+    uint32_t slot = AllocSrvSlots(4);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -1572,18 +1569,17 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     dev_->CreateShaderResourceView(src, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
     sv.Format = kBgra;
     dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
-    if (o.depth) {
-        sv = {};
-        sv.Format = kDepthRead;
-        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
-        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        dev_->CreateShaderResourceView(o.depth, &sv, Cpu(srv_heap_.Get(), slot + 3, srv_inc_));
-    }
+    dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot + 2, srv_inc_));
+    sv = {};
+    sv.Format = kDepthRead;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    dev_->CreateShaderResourceView(depth, &sv, Cpu(srv_heap_.Get(), slot + 3, srv_inc_));
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
     float c[16] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                    o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
-                   o.post, o.bloom, o.dof, 0.0f,
+                   o.post, o.bloom, depth ? o.dof : 0.0f, 0.0f,
                    o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z};
     std::memcpy(cb.cpu, c, sizeof(c));
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples), cb.gpu, slot, si);
@@ -2582,13 +2578,6 @@ constexpr uint64_t kPretransformedSalt = 0x5A5A;  // screen space fixed function
 constexpr uint64_t kQuadSalt = 0xC3C30000;        // the QuadHlsl variant, apart from the plain shader
 constexpr uint64_t kSpriteSalt = 0x3C3C0000;      // the SpriteSizeHlsl variant
 
-// Seed programs of the city-wall family. Seeing one marks its texture as a wall texture; from
-// then on any other wall variant that draws the same texture is shaded the same way.
-bool IsWallSeed(uint64_t vkey) {
-    return vkey == 0xC38A57E94581B919ull || vkey == 0xA7C64CECC5C46C51ull ||
-           vkey == 0x8F852580C00796AFull || vkey == 0x7A05371AA7B57460ull;
-}
-
 uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     uint64_t seed = sh.prog ? s.vs->hash ^ a.regs : Hash(&s.vs_handle, 4, a.regs | kDeclarationSalt);
     uint64_t vkey = Hash(&a.decode, 8, seed);
@@ -2597,6 +2586,33 @@ uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     if (sh.sprite) vkey ^= kSpriteSalt;
     if (!sh.prog) vkey = Hash(&sh.fk, sizeof(sh.fk), vkey);
     return vkey;
+}
+
+// Recognize the city's prelit material family in the translated program. The light count
+// and declaration vary, but the normal, ambient mask and texture scale use the same inputs.
+bool IsCityPrelitProgram(std::string_view source, bool streamed_mask) {
+    const std::string_view mask = streamed_mask ? "mac_mul(((i.v4)." : "mac_mul(((vdef[4]).";
+    for (const std::string_view swizzle : {std::string_view{"xyzz"}, std::string_view{"xyzw"}}) {
+        std::string ambient(mask);
+        ambient += swizzle;
+        ambient += "), ((c[186]).";
+        ambient += swizzle;
+        ambient += "))";
+        if (source.find(ambient) != std::string_view::npos) {
+            return (source.find("dot(((i.v1).xyzz).xyz,") != std::string_view::npos ||
+                    source.find("dot(((i.v1).xyzw).xyz,") != std::string_view::npos) &&
+                   source.find("mac_mul(((i.v2).xyzw), ((c[179]).zzxy))") != std::string_view::npos &&
+                   source.find("oD0.xyz = mr.xyz;") != std::string_view::npos;
+        }
+    }
+    return false;
+}
+
+bool IsOpaqueWallDraw(const State& s) {
+    if (s.ps || !s.textures[0] || !s.rs[kRsZEnable] || !SimpleState(s, kMZWriteEnable)) return false;
+    return !SimpleState(s, kMBlendEnable) ||
+           (SimpleState(s, kMSrcBlend) == 1 && SimpleState(s, kMDestBlend) == 0 &&
+            BlendOp(SimpleState(s, kMBlendOp)) == D3D12_BLEND_OP_ADD);
 }
 
 // a point sprite's program hands its point size to SpriteHlsl in tc3, whose coordinates the sprite makes
@@ -2614,30 +2630,25 @@ std::string SpriteSizeHlsl(std::string s) {
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
     if (sh.prog) {
         std::string src = VertexProgramHlsl(s.vs->program, a.regs, a.decode);
-        // Reference lighting: the prelit city wall shaders multiply the ambient constant by
-        // vdef[4], which is (0,0,0,1) for these meshes, so the ambient was lost. The PC build's
-        // SinglePrelit shader adds the ambient directly.
-        //
-        // The city also swaps these walls between a point-light and a directional-light program as
-        // the camera moves, and those programs' light directions are camera-relative. Reusing their
-        // lit result makes the whole facade pop on every swap. Instead shade the walls from the
-        // baked vertex colour plus the constant ambient, which is identical for both programs and
-        // does not depend on the camera. Characters, eyes and vegetation keep their own lighting.
-        static const bool no_wall_light = getenv("XBE_NO_WALL_LIGHT") != nullptr;
-        const bool city_wall = !no_wall_light && sh.wall && src.find("vdef[4]") != std::string::npos;
-        if (city_wall) {
-            static const std::string kOutput = "oD0.xyz = mr.xyz;";
-            static const std::string kStable =
-                "float3 city_n = -((i.v1).xyz); "
-                "float city_nl = length(city_n); "
-                "city_n = city_nl > 1e-5 ? city_n / city_nl : float3(0, 0, 1); "
-                "float city_ndl = saturate(dot(city_n, float3(0.10, -0.35, 0.93))); "
-                "float3 city_base = saturate(((c[186]).xyz) * 0.75 + city_ndl * 0.30); "
-                "float city_lum = dot(city_base, float3(0.2126, 0.7152, 0.0722)); "
-                "oD0.xyz = city_base * (1.0 + 0.8 * (1.0 - saturate(city_lum)));";
-            for (size_t at = src.find(kOutput); at != std::string::npos; at = src.find(kOutput, at)) {
-                src.replace(at, kOutput.size(), kStable);
-                at += kStable.size();
+        const bool streamed_mask = (a.regs & (1u << 4)) != 0;
+        if (sh.city_shadow_fill && IsCityPrelitProgram(src, streamed_mask)) {
+            constexpr std::string_view output = "o.d0 = saturate(oD0);";
+            const size_t at = src.find(output);
+            if (at != std::string::npos) {
+                // Some wall variants stream their ambient mask while others use the retained
+                // attribute. Preserve the material's mask contrast and the original light terms.
+                std::string fill = R"(
+    float3 wallAmbient = saturate(c[186].xyz);
+    float ambientLevel = max(wallAmbient.r, max(wallAmbient.g, wallAmbient.b));
+    float exteriorWeight = smoothstep(0.14, 0.19, ambientLevel) *
+                           (1.0 - smoothstep(0.35, 0.55, ambientLevel));
+    float3 wallMask = saturate()";
+                fill += streamed_mask ? "i.v4.xyz" : "vdef[4].xyz";
+                fill += R"();
+    float3 ambientFill = min(wallAmbient * 1.4 * (1.0 - 0.65 * wallMask), 0.27);
+    oD0.rgb += ambientFill * (1.0 - saturate(oD0.rgb)) * exteriorWeight;
+    )";
+                src.insert(at, fill);
             }
         }
         return sh.sprite ? SpriteSizeHlsl(std::move(src)) : src;
@@ -3458,18 +3469,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     DrawShaders sh = ClassifyShaders(s, a, count);
     if (sh.prog) EnsureProgramHash(s);
     sh.vkey = VertexKey(s, a, sh);
-    // learn the city-wall textures from the seed programs, then shade every variant that draws one.
-    // Only opaque surfaces: additive light glows reuse the wall program and keep their own colour.
-    const uint32_t wall_tex = s.textures[0];
-    const bool blend = SimpleState(s, kMBlendEnable) != 0;
-    const bool opaque = !blend || (SimpleState(s, kMSrcBlend) == 1 && SimpleState(s, kMDestBlend) == 0);
-    // dark ambient: the unlit night exterior. Indoors the title raises the ambient to fully light
-    // the room; leaving those draws alone keeps interior shading and brightness.
-    const float wall_amb = std::max(s.vsc[186][0], std::max(s.vsc[186][1], s.vsc[186][2]));
-    const bool dark = wall_amb < 0.5f;
-    if (sh.prog && wall_tex && opaque && dark && IsWallSeed(sh.vkey)) wall_textures_.insert(wall_tex);
-    sh.wall = sh.prog && wall_tex && opaque && dark && wall_textures_.count(wall_tex) != 0;
-    if (sh.wall) sh.vkey ^= 0x57A11000;  // a separate compiled shader for wall draws
+    sh.city_shadow_fill = sh.prog && app::Get().city_shadow_fill &&
+                          bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ &&
+                          IsOpaqueWallDraw(s);
+    if (sh.city_shadow_fill) sh.vkey ^= 0xED92F1CA356B0748ull;
     EnsureVertexShader(s, a, sh);
 
     // stage textures, then the pixel shader made for them
@@ -3499,14 +3502,17 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     c.tscale[1] = TargetScaleY();
     c.tscale[2] = UiSqueeze(s, a, stages);
     if (bound_rt_ && !a.pretransformed) bound_rt_->scene = true;
-    // the last full-size 3D depth target is the scene depth used by the distance blur
-    if (bound_rt_ && bound_ds_ && !a.pretransformed && bound_ds_->gw == bound_rt_->gw &&
-        bound_ds_->gh == bound_rt_->gh) {
-        scene_depth_ = bound_ds_;
-        scene_depth_data_ = bound_ds_->data;
-        dof_msaa_ = bound_ds_->res->GetDesc().SampleDesc.Count > 1;
+    // Distance blur only uses this frame's full-size, multisampled scene depth. The allocation can
+    // fall back to one sample, so check the resource, not the configured mode.
+    const bool depth_msaa = bound_ds_ && bound_ds_->res &&
+                            bound_ds_->res->GetDesc().SampleDesc.Count > 1;
+    if (app::Get().dof && depth_msaa && bound_rt_ && bound_ds_ && !a.pretransformed && k.zwrite &&
+        bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ &&
+        bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h &&
+        s.viewport.w == guest_w_ && s.viewport.h == guest_h_) {
         const WRange r = ProjectionWRange(s.transforms[kTsProjection].data());
         if (r.near_w > 0 && r.far_w > r.near_w) {
+            scene_depth_ = bound_ds_;
             scene_near_ = r.near_w;
             scene_far_ = r.far_w;
         }
@@ -3896,7 +3902,7 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     // CPU wrote (movies, legal screens) was made for 16:9 and is shown that way in the middle of a wider frame.
     float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
     if (t.cpu || t.scene) t.picture = t.cpu && !t.scene;  // a frame with neither shows what it showed
-    const bool picture = t.picture;                       // movies and legal screens keep their own look
+    const bool scene = t.scene && !t.picture;             // presentation effects are for 3D frames
     t.cpu = t.scene = false;                              // the surface starts its next frame
     if (t.picture && aspect > 16.0f / 9.0f) aspect = 16.0f / 9.0f;
     float w = float(bb_w_);
@@ -3909,9 +3915,9 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
     binds_ = {};
-    const float post = !picture && app::Get().pc_contrast ? 1.0f : 0.0f;
-    const float bloom = !picture && app::Get().bloom ? 1.0f : 0.0f;
-    const float dof = !picture && app::Get().dof && dof_depth_ ? 1.0f : 0.0f;
+    const float post = !t.picture && app::Get().pc_contrast ? 1.0f : 0.0f;
+    const float bloom = scene && app::Get().bloom ? 1.0f : 0.0f;
+    const float dof = scene && app::Get().dof && dof_depth_ ? 1.0f : 0.0f;
     if (aa) {  // ApplySmaa left it readable
         Blit(aa, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h),
                              .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_});
@@ -4231,8 +4237,9 @@ void D3D12Backend::Present(const Surface& front) {
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     dof_depth_ = nullptr;
-    if (t && app::Get().dof && dof_msaa_ && scene_depth_ && scene_depth_->data == scene_depth_data_ &&
-        scene_depth_->res) {
+    if (t && app::Get().dof && scene_depth_ && scene_depth_->res &&
+        scene_depth_->res->GetDesc().SampleDesc.Count > 1 &&
+        scene_depth_->w == t->w && scene_depth_->h == t->h) {
         dof_depth_ = scene_depth_->res.Get();
         Transition(dof_depth_, scene_depth_->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         dof_near_ = scene_near_;
@@ -4242,6 +4249,8 @@ void D3D12Backend::Present(const Surface& front) {
     ID3D12Resource* aa = t && app::Get().smaa ? ApplySmaa(*t) : nullptr;
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi, aa);
+    scene_depth_ = nullptr;
+    dof_depth_ = nullptr;
     Submit(false);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     DeliverReports();
@@ -4294,6 +4303,7 @@ void D3D12Backend::ApplySettings() {
     if (std::fabs(want - scale_) > 1e-4f || std::fabs(want_stretch - stretch_) > 1e-4f || want_msaa != msaa_ || remake) {
         Flush();
         for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
+        scene_depth_ = nullptr;
         targets_.clear();
         if (want_msaa != msaa_) LOGR("d3d12: live MSAA set to %u samples", want_msaa ? want_msaa : 1);
         msaa_ = want_msaa;

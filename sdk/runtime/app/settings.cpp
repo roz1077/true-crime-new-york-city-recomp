@@ -71,6 +71,7 @@ void Load() {
     const auto samples = t["msaa"].value_or(t["msaa"].value_or(false) ? 4u : 0u);
     SetMsaaSamples(samples == 2 || samples == 4 || samples == 8 ? samples : 0);
     s.smaa = t["smaa"].value_or(s.smaa);
+    s.city_shadow_fill = t["city_shadow_fill"].value_or(s.city_shadow_fill);
     s.bloom = t["bloom"].value_or(s.bloom);
     s.dof = t["dof"].value_or(s.dof);
     s.pc_contrast = t["pc_contrast"].value_or(s.pc_contrast);
@@ -102,6 +103,7 @@ toml::table Table() {
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"msaa", MsaaSamples()},
                   {"smaa", s.smaa},
+                  {"city_shadow_fill", s.city_shadow_fill},
                   {"bloom", s.bloom},
                   {"dof", s.dof},
                   {"pc_contrast", s.pc_contrast},
@@ -120,8 +122,39 @@ toml::table Table() {
 }  // namespace
 
 void Save() {
-    std::ofstream f(File());
-    f << Table() << "\n";
+    // Two menus can save at once, and a failed write must not leave the live file truncated.
+    static std::mutex save_lock;
+    std::lock_guard<std::mutex> guard(save_lock);
+    std::ostringstream out;
+    out << Table() << "\n";
+    const std::string text = out.str();
+    const std::filesystem::path path = File();
+    const std::filesystem::path temp = path.wstring() + L".tmp";
+    {
+        std::ofstream f(temp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            LOGE("Settings: could not open %s", temp.string().c_str());
+            return;
+        }
+        f.write(text.data(), std::streamsize(text.size()));
+        f.flush();
+        if (!f) {
+            LOGE("Settings: could not write %s", temp.string().c_str());
+            f.close();
+            DeleteFileW(temp.c_str());
+            return;
+        }
+        f.close();
+        if (f.fail()) {
+            LOGE("Settings: could not close %s", temp.string().c_str());
+            DeleteFileW(temp.c_str());
+            return;
+        }
+    }
+    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        LOGE("Settings: could not replace %s (error %lu)", path.string().c_str(), GetLastError());
+        DeleteFileW(temp.c_str());
+    }
 }
 
 void LogSettings() {
