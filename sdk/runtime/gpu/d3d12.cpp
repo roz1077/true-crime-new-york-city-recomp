@@ -1221,6 +1221,9 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator 
 // the host texture of a new target, at render scale or the extension's
 bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
     float sc = scale_;
+    t.want_samples = msaa_;
+    t.want_scale = scale_;
+    t.want_stretch = stretch_;
     if (ext_) ext_->MakeTarget(s, t.depth, t.gw, t.gh, sc, t.fmt);
     t.w = std::max(1u, uint32_t(std::lround(t.gw * sc * stretch_)));
     t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
@@ -1326,8 +1329,16 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     if (ext_ && !ext_->TargetKey(s, depth, alt)) return nullptr;
     TargetSlot slot = FindTargetSlot(s, depth, alt);
     UpdateTargetUsed(slot.data);
-    if (slot.sized) return &slot.it->second;
-    if (slot.it != targets_.end()) ReleaseTarget(slot.it);
+    if (slot.sized) {
+        Target& t = slot.it->second;
+        // Targets that are only sampled keep their contents across a settings change; one that is
+        // drawn into again is rebuilt when its MSAA/scale no longer match.
+        if (t.want_samples == msaa_ && t.want_scale == scale_ && t.want_stretch == stretch_)
+            return &t;
+        ReleaseTarget(slot.it);
+    } else if (slot.it != targets_.end()) {
+        ReleaseTarget(slot.it);
+    }
     Target t;
     t.depth = depth;
     t.gw = slot.gw;
@@ -4333,14 +4344,18 @@ void D3D12Backend::ApplySettings() {
     bool remake = ext_ && ext_->Settings();
     if (std::fabs(want - scale_) > 1e-4f || std::fabs(want_stretch - stretch_) > 1e-4f || want_msaa != msaa_ || remake) {
         Flush();
-        for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
         scene_depth_.clear();
-        targets_.clear();
+        if (remake) {
+            for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
+            targets_.clear();
+        }
         if (want_msaa != msaa_) LOGR("d3d12: live MSAA set to %u samples", want_msaa ? want_msaa : 1);
         msaa_ = want_msaa;
         scale_ = want;
         stretch_ = want_stretch;
         if (ext_) ext_->Reset(*this);
+        // Existing targets stay until they are next bound as render targets: a target the title
+        // only samples (the HUD's small icon buffers) must keep its contents across the change.
         bound_rt_ = bound_ds_ = nullptr;
     }
 }

@@ -25,6 +25,8 @@ struct Target {
     Microsoft::WRL::ComPtr<ID3D12Resource> res;
     bool depth = false;
     uint32_t gw = 0, gh = 0, w = 0, h = 0;
+    uint32_t want_samples = 0;                 // the MSAA count it was made with
+    float want_scale = 0, want_stretch = 0;    // the render scale it was made with
     uint32_t view = 0;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     uint32_t data = 0, bytes = 0;
