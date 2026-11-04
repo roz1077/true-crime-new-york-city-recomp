@@ -130,6 +130,10 @@ bool ReadKeyboardMouse(Pad& pad) {
 }
 
 void AddPad(SDL_JoystickID id) {
+    // XBE_NO_GAMEPADS=1: ignore controllers entirely, for keyboard/mouse only
+    // capture and comparison runs.
+    static const bool no_gamepads = std::getenv("XBE_NO_GAMEPADS") != nullptr;
+    if (no_gamepads) return;
     for (SDL_Gamepad* pad : g_pads)
         if (pad && SDL_GetGamepadID(pad) == id) return;
     SDL_Gamepad** slot = std::find(std::begin(g_pads), std::end(g_pads), nullptr);
