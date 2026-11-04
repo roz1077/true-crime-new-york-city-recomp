@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -96,6 +97,7 @@ struct Image {
         libraries.clear();
         tls = {};
         debug = false;
+        title_id = 0;
         if (file.size() < 0x180 || std::memcmp(file.data(), "XBEH", 4)) {
             error = "not an XBE";
             return false;
@@ -147,7 +149,8 @@ struct Image {
             s.vsize = U32(o + 8);
             s.raw = U32(o + 12);
             s.rsize = U32(o + 16);
-            if (s.rsize && (!InFile(s.raw, s.rsize) || uint64_t(s.va) + s.rsize > image_end || s.va < base)) {
+            if (!InFile(s.raw, s.rsize) ||
+                (s.rsize && (uint64_t(s.va) + s.rsize > image_end || s.va < base))) {
                 error = "section data is outside the image";
                 return false;
             }
@@ -198,18 +201,21 @@ struct Image {
         }
         if (tls_addr) {
             const int64_t o = Offset(tls_addr);
-            if (o >= 0 && InFile(uint64_t(o), 24)) {
-                tls.data_start = U32(uint64_t(o));
-                tls.data_end = U32(uint64_t(o) + 4);
-                tls.index_addr = U32(uint64_t(o) + 8);
-                tls.callbacks = U32(uint64_t(o) + 12);
-                tls.zero_fill = U32(uint64_t(o) + 16);
-                tls.characteristics = U32(uint64_t(o) + 20);
-                if (tls.data_start > tls.data_end || (tls.data_end && tls.data_end > image_end) ||
-                    (tls.index_addr && (tls.index_addr < base || tls.index_addr >= image_end))) {
-                    error = "TLS record is invalid";
-                    return false;
-                }
+            if (o < 0 || !InFile(uint64_t(o), 24) || uint64_t(tls_addr) + 24 > image_end ||
+                Offset(tls_addr + 23) != o + 23) {
+                error = "TLS record is outside the image";
+                return false;
+            }
+            tls.data_start = U32(uint64_t(o));
+            tls.data_end = U32(uint64_t(o) + 4);
+            tls.index_addr = U32(uint64_t(o) + 8);
+            tls.callbacks = U32(uint64_t(o) + 12);
+            tls.zero_fill = U32(uint64_t(o) + 16);
+            tls.characteristics = U32(uint64_t(o) + 20);
+            if (tls.data_start > tls.data_end || (tls.data_end && (tls.data_start < base || tls.data_end > image_end)) ||
+                (tls.index_addr && (tls.index_addr < base || tls.index_addr >= image_end))) {
+                error = "TLS record is invalid";
+                return false;
             }
         }
         return true;

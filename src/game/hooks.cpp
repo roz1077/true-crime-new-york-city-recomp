@@ -116,3 +116,26 @@ X86_FUNC(sub_0024C020) {
     }
     __imp__sub_0024C020(ctx, base);
 }
+
+// The HUD menu loader leaves menuscript.tag in guest memory at object + 8.
+// HUDTelephoneAnim starts at x = -64, but its 64-pixel icon is drawn with a
+// one-pixel inset. Move only the hidden keyframe so its right edge lands at 0.
+X86_EXTERN_FUNC(__imp__sub_00258EB0);
+X86_FUNC(sub_00258EB0) {
+    constexpr uint32_t kHudMenu = 0x363D50;
+    const uint32_t menu = ctx.ecx;
+    __imp__sub_00258EB0(ctx, base);
+    if (menu != kHudMenu) return;
+
+    constexpr uint32_t kPhoneTag = 0xFD8, kHiddenKey = 0x87C40;
+    const uint32_t data = X86_MEM32(menu + 8);
+    if (!data || uint64_t(data) + kHiddenKey + 12 > 0x100000000ull ||
+        !mem::IsCommitted(data + kPhoneTag) || !mem::IsCommitted(data + kHiddenKey) ||
+        !mem::IsCommitted(data + kHiddenKey + 11)) return;
+
+    if (X86_MEM32(data + kPhoneTag) == 0x4BBD4B3E &&  // HUDTelephoneAnim
+        X86_MEM32(data + kHiddenKey) == 0x8CDC1683 &&  // x
+        X86_MEM32(data + kHiddenKey + 4) == 0x10000 &&
+        X86_MEM32(data + kHiddenKey + 8) == uint32_t(-64))
+        X86_MEM32(data + kHiddenKey + 8) = uint32_t(-65);
+}

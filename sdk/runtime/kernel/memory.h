@@ -33,7 +33,7 @@ struct RegionInfo {
     uint32_t base, alloc_base, alloc_protect, size, state, protect, type;
 };
 bool QueryVirtual(uint32_t addr, RegionInfo& out);
-void ReserveImage(uint32_t base, uint32_t size);
+bool ReserveImage(uint32_t base, uint32_t size);
 
 uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint32_t align);
 void FreeContiguous(uint32_t va);

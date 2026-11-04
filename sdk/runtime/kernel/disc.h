@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <unordered_set>
 
 namespace kernel {
 
@@ -36,10 +37,12 @@ public:
 
 private:
     uint32_t ReadAt(uint64_t at, void* out, uint32_t len) const;
-    bool ReadDir(Entry& dir, int depth);
+    bool ReadDir(Entry& dir, int depth, uint64_t& budget, std::unordered_set<uint64_t>& active);
+    bool Contains(uint64_t offset, uint64_t size) const;
 
     intptr_t file_ = -1;  // HANDLE or fd
     std::filesystem::path path_;
+    uint64_t file_size_ = 0;
     uint64_t base_ = 0;  // the game partition
     uint64_t time_ = 0;
     Entry root_;

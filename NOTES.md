@@ -1081,3 +1081,12 @@ The actual cause was leaked file-object references (see "file-object references 
   never fired, so it is not slot reuse either. It always follows "no ready head" at ~429.8 s (scripted moment).
   Added a trace ("tcnyc: body N ...") of allocate / load service 0xDBA10 / set up 0x21BD50 / clear 0x21BFF0 /
   release 0xDB860 on entries 28..39.
+
+## 2026-11-04 · Review follow-up and HUD capture
+
+- Hardened XISO extraction with extent checks, path containment and exclusive temporary files. Runtime disc reads validate extents before allocation and bound directory traversal. XBE boot rejects invalid TLS records, bounds the import scan and checks guest image reservation before copying.
+- The launcher validates the selected ISO against the build's XBE fingerprint, copies on a cancellable worker and preserves existing images. The SDK patch was regenerated and passed a reverse-apply check.
+- CMake, the first-launch compiler and the developer relink helper publish DLL stamps containing the executable, XBE and DLL hashes. The runtime rejects missing or mismatched stamps. Older unstamped installations require a rebuild. The relink helper checks its cached partitions against the developer build.
+- Distance blur tracks multisampled depth per color target and carries the association through full-frame copies. Overwrites and target release invalidate the association. Camera FOV reads use the settings lock.
+- Capture `203445` identified the black line as the last pixel of the hidden phone HUD sprite (draw 0270). The title hook changes only the hidden X key from -64 to -65 in the loaded retail HUD data. Draw 0224 uses the original Fighting Style HUD slot texture for the FS icon. Its reported connection to a settings change remains unverified.
+- The release build, developer relink, native retail-disc parsing and all 12 regression checks passed. Isolated checks rejected missing or changed DLL stamps and confirmed the phone hook changes only the intended byte. The user's smoke test reached gameplay, switched to 4x MSAA with depth of field enabled and exited cleanly. Still to verify in-game are the phone fix, the FS trigger, MSAA Off with depth of field enabled, and a clean first launch with the D3D12 debug layer.

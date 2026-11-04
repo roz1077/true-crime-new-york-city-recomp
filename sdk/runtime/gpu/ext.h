@@ -30,8 +30,8 @@ struct Target {
     uint32_t data = 0, bytes = 0;
     uint64_t epoch = 0, sig = 0;  // last lock seen, guest memory as last matched
     bool drawn = false;           // the GPU wrote it since the last readback
-    // since it was last presented: the CPU wrote pixels; it was cleared or a 3D (not screen space) draw went to it
-    bool cpu = false, scene = false;
+    bool cpu = false;             // CPU pixels since the last presentation or overwrite
+    uint64_t scene_frame = ~0ull; // frame of the last clear or 3D draw
     // as last presented with either: CPU pixels and no clear or 3D, a picture (a movie frame, a legal screen), shown
     // at 16:9 on a wider frame
     bool picture = false;

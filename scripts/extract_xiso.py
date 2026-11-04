@@ -9,6 +9,7 @@ malformed image cannot write outside <out_dir> or make the extractor hang.
 import os
 import struct
 import sys
+import tempfile
 
 SECTOR = 2048
 MAGIC = b"MICROSOFT*XBOX*MEDIA"
@@ -134,9 +135,9 @@ def main():
             if is_dir:
                 if list_only:
                     continue
-                os.makedirs(dest, exist_ok=True)
                 if not within(root, os.path.realpath(dest)):
                     raise SystemExit(f"refusing to write outside {root}: {path!r}")
+                os.makedirs(dest, exist_ok=True)
                 continue
 
             total += size
@@ -144,16 +145,16 @@ def main():
                 print(f"{size:12d}  {path}")
                 continue
 
-            os.makedirs(parent, exist_ok=True)
             if not within(root, os.path.realpath(parent)):
                 raise SystemExit(f"refusing to write outside {root}: {path!r}")
+            os.makedirs(parent, exist_ok=True)
             if os.path.exists(dest) and not os.path.islink(dest) and os.path.getsize(dest) == size:
                 continue
 
             f.seek(base + start * SECTOR)
-            tmp = dest + ".part"
+            fd, tmp = tempfile.mkstemp(prefix=".extract-", dir=parent)
             try:
-                with open(tmp, "wb") as o:
+                with os.fdopen(fd, "wb") as o:
                     left = size
                     while left:
                         chunk = f.read(min(left, 1 << 22))

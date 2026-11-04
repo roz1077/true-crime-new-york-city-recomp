@@ -71,7 +71,10 @@ void AdjustProjection(X86Context &ctx, uint8_t *base, const char *which, bool ga
                  gameplay ? " (gameplay)" : "");
         }
     }
-    const uint32_t percent = game::choices::ClampFovPercent(game::g_fov_percent);
+    const uint32_t percent = [] {
+        app::SettingsLock lock;
+        return game::choices::ClampFovPercent(game::g_fov_percent);
+    }();
     if (!gameplay || percent == 100) return;
     const float scaled = k * 100.0f / float(percent);
     std::memcpy(base + arg, &scaled, 4); // the caller's pushed argument

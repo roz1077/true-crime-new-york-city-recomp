@@ -134,7 +134,11 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_link_libraries(${target}_code PRIVATE ${target})
     target_link_options(${target}_code PRIVATE -fuse-ld=lld -Wl,/noentry,/nodefaultlib,/opt:noicf
         -Wl,/def:${GEN}/exports.def)
-    # a stamp from an earlier build on the executable's first start would outrank this DLL
+    set(stamp_script ${XBE_SDK_DIR}/cmake/StampGameCode.cmake)
+    # The import library can remain identical after a host-only edit, but the stamp binds to the EXE.
+    set_property(TARGET ${target}_code APPEND PROPERTY LINK_DEPENDS "${stamp_script}" "$<TARGET_FILE:${target}>")
     add_custom_command(TARGET ${target}_code POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E rm -f ${XBE_COMPILER_DIR}/work/${target}/built.txt)
+        COMMAND ${CMAKE_COMMAND} "-DHOST=$<TARGET_FILE:${target}>" "-DXBE_SHA1=${xbe_sha1}"
+                "-DDLL=$<TARGET_FILE:${target}_code>" -P "${stamp_script}"
+        VERBATIM)
 endfunction()

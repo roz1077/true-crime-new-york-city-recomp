@@ -14,6 +14,7 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -87,6 +88,19 @@ bool Disc::Open(const std::filesystem::path& path, std::string& error) {
         error = "cannot open the file";
         return false;
     }
+#ifdef _WIN32
+    LARGE_INTEGER size{};
+    const bool sized = GetFileSizeEx(HANDLE(file_), &size) && size.QuadPart >= 0;
+    file_size_ = sized ? uint64_t(size.QuadPart) : 0;
+#else
+    struct stat info{};
+    const bool sized = fstat(int(file_), &info) == 0 && info.st_size >= 0;
+    file_size_ = sized ? uint64_t(info.st_size) : 0;
+#endif
+    if (!sized) {
+        error = "cannot read the image size";
+        return false;
+    }
     for (uint64_t base : kPartitions) {
         uint8_t volume[kSector];
         if (ReadAt(base + kVolume, volume, kSector) != kSector || std::memcmp(volume, kMagic, kMagicSize) != 0 ||
@@ -98,7 +112,9 @@ bool Disc::Open(const std::filesystem::path& path, std::string& error) {
         std::memcpy(&size, volume + 0x18, 4);
         std::memcpy(&time_, volume + 0x1C, 8);
         root_ = {{}, base + uint64_t(sector) * kSector, size, true, {}};
-        if (!ReadDir(root_, 0)) {
+        uint64_t budget = 64ull << 20;  // total directory bytes, including repeated tables
+        std::unordered_set<uint64_t> active;
+        if (!ReadDir(root_, 0, budget, active)) {
             error = "its folders cannot be read";
             return false;
         }
@@ -108,9 +124,15 @@ bool Disc::Open(const std::filesystem::path& path, std::string& error) {
     return false;
 }
 
-bool Disc::ReadDir(Entry& dir, int depth) {
+bool Disc::Contains(uint64_t offset, uint64_t size) const {
+    return offset <= file_size_ && size <= file_size_ - offset;
+}
+
+bool Disc::ReadDir(Entry& dir, int depth, uint64_t& budget, std::unordered_set<uint64_t>& active) {
     if (!dir.size) return true;
-    if (depth > 32 || dir.size > kMaxTable) return false;
+    if (depth > 32 || dir.size > kMaxTable || dir.size > budget || !Contains(dir.offset, dir.size) ||
+        !active.insert(dir.offset).second) return false;
+    budget -= dir.size;
     std::vector<uint8_t> table(dir.size);
     if (ReadAt(dir.offset, table.data(), dir.size) != dir.size) return false;
     std::vector<bool> seen(dir.size / 4 + 1);
@@ -131,13 +153,16 @@ bool Disc::ReadDir(Entry& dir, int depth) {
         if (at + kEntryHead + length > dir.size) continue;
         if (left) todo.push_back(uint32_t(left) * 4);
         if (right) todo.push_back(uint32_t(right) * 4);
+        const uint64_t offset = base_ + uint64_t(sector) * kSector;
+        if (size && !Contains(offset, size)) return false;
         dir.children.push_back({std::string(reinterpret_cast<const char*>(&table[at + kEntryHead]), length),
-                                base_ + uint64_t(sector) * kSector, size, (attributes & kFolder) != 0, {}});
+                                offset, size, (attributes & kFolder) != 0, {}});
     }
     std::sort(dir.children.begin(), dir.children.end(),
               [](const Entry& a, const Entry& b) { return Upper(a.name) < Upper(b.name); });
     for (Entry& child : dir.children)
-        if (child.dir && !ReadDir(child, depth + 1)) return false;
+        if (child.dir && !ReadDir(child, depth + 1, budget, active)) return false;
+    active.erase(dir.offset);
     return true;
 }
 
@@ -175,7 +200,7 @@ uint32_t Disc::Read(const Entry& file, uint64_t pos, void* out, uint32_t len) co
 
 bool Disc::Load(std::string_view path, std::vector<uint8_t>& out) const {
     const Entry* e = Find(path);
-    if (!e || e->dir) return false;
+    if (!e || e->dir || (e->size && !Contains(e->offset, e->size))) return false;
     out.resize(e->size);
     return Read(*e, 0, out.data(), e->size) == e->size;
 }

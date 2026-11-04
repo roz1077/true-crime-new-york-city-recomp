@@ -131,17 +131,6 @@ struct Target {
     std::string stamp;
 };
 
-// a DLL serves the executable it was linked against and the xbe it was translated from
-bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& stamp) {
-    WIN32_FILE_ATTRIBUTE_DATA exe{};
-    fs::path path = ExeDir() / (image.exe + L".exe");
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &exe)) return false;
-    uint64_t size = (uint64_t(exe.nFileSizeHigh) << 32) | exe.nFileSizeLow;
-    uint64_t time = (uint64_t(exe.ftLastWriteTime.dwHighDateTime) << 32) | exe.ftLastWriteTime.dwLowDateTime;
-    stamp = std::to_string(size) + " " + std::to_string(time) + " " + Sha1(xbe);
-    return true;
-}
-
 bool Sha1File(const fs::path& path, std::string& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
@@ -156,22 +145,15 @@ bool Sha1File(const fs::path& path, std::string& out) {
     return true;
 }
 
-// build.bat's DLL has no stamp: it is current when newer than the executable it was linked against
+// Stamp format shared with the CMake build and relink_game.py: host, XBE, DLL hashes.
+bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& stamp) {
+    if (!Sha1File(ExeDir() / (image.exe + L".exe"), stamp)) return false;
+    stamp += " " + Sha1(xbe);
+    return true;
+}
+
 bool Current(const Target& target) {
-    std::error_code ec;
-    fs::file_time_type built = fs::last_write_time(CodeDll(*target.image), ec);
-    if (ec) return false;
     std::ifstream f(StampFile(*target.image));
-    if (!f) {
-        if (!(built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec))) return false;
-        // Adopt a DLL built by build.bat: stamp its hash now, so later launches verify it too.
-        std::string hash;
-        if (Sha1File(CodeDll(*target.image), hash)) {
-            std::ofstream out(StampFile(*target.image), std::ios::binary | std::ios::trunc);
-            if (out) out << target.stamp << " " << hash << "\n";
-        }
-        return true;
-    }
     std::string line;
     if (!std::getline(f, line)) return false;
     const std::string prefix = target.stamp + " ";
@@ -328,7 +310,10 @@ bool Translate(std::vector<Target>& targets, Processes& run) {
     for (Target& target : targets) {
         fs::path work = WorkDir(*target.image);
         fs::path xbe = work / target.image->xbe;
-        std::ofstream(xbe, std::ios::binary).write(reinterpret_cast<const char*>(target.xbe.data()), target.xbe.size());
+        std::ofstream input(xbe, std::ios::binary);
+        input.write(reinterpret_cast<const char*>(target.xbe.data()), target.xbe.size());
+        input.close();
+        if (!input) return RecordFailure(L"Could not stage " + xbe.filename().wstring() + L" for translation.");
         std::wstring command = Quote(CompilerDir() / "xbe_recomp.exe") + L" " + Quote(target.image->config);
         command += L" " + Quote(xbe) + L" " + Quote(work) + L" --xdk " + Quote(CompilerDir() / "xdk");
         HANDLE process = run.Start(command, work);
@@ -437,21 +422,15 @@ bool Link(const Target& target, Processes& run) {
         fs::remove(staged, ec);
         return RecordFailure(L"Linking " + name + L" produced no file.");
     }
-    // Staged link, then the stamp: a stamp on its own never vouches for a half written DLL.
-    if (!MoveFileExW(staged.c_str(), dll.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const DWORD error = GetLastError();
-        fs::remove(staged, ec);
-        return RecordFailure(L"Publishing " + name + L" failed (error " + std::to_wstring(error) + L").");
-    }
     std::string hash;
-    if (!Sha1File(dll, hash)) {
-        DeleteFileW(dll.c_str());
+    if (!Sha1File(staged, hash)) {
+        DeleteFileW(staged.c_str());
         return RecordFailure(L"Could not verify " + name + L" after linking.");
     }
     {
         std::ofstream f(stamp_tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
-            DeleteFileW(dll.c_str());
+            DeleteFileW(staged.c_str());
             return RecordFailure(L"Could not write the build stamp for " + name + L".");
         }
         f << target.stamp << " " << hash << "\n";
@@ -459,20 +438,25 @@ bool Link(const Target& target, Processes& run) {
         if (!f) {
             f.close();
             DeleteFileW(stamp_tmp.c_str());
-            DeleteFileW(dll.c_str());
+            DeleteFileW(staged.c_str());
             return RecordFailure(L"Could not write the build stamp for " + name + L".");
         }
         f.close();
         if (f.fail()) {
             DeleteFileW(stamp_tmp.c_str());
-            DeleteFileW(dll.c_str());
+            DeleteFileW(staged.c_str());
             return RecordFailure(L"Could not close the build stamp for " + name + L".");
         }
+    }
+    if (!MoveFileExW(staged.c_str(), dll.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD error = GetLastError();
+        DeleteFileW(staged.c_str());
+        DeleteFileW(stamp_tmp.c_str());
+        return RecordFailure(L"Publishing " + name + L" failed (error " + std::to_wstring(error) + L").");
     }
     if (!MoveFileExW(stamp_tmp.c_str(), stamp.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         const DWORD error = GetLastError();
         DeleteFileW(stamp_tmp.c_str());
-        DeleteFileW(dll.c_str());
         return RecordFailure(L"Publishing the build stamp for " + name + L" failed (error " +
                              std::to_wstring(error) + L").");
     }
@@ -816,16 +800,28 @@ bool PrepareGameCode(const GameFiles& game) {
     // one build at a time: a second copy of the game started meanwhile waits for it, then finds the DLL current
     std::wstring mutex_name = std::wstring(kGame.name) + L"-GameCode";
     HANDLE lock = CreateMutexW(nullptr, FALSE, mutex_name.c_str());
-    WaitForSingleObject(lock, INFINITE);
+    const DWORD wait = lock ? WaitForSingleObject(lock, INFINITE) : WAIT_FAILED;
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+        if (lock) CloseHandle(lock);
+        MessageBoxW(nullptr, L"Could not acquire the game-code build lock.", kGame.title, MB_ICONERROR);
+        return false;
+    }
     std::vector<Image> images = Images();
     std::vector<Target> stale = StaleTargets(game, images);
     for (const Target& target : stale) LOGR("Game code: building %ls.dll", target.image->exe.c_str());
     bool built = stale.empty() || BuildWithWindow(stale);
+    bool loaded = false;
+    if (built) {
+        for (const Image& image : images) {
+            if (image.xbe != IMAGE_XBE) continue;
+            Target target{&image};
+            if (StampFor(image, game.xbe, target.stamp) && Current(target)) loaded = dispatch::Load(CodeDll(image));
+            break;
+        }
+    }
     ReleaseMutex(lock);
     CloseHandle(lock);
-    if (!built) return false;
-    for (const Image& image : images)
-        if (image.xbe == IMAGE_XBE && dispatch::Load(CodeDll(image))) return true;
+    if (!built || loaded) return loaded;
     MessageBoxW(nullptr, L"The game's code could not be loaded, see the log in the logs folder.", kGame.title,
                 MB_ICONERROR);
     return false;

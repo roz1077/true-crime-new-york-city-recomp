@@ -885,10 +885,12 @@ private:
     Target* bound_ds_ = nullptr;
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
     Target* draw_ds_ = nullptr;
-    Target* scene_depth_ = nullptr;  // the last full-size 3D depth target, for distance blur
-    Target* scene_rt_ = nullptr;     // the colour target that depth belongs to
-    app::Settings render_;           // coherent settings snapshot for this frame
-    float scene_near_ = 0.1f, scene_far_ = 1000.0f;
+    app::Settings render_;  // snapshot shared by draws and presentation of this frame
+    struct SceneDepth {
+        Target* target;
+        float near_z, far_z;
+    };
+    std::unordered_map<Target*, SceneDepth> scene_depth_;  // per colour target, cleared at present
     ID3D12Resource* dof_depth_ = nullptr;  // this frame's readable depth, set at present
     float dof_near_ = 0.1f, dof_far_ = 1000.0f;
     uint32_t guest_w_ = 640;
@@ -940,6 +942,7 @@ private:
 };
 
 bool D3D12Backend::Init(uint32_t width, uint32_t height) {
+    render_ = app::Snapshot();
     g_reversed_depth = true;
     guest_w_ = width;
     guest_h_ = height;
@@ -1203,8 +1206,10 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
 
 // a resized target gives back its view and its resources
 void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
-    if (scene_depth_ == &it->second) scene_depth_ = nullptr;
-    if (scene_rt_ == &it->second) scene_rt_ = nullptr;
+    if (it->second.depth)
+        std::erase_if(scene_depth_, [&](const auto& entry) { return entry.second.target == &it->second; });
+    else
+        scene_depth_.erase(&it->second);
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) bound_rt_ = bound_ds_ = nullptr;
     (it->second.depth ? free_dsv_ : free_rtv_).push_back(it->second.view);
     CurrentFrame().garbage.push_back(it->second.res);
@@ -1512,6 +1517,10 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
                              .samples = t.res->GetDesc().SampleDesc.Count});
     CurrentFrame().garbage.push_back(tex);
     t.cpu = true;
+    if (!over) {
+        t.scene_frame = ~0ull;
+        scene_depth_.erase(&t);
+    }
     t.epoch = DirtyEpoch(t.data);
     t.sig = MemSig(t.data, t.bytes);
 }
@@ -1957,7 +1966,7 @@ float D3D12Backend::TargetScaleY() const {
 float D3D12Backend::UiSqueeze(const State& s, const Assembled& a, const DrawTextures& stages) const {
     constexpr float kUiAspect = 16.0f / 9.0f;
     if (!bound_rt_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_) return 1;
-    if (bound_rt_->cpu && !bound_rt_->scene) return 1;  // over a CPU picture: the whole frame is shown at 16:9
+    if (bound_rt_->cpu && bound_rt_->scene_frame != frame_) return 1;  // over a CPU picture: the whole frame is shown at 16:9
     const float aspect = app::AspectRatio();
     if (aspect <= kUiAspect + 1e-3f) return 1;
     const float squeeze = kUiAspect / aspect;
@@ -3504,22 +3513,18 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     c.tscale[0] = TargetScale();
     c.tscale[1] = TargetScaleY();
     c.tscale[2] = UiSqueeze(s, a, stages);
-    if (bound_rt_ && !a.pretransformed) bound_rt_->scene = true;
+    if (bound_rt_ && !a.pretransformed) bound_rt_->scene_frame = frame_;
     // Distance blur only uses this frame's full-size, multisampled scene depth. The allocation can
     // fall back to one sample, so check the resource, not the configured mode.
     const bool depth_msaa = bound_ds_ && bound_ds_->res &&
                             bound_ds_->res->GetDesc().SampleDesc.Count > 1;
-    if (render_.dof && depth_msaa && bound_rt_ && bound_ds_ && !a.pretransformed && k.zwrite &&
+    if (render_.dof && depth_msaa && bound_rt_ && !a.pretransformed && k.zwrite &&
         bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ &&
         bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h &&
         s.viewport.w == guest_w_ && s.viewport.h == guest_h_) {
         const WRange r = ProjectionWRange(s.transforms[kTsProjection].data());
-        if (r.near_w > 0 && r.far_w > r.near_w) {
-            scene_depth_ = bound_ds_;
-            scene_rt_ = bound_rt_;
-            scene_near_ = r.near_w;
-            scene_far_ = r.far_w;
-        }
+        if (r.near_w > 0 && r.far_w > r.near_w)
+            scene_depth_.insert_or_assign(bound_rt_, SceneDepth{bound_ds_, r.near_w, r.far_w});
     }
     UploadConstants(s, sh, k, stages, size, c);
     if (ext_) binds_ = {};
@@ -3562,6 +3567,8 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         rs.push_back(ScaledRect(t, int(v.x), int(v.y), int(v.x + v.w), int(v.y + v.h)));
     }
     if (t.depth) {
+        if (c.flags & kClearZ)
+            std::erase_if(scene_depth_, [&](const auto& entry) { return entry.second.target == &t; });
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         D3D12_CLEAR_FLAGS cf = D3D12_CLEAR_FLAGS(((c.flags & kClearZ) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
                                                  ((c.flags & kClearStencil) ? D3D12_CLEAR_FLAG_STENCIL : 0));
@@ -3577,6 +3584,7 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         for (int i = 0; t.range != 1 && i < 3; i++) col[i] /= t.range;
         // D3DCLEAR_TARGET_R/G/B/A are bits 4 to 7, D3D12's write mask has the same order
         uint8_t mask = uint8_t((c.flags & kClearTarget) >> 4);
+        scene_depth_.erase(&t);
         if (mask == D3D12_COLOR_WRITE_ENABLE_ALL) {
             cl_->ClearRenderTargetView(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), col, UINT(rs.size()), rs.data());
         } else {
@@ -3584,7 +3592,7 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         }
     }
     t.drawn = true;
-    t.scene = true;
+    t.scene_frame = frame_;
 }
 
 // ClearChannels' pipeline for the target format and channel mask, kept in blit_psos_; null when it can't be made
@@ -3811,21 +3819,30 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
     Resolve(*src_t);
     Target* dst_t = EnsureTarget(dst, false);
     if (!dst_t || src_t == dst_t) return;
-    // A full-frame copy carries the scene classification, and a copied scene carries the depth
-    // association so the destination can still use the distance blur this frame.
-    if (!count) {
-        dst_t->scene = src_t->scene;
-        if (scene_rt_ == src_t && scene_depth_) scene_rt_ = dst_t;
-    }
     ID3D12Resource* copy_src = ResolveColor(*src_t);
     if (!copy_src) return;
     auto& copy_state = copy_src == src_t->res.Get() ? src_t->state : src_t->resolved_state;
     CopyList l{.count = count, .src_rects = src_rects, .dst_points = dst_points};
-    if (src_t->fmt != dst_t->fmt || dst_t->res->GetDesc().SampleDesc.Count > 1) {
+    if (src_t->fmt != dst_t->fmt || dst_t->res->GetDesc().SampleDesc.Count > 1)
         CopyByDraw(*src_t, copy_src, copy_state, *dst_t, l);
-        return;
+    else
+        CopyByRegion(*src_t, copy_src, copy_state, *dst_t, l);
+
+    scene_depth_.erase(dst_t);
+    bool full = !count || !src_rects;
+    if (count == 1 && src_rects) {
+        const auto r = ReadDrawnRect(src_rects, dst_points, 0);
+        full = r.x0 == 0 && r.y0 == 0 && r.dx == 0 && r.dy == 0 &&
+               r.x1 == float(src_t->gw) && r.y1 == float(src_t->gh);
     }
-    CopyByRegion(*src_t, copy_src, copy_state, *dst_t, l);
+    if (full && src_t->gw == dst_t->gw && src_t->gh == dst_t->gh) {
+        dst_t->scene_frame = src_t->scene_frame;
+        dst_t->cpu = src_t->cpu || src_t->picture;
+        if (auto depth = scene_depth_.find(src_t); depth != scene_depth_.end()) {
+            const SceneDepth source = depth->second;
+            scene_depth_.insert_or_assign(dst_t, source);
+        }
+    }
     if (cap_) {
         char name[32];
         snprintf(name, sizeof(name), "%04u_copy_%08X", cap_i_, dst_t->data);
@@ -3911,9 +3928,10 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     // at the aspect setting (by default the output's shape); 4:3 when the console reports a 4:3 TV. A picture the
     // CPU wrote (movies, legal screens) was made for 16:9 and is shown that way in the middle of a wider frame.
     float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
-    if (t.cpu || t.scene) t.picture = t.cpu && !t.scene;  // a frame with neither shows what it showed
-    const bool scene = t.scene && !t.picture;             // presentation effects are for 3D frames
-    t.cpu = t.scene = false;                              // the surface starts its next frame
+    const bool scene = t.scene_frame == frame_;
+    if (t.cpu || scene) t.picture = t.cpu && !scene;
+    t.cpu = false;
+    t.scene_frame = ~0ull;
     if (t.picture && aspect > 16.0f / 9.0f) aspect = 16.0f / 9.0f;
     float w = float(bb_w_);
     float h = float(bb_h_);
@@ -4234,7 +4252,6 @@ void LogPerf() {
 
 void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
-    render_ = app::Snapshot();  // one coherent copy for this frame
     if (cap_) {
         FinishCapture(front);
     } else if (g_capture.exchange(false) && CaptureOn()) {
@@ -4248,20 +4265,21 @@ void D3D12Backend::Present(const Surface& front) {
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     dof_depth_ = nullptr;
-    if (t && render_.dof && scene_depth_ && scene_rt_ == t && scene_depth_->res &&
-        scene_depth_->res->GetDesc().SampleDesc.Count > 1 &&
-        scene_depth_->w == t->w && scene_depth_->h == t->h) {
-        dof_depth_ = scene_depth_->res.Get();
-        Transition(dof_depth_, scene_depth_->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        dof_near_ = scene_near_;
-        dof_far_ = scene_far_;
+    const auto depth = scene_depth_.find(t);
+    if (t && render_.dof && depth != scene_depth_.end()) {
+        Target& ds = *depth->second.target;
+        if (ds.res && ds.res->GetDesc().SampleDesc.Count > 1 && ds.w == t->w && ds.h == t->h) {
+            dof_depth_ = ds.res.Get();
+            Transition(dof_depth_, ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            dof_near_ = depth->second.near_z;
+            dof_far_ = depth->second.far_z;
+        }
     }
 
     ID3D12Resource* aa = t && render_.smaa ? ApplySmaa(*t) : nullptr;
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi, aa);
-    scene_depth_ = nullptr;
-    scene_rt_ = nullptr;
+    scene_depth_.clear();
     dof_depth_ = nullptr;
     Submit(false);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
@@ -4280,6 +4298,7 @@ void D3D12Backend::Present(const Surface& front) {
     CountFps();
     if (diag::Perf()) LogPerf();
     ApplySettings();
+    render_ = app::Snapshot();
 }
 
 // the slot is not reused before the caller's wait: the title runs at most one present ahead
@@ -4315,7 +4334,7 @@ void D3D12Backend::ApplySettings() {
     if (std::fabs(want - scale_) > 1e-4f || std::fabs(want_stretch - stretch_) > 1e-4f || want_msaa != msaa_ || remake) {
         Flush();
         for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
-        scene_depth_ = nullptr;
+        scene_depth_.clear();
         targets_.clear();
         if (want_msaa != msaa_) LOGR("d3d12: live MSAA set to %u samples", want_msaa ? want_msaa : 1);
         msaa_ = want_msaa;

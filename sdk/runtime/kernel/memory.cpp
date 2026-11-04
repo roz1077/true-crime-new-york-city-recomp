@@ -230,15 +230,18 @@ static void EnsureRanges() {
     Commit(kKernelDataBase, kKernelDataSize);
 }
 
-void ReserveImage(uint32_t base, uint32_t size) {
+bool ReserveImage(uint32_t base, uint32_t size) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    const uint64_t end = (uint64_t(base) + size + 0xFFFF) & ~0xFFFFull;
+    if (!size || base < kUserLow || end > kUserHigh) return false;
     EnsureRanges();
-    uint32_t b = base & ~0xFFFFu;
-    uint32_t e = (base + size + 0xFFFF) & ~0xFFFFu;
+    const uint32_t b = base & ~0xFFFFu;
+    const uint32_t e = uint32_t(end);
+    if (!Commit(b, e - b)) return false;
     g_user.Remove(b, e - b);
     Reservation r{e - b, 4, std::vector<uint8_t>((e - b) / kPage, 1)};  // 4 is PAGE_READWRITE
     g_reserved[b] = std::move(r);
-    Commit(b, e - b);
+    return true;
 }
 
 static Reservation* FindReservation(uint32_t addr, uint32_t* start) {

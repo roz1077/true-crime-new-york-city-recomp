@@ -108,7 +108,17 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
         LOGE("boot: %s: image spans are invalid", xbe_name.c_str());
         return false;
     }
-    mem::ReserveImage(img.base, img.image_size);
+    uint64_t tls = 0;
+    if (img.tls_addr) tls = ((uint64_t(img.tls.data_end - img.tls.data_start) + img.tls.zero_fill + 15) & ~15ull) + 4;
+    const uint32_t stack = std::max<uint32_t>(img.stack_commit, 0x10000);
+    if (stack + tls + 0x1000 > mem::kStackSize - 0x10000) {
+        LOGE("boot: guest stack and TLS are too large");
+        return false;
+    }
+    if (!mem::ReserveImage(img.base, img.image_size)) {
+        LOGE("boot: %s: could not reserve the guest image", xbe_name.c_str());
+        return false;
+    }
     std::memcpy(g_base + img.base, img.file.data(), std::min<size_t>(img.header_size, img.file.size()));
     // XBE header 0x120 points at the section headers, 56 bytes each, +0x18 is the reference count that marks one loaded
     uint32_t sec_hdr = img.U32(0x120);
@@ -135,9 +145,13 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     dispatch::Init();
 
     uint32_t missing = 0;
-    for (uint32_t slot = img.kernel_thunk;; slot += 4) {
+    bool terminated = false;
+    for (uint32_t slot = img.kernel_thunk; uint64_t(slot) + 4 <= image_end; slot += 4) {
         uint32_t v = R32(slot);
-        if (!v) break;
+        if (!v) {
+            terminated = true;
+            break;
+        }
         uint32_t ord = v & 0x7FFFFFFF;  // high bit flags an import by ordinal
         uint32_t data = DataAddress(ord);
         W32(slot, data ? data : dispatch::KernelThunkAddress(ord));
@@ -145,6 +159,10 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
             LOGW("boot: kernel import %u (%s) has no implementation", ord, ExportName(ord));
             missing++;
         }
+    }
+    if (!terminated) {
+        LOGE("boot: unterminated kernel import table");
+        return false;
     }
     LOGI("boot: kernel imports resolved, %u missing", missing);
 
@@ -164,9 +182,7 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     }
     std::remove(PersistFile().c_str());
 
-    uint32_t tls = 0;
-    if (img.tls_addr) tls = ((img.tls.data_end - img.tls.data_start + img.tls.zero_fill + 15) & ~15u) + 4;
-    ThreadRef t = CreateThread(std::max<uint32_t>(img.stack_commit, 0x10000), tls, 0, img.entry, 0, false);
+    ThreadRef t = CreateThread(stack, uint32_t(tls), 0, img.entry, 0, false);
     StartThread(t);
     return true;
 }
