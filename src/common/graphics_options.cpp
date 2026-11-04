@@ -57,6 +57,7 @@ enum class Row {
     Msaa,
     Smaa,
     Bloom,
+    DepthOfField,
     PcContrast,
     VSync,
     FrameCap,
@@ -77,6 +78,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::Msaa,
                          Row::Smaa,
                          Row::Bloom,
+                         Row::DepthOfField,
                          Row::PcContrast,
                          Row::VSync,
                          Row::FrameCap,
@@ -179,6 +181,7 @@ void RestoreDefaults() {
     app::SetMsaaSamples(d.msaa);
     s.smaa = d.smaa;
     s.bloom = d.bloom;
+    s.dof = d.dof;
     s.pc_contrast = d.pc_contrast;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
@@ -204,6 +207,7 @@ Kind KindOf(Row row) {
         return Kind::Choice;
     case Row::Smaa:
     case Row::Bloom:
+    case Row::DepthOfField:
     case Row::PcContrast:
     case Row::VSync:
     case Row::ShowFps:
@@ -243,6 +247,8 @@ const char *Label(Row row) {
         return "SMAA";
     case Row::Bloom:
         return "Bloom";
+    case Row::DepthOfField:
+        return "Depth of field";
     case Row::PcContrast:
         return "PC contrast";
     case Row::VSync:
@@ -309,6 +315,8 @@ const char *Help(Row row) {
         return "Smooths jagged edges on the finished frame (SMAA 1x). The HUD is smoothed with it.";
     case Row::Bloom:
         return "Adds the PC release's bright-pass bloom to the finished frame.";
+    case Row::DepthOfField:
+        return "Blurs distant objects with the PC release's depth-driven distance blur.";
     case Row::PcContrast:
         return "Matches the PC version's contrast on the finished frame: same average brightness with "
                "deeper shadows and brighter highlights.";
@@ -389,6 +397,8 @@ std::string Value(Row row) {
         return s.smaa ? "On" : "Off";
     case Row::Bloom:
         return s.bloom ? "On" : "Off";
+    case Row::DepthOfField:
+        return s.dof ? "On" : "Off";
     case Row::PcContrast:
         return s.pc_contrast ? "On" : "Off";
     case Row::VSync:
@@ -487,6 +497,9 @@ void Activate(Row row) {
             break;
         case Row::Bloom:
             s.bloom = !s.bloom;
+            break;
+        case Row::DepthOfField:
+            s.dof = !s.dof;
             break;
         case Row::PcContrast:
             s.pc_contrast = !s.pc_contrast;

@@ -129,6 +129,7 @@ const char* kBlitHlsl = R"(
 cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
+Texture2DMS<float> depthTex : register(t3);
 SamplerState ls : register(s0);
 SamplerState ps : register(s1);
 struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
@@ -140,8 +141,19 @@ float3 ToGamma(float3 c) {
                   lut.Sample(ps, float2(c.b, 0.5)).b);
 }
 
-// A single-pass approximation of the PC release's bright-pass bloom. The source is the game's
-// finished frame, so only genuinely bright pixels contribute and the effect stays off walls.
+// A single-pass approximation of the PC release's bright-pass bloom. Each tap first averages a
+// small box, so thin chrome/specular edges are diluted before the threshold while lamps and neon
+// still pass.
+float3 BrightAt(float2 uv) {
+    float2 q = src.xy * 0.5;
+    float3 c = (img.SampleLevel(ls, uv + float2(-q.x, -q.y), 0).rgb +
+                img.SampleLevel(ls, uv + float2( q.x, -q.y), 0).rgb +
+                img.SampleLevel(ls, uv + float2(-q.x,  q.y), 0).rgb +
+                img.SampleLevel(ls, uv + float2( q.x,  q.y), 0).rgb) * 0.25;
+    c = ToGamma(c);
+    return max(c - 0.94, 0.0);
+}
+
 float3 Bloom(float2 uv) {
     static const float2 dirs[8] = {
         float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
@@ -150,13 +162,35 @@ float3 Bloom(float2 uv) {
     };
     float2 t = src.xy * 8.0;
     float3 b = 0;
-    [unroll] for (int k = 0; k < 8; k++) {
-        float3 s = ToGamma(img.SampleLevel(ls, uv + dirs[k] * t, 0).rgb);
-        b += max(s - 0.90, 0.0);
-    }
-    float3 c = ToGamma(img.SampleLevel(ls, uv, 0).rgb);
-    b += max(c - 0.90, 0.0);
+    [unroll] for (int k = 0; k < 8; k++) b += BrightAt(uv + dirs[k] * t);
+    b += BrightAt(uv);
     return b * (1.0 / 9.0);
+}
+
+// PC distance blur: 13-tap hex blur weighted by the linearised scene depth. The scene depth is
+// multisampled; sample 0 and undo the reversed depth before the PC linearisation.
+float3 DistanceBlur(float2 uv, float3 color) {
+    static const float2 hex[13] = {
+        float2(0, 0), float2(0.5, 0.8660), float2(-0.5, 0.8660), float2(-1, 0),
+        float2(-0.5, -0.8660), float2(0.5, -0.8660), float2(1, 0),
+        float2(1, 1.7320), float2(-1, 1.7320), float2(-2, 0),
+        float2(-1, -1.7320), float2(1, -1.7320), float2(2, 0)
+    };
+    uint w, h, samples;
+    depthTex.GetDimensions(w, h, samples);
+    uint2 p = uint2(saturate(uv) * float2(max(w, 1) - 1, max(h, 1) - 1));
+    float raw = 1.0 - depthTex.Load(p, 0);
+    float world = src.z * src.w / max(src.w - raw * (src.w - src.z), 1e-4);
+    float coef = saturate((world - 40.0) / (65.0 - 40.0));
+    if (coef <= 0.0) return color;
+    float3 sum = 0;
+    float count = 0;
+    [unroll] for (int i = 0; i < 13; i++) {
+        float wgt = exp(-dot(hex[i], hex[i]) * 0.5);
+        sum += img.SampleLevel(ls, uv + hex[i] * src.xy * coef, 0).rgb * wgt;
+        count += wgt;
+    }
+    return sum / count;
 }
 
 // Match the PC release's tone on the finished frame.
@@ -190,8 +224,9 @@ float4 psmain(O i) : SV_Target {
         for (int x = 0; x < n; x++) c += img.SampleLevel(ls, i.uv + px * ((float2(x, y) + 0.5) / n - 0.5), 0);
     c /= n * n;
     c.rgb *= opts.w;
+    if (post.z > 0) c.rgb = DistanceBlur(i.uv, c.rgb);
     c.rgb = ToGamma(c.rgb);
-    if (post.y > 0) c.rgb += Bloom(i.uv) * 1.5;
+    if (post.y > 0) c.rgb += Bloom(i.uv) * 1.2;
     if (post.x > 0) c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
     return float4(c.rgb, opts.y > 0 ? c.a : 1);
 }
@@ -450,6 +485,9 @@ struct BlitOptions {
     float post = 0;           // PC contrast strength, 0 off
     float bloom = 0;          // bright-pass bloom strength, 0 off
     float src_w = 0, src_h = 0;  // source size in texels, for the bloom radius
+    ID3D12Resource* depth = nullptr;  // scene depth for the distance blur
+    float dof = 0;            // distance blur strength, 0 off
+    float near_z = 0, far_z = 0;  // camera planes for the depth linearisation
 };
 
 // Shrink's settings past the source and the size
@@ -501,6 +539,7 @@ struct DrawShaders {
     bool quad = false;
     bool fixed_transform = false;  // fixed function on untransformed vertices: the shader reads matrices and lights
     bool sprite = false;           // a program's points drawn as point sprites (SpriteHlsl)
+    bool wall = false;             // a city-wall draw on a known wall texture, gets stable shading
     FixedKey fk;
     uint64_t vkey = 0;
     uint64_t vh = 0;
@@ -644,7 +683,7 @@ private:
     void FillTextureConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages, DrawConstants& c);
     void FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c);
     void CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
-                     const DrawTextures& stages);
+                     const DrawTextures& stages, uint64_t vkey);
     void CaptureTextures(const State& s, const DrawTextures& stages);
     void EndDrawCapture(const State& s, const Assembled& a, uint32_t count, const DrawConstants& c);
     void CaptureInputs(const State& s, const Assembled& a, const DrawConstants& c);
@@ -818,6 +857,9 @@ private:
     uint32_t cap_rt_ = 0;
     std::unordered_set<uint32_t> cap_seen_;
     std::unordered_set<uint64_t> cap_sh_;
+    // wall textures seen so far: any shader variant that draws one gets the stable wall shade,
+    // so a new city-wall variant does not need its own key
+    std::unordered_set<uint32_t> wall_textures_;
     struct CapTex {
         ComPtr<ID3D12Resource> res;
         DXGI_FORMAT fmt;
@@ -846,6 +888,12 @@ private:
     Target* bound_ds_ = nullptr;
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
     Target* draw_ds_ = nullptr;
+    Target* scene_depth_ = nullptr;  // the last full-size 3D depth target, for distance blur
+    uint32_t scene_depth_data_ = 0;
+    float scene_near_ = 0.1f, scene_far_ = 1000.0f;
+    ID3D12Resource* dof_depth_ = nullptr;  // this frame's readable depth, set at present
+    float dof_near_ = 0.1f, dof_far_ = 1000.0f;
+    bool dof_msaa_ = false;
     uint32_t guest_w_ = 640;
     uint32_t guest_h_ = 480;
     uint32_t bb_w_ = 0;
@@ -1514,7 +1562,8 @@ void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_AD
 }
 
 void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o) {
-    uint32_t slot = AllocSrvSlots(2);
+    const uint32_t slots = o.depth ? 4 : 2;
+    uint32_t slot = AllocSrvSlots(slots);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -1523,12 +1572,19 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     dev_->CreateShaderResourceView(src, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
     sv.Format = kBgra;
     dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
+    if (o.depth) {
+        sv = {};
+        sv.Format = kDepthRead;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        dev_->CreateShaderResourceView(o.depth, &sv, Cpu(srv_heap_.Get(), slot + 3, srv_inc_));
+    }
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
     float c[16] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                    o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
-                   o.post, o.bloom, 0.0f, 0.0f,
-                   o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, 0.0f, 0.0f};
+                   o.post, o.bloom, o.dof, 0.0f,
+                   o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z};
     std::memcpy(cb.cpu, c, sizeof(c));
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples), cb.gpu, slot, si);
 }
@@ -2526,6 +2582,13 @@ constexpr uint64_t kPretransformedSalt = 0x5A5A;  // screen space fixed function
 constexpr uint64_t kQuadSalt = 0xC3C30000;        // the QuadHlsl variant, apart from the plain shader
 constexpr uint64_t kSpriteSalt = 0x3C3C0000;      // the SpriteSizeHlsl variant
 
+// Seed programs of the city-wall family. Seeing one marks its texture as a wall texture; from
+// then on any other wall variant that draws the same texture is shaded the same way.
+bool IsWallSeed(uint64_t vkey) {
+    return vkey == 0xC38A57E94581B919ull || vkey == 0xA7C64CECC5C46C51ull ||
+           vkey == 0x8F852580C00796AFull || vkey == 0x7A05371AA7B57460ull;
+}
+
 uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     uint64_t seed = sh.prog ? s.vs->hash ^ a.regs : Hash(&s.vs_handle, 4, a.regs | kDeclarationSalt);
     uint64_t vkey = Hash(&a.decode, 8, seed);
@@ -2551,31 +2614,30 @@ std::string SpriteSizeHlsl(std::string s) {
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
     if (sh.prog) {
         std::string src = VertexProgramHlsl(s.vs->program, a.regs, a.decode);
-        // Reference lighting: the prelit city shaders multiply the ambient constant by vdef[4], which
-        // is (0,0,0,1) for these meshes, so the ambient is lost. The PC build's SinglePrelit shader
-        // adds the ambient constant directly; do the same for every shader in that family.
-        static const std::string kAmbient = "mac_mul(((vdef[4]).xyzz), ((c[186]).xyzz))";
-        const bool city_prelit = src.find(kAmbient) != std::string::npos;
-        for (size_t at = src.find(kAmbient); at != std::string::npos; at = src.find(kAmbient, at))
-            src.replace(at, kAmbient.size(), "((c[186]).xyzz)");
-        if (city_prelit) {
-            // The Xbox meshes hand these shaders normals opposite to the light directions, so the
-            // lamp dots are negative and the wall only gets ambient. Flip the normal for the whole
-            // prelit city family.
-            static const std::string kNormal = "((i.v1).xyzz)";
-            for (size_t at = src.find(kNormal); at != std::string::npos; at = src.find(kNormal, at)) {
-                src.replace(at, kNormal.size(), "(-((i.v1).xyzz))");
-                at += 16;
-            }
-            // Weight the gain by darkness: shadowed walls and stairs get the full lift, while
-            // already-bright background buildings get almost none, so they do not glow.
+        // Reference lighting: the prelit city wall shaders multiply the ambient constant by
+        // vdef[4], which is (0,0,0,1) for these meshes, so the ambient was lost. The PC build's
+        // SinglePrelit shader adds the ambient directly.
+        //
+        // The city also swaps these walls between a point-light and a directional-light program as
+        // the camera moves, and those programs' light directions are camera-relative. Reusing their
+        // lit result makes the whole facade pop on every swap. Instead shade the walls from the
+        // baked vertex colour plus the constant ambient, which is identical for both programs and
+        // does not depend on the camera. Characters, eyes and vegetation keep their own lighting.
+        static const bool no_wall_light = getenv("XBE_NO_WALL_LIGHT") != nullptr;
+        const bool city_wall = !no_wall_light && sh.wall && src.find("vdef[4]") != std::string::npos;
+        if (city_wall) {
             static const std::string kOutput = "oD0.xyz = mr.xyz;";
-            static const std::string kWeighted =
-                "float city_lum = dot(mr.xyz, float3(0.2126, 0.7152, 0.0722)); "
-                "oD0.xyz = mr.xyz * (1.0 + 1.7 * (1.0 - saturate(city_lum)));";
+            static const std::string kStable =
+                "float3 city_n = -((i.v1).xyz); "
+                "float city_nl = length(city_n); "
+                "city_n = city_nl > 1e-5 ? city_n / city_nl : float3(0, 0, 1); "
+                "float city_ndl = saturate(dot(city_n, float3(0.10, -0.35, 0.93))); "
+                "float3 city_base = saturate(((c[186]).xyz) * 0.75 + city_ndl * 0.30); "
+                "float city_lum = dot(city_base, float3(0.2126, 0.7152, 0.0722)); "
+                "oD0.xyz = city_base * (1.0 + 0.8 * (1.0 - saturate(city_lum)));";
             for (size_t at = src.find(kOutput); at != std::string::npos; at = src.find(kOutput, at)) {
-                src.replace(at, kOutput.size(), kWeighted);
-                at += kWeighted.size();
+                src.replace(at, kOutput.size(), kStable);
+                at += kStable.size();
             }
         }
         return sh.sprite ? SpriteSizeHlsl(std::move(src)) : src;
@@ -3040,11 +3102,12 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
 
 // the draw's line: its state, then its textures
 void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
-                               const DrawTextures& stages) {
+                               const DrawTextures& stages, uint64_t vkey) {
     fprintf(cap_,
-            "%04u draw rt %08X ds %08X prim %u count %u vs %08X ps %08X blend %u %X %X zen %u %X zwrite %u "
+            "%04u draw rt %08X ds %08X prim %u count %u vs %08X vk %016llX ps %08X blend %u %X %X zen %u %X zwrite %u "
             "zbias %d %.2f cull %u cw %X c0 %.3f %.3f %.3f %.3f",
-            cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
+            cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, (unsigned long long)vkey,
+            s.ps ? s.ps->handle : 0, k.blend,
             k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
             c.pc[0][2], c.pc[0][3]);
     if (k.sten)
@@ -3054,6 +3117,17 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
         fprintf(cap_, " vp %u %u %u %u sc %u %u %u %u %u", s.viewport.x, s.viewport.y, s.viewport.w, s.viewport.h,
                 s.scissor_count, s.scissors[0], s.scissors[1], s.scissors[2], s.scissors[3]);
     fprintf(cap_, " v3 %.3f %.3f %.3f %.3f zclip %g %g %u bcol %08X", s.vdef[3][0], s.vdef[3][1], s.vdef[3][2], s.vdef[3][3], s.zclip[0], s.zclip[1], s.zclip_on, SimpleState(s, kMBlendColor));
+    // the lighting constants the vertex programs read; a camera-dependent flip here explains walls that change brightness
+    fprintf(cap_, " amb %.4f %.4f %.4f L0 %.4f %.4f %.4f i0 %.4f i1 %.4f i2 %.4f L1 %.4f %.4f %.4f L2 %.4f %.4f %.4f"
+                   " mat %.4f %.4f %.4f spec %.4f %.4f %.4f pow %.4f",
+            s.vsc[186][0], s.vsc[186][1], s.vsc[186][2],
+            s.vsc[180][0], s.vsc[180][1], s.vsc[180][2],
+            s.vsc[181][0], s.vsc[183][0], s.vsc[185][0],
+            s.vsc[182][0], s.vsc[182][1], s.vsc[182][2],
+            s.vsc[184][0], s.vsc[184][1], s.vsc[184][2],
+            s.vsc[168][0], s.vsc[168][1], s.vsc[168][2],
+            s.vsc[187][0], s.vsc[187][1], s.vsc[187][2],
+            s.vsc[179][0]);
     if (SimpleState(s, kMAlphaTestEnable))
         fprintf(cap_, " atest func %.0f ref %.0f", c.misc[1], c.misc[0]);
     if (s.rs[kRsFogEnable])
@@ -3384,6 +3458,18 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     DrawShaders sh = ClassifyShaders(s, a, count);
     if (sh.prog) EnsureProgramHash(s);
     sh.vkey = VertexKey(s, a, sh);
+    // learn the city-wall textures from the seed programs, then shade every variant that draws one.
+    // Only opaque surfaces: additive light glows reuse the wall program and keep their own colour.
+    const uint32_t wall_tex = s.textures[0];
+    const bool blend = SimpleState(s, kMBlendEnable) != 0;
+    const bool opaque = !blend || (SimpleState(s, kMSrcBlend) == 1 && SimpleState(s, kMDestBlend) == 0);
+    // dark ambient: the unlit night exterior. Indoors the title raises the ambient to fully light
+    // the room; leaving those draws alone keeps interior shading and brightness.
+    const float wall_amb = std::max(s.vsc[186][0], std::max(s.vsc[186][1], s.vsc[186][2]));
+    const bool dark = wall_amb < 0.5f;
+    if (sh.prog && wall_tex && opaque && dark && IsWallSeed(sh.vkey)) wall_textures_.insert(wall_tex);
+    sh.wall = sh.prog && wall_tex && opaque && dark && wall_textures_.count(wall_tex) != 0;
+    if (sh.wall) sh.vkey ^= 0x57A11000;  // a separate compiled shader for wall draws
     EnsureVertexShader(s, a, sh);
 
     // stage textures, then the pixel shader made for them
@@ -3413,11 +3499,23 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     c.tscale[1] = TargetScaleY();
     c.tscale[2] = UiSqueeze(s, a, stages);
     if (bound_rt_ && !a.pretransformed) bound_rt_->scene = true;
+    // the last full-size 3D depth target is the scene depth used by the distance blur
+    if (bound_rt_ && bound_ds_ && !a.pretransformed && bound_ds_->gw == bound_rt_->gw &&
+        bound_ds_->gh == bound_rt_->gh) {
+        scene_depth_ = bound_ds_;
+        scene_depth_data_ = bound_ds_->data;
+        dof_msaa_ = bound_ds_->res->GetDesc().SampleDesc.Count > 1;
+        const WRange r = ProjectionWRange(s.transforms[kTsProjection].data());
+        if (r.near_w > 0 && r.far_w > r.near_w) {
+            scene_near_ = r.near_w;
+            scene_far_ = r.far_w;
+        }
+    }
     UploadConstants(s, sh, k, stages, size, c);
     if (ext_) binds_ = {};
 
     if (cap_) {
-        CaptureDraw(s, prim, count, k, c, stages);
+        CaptureDraw(s, prim, count, k, c, stages, sh.vkey);
         EndDrawCapture(s, a, count, c);
         CaptureShaders(s, a, sh, pk);
     }
@@ -3813,15 +3911,18 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     binds_ = {};
     const float post = !picture && app::Get().pc_contrast ? 1.0f : 0.0f;
     const float bloom = !picture && app::Get().bloom ? 1.0f : 0.0f;
+    const float dof = !picture && app::Get().dof && dof_depth_ ? 1.0f : 0.0f;
     if (aa) {  // ApplySmaa left it readable
-        Blit(aa, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h)});
+        Blit(aa, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h),
+                             .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_});
         return;
     }
     ID3D12Resource* color = ResolveColor(t);
     if (!color) return;
     auto& state = color == t.res.Get() ? t.state : t.resolved_state;
     Transition(color, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Blit(color, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h)});
+    Blit(color, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h),
+                            .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_});
 }
 
 void D3D12Backend::RenderUi() {
@@ -4128,6 +4229,15 @@ void D3D12Backend::Present(const Surface& front) {
     if (t) Resolve(*t);
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    dof_depth_ = nullptr;
+    if (t && app::Get().dof && dof_msaa_ && scene_depth_ && scene_depth_->data == scene_depth_data_ &&
+        scene_depth_->res) {
+        dof_depth_ = scene_depth_->res.Get();
+        Transition(dof_depth_, scene_depth_->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        dof_near_ = scene_near_;
+        dof_far_ = scene_far_;
+    }
 
     ID3D12Resource* aa = t && app::Get().smaa ? ApplySmaa(*t) : nullptr;
     uint32_t bi = swap_->GetCurrentBackBufferIndex();

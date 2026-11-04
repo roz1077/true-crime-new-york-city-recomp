@@ -72,6 +72,7 @@ void Load() {
     SetMsaaSamples(samples == 2 || samples == 4 || samples == 8 ? samples : 0);
     s.smaa = t["smaa"].value_or(s.smaa);
     s.bloom = t["bloom"].value_or(s.bloom);
+    s.dof = t["dof"].value_or(s.dof);
     s.pc_contrast = t["pc_contrast"].value_or(s.pc_contrast);
     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
@@ -102,6 +103,7 @@ toml::table Table() {
                   {"msaa", MsaaSamples()},
                   {"smaa", s.smaa},
                   {"bloom", s.bloom},
+                  {"dof", s.dof},
                   {"pc_contrast", s.pc_contrast},
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},

@@ -27,6 +27,7 @@ struct Settings {
     uint32_t msaa = 0;               // 0, 2, 4 or 8 samples
     bool smaa = false;               // SMAA 1x on the finished frame
     bool bloom = true;               // bright-pass bloom on the finished frame
+    bool dof = true;                 // distance blur on the finished frame
     bool pc_contrast = true;         // PC contrast curve on the finished frame
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
