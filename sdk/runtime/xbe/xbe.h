@@ -46,30 +46,39 @@ struct Image {
     std::vector<Library> libraries;
     Tls tls;
 
-    uint32_t U32(uint32_t off) const {
-        uint32_t v;
-        std::memcpy(&v, file.data() + off, 4);
+    bool InFile(uint64_t off, uint64_t len) const {
+        return off <= file.size() && len <= file.size() - off;
+    }
+
+    uint32_t U32(uint64_t off) const {
+        uint32_t v = 0;
+        if (InFile(off, 4)) std::memcpy(&v, file.data() + off, 4);
         return v;
     }
 
     // file offset for a virtual address, -1 if unmapped or in the zero filled tail
     int64_t Offset(uint32_t va) const {
-        if (va >= base && va < base + header_size) return va - base;
-        for (auto& s : sections)
-            if (va >= s.va && va < s.va + s.rsize) return int64_t(s.raw) + (va - s.va);
+        if (va >= base && uint64_t(va) - base < header_size && InFile(uint64_t(va) - base, 1))
+            return int64_t(uint64_t(va) - base);
+        for (auto& s : sections) {
+            if (va >= s.va && uint64_t(va) - s.va < s.rsize) {
+                const uint64_t o = uint64_t(s.raw) + (uint64_t(va) - s.va);
+                return InFile(o, 1) ? int64_t(o) : -1;
+            }
+        }
         return -1;
     }
 
     const Section* SectionAt(uint32_t va) const {
         for (auto& s : sections)
-            if (va >= s.va && va < s.va + s.vsize) return &s;
+            if (va >= s.va && uint64_t(va) - s.va < s.vsize) return &s;
         return nullptr;
     }
 
     bool Read32(uint32_t va, uint32_t& out) const {
         int64_t o = Offset(va);
-        if (o < 0 || o + 4 > int64_t(file.size())) return false;
-        out = U32(uint32_t(o));
+        if (o < 0 || !InFile(uint64_t(o), 4)) return false;
+        out = U32(uint64_t(o));
         return true;
     }
 
@@ -83,6 +92,10 @@ struct Image {
 
     bool Parse(std::vector<uint8_t> data, std::string& error) {
         file = std::move(data);
+        sections.clear();
+        libraries.clear();
+        tls = {};
+        debug = false;
         if (file.size() < 0x180 || std::memcmp(file.data(), "XBEH", 4)) {
             error = "not an XBE";
             return false;
@@ -98,7 +111,14 @@ struct Image {
         stack_commit = U32(0x130);
         heap_reserve = U32(0x134);
         heap_commit = U32(0x138);
-        auto inside = [&](uint32_t v) { return v >= base && v < base + image_size; };
+        // The image addresses are 32 bit and every span below is checked before it is read.
+        const uint64_t image_end = uint64_t(base) + image_size;
+        if (!base || header_size < 0x178 || header_size > file.size() || image_size < header_size ||
+            image_end > 0x100000000ull) {
+            error = "header sizes are invalid";
+            return false;
+        }
+        auto inside = [&](uint32_t v) { return v >= base && uint64_t(v) < image_end; };
         if (inside(ep ^ kRetailEntryKey) && inside(kt ^ kRetailThunkKey)) {
             entry = ep ^ kRetailEntryKey;
             kernel_thunk = kt ^ kRetailThunkKey;
@@ -110,39 +130,86 @@ struct Image {
             error = "entry point key not recognised";
             return false;
         }
+        if (nsec > 1024 || (nsec && sec_addr < base)) {
+            error = "section table is invalid";
+            return false;
+        }
+        const uint64_t sec_off = uint64_t(sec_addr) - base;
+        if (nsec && (!InFile(sec_off, uint64_t(nsec) * 56) || sec_off + uint64_t(nsec) * 56 > header_size)) {
+            error = "section table is outside the header";
+            return false;
+        }
         for (uint32_t i = 0; i < nsec; i++) {
-            uint32_t o = sec_addr - base + i * 56;
+            const uint64_t o = sec_off + uint64_t(i) * 56;
             Section s;
             s.flags = U32(o);
             s.va = U32(o + 4);
             s.vsize = U32(o + 8);
             s.raw = U32(o + 12);
             s.rsize = U32(o + 16);
+            if (s.rsize && (!InFile(s.raw, s.rsize) || uint64_t(s.va) + s.rsize > image_end || s.va < base)) {
+                error = "section data is outside the image";
+                return false;
+            }
+            if (s.vsize && (s.va < base || uint64_t(s.va) + s.vsize > image_end)) {
+                error = "section range is outside the image";
+                return false;
+            }
             uint32_t name = U32(o + 20);
-            if (name - base < header_size)
-                s.name = reinterpret_cast<const char*>(file.data() + (name - base));
-            sections.push_back(s);
+            if (name >= base) {
+                const uint64_t no = uint64_t(name) - base;
+                if (no < header_size && InFile(no, 1)) {
+                    const size_t max = size_t(std::min<uint64_t>(header_size - no, file.size() - no));
+                    size_t n = 0;
+                    while (n < max && file[size_t(no) + n]) ++n;
+                    if (n == max) {
+                        error = "section name is not terminated";
+                        return false;
+                    }
+                    s.name.assign(reinterpret_cast<const char*>(file.data() + no), n);
+                }
+            }
+            sections.push_back(std::move(s));
         }
         uint32_t nlib = U32(0x160), lib_addr = U32(0x164);
-        for (uint32_t i = 0; i < nlib && lib_addr; i++) {
-            uint32_t o = lib_addr - base + i * 16;
-            Library l;
-            char n[9] = {};
-            std::memcpy(n, file.data() + o, 8);
-            l.name = n;
-            std::memcpy(&l.major, file.data() + o + 8, 8);  // major, minor, build and flags, four uint16 in order
-            libraries.push_back(l);
+        if (nlib) {
+            if (nlib > 1024 || lib_addr < base) {
+                error = "library table is invalid";
+                return false;
+            }
+            const uint64_t lib_off = uint64_t(lib_addr) - base;
+            if (!InFile(lib_off, uint64_t(nlib) * 16)) {
+                error = "library table is outside the file";
+                return false;
+            }
+            for (uint32_t i = 0; i < nlib; i++) {
+                const uint64_t o = lib_off + uint64_t(i) * 16;
+                Library l;
+                char n[9] = {};
+                std::memcpy(n, file.data() + o, 8);
+                l.name = n;
+                std::memcpy(&l.major, file.data() + o + 8, 8);  // major, minor, build and flags, four uint16 in order
+                libraries.push_back(l);
+            }
         }
-        if (cert - base + 12 <= file.size()) title_id = U32(cert - base + 8);  // certificate +8 is the title id
+        if (cert >= base) {
+            const uint64_t co = uint64_t(cert) - base;
+            if (InFile(co, 12)) title_id = U32(co + 8);  // certificate +8 is the title id
+        }
         if (tls_addr) {
-            int64_t o = Offset(tls_addr);
-            if (o >= 0) {
-                tls.data_start = U32(uint32_t(o));
-                tls.data_end = U32(uint32_t(o) + 4);
-                tls.index_addr = U32(uint32_t(o) + 8);
-                tls.callbacks = U32(uint32_t(o) + 12);
-                tls.zero_fill = U32(uint32_t(o) + 16);
-                tls.characteristics = U32(uint32_t(o) + 20);
+            const int64_t o = Offset(tls_addr);
+            if (o >= 0 && InFile(uint64_t(o), 24)) {
+                tls.data_start = U32(uint64_t(o));
+                tls.data_end = U32(uint64_t(o) + 4);
+                tls.index_addr = U32(uint64_t(o) + 8);
+                tls.callbacks = U32(uint64_t(o) + 12);
+                tls.zero_fill = U32(uint64_t(o) + 16);
+                tls.characteristics = U32(uint64_t(o) + 20);
+                if (tls.data_start > tls.data_end || (tls.data_end && tls.data_end > image_end) ||
+                    (tls.index_addr && (tls.index_addr < base || tls.index_addr >= image_end))) {
+                    error = "TLS record is invalid";
+                    return false;
+                }
             }
         }
         return true;

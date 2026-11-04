@@ -37,19 +37,33 @@ std::string Normalize(std::string p) {
     return out;
 }
 
-// host lookup that ignores case on file systems that do not
+// true when p is root or below it, both already resolved
+bool Within(const fs::path& root, const fs::path& p) {
+    const fs::path rel = p.lexically_relative(root);
+    if (rel.empty() || rel.is_absolute()) return false;
+    return rel == "." || *rel.begin() != "..";
+}
+
+// host lookup that ignores case on file systems that do not. Guest names are untrusted: '..' never
+// climbs above the mapped device, and the resolved host path must stay inside it even through a
+// symlink or junction.
 fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts) {
     fs::path cur = dir;
+    size_t depth = 0;
     for (auto& part : parts) {
         if (part.empty() || part == ".") continue;
         if (part == "..") {
-            cur = cur.parent_path();
+            if (depth) {
+                cur = cur.parent_path();
+                --depth;
+            }
             continue;
         }
         fs::path direct = cur / part;
         std::error_code ec;
         if (fs::exists(direct, ec)) {
             cur = direct;
+            ++depth;
             continue;
         }
         bool found = false;
@@ -62,8 +76,17 @@ fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts) {
             }
         }
         if (!found) cur = direct;
+        ++depth;
     }
-    return cur;
+    std::error_code ec;
+    const fs::path root = fs::weakly_canonical(dir, ec);
+    if (ec) return {};
+    const fs::path resolved = fs::weakly_canonical(cur, ec);
+    if (ec || !Within(root, resolved)) {
+        LOGW("files: refusing path outside %s: %s", dir.string().c_str(), cur.string().c_str());
+        return {};
+    }
+    return resolved;
 }
 
 struct File : Object {

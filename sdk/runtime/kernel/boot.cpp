@@ -103,13 +103,29 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     LOGI("boot: title %08X, entry %08X, %zu sections", img.title_id, img.entry, img.sections.size());
     for (auto& l : img.libraries) LOGI("boot: library %-8s %u.%u.%u", l.name.c_str(), l.major, l.minor, l.build);
 
+    if (!img.image_size || img.header_size > img.file.size() ||
+        uint64_t(img.base) + img.image_size > 0x100000000ull) {
+        LOGE("boot: %s: image spans are invalid", xbe_name.c_str());
+        return false;
+    }
     mem::ReserveImage(img.base, img.image_size);
     std::memcpy(g_base + img.base, img.file.data(), std::min<size_t>(img.header_size, img.file.size()));
     // XBE header 0x120 points at the section headers, 56 bytes each, +0x18 is the reference count that marks one loaded
     uint32_t sec_hdr = img.U32(0x120);
+    const uint64_t image_end = uint64_t(img.base) + img.image_size;
+    if (!img.sections.empty() &&
+        (sec_hdr < img.base || uint64_t(sec_hdr) - img.base + img.sections.size() * 56 > img.header_size)) {
+        LOGE("boot: %s: section header table is outside the header", xbe_name.c_str());
+        return false;
+    }
     for (size_t i = 0; i < img.sections.size(); i++) {
         auto& s = img.sections[i];
         if (!(s.flags & xbe::kPreload)) continue;
+        if (s.va < img.base || uint64_t(s.raw) + s.rsize > img.file.size() ||
+            uint64_t(s.va) + s.rsize > image_end || uint64_t(s.va) + s.vsize > image_end) {
+            LOGE("boot: %s: section %zu lies outside the image", xbe_name.c_str(), i);
+            return false;
+        }
         std::memcpy(g_base + s.va, img.file.data() + s.raw, std::min(s.rsize, s.vsize));
         W32(sec_hdr + uint32_t(i) * 56 + 0x18, 1);
     }
