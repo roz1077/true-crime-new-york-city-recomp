@@ -117,7 +117,7 @@ index e1c1254..6ac056d 100644
  
  }  // namespace app
 diff --git a/runtime/app/game_code.cpp b/runtime/app/game_code.cpp
-index 0582ed9..e296b89 100644
+index 0582ed9..908a458 100644
 --- a/runtime/app/game_code.cpp
 +++ b/runtime/app/game_code.cpp
 @@ -112,7 +112,8 @@ std::vector<Image> Images() {
@@ -130,7 +130,7 @@ index 0582ed9..e296b89 100644
  std::wstring Quote(const fs::path& path) { return L"\"" + path.wstring() + L"\""; }
  fs::path CompileLog() { return ExeDir() / "logs" / "compile.log"; }
  
-@@ -141,6 +142,20 @@ bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string&
+@@ -141,15 +142,42 @@ bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string&
      return true;
  }
  
@@ -151,9 +151,20 @@ index 0582ed9..e296b89 100644
  // build.bat's DLL has no stamp: it is current when newer than the executable it was linked against
  bool Current(const Target& target) {
      std::error_code ec;
-@@ -149,7 +164,11 @@ bool Current(const Target& target) {
+     fs::file_time_type built = fs::last_write_time(CodeDll(*target.image), ec);
+     if (ec) return false;
      std::ifstream f(StampFile(*target.image));
-     if (!f) return built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec);
+-    if (!f) return built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec);
++    if (!f) {
++        if (!(built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec))) return false;
++        // Adopt a DLL built by build.bat: stamp its hash now, so later launches verify it too.
++        std::string hash;
++        if (Sha1File(CodeDll(*target.image), hash)) {
++            std::ofstream out(StampFile(*target.image), std::ios::binary | std::ios::trunc);
++            if (out) out << target.stamp << " " << hash << "\n";
++        }
++        return true;
++    }
      std::string line;
 -    return std::getline(f, line) && line == target.stamp;
 +    if (!std::getline(f, line)) return false;
@@ -164,7 +175,7 @@ index 0582ed9..e296b89 100644
  }
  
  // an image's xbe from the game in assets: the extracted file, else the mounted disc image
-@@ -384,19 +403,70 @@ bool Compile(std::vector<Job>& jobs, Processes& run) {
+@@ -384,19 +412,70 @@ bool Compile(std::vector<Job>& jobs, Processes& run) {
  bool Link(const Target& target, Processes& run) {
      const Image& image = *target.image;
      fs::path work = WorkDir(image);

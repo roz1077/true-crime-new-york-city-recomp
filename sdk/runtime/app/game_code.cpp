@@ -162,7 +162,16 @@ bool Current(const Target& target) {
     fs::file_time_type built = fs::last_write_time(CodeDll(*target.image), ec);
     if (ec) return false;
     std::ifstream f(StampFile(*target.image));
-    if (!f) return built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec);
+    if (!f) {
+        if (!(built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec))) return false;
+        // Adopt a DLL built by build.bat: stamp its hash now, so later launches verify it too.
+        std::string hash;
+        if (Sha1File(CodeDll(*target.image), hash)) {
+            std::ofstream out(StampFile(*target.image), std::ios::binary | std::ios::trunc);
+            if (out) out << target.stamp << " " << hash << "\n";
+        }
+        return true;
+    }
     std::string line;
     if (!std::getline(f, line)) return false;
     const std::string prefix = target.stamp + " ";
