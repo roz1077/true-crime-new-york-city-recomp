@@ -106,11 +106,7 @@ uint32_t JoinAddress() {
     static std::mutex m;
     static std::string last;
     static uint32_t address = 0;
-    std::string text;
-    {
-        std::lock_guard<std::recursive_mutex> ui(app::UiLock());
-        text = app::Get().join_ip;
-    }
+    std::string text = app::Snapshot().join_ip;
     text.erase(0, text.find_first_not_of(" \t"));
     text.erase(text.find_last_not_of(" \t") + 1);
     std::lock_guard<std::mutex> lock(m);

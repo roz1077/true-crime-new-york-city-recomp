@@ -112,7 +112,8 @@ std::vector<Image> Images() {
 
 fs::path WorkDir(const Image& image) { return CompilerDir() / "work" / image.exe; }
 fs::path CodeDll(const Image& image) { return ExeDir() / (image.exe + L".dll"); }
-fs::path StampFile(const Image& image) { return WorkDir(image) / "built.txt"; }
+// Beside the DLL, not in the compiler work folder: a release deletes that folder after the first run.
+fs::path StampFile(const Image& image) { return ExeDir() / (image.exe + L".dll.stamp"); }
 std::wstring Quote(const fs::path& path) { return L"\"" + path.wstring() + L"\""; }
 fs::path CompileLog() { return ExeDir() / "logs" / "compile.log"; }
 
@@ -141,6 +142,20 @@ bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& 
     return true;
 }
 
+bool Sha1File(const fs::path& path, std::string& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::vector<uint8_t> data;
+    char buffer[64 * 1024];
+    while (f) {
+        f.read(buffer, sizeof(buffer));
+        data.insert(data.end(), buffer, buffer + f.gcount());
+    }
+    if (f.bad()) return false;
+    out = Sha1(data);
+    return true;
+}
+
 // build.bat's DLL has no stamp: it is current when newer than the executable it was linked against
 bool Current(const Target& target) {
     std::error_code ec;
@@ -149,7 +164,11 @@ bool Current(const Target& target) {
     std::ifstream f(StampFile(*target.image));
     if (!f) return built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec);
     std::string line;
-    return std::getline(f, line) && line == target.stamp;
+    if (!std::getline(f, line)) return false;
+    const std::string prefix = target.stamp + " ";
+    if (line.rfind(prefix, 0) != 0) return false;
+    std::string hash;
+    return Sha1File(CodeDll(*target.image), hash) && hash == line.substr(prefix.size());
 }
 
 // an image's xbe from the game in assets: the extracted file, else the mounted disc image
@@ -384,19 +403,70 @@ bool Compile(std::vector<Job>& jobs, Processes& run) {
 bool Link(const Target& target, Processes& run) {
     const Image& image = *target.image;
     fs::path work = WorkDir(image);
+    const fs::path dll = CodeDll(image);
+    const fs::path staged = dll.wstring() + L".tmp";
+    const fs::path stamp = StampFile(image);
+    const fs::path stamp_tmp = stamp.wstring() + L".tmp";
+    std::error_code ec;
+    // Never let an interrupted link leave a file the next launch would load.
+    fs::remove(staged, ec);
+    fs::remove(stamp_tmp, ec);
     std::wstring command = Quote(CompilerDir() / "lld-link.exe") + L" " + kLinkFlags + L" /def:exports.def";
-    command += L" /implib:code.lib /out:" + Quote(CodeDll(image));
+    command += L" /implib:code.lib /out:" + Quote(staged);
     command += L" " + Quote(CompilerDir() / (image.exe + L".lib")) + L" x86_func_mapping.obj";
     for (uint32_t i = 0; i < PartitionCount(image); i++) command += L" x86_recomp." + std::to_wstring(i) + L".obj";
-    std::wstring dll = CodeDll(image).filename().wstring();
+    std::wstring name = dll.filename().wstring();
     std::vector<HANDLE> process{run.Start(command, work)};
     if (!process[0]) return RecordFailure(L"lld-link.exe could not be started.");
     if (!run.WaitAll(process)) return false;
     if (!Processes::Succeeded(process[0])) {
+        fs::remove(staged, ec);
         std::wstring hint = L" If the game is already running, close it, then start it again.";
-        return RecordFailure(L"Linking " + dll + L" failed." + hint);
+        return RecordFailure(L"Linking " + name + L" failed." + hint);
     }
-    std::ofstream(StampFile(image)) << target.stamp << "\n";
+    if (!fs::exists(staged, ec) || fs::file_size(staged, ec) == 0) {
+        fs::remove(staged, ec);
+        return RecordFailure(L"Linking " + name + L" produced no file.");
+    }
+    // Staged link, then the stamp: a stamp on its own never vouches for a half written DLL.
+    if (!MoveFileExW(staged.c_str(), dll.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD error = GetLastError();
+        fs::remove(staged, ec);
+        return RecordFailure(L"Publishing " + name + L" failed (error " + std::to_wstring(error) + L").");
+    }
+    std::string hash;
+    if (!Sha1File(dll, hash)) {
+        DeleteFileW(dll.c_str());
+        return RecordFailure(L"Could not verify " + name + L" after linking.");
+    }
+    {
+        std::ofstream f(stamp_tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            DeleteFileW(dll.c_str());
+            return RecordFailure(L"Could not write the build stamp for " + name + L".");
+        }
+        f << target.stamp << " " << hash << "\n";
+        f.flush();
+        if (!f) {
+            f.close();
+            DeleteFileW(stamp_tmp.c_str());
+            DeleteFileW(dll.c_str());
+            return RecordFailure(L"Could not write the build stamp for " + name + L".");
+        }
+        f.close();
+        if (f.fail()) {
+            DeleteFileW(stamp_tmp.c_str());
+            DeleteFileW(dll.c_str());
+            return RecordFailure(L"Could not close the build stamp for " + name + L".");
+        }
+    }
+    if (!MoveFileExW(stamp_tmp.c_str(), stamp.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD error = GetLastError();
+        DeleteFileW(stamp_tmp.c_str());
+        DeleteFileW(dll.c_str());
+        return RecordFailure(L"Publishing the build stamp for " + name + L" failed (error " +
+                             std::to_wstring(error) + L").");
+    }
     return true;
 }
 

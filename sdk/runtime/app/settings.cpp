@@ -25,6 +25,7 @@ namespace {
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
 
 std::filesystem::path File() { return ExeDir() / kGame.settings; }
+std::recursive_mutex g_settings_lock;
 
 }  // namespace
 
@@ -49,7 +50,37 @@ Settings& Get() {
     return s;
 }
 
+Settings Snapshot() {
+    std::lock_guard<std::recursive_mutex> guard(g_settings_lock);
+    const Settings& g = Get();
+    Settings s;
+    s.display_mode = g.display_mode;
+    s.width = g.width;
+    s.height = g.height;
+    s.render_percent = g.render_percent;
+    s.aspect = g.aspect;
+    s.vsync = g.vsync;
+    s.aniso = g.aniso;
+    s.smaa = g.smaa;
+    s.city_shadow_fill = g.city_shadow_fill;
+    s.bloom = g.bloom;
+    s.dof = g.dof;
+    s.pc_contrast = g.pc_contrast;
+    s.custom_textures = g.custom_textures;
+    s.dump_textures = g.dump_textures;
+    s.texture_dump_format = g.texture_dump_format;
+    s.join_ip = g.join_ip;
+    // these two are written atomically, so read them atomically
+    s.fps_cap = FrameCap();
+    s.msaa = MsaaSamples();
+    return s;
+}
+
+SettingsLock::SettingsLock() { g_settings_lock.lock(); }
+SettingsLock::~SettingsLock() { g_settings_lock.unlock(); }
+
 void Load() {
+    SettingsLock guard;
     Settings& s = Get();
     toml::table t;
     try {
@@ -123,8 +154,7 @@ toml::table Table() {
 
 void Save() {
     // Two menus can save at once, and a failed write must not leave the live file truncated.
-    static std::mutex save_lock;
-    std::lock_guard<std::mutex> guard(save_lock);
+    SettingsLock guard;
     std::ostringstream out;
     out << Table() << "\n";
     const std::string text = out.str();
@@ -178,7 +208,7 @@ Mode Desktop() {
 }
 
 Mode Output() {
-    const Settings& s = Get();
+    const Settings s = Snapshot();
     if (s.width && s.height) return {s.width, s.height};
     return Desktop();
 }
@@ -195,18 +225,20 @@ Mode CachedOutput() {
     static std::mutex lock;
     static Key key{};
     static Mode mode{};
-    const Settings& s = Get();
+    const Settings s = Snapshot();
     Key now{s.width, s.height, MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY)};
+    Mode out = s.width && s.height ? Mode{s.width, s.height} : Desktop();
     std::lock_guard<std::mutex> guard(lock);
     if (!(now == key) || !mode.height) {
         key = now;
-        mode = Output();
+        mode = out;
     }
     return mode;
 }
 
 float AspectRatio() {
-    if (uint32_t a = Get().aspect) return float(a) / 1000.0f;
+    const Settings s = Snapshot();
+    if (uint32_t a = s.aspect) return float(a) / 1000.0f;
     Mode m = CachedOutput();
     return m.width && m.height ? float(m.width) / float(m.height) : 16.0f / 9.0f;
 }
@@ -221,10 +253,11 @@ float RenderStretch(uint32_t guest_width, uint32_t guest_height) {
 
 float RenderScale(uint32_t guest_height) {
     // the frame fills the output's height, or its width when the frame is wider than the output
+    const Settings s = Snapshot();
     Mode m = CachedOutput();
     float shown = float(m.height);
     if (m.width && float(m.width) < shown * AspectRatio()) shown = float(m.width) / AspectRatio();
-    float h = shown * (Get().render_percent / 100.0f);
+    float h = shown * (s.render_percent / 100.0f);
     return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
 }
 

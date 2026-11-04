@@ -37,6 +37,16 @@ struct Settings {
 };
 
 Settings& Get();
+// a coherent copy for the window and render threads, which share these fields with the menus
+Settings Snapshot();
+// serialises multi-field settings reads and writes; recursive so a locked menu can save
+class SettingsLock {
+public:
+    SettingsLock();
+    ~SettingsLock();
+    SettingsLock(const SettingsLock&) = delete;
+    SettingsLock& operator=(const SettingsLock&) = delete;
+};
 uint32_t FrameCap();
 void SetFrameCap(uint32_t cap);
 uint32_t MsaaSamples();

@@ -55,6 +55,7 @@ bool g_pending = false;
 std::vector<uint64_t> g_sizes;
 
 Values Current() {
+    app::SettingsLock lock;
     const app::Settings &s = app::Get();
     const uint64_t applied = Size(s.width, s.height);
     return {s.render_percent, game::g_fov_percent,
@@ -68,6 +69,7 @@ Values Current() {
 // guest thread; the renderer reads these each frame and app::Pace each Swap (aligned 32-bit stores). The
 // resolution only changes through ApplySize.
 void Apply(const Values &v) {
+    app::SettingsLock lock;
     app::Settings &s = app::Get();
     s.render_percent = v.render_percent;
     game::g_fov_percent = v.fov_percent;
@@ -84,6 +86,7 @@ void Apply(const Values &v) {
 // sets the output resolution and has the window thread apply it, as the overlay's Apply does
 void ApplySize(uint64_t size) {
     g_pending = false;
+    app::SettingsLock lock;
     app::Settings &s = app::Get();
     const uint32_t w = uint32_t(size >> 32), h = uint32_t(size);
     if (s.width == w && s.height == h) return;

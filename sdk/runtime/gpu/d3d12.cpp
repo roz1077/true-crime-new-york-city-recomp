@@ -886,6 +886,8 @@ private:
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
     Target* draw_ds_ = nullptr;
     Target* scene_depth_ = nullptr;  // the last full-size 3D depth target, for distance blur
+    Target* scene_rt_ = nullptr;     // the colour target that depth belongs to
+    app::Settings render_;           // coherent settings snapshot for this frame
     float scene_near_ = 0.1f, scene_far_ = 1000.0f;
     ID3D12Resource* dof_depth_ = nullptr;  // this frame's readable depth, set at present
     float dof_near_ = 0.1f, dof_far_ = 1000.0f;
@@ -1202,6 +1204,7 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
 // a resized target gives back its view and its resources
 void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
     if (scene_depth_ == &it->second) scene_depth_ = nullptr;
+    if (scene_rt_ == &it->second) scene_rt_ = nullptr;
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) bound_rt_ = bound_ds_ = nullptr;
     (it->second.depth ? free_dsv_ : free_rtv_).push_back(it->second.view);
     CurrentFrame().garbage.push_back(it->second.res);
@@ -2532,7 +2535,7 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
 
 uint32_t D3D12Backend::EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp) {
     D3D12_SAMPLER_DESC sd[4];
-    uint32_t aniso = app::Get().aniso;
+    uint32_t aniso = render_.aniso;
     for (int i = 0; i < 4; i++) sd[i] = StageSampler(s, i, stages, clamp, aniso);
     uint64_t key = Hash(sd, sizeof(sd));
     auto it = samplers_.find(key);
@@ -3469,7 +3472,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     DrawShaders sh = ClassifyShaders(s, a, count);
     if (sh.prog) EnsureProgramHash(s);
     sh.vkey = VertexKey(s, a, sh);
-    sh.city_shadow_fill = sh.prog && app::Get().city_shadow_fill &&
+    sh.city_shadow_fill = sh.prog && render_.city_shadow_fill &&
                           bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ &&
                           IsOpaqueWallDraw(s);
     if (sh.city_shadow_fill) sh.vkey ^= 0xED92F1CA356B0748ull;
@@ -3506,13 +3509,14 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // fall back to one sample, so check the resource, not the configured mode.
     const bool depth_msaa = bound_ds_ && bound_ds_->res &&
                             bound_ds_->res->GetDesc().SampleDesc.Count > 1;
-    if (app::Get().dof && depth_msaa && bound_rt_ && bound_ds_ && !a.pretransformed && k.zwrite &&
+    if (render_.dof && depth_msaa && bound_rt_ && bound_ds_ && !a.pretransformed && k.zwrite &&
         bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ &&
         bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h &&
         s.viewport.w == guest_w_ && s.viewport.h == guest_h_) {
         const WRange r = ProjectionWRange(s.transforms[kTsProjection].data());
         if (r.near_w > 0 && r.far_w > r.near_w) {
             scene_depth_ = bound_ds_;
+            scene_rt_ = bound_rt_;
             scene_near_ = r.near_w;
             scene_far_ = r.far_w;
         }
@@ -3807,6 +3811,12 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
     Resolve(*src_t);
     Target* dst_t = EnsureTarget(dst, false);
     if (!dst_t || src_t == dst_t) return;
+    // A full-frame copy carries the scene classification, and a copied scene carries the depth
+    // association so the destination can still use the distance blur this frame.
+    if (!count) {
+        dst_t->scene = src_t->scene;
+        if (scene_rt_ == src_t && scene_depth_) scene_rt_ = dst_t;
+    }
     ID3D12Resource* copy_src = ResolveColor(*src_t);
     if (!copy_src) return;
     auto& copy_state = copy_src == src_t->res.Get() ? src_t->state : src_t->resolved_state;
@@ -3915,9 +3925,9 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
     binds_ = {};
-    const float post = !t.picture && app::Get().pc_contrast ? 1.0f : 0.0f;
-    const float bloom = scene && app::Get().bloom ? 1.0f : 0.0f;
-    const float dof = scene && app::Get().dof && dof_depth_ ? 1.0f : 0.0f;
+    const float post = !t.picture && render_.pc_contrast ? 1.0f : 0.0f;
+    const float bloom = scene && render_.bloom ? 1.0f : 0.0f;
+    const float dof = scene && render_.dof && dof_depth_ ? 1.0f : 0.0f;
     if (aa) {  // ApplySmaa left it readable
         Blit(aa, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h),
                              .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_});
@@ -4224,6 +4234,7 @@ void LogPerf() {
 
 void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
+    render_ = app::Snapshot();  // one coherent copy for this frame
     if (cap_) {
         FinishCapture(front);
     } else if (g_capture.exchange(false) && CaptureOn()) {
@@ -4237,7 +4248,7 @@ void D3D12Backend::Present(const Surface& front) {
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     dof_depth_ = nullptr;
-    if (t && app::Get().dof && scene_depth_ && scene_depth_->res &&
+    if (t && render_.dof && scene_depth_ && scene_rt_ == t && scene_depth_->res &&
         scene_depth_->res->GetDesc().SampleDesc.Count > 1 &&
         scene_depth_->w == t->w && scene_depth_->h == t->h) {
         dof_depth_ = scene_depth_->res.Get();
@@ -4246,15 +4257,16 @@ void D3D12Backend::Present(const Surface& front) {
         dof_far_ = scene_far_;
     }
 
-    ID3D12Resource* aa = t && app::Get().smaa ? ApplySmaa(*t) : nullptr;
+    ID3D12Resource* aa = t && render_.smaa ? ApplySmaa(*t) : nullptr;
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi, aa);
     scene_depth_ = nullptr;
+    scene_rt_ = nullptr;
     dof_depth_ = nullptr;
     Submit(false);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     DeliverReports();
-    bool vsync = app::Get().vsync;
+    bool vsync = render_.vsync;
     {
         PerfScope perf_swap{g_perf.swap};
         swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);

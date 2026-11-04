@@ -490,7 +490,7 @@ Image Decode(const TextureDesc& d, const uint8_t* guest, const uint32_t* palette
 
 // the settings into g.set; false when none changed
 bool LatchSettings() {
-    const app::Settings& s = app::Get();
+    const app::Settings s = app::Snapshot();
     Latched now{s.custom_textures, s.dump_textures, s.texture_dump_format};
     if (now == g.set) return false;
     g.set = now;

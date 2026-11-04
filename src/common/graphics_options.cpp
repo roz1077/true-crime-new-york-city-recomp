@@ -132,11 +132,13 @@ std::vector<app::Mode> DisplayModes() {
 namespace {
 
 bool DisplayPending() {
+    app::SettingsLock lock;
     const app::Settings &s = app::Get();
     return g_menu.mode != s.display_mode || !SameMode(g_menu.resolution, {s.width, s.height});
 }
 
 void OpenMenu() {
+    app::SettingsLock lock;
     const app::Settings &s = app::Get();
     g_menu.open = true;
     g_menu.dirty = false;
@@ -162,6 +164,7 @@ void CloseMenu() {
 }
 
 void ApplyDisplayChanges() {
+    app::SettingsLock lock;
     app::Settings &s = app::Get();
     s.display_mode = g_menu.mode;
     s.width = g_menu.resolution.width;
@@ -173,6 +176,7 @@ void ApplyDisplayChanges() {
 }
 
 void RestoreDefaults() {
+    app::SettingsLock lock;
     const app::Settings d;
     app::Settings &s = app::Get();
     s.render_percent = d.render_percent;
@@ -351,6 +355,7 @@ const char *Help(Row row) {
 }
 
 std::string Value(Row row) {
+    app::SettingsLock lock;
     const app::Settings &s = app::Get();
     char text[64];
     switch (row) {
@@ -490,6 +495,7 @@ bool Change(Row row, int direction) {
 }
 
 void Activate(Row row) {
+    app::SettingsLock lock;
     app::Settings &s = app::Get();
     switch (KindOf(row)) {
     case Kind::Choice:

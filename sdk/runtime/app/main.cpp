@@ -120,7 +120,7 @@ void DumpThreads() {
 
 // window thread only
 void ApplyNow() {
-    const Settings& s = Get();
+    const Settings s = Snapshot();
     HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
@@ -200,7 +200,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_mode_changed = false;
                     ShowWindow(hwnd, SW_MINIMIZE);
                 }
-            } else if (Get().display_mode == DisplayMode::Fullscreen && Get().width && Get().height && !g_mode_changed &&
+            } else if (const Settings s = Snapshot();
+                       s.display_mode == DisplayMode::Fullscreen && s.width && s.height && !g_mode_changed &&
                        IsWindowVisible(hwnd) && !g_apply_posted) {
                 // once: restoring the window activates it again from inside the apply, and a second apply switched
                 // the mode back and forth, after which presents were not taken for a while (the game stood still
