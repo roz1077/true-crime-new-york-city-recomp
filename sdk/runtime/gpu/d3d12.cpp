@@ -199,9 +199,14 @@ float3 PcContrast(float3 c) {
     float l = dot(c, L);
     const float pivot = 0.114;
     float l2 = pivot + (l - pivot) * 1.35;
-    // After the Xbox gamma ramp the intro steps are already close to black.
-    // Lift that range while anchoring black and the original contrast pivot.
-    if (l < pivot) l2 = pivot * sqrt(saturate(l / pivot));
+    // After the Xbox gamma ramp the intro steps are already close to black. Lift that range while
+    // anchoring black and the original contrast pivot. A square root has unbounded gain near
+    // black and turns dark reflections into visible streaks; this toe caps the lift at about 3x.
+    if (l < pivot) {
+        const float t = saturate(l / pivot);
+        const float k = 3.0;
+        l2 = pivot * (1.0 - exp(-k * t)) / (1.0 - exp(-k));
+    }
     float over = max(l2 - 0.80, 0.0);
     l2 = l2 > 0.80 ? 0.80 + over / (1.0 + over * 2.0) : l2;
     l2 = saturate(l2);
@@ -227,7 +232,15 @@ float4 psmain(O i) : SV_Target {
     if (post.z > 0) c.rgb = DistanceBlur(i.uv, c.rgb);
     c.rgb = ToGamma(c.rgb);
     if (post.y > 0) c.rgb += Bloom(i.uv) * 1.2;
-    if (post.x > 0) c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
+    if (post.x > 0) {
+        c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
+        // The contrast curve stretches the darkest 8-bit steps; an ordered dither breaks them up
+        // before the back buffer quantises the result again.
+        static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+        int2 dp = int2(i.p.xy) % 4;
+        float d = (kDither[dp.y * 4 + dp.x] + 0.5) / 16.0 - 0.5;
+        c.rgb = saturate(c.rgb + d / 255.0);
+    }
     return float4(c.rgb, opts.y > 0 ? c.a : 1);
 }
 )";
