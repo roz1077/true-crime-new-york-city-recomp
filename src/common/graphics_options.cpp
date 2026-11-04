@@ -57,6 +57,7 @@ enum class Row {
     Msaa,
     Smaa,
     Bloom,
+    PcContrast,
     VSync,
     FrameCap,
     ShowFps,
@@ -76,6 +77,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::Msaa,
                          Row::Smaa,
                          Row::Bloom,
+                         Row::PcContrast,
                          Row::VSync,
                          Row::FrameCap,
                          Row::ShowFps,
@@ -177,6 +179,7 @@ void RestoreDefaults() {
     app::SetMsaaSamples(d.msaa);
     s.smaa = d.smaa;
     s.bloom = d.bloom;
+    s.pc_contrast = d.pc_contrast;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
     s.texture_dump_format = d.texture_dump_format;
@@ -201,6 +204,7 @@ Kind KindOf(Row row) {
         return Kind::Choice;
     case Row::Smaa:
     case Row::Bloom:
+    case Row::PcContrast:
     case Row::VSync:
     case Row::ShowFps:
     case Row::TextureReplacement:
@@ -239,6 +243,8 @@ const char *Label(Row row) {
         return "SMAA";
     case Row::Bloom:
         return "Bloom";
+    case Row::PcContrast:
+        return "PC contrast";
     case Row::VSync:
         return "V-Sync";
     case Row::FrameCap:
@@ -303,6 +309,9 @@ const char *Help(Row row) {
         return "Smooths jagged edges on the finished frame (SMAA 1x). The HUD is smoothed with it.";
     case Row::Bloom:
         return "Adds the PC release's bright-pass bloom to the finished frame.";
+    case Row::PcContrast:
+        return "Matches the PC version's contrast on the finished frame: same average brightness with "
+               "deeper shadows and brighter highlights.";
     case Row::VSync:
         return "Waits for the monitor's refresh before showing a frame, which prevents tearing.";
     case Row::FrameCap:
@@ -380,6 +389,8 @@ std::string Value(Row row) {
         return s.smaa ? "On" : "Off";
     case Row::Bloom:
         return s.bloom ? "On" : "Off";
+    case Row::PcContrast:
+        return s.pc_contrast ? "On" : "Off";
     case Row::VSync:
         return s.vsync ? "On" : "Off";
     case Row::ShowFps:
@@ -476,6 +487,9 @@ void Activate(Row row) {
             break;
         case Row::Bloom:
             s.bloom = !s.bloom;
+            break;
+        case Row::PcContrast:
+            s.pc_contrast = !s.pc_contrast;
             break;
         case Row::VSync:
             s.vsync = !s.vsync;

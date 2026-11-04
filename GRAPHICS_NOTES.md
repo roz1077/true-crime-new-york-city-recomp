@@ -250,8 +250,8 @@ the walls received no direct light.
 - the gain is shadow-weighted: dark walls and stoops get up to about 2.2x, already-bright background
   buildings get close to 1x, which keeps them from glowing
 
-The final-frame **PC contrast** pass is always applied to the 3D frame (movies and legal screens keep
-their own look) and is not a menu option. It matches the PC release's tone: contrast 1.35 about 0.114
+The final-frame **PC contrast** pass is a toggle in the F10 Graphics menu (on by default; movies and
+legal screens keep their own look). It matches the PC release's tone: contrast 1.35 about 0.114
 with a soft shoulder and a shadow toe (`max(l2, l * 0.5 + 0.004)`). The toe keeps stairs and shadow
 detail visible instead of crushing them to black.
 

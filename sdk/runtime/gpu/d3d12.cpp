@@ -3811,7 +3811,7 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
     binds_ = {};
-    const float post = picture ? 0.0f : 1.0f;  // movies and legal screens keep their own look
+    const float post = !picture && app::Get().pc_contrast ? 1.0f : 0.0f;
     const float bloom = !picture && app::Get().bloom ? 1.0f : 0.0f;
     if (aa) {  // ApplySmaa left it readable
         Blit(aa, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h)});
