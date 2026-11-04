@@ -1092,3 +1092,70 @@ The actual cause was leaked file-object references (see "file-object references 
 - **Fixed: FS icon replacing the stamina icon after an MSAA or render-scale change.** The top-right HUD slot is a 104x60 render target the game draws into (`t0 83267C80 ... target` in captures `205448`/`210136`). `ApplySettings` cleared every target on a sample-count or scale change, so the game sampled that address as an ordinary texture and got the static red "FS" placeholder (captures `205456`/`210144`, no `target` marker). Target rebuilds are now lazy: a target that is only sampled keeps its contents across the change and is recreated only when it is next bound as a render target whose MSAA/scale differ. Verified in-game with both MSAA and render-scale changes.
 - **Fixed: PC contrast banding on dark gradients** (the blue car's neon reflection and the character's trousers, captures `210849`/`210910`). The contrast curve's square-root toe had unbounded gain near black, turning low-level reflection detail and 8-bit steps into visible streaks. It is now a smooth exponential toe capped at 2x (the best balance found in testing), followed by an ordered dither before the back-buffer write. Verified by toggling PC contrast and in-game. The trousers' DXT1 source texture still carries some 4x4 blocking of its own.
 - The release build, developer relink, native retail-disc parsing and all 12 regression checks passed. Isolated checks rejected missing or changed DLL stamps and confirmed the phone hook changes only the intended byte. The user's smoke test reached gameplay, switched to 4x MSAA with depth of field enabled and exited cleanly. Still to verify in-game are the phone fix, MSAA Off with depth of field enabled, and a clean first launch with the D3D12 debug layer.
+
+## 2026-11-04 — Character LOD and PC asset import (pinned)
+
+Pinned by request. Nothing in `assets/` is modified and no SDK hook is compiled in; this section records what was
+learned and what the next step would be.
+
+**Reported symptom.** A nearby pedestrian renders with a very low-poly body (capture `214052`, and the left-edge
+figure in the 4:3 capture `214508`). It does not change with aspect, FOV, Bloom, DOF or PC contrast. The player model
+and other pedestrians look normal. The user believes it is draw distance or LOD.
+
+**Character LOD in the Xbox build.**
+- The game asks the file layer for `D:\Data\Lreschar\Bodies\BODY_*.XB2` and `\Heads\HEAD_*.XB2` when pedestrians
+  spawn. This was proven by logging the open paths (see the hook note below).
+- `uLODStart` in the `BodyHeadInfo` table (`0x3520F0 + (id-0x85)*0x58 + 0x14`) is read only by `0x7D350`, whose
+  single caller (`0xFB...`) copies it into a vector property (`0x21F420`, hash `0x7789F8A9`). It does not choose a
+  mesh, so it is not the per-object LOD switch.
+- The only character detail switch is the asset set: `LResChar` versus `Char`. The container's chunk 0 (mesh) has
+  `3` sub-blocks in `LResChar` and `1` in `Char`; the single `Char` mesh is larger than all three `LResChar` blocks
+  combined (e.g. `Body_F_Bum`: 119,488 vs 89,312 bytes).
+- Forcing every character open from `LResChar` to `Char` is safe and was verified in game (24 body types redirected
+  in one session). The visual gain is small because the Xbox `Char` asset is only ~10% larger than `LResChar`
+  (e.g. `Body_F_Casual_Heavy`: 192,896 → 213,120 bytes). There is no higher-detail Xbox character asset to switch to.
+
+**PC assets are the only higher-detail source, but they are not drop-in.**
+- PC character bodies are ~5x larger (`Body_F_Casual_Heavy.pcf` 934,400 B vs Xbox 213,120 B).
+- Textures are the same resolution: PC is 256x256 DXT1, Xbox is 256x256 palettised (P8) plus some 128x64/32x32
+  detail maps. Texture replacement therefore does not add detail; the gap is geometry.
+- The container layout is shared (12-entry chunk table at `0x0C`, stride 8; chunk 0 mesh, chunk 1 materials,
+  chunk 2 texture table), but:
+  - PC texture records are 0x28 bytes with twelve `0xCD` bytes where the Xbox records (0x24 bytes) carry runtime
+    fields. Those fields are cooked per file, not content hashes, and cannot be copied from another file.
+  - PC meshes use an 88-byte vertex; Xbox meshes use 104 bytes. The Xbox stream is reordered and carries 16 extra
+    bytes of packed normal/skinning data per vertex (PC vertex 1's position bytes appear inside Xbox vertex 0), so
+    this is not a stride change or a chunk splice.
+
+**Experiments (all reverted; originals backed up under `out/asset-backup/`).**
+1. Raw PC `.pcf` copied over the Xbox `.xb2`: crash, `read 1CDF880F0`, `edi CDCD0000` — the `0xCD` runtime fields.
+2. Hybrid (PC data with the Xbox texture-table runtime fields copied in): crash, `read 139680F1`,
+   `edi 136B0001` — the fields are layout-dependent, not hashes.
+3. Mesh splice (Xbox container and textures, only the PC mesh chunk inserted, later chunk offsets shifted): the
+   loader accepted it, but the renderer crashed reading the PC vertex stream (`read 3DE72DFD`, stack `0x243EB2`).
+4. Texture-only replacement via the custom texture pack was investigated: the matched PC and Xbox atlases have the
+   same resolution, so it does not address the low-poly silhouette.
+
+**Scripts kept for the follow-up** (all operate on `assets/data`, back up before writing, and have a restore path):
+- `scripts/pc_char_swap.py` — copy PC character bodies/heads over the Xbox ones; `apply LResChar|Char`, `restore`, `status`.
+- `scripts/pc_hybrid_body.py` — single body: PC data plus Xbox texture-table runtime fields.
+- `scripts/pc_bulk_body.py` — same for every body/head (463 converted, 2 skipped: `Body_F_Int_Dominatrix`,
+  texture-count mismatch; `Head_Invisible`, no textures); `restore`, `status`.
+- `scripts/pc_mesh_splice.py` — Xbox container, PC mesh chunk only.
+- `scripts/pc_texture_match.py` — decode PC containers, match dumped Xbox textures, write custom-texture replacements.
+- PC container facts used by the scripts: header `09 00 00 00 | 06 00 00 00 | 6c 00 00 00`; chunk table at `0x0C`;
+  entry `(u16 id, u16 count, u32 offset)`; mesh sub-block header `10 00 00 00`, size, `42 00 00 00`,
+  `01 00 00 00`, magic, FVF, stride; PC texture records stride `0x28`, Xbox `0x24`.
+
+**Diagnostic hook used (removed again; re-add only with the SDK patch).** In `sdk/runtime/kernel/files.cpp` an
+`ApplyCharOverride` rewrote `\LRESCHAR\` to `\CHAR\` in `NtCreateFile`/`NtOpenFile`, and `TraceCharOpen` wrote
+`char asset request ...` / `char override ...` report lines. Gate both on environment variables
+(`XBE_FORCE_CHAR_ASSETS`, `XBE_TRACE_CHAR`) if re-added; release logs drop Info/Warn, so the trace must use `LOGR`.
+`patches/xboxxberecomp-local.patch` must be regenerated if the hook is kept.
+
+**Next step if this is unpinned.** Write a real vertex converter: decode both streams, map the shared 52-byte prefix
+and the packed normal/skinning fields, re-encode PC vertices into the 104-byte Xbox layout, and rebuild the mesh
+chunk with the Xbox header. Validate on one body (`Body_F_Bum`) before batching. The same approach is needed for
+vehicle and city meshes, which share the container but also differ in vertex size. Budget for the 64 MB guest
+memory: PC bodies are ~1 MB each.
+
