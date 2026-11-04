@@ -8,18 +8,78 @@
 #include <commdlg.h>
 
 #include <filesystem>
+#include <string>
+#include <utility>
 #include <vector>
+
+#include "kernel/disc.h"
+#include "xbe/xbe.h"
 
 namespace fs = std::filesystem;
 
 namespace {
 
+constexpr wchar_t kTitle[] = L"True Crime NYC Launcher";
+bool g_installing = false;
+
 int Error(const wchar_t *message) {
-    MessageBoxW(nullptr, message, L"True Crime NYC Launcher", MB_OK | MB_ICONERROR);
+    MessageBoxW(nullptr, message, kTitle, MB_OK | MB_ICONERROR);
     return 1;
 }
 
-int InstallIso(const fs::path &source) {
+std::wstring Widen(const std::string &text) {
+    if (text.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), int(text.size()), nullptr, 0);
+    std::wstring out(size_t(n), L'\0');
+    if (n) MultiByteToWideChar(CP_UTF8, 0, text.c_str(), int(text.size()), out.data(), n);
+    return out;
+}
+
+// The runtime rejects an image it cannot mount or whose default.xbe cannot be parsed. Check the
+// same things here so a bad file never takes the assets slot.
+bool ValidateIso(const fs::path &image, std::wstring &error) {
+    kernel::Disc disc;
+    std::string why;
+    if (!disc.Open(image, why)) {
+        error = L"This is not a usable Xbox disc image. " + Widen(why);
+        return false;
+    }
+    std::vector<uint8_t> xbe;
+    if (!disc.Load("default.xbe", xbe)) {
+        error = L"The disc image has no default.xbe.";
+        return false;
+    }
+    xbe::Image parsed;
+    if (!parsed.Parse(std::move(xbe), why)) {
+        error = L"The image's default.xbe is invalid. " + Widen(why);
+        return false;
+    }
+    return true;
+}
+
+struct CopyState {
+    HWND window;
+};
+
+DWORD CALLBACK CopyProgress(LARGE_INTEGER total, LARGE_INTEGER transferred, LARGE_INTEGER, LARGE_INTEGER, DWORD,
+                            DWORD, HANDLE, HANDLE, LPVOID data) {
+    auto *state = static_cast<CopyState *>(data);
+    // Keep the launcher painting and responding while the image is copied.
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (total.QuadPart > 0) {
+        wchar_t title[96];
+        swprintf_s(title, L"%s - installing %d%%", kTitle,
+                   int(transferred.QuadPart * 100 / total.QuadPart));
+        SetWindowTextW(state->window, title);
+    }
+    return PROGRESS_CONTINUE;
+}
+
+int InstallIso(HWND window, const fs::path &source) {
     if (source.empty()) return 0;
     std::vector<wchar_t> path(32768);
     const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
@@ -30,34 +90,55 @@ int InstallIso(const fs::path &source) {
 
     try {
         if (_wcsicmp(source.extension().c_str(), L".iso") != 0) return Error(L"Select an .iso file.");
+        std::wstring why;
+        if (!ValidateIso(source, why)) return Error(why.c_str());
 
         fs::create_directories(assets);
         if (fs::exists(assets / L"default.xbe")) {
             return Error(L"Move the extracted game files out of the local assets folder before launching an ISO.");
         }
-        bool alreadyInstalled = false;
+
+        std::vector<fs::path> installed;
         for (const auto &entry : fs::directory_iterator(assets)) {
-            if (!entry.is_regular_file() || _wcsicmp(entry.path().extension().c_str(), L".iso") != 0) continue;
-            if (!fs::equivalent(entry.path(), source)) {
+            if (entry.is_regular_file() && _wcsicmp(entry.path().extension().c_str(), L".iso") == 0)
+                installed.push_back(entry.path());
+        }
+        bool alreadyInstalled = false;
+        for (const auto &other : installed) {
+            if (fs::equivalent(other, source)) {
+                alreadyInstalled = true;
+                continue;
+            }
+            // An image the runtime rejected can be replaced; a valid one must be moved out first.
+            if (ValidateIso(other, why)) {
                 return Error(L"Move the other ISO out of the local assets folder before selecting a different ISO.");
             }
-            alreadyInstalled = true;
+            std::error_code ec;
+            fs::remove(other, ec);
+            if (ec) return Error(L"Could not remove the unusable ISO from the assets folder.");
         }
-        if (!alreadyInstalled) {
-            const auto staged = assets / L"launcher-import.tmp";
-            const auto destination = assets / source.filename();
-            if (!CopyFileW(source.c_str(), staged.c_str(), TRUE)) {
-                return Error(L"Could not copy the ISO. Check free space and write access, and remove any leftover "
-                             L"launcher-import.tmp from assets.");
-            }
-            if (!MoveFileW(staged.c_str(), destination.c_str())) {
-                DeleteFileW(staged.c_str());
-                return Error(L"Could not install the ISO in assets.");
-            }
+        if (alreadyInstalled) return 0;
+
+        const auto staged = assets / L"launcher-import.tmp";
+        const auto destination = assets / source.filename();
+        DeleteFileW(staged.c_str());
+        CopyState state{window};
+        SetWindowTextW(window, L"True Crime NYC Launcher - installing 0%");
+        if (!CopyFileExW(source.c_str(), staged.c_str(), CopyProgress, &state, nullptr, 0)) {
+            DeleteFileW(staged.c_str());
+            SetWindowTextW(window, kTitle);
+            return Error(L"Could not copy the ISO. Check free space and write access, and remove any leftover "
+                         L"launcher-import.tmp from assets.");
+        }
+        SetWindowTextW(window, kTitle);
+        if (!MoveFileW(staged.c_str(), destination.c_str())) {
+            DeleteFileW(staged.c_str());
+            return Error(L"Could not install the ISO in assets.");
         }
 
         return 0;
     } catch (const fs::filesystem_error &) {
+        SetWindowTextW(window, kTitle);
         return Error(L"Could not access the selected ISO or the local assets folder.");
     }
 }
@@ -106,10 +187,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         AddControl(window, L"BUTTON", L"&Launch", WS_TABSTOP, 376, 79, 80, 29, kLaunch);
         return 0;
     case WM_COMMAND:
+        if (g_installing) return 0;  // the copy's message pump must not start a second install
         if (LOWORD(wParam) == kBrowse) Browse(window);
         if (LOWORD(wParam) == kLaunch) {
             HCURSOR previous = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-            const int result = InstallIso(selectedIso);
+            g_installing = true;
+            const int result = InstallIso(window, selectedIso);
+            g_installing = false;
             SetCursor(previous);
             if (result == 0) {
                 launchRequested = true;
