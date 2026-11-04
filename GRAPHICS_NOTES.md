@@ -253,8 +253,13 @@ the walls received no direct light.
 The final-frame **PC contrast** pass is always applied to the 3D frame (movies and legal screens keep
 their own look) and is not a menu option. It matches the PC release's tone: contrast 1.35 about 0.114
 with a soft shoulder and a shadow toe (`max(l2, l * 0.5 + 0.004)`). The toe keeps stairs and shadow
-detail visible instead of crushing them to black. There is no saturation boost or glow; the earlier
-bloom experiment and its settings were removed.
+detail visible instead of crushing them to black.
+
+**Bloom** is a single-pass bright-pass in the same presentation shader (`kBlitHlsl`): source texels
+above 0.90 are sampled in eight directions at an 8-texel radius, averaged, and added at 1.5x before
+the contrast pass. It approximates the PC release's half-resolution 4-pass bloom without extra render
+targets. The F10 Graphics menu has a **Bloom** toggle, on by default; movies and legal screens are
+excluded.
 
 Measured on the same doorway frame, the PC reference is mean 29.0 / std 25.0; the corrected Xbox
 frame with the contrast pass is mean 30.5 / std 24.9, with the 5th percentile lifted to about 5.

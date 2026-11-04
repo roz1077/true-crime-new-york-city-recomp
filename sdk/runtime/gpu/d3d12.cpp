@@ -126,7 +126,7 @@ bool CaptureOn() {
 }
 
 const char* kBlitHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; };
+cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
 SamplerState ls : register(s0);
@@ -138,6 +138,25 @@ float3 ToGamma(float3 c) {
     return float3(lut.Sample(ps, float2(c.r, 0.5)).r,
                   lut.Sample(ps, float2(c.g, 0.5)).g,
                   lut.Sample(ps, float2(c.b, 0.5)).b);
+}
+
+// A single-pass approximation of the PC release's bright-pass bloom. The source is the game's
+// finished frame, so only genuinely bright pixels contribute and the effect stays off walls.
+float3 Bloom(float2 uv) {
+    static const float2 dirs[8] = {
+        float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
+        float2(0.7071, 0.7071), float2(-0.7071, 0.7071),
+        float2(0.7071, -0.7071), float2(-0.7071, -0.7071)
+    };
+    float2 t = src.xy * 8.0;
+    float3 b = 0;
+    [unroll] for (int k = 0; k < 8; k++) {
+        float3 s = ToGamma(img.SampleLevel(ls, uv + dirs[k] * t, 0).rgb);
+        b += max(s - 0.90, 0.0);
+    }
+    float3 c = ToGamma(img.SampleLevel(ls, uv, 0).rgb);
+    b += max(c - 0.90, 0.0);
+    return b * (1.0 / 9.0);
 }
 
 // Match the PC release's tone on the finished frame.
@@ -172,6 +191,7 @@ float4 psmain(O i) : SV_Target {
     c /= n * n;
     c.rgb *= opts.w;
     c.rgb = ToGamma(c.rgb);
+    if (post.y > 0) c.rgb += Bloom(i.uv) * 1.5;
     if (post.x > 0) c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
     return float4(c.rgb, opts.y > 0 ? c.a : 1);
 }
@@ -428,6 +448,8 @@ struct BlitOptions {
     bool over = false;        // premultiplied over the target, which keeps its alpha
     uint32_t samples = 1;     // destination sample count
     float post = 0;           // PC contrast strength, 0 off
+    float bloom = 0;          // bright-pass bloom strength, 0 off
+    float src_w = 0, src_h = 0;  // source size in texels, for the bloom radius
 };
 
 // Shrink's settings past the source and the size
@@ -1503,9 +1525,10 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
-    float c[12] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
+    float c[16] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                    o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
-                   o.post, 0.0f, 0.0f, 0.0f};
+                   o.post, o.bloom, 0.0f, 0.0f,
+                   o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, 0.0f, 0.0f};
     std::memcpy(cb.cpu, c, sizeof(c));
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples), cb.gpu, slot, si);
 }
@@ -3789,15 +3812,16 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     cl_->RSSetScissorRects(1, &scissor);
     binds_ = {};
     const float post = picture ? 0.0f : 1.0f;  // movies and legal screens keep their own look
+    const float bloom = !picture && app::Get().bloom ? 1.0f : 0.0f;
     if (aa) {  // ApplySmaa left it readable
-        Blit(aa, t.fmt, uv, {.gamma = gamma_, .post = post});
+        Blit(aa, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h)});
         return;
     }
     ID3D12Resource* color = ResolveColor(t);
     if (!color) return;
     auto& state = color == t.res.Get() ? t.state : t.resolved_state;
     Transition(color, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Blit(color, t.fmt, uv, {.gamma = gamma_, .post = post});
+    Blit(color, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h)});
 }
 
 void D3D12Backend::RenderUi() {

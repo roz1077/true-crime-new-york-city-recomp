@@ -56,6 +56,7 @@ enum class Row {
     Anisotropic,
     Msaa,
     Smaa,
+    Bloom,
     VSync,
     FrameCap,
     ShowFps,
@@ -74,6 +75,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::Anisotropic,
                          Row::Msaa,
                          Row::Smaa,
+                         Row::Bloom,
                          Row::VSync,
                          Row::FrameCap,
                          Row::ShowFps,
@@ -174,6 +176,7 @@ void RestoreDefaults() {
     s.aniso = d.aniso;
     app::SetMsaaSamples(d.msaa);
     s.smaa = d.smaa;
+    s.bloom = d.bloom;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
     s.texture_dump_format = d.texture_dump_format;
@@ -197,6 +200,7 @@ Kind KindOf(Row row) {
     case Row::Msaa:
         return Kind::Choice;
     case Row::Smaa:
+    case Row::Bloom:
     case Row::VSync:
     case Row::ShowFps:
     case Row::TextureReplacement:
@@ -233,6 +237,8 @@ const char *Label(Row row) {
         return "MSAA";
     case Row::Smaa:
         return "SMAA";
+    case Row::Bloom:
+        return "Bloom";
     case Row::VSync:
         return "V-Sync";
     case Row::FrameCap:
@@ -295,6 +301,8 @@ const char *Help(Row row) {
         return "Smooths geometry edges. Higher counts require more GPU memory.";
     case Row::Smaa:
         return "Smooths jagged edges on the finished frame (SMAA 1x). The HUD is smoothed with it.";
+    case Row::Bloom:
+        return "Adds the PC release's bright-pass bloom to the finished frame.";
     case Row::VSync:
         return "Waits for the monitor's refresh before showing a frame, which prevents tearing.";
     case Row::FrameCap:
@@ -370,6 +378,8 @@ std::string Value(Row row) {
     }
     case Row::Smaa:
         return s.smaa ? "On" : "Off";
+    case Row::Bloom:
+        return s.bloom ? "On" : "Off";
     case Row::VSync:
         return s.vsync ? "On" : "Off";
     case Row::ShowFps:
@@ -463,6 +473,9 @@ void Activate(Row row) {
         switch (row) {
         case Row::Smaa:
             s.smaa = !s.smaa;
+            break;
+        case Row::Bloom:
+            s.bloom = !s.bloom;
             break;
         case Row::VSync:
             s.vsync = !s.vsync;
