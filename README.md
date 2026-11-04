@@ -31,6 +31,7 @@ closes.
 - **Anisotropic filtering** - Game default, 2x, 4x, 8x or 16x.
 - **MSAA** - Off, 2x, 4x or 8x multisample anti-aliasing.
 - **SMAA** - SMAA 1x anti-aliasing on the finished frame.
+- **PC contrast** - matches the PC version's tone on the finished frame: same average brightness with deeper shadows and brighter highlights. Always applied to the 3D frame; movies and legal screens keep their own look.
 - **V-Sync** and **Frame rate limit** (30 or 60 FPS; the game's timing is built for at most 60).
 - **FPS counter**.
 - **Texture replacement**, **texture dumping** and **dump format** (PNG or DDS).

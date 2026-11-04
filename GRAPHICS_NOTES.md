@@ -234,3 +234,32 @@ remain unverified. Nearby functions also reference `inmessage`,
 do not establish that the Options tab count originates in that state
 machine. No new executable or controller capture was needed for this
 finding.
+
+## City lighting and PC contrast (2026-11-04)
+
+The final look came from disassembling the PC build's D3D8 vertex shaders, not from a global filter.
+The PC `SinglePrelit` shader adds the ambient constant directly; the Xbox guest city shaders instead
+multiply it by `vdef[4]`, which is `(0,0,0,1)` on these meshes, so the ambient was being zeroed. The
+Xbox city normals are also opposite the light directions, so the lamp dot products were negative and
+the walls received no direct light.
+
+`VertexHlsl` (sdk/runtime/gpu/d3d12.cpp) now corrects every prelit city shader:
+
+- ambient `c186` is added directly instead of through `vdef[4]`
+- the normal is flipped so the lamps hit the facades
+- the gain is shadow-weighted: dark walls and stoops get up to about 2.2x, already-bright background
+  buildings get close to 1x, which keeps them from glowing
+
+The final-frame **PC contrast** pass is always applied to the 3D frame (movies and legal screens keep
+their own look) and is not a menu option. It matches the PC release's tone: contrast 1.35 about 0.114
+with a soft shoulder and a shadow toe (`max(l2, l * 0.5 + 0.004)`). The toe keeps stairs and shadow
+detail visible instead of crushing them to black. There is no saturation boost or glow; the earlier
+bloom experiment and its settings were removed.
+
+Measured on the same doorway frame, the PC reference is mean 29.0 / std 25.0; the corrected Xbox
+frame with the contrast pass is mean 30.5 / std 24.9, with the 5th percentile lifted to about 5.
+
+The earlier one-second-interval capture pair (captures-intro5, shots/ps2-opening4) remains the
+reference set. Xbox captures use BMP at the guest 640x480; PS2 captures use PPM at 3x the 640x448 guest
+resolution. Frames are matched by content score, not by timestamp, because the two runs start at
+different points in the cutscene.

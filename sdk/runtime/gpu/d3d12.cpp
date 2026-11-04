@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -125,12 +126,36 @@ bool CaptureOn() {
 }
 
 const char* kBlitHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 opts; };
+cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
 SamplerState ls : register(s0);
 SamplerState ps : register(s1);
 struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+
+float3 ToGamma(float3 c) {
+    if (opts.x <= 0) return c;
+    return float3(lut.Sample(ps, float2(c.r, 0.5)).r,
+                  lut.Sample(ps, float2(c.g, 0.5)).g,
+                  lut.Sample(ps, float2(c.b, 0.5)).b);
+}
+
+// Match the PC release's tone on the finished frame.
+float3 PcContrast(float3 c) {
+    const float3 L = float3(0.2126, 0.7152, 0.0722);
+    float l = dot(c, L);
+    // Match the PC version's tone: same average level as the Xbox frame, with its higher contrast.
+    float l2 = 0.114 + (l - 0.114) * 1.35;
+    // Do not crush the darkest values: stoops, stairs and shadow detail keep a floor instead of
+    // going to black. The toe leaves the PC contrast in the midtones and highlights intact.
+    l2 = max(l2, l * 0.5 + 0.004);
+    float over = max(l2 - 0.80, 0.0);
+    l2 = l2 > 0.80 ? 0.80 + over / (1.0 + over * 2.0) : l2;
+    l2 = saturate(l2);
+    c *= l2 / max(l, 1e-4);
+    return saturate(c);
+}
+
 O vs(uint id : SV_VertexID) {
     O o;
     float2 t = float2((id << 1) & 2, id & 2);
@@ -146,7 +171,8 @@ float4 psmain(O i) : SV_Target {
         for (int x = 0; x < n; x++) c += img.SampleLevel(ls, i.uv + px * ((float2(x, y) + 0.5) / n - 0.5), 0);
     c /= n * n;
     c.rgb *= opts.w;
-    if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
+    c.rgb = ToGamma(c.rgb);
+    if (post.x > 0) c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
     return float4(c.rgb, opts.y > 0 ? c.a : 1);
 }
 )";
@@ -401,6 +427,7 @@ struct BlitOptions {
     DXGI_FORMAT rtv = kBgra;  // the target's format
     bool over = false;        // premultiplied over the target, which keeps its alpha
     uint32_t samples = 1;     // destination sample count
+    float post = 0;           // PC contrast strength, 0 off
 };
 
 // Shrink's settings past the source and the size
@@ -1476,8 +1503,9 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
-    float c[8] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
-                  o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul};
+    float c[12] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
+                   o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
+                   o.post, 0.0f, 0.0f, 0.0f};
     std::memcpy(cb.cpu, c, sizeof(c));
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples), cb.gpu, slot, si);
 }
@@ -2500,6 +2528,33 @@ std::string SpriteSizeHlsl(std::string s) {
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
     if (sh.prog) {
         std::string src = VertexProgramHlsl(s.vs->program, a.regs, a.decode);
+        // Reference lighting: the prelit city shaders multiply the ambient constant by vdef[4], which
+        // is (0,0,0,1) for these meshes, so the ambient is lost. The PC build's SinglePrelit shader
+        // adds the ambient constant directly; do the same for every shader in that family.
+        static const std::string kAmbient = "mac_mul(((vdef[4]).xyzz), ((c[186]).xyzz))";
+        const bool city_prelit = src.find(kAmbient) != std::string::npos;
+        for (size_t at = src.find(kAmbient); at != std::string::npos; at = src.find(kAmbient, at))
+            src.replace(at, kAmbient.size(), "((c[186]).xyzz)");
+        if (city_prelit) {
+            // The Xbox meshes hand these shaders normals opposite to the light directions, so the
+            // lamp dots are negative and the wall only gets ambient. Flip the normal for the whole
+            // prelit city family.
+            static const std::string kNormal = "((i.v1).xyzz)";
+            for (size_t at = src.find(kNormal); at != std::string::npos; at = src.find(kNormal, at)) {
+                src.replace(at, kNormal.size(), "(-((i.v1).xyzz))");
+                at += 16;
+            }
+            // Weight the gain by darkness: shadowed walls and stairs get the full lift, while
+            // already-bright background buildings get almost none, so they do not glow.
+            static const std::string kOutput = "oD0.xyz = mr.xyz;";
+            static const std::string kWeighted =
+                "float city_lum = dot(mr.xyz, float3(0.2126, 0.7152, 0.0722)); "
+                "oD0.xyz = mr.xyz * (1.0 + 1.7 * (1.0 - saturate(city_lum)));";
+            for (size_t at = src.find(kOutput); at != std::string::npos; at = src.find(kOutput, at)) {
+                src.replace(at, kOutput.size(), kWeighted);
+                at += kWeighted.size();
+            }
+        }
         return sh.sprite ? SpriteSizeHlsl(std::move(src)) : src;
     }
     return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
@@ -3720,6 +3775,7 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     // CPU wrote (movies, legal screens) was made for 16:9 and is shown that way in the middle of a wider frame.
     float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
     if (t.cpu || t.scene) t.picture = t.cpu && !t.scene;  // a frame with neither shows what it showed
+    const bool picture = t.picture;                       // movies and legal screens keep their own look
     t.cpu = t.scene = false;                              // the surface starts its next frame
     if (t.picture && aspect > 16.0f / 9.0f) aspect = 16.0f / 9.0f;
     float w = float(bb_w_);
@@ -3732,15 +3788,16 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
     binds_ = {};
+    const float post = picture ? 0.0f : 1.0f;  // movies and legal screens keep their own look
     if (aa) {  // ApplySmaa left it readable
-        Blit(aa, t.fmt, uv, {.gamma = gamma_});
+        Blit(aa, t.fmt, uv, {.gamma = gamma_, .post = post});
         return;
     }
     ID3D12Resource* color = ResolveColor(t);
     if (!color) return;
     auto& state = color == t.res.Get() ? t.state : t.resolved_state;
     Transition(color, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Blit(color, t.fmt, uv, {.gamma = gamma_});
+    Blit(color, t.fmt, uv, {.gamma = gamma_, .post = post});
 }
 
 void D3D12Backend::RenderUi() {
