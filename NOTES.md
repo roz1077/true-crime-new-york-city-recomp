@@ -101,25 +101,45 @@ measurements in `PERFORMANCE.md`, and the build, checks and diagnostics in `DEVE
   reset and table rebuild (`scene_nodes.cpp`), fixing the crash that followed the earlier mouse
   work.
 
-## Traffic variety and Copland (2026-11-03)
+## Traffic variety and Copland (2026-11-04)
 
 The Xbox glitch guide reports that ordinary traffic can dwindle to cruisers
-and parked sedans after returning to free roam. The cause has not been
-reproduced in this port. See the [Xbox glitch guide](https://gamefaqs.gamespot.com/xbox/925118-true-crime-new-york-city/faqs/40332).
+and parked sedans after returning to free roam. It is reproducible in normal
+free roam in the port. See the
+[Xbox glitch guide](https://gamefaqs.gamespot.com/xbox/925118-true-crime-new-york-city/faqs/40332).
+
+The PC v1.0 build was compared directly: its selector (`0x402E00`), RNG,
+spawn weights and `SpawnInfo`/`Vehicle` data match the Xbox build, so there is
+no PC-side Copland fix to copy. The fix below is a port-side repair of the
+shared logic.
+
+Mechanism: the selector at `0x158F0` scans 16 references at world `+0x2660`
+(stride `0x14`), and `0x14170` resolves a model from the 16-entry model table
+at world `+0x27A0`. The scripted/random-crime vehicle queue clears the table
+(`0x8EA32`/`0x8804D` -> `0x83240`) and then reserves records by calling
+`0x7DBD0` from `0x1CC6C`/`0x1E492` with weight 0. Those zero weights leave the
+availability mask built by `0x818A0` without the civilian categories: `0x14170`
+returns `-1`, the caller at `0x1850F` rejects the civilian ref, and only police
+still resolve (the "Copland" state).
+
+Fix: after `0x7DBD0` runs, a queue-created record with weight 0 is repaired
+from the matching traffic ref's weight (`ref+8`) for the same slot, and its
+idle bit is cleared. The queue still receives its record, so it does not spin
+(skipping the call hangs the vehicle queue); the civilian model stays
+selectable. Longer play testing is still worthwhile.
 
 `XBE_TRACE_TRAFFIC=1` enables the read-only hooks in `src/game/traffic_trace.cpp`.
-The selector at `0x158F0` scans 16 references at world `+0x2660` with stride
-`0x14`. The trace records changes to the candidate pool, the per-reference
-exclusion bits, selected models, and the resource and vehicle model IDs at
-the `0x823C0` and `0x7DD80` spawn paths. Guest model IDs 7, 62, 63 and 89
-identify Crownwig, police sedan, taxi and training police sedan respectively.
-A resource with no data pointer can still produce a vehicle in a healthy run,
-so a zero residency field alone does not establish a spawn failure.
+The trace records the candidate pool, exclusion bits, effective weights,
+selected models, the model-table add/clear callers, the `0x14170` pick table,
+and the resource and vehicle model IDs at the `0x823C0` and `0x7DD80` spawn
+paths. Guest model IDs 7, 62, 63 and 89 identify Crownwig, police sedan, taxi
+and training police sedan respectively. A resource with no data pointer can
+still produce a vehicle in a healthy run, so a zero residency field alone does
+not establish a spawn failure.
 
 The 30 FPS spawn baseline and 60 FPS selector baseline are saved as
 `traffic-baseline.log` and `traffic-selector-baseline.log` under
-`out/build/release/logs`. A failing trace should cover the transition from
-varied traffic to the affected state and be copied before relaunch.
+`out/build/release/logs`.
 
 ## Follow-up performance review and user-driven street profile (2026-11-02)
 
