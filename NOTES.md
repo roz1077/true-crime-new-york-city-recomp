@@ -21,6 +21,22 @@ measurements in `PERFORMANCE.md`, and the build, checks and diagnostics in `DEVE
   keyboard-mouse prompts (see the 2026-11-03 mouse aim section).
 - Open: traffic variety after free roam (below), draw distance, HDR and ambient occlusion.
 
+## Scripted voice-over through the car radio (2026-11-04)
+
+- The mission dialogue played over the car radio was silent while the radio ducked. The
+  `.wma` files were opened and read, and the WMA decoder produced non-zero PCM, so neither the
+  file nor the decoder was at fault.
+- The title's voice-over slots are mono **3D** `CDirectSoundStream`s. The host positional mixer
+  attenuated them to silence because a scripted voice has no useful world position. The same
+  PCM was already being submitted to the stream (`RMS 800..900` in the audio trace).
+- `DirectSoundCreateStream` now treats mono streams as non-positional: voice-over plays
+  centred, while buffers and stereo streams keep their 3D/mix behaviour. The radio still ducks
+  `0.75 -> 0.19` during the line and returns to `0.75` afterwards.
+- PC reference: `Data\NPCVO\INT_M4\M4_CarTalk_A.WMA` is bit-identical between the Xbox assets
+  and the PC install; the PC `Cine` tracks are about 1 dB louder than the Xbox ones. The
+  remaining level difference is mix/bus gain, not the asset. The temporary host-side
+  Media Foundation fallback was removed.
+
 ## Menu previews follow the centred UI (2026-11-03)
 
 - The character outfit (Street Flack) and car selection previews are 3D draws into a

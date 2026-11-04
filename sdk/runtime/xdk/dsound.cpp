@@ -1120,7 +1120,10 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     v.callback = R32(desc + 12);
     v.context = R32(desc + 16);
     SetBins(v, R32(desc + 20));
-    v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
+    // Mono streams are the title's voice-over channels. The host's positional
+    // mixer attenuates them to silence when the scripted voice has no useful
+    // world position; play them centred instead. Buffers keep their 3D sound.
+    v.is3d = (flags & 0x10) && !(v.stream && v.channels == 1);
     v.headroom = DefaultHeadroom(flags);
     W32(a[1], obj);
     return 0;
