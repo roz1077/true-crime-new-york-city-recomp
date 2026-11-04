@@ -1159,3 +1159,18 @@ chunk with the Xbox header. Validate on one body (`Body_F_Bum`) before batching.
 vehicle and city meshes, which share the container but also differ in vertex size. Budget for the 64 MB guest
 memory: PC bodies are ~1 MB each.
 
+### City LOD distance experiment (same day, reverted)
+
+Tried the "make higher-detail city meshes load farther away" option and traced the render path with a temporary
+D3D8 draw tracer:
+
+- The indexed draws come through `0x20C470` (per mesh) ← `0x1389B0` (draw list at renderer+0x6438, count +0x6634)
+  ← `0x142C90` (scene submit) ← `0x13E5A0`.
+- Each city cell is drawn by `0x13C4C0`. It selects the LOD/node with the index at `[cell+0x90]` and the 0x40-byte
+  node table at `[cell+0x34]`; nodes are chained `0 → 1 → 2` in the model files.
+- Hooked `0x13C4C0` to log the replaced index and force `[cell+0x90] = 0` (highest-detail node) for every cell.
+- **Result: the visible line / low-detail building did not change.** So that artifact is not city mesh LOD, and
+  raising a mesh-LOD distance will not fix it. The remaining candidates are the projected light/reflection composite
+  or a texture edge, not geometry LOD.
+- Hook and tracer removed again; no source change remains.
+
