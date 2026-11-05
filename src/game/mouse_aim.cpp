@@ -7,10 +7,9 @@
 // injecting the mouse there covers the camera modes that accumulate the globals:
 // on foot (mode 5), precision aim / crosshair (modes 0/6/11), drive-by, sniper
 // and the other mission cameras, not just the four modes the PC fix names. The
-// unarmed camera (mode 23) derives its yaw from the followed target instead of
-// accumulating it, so there the raw counts are kept as a separate offset and
-// added back after the controller, skipping the character-turn smoothing and
-// the stick dead zone that used to swallow small horizontal steps.
+// unarmed and transition controllers can replace the yaw before building the
+// view. Keep the requested heading for this update and restore it immediately
+// before their shared orientation builder reads it.
 //
 // The look controllers accumulate a yaw and a pitch in 0x348B20 (yaw) and
 // 0x348A80 (pitch); the camera update turns those globals into the final
@@ -123,22 +122,15 @@ bool IsGameplayCamera(uint8_t *base, uint32_t camera) {
     return Rd8(base, camera + kActiveFlag) != 0;
 }
 
-// The unarmed camera, sub_0002D230. It does not accumulate the look stick into
-// the globals and does not read them back either: it derives yaw from the
-// followed target's forward vector and overwrites 0x348B20 with that value
-// every frame. Rotating the target works but the game eases the character's
-// facing into the camera, which made the first second of horizontal movement
-// disappear. Instead keep our own raw yaw offset and add it back after the
-// controller has written the target-derived yaw, so the view turns on the next
-// camera build without waiting for the character to catch up.
-constexpr uint8_t kModeUnarmed = 23;
-
-// radians of raw mouse yaw on top of the unarmed controller's target angle
-float g_unarmed_yaw = 0;
-// last yaw the target-driven controller produced; kept while a zone load or a
-// car exit temporarily clears the target so the raw offset still has a base
-float g_unarmed_base = 0;
-bool g_unarmed_base_valid = false;
+// Scoped to a shared camera update: other cameras and unrelated calls to the
+// orientation builder must keep their own angles. Thread-local because guest
+// threads can build other cameras while the gameplay update is running.
+struct CameraAim {
+    uint32_t controller = 0;
+    float yaw = 0;
+    bool active = false;
+};
+thread_local CameraAim g_camera_aim;
 
 // Adds the pending raw mouse delta to the camera angles.  The caller injects
 // before the controller runs and widens that controller's own pitch clamp, so
@@ -166,29 +158,6 @@ void ApplyAim(uint8_t *base, uint32_t controller, float pitch_min, float pitch_m
     std::memcpy(base + kPitch, &pitch, sizeof(pitch));
 }
 
-// Unarmed camera: keep the raw yaw offset and write the pitch accumulator.
-// Pitch survives the controller; yaw does not, because the controller replaces
-// it with the target-derived angle, so the caller adds g_unarmed_yaw back after
-// the controller runs.
-void ApplyUnarmedAim(uint8_t *base, uint32_t controller, float pitch_min, float pitch_max) {
-    // tells input this camera is still the one updating; when it stops, input
-    // falls back to the right stick for the new camera mode
-    input::UseDirectMouseAim();
-    float dx = 0, dy = 0;
-    if (!input::ConsumeMouseAim(dx, dy)) return;
-
-    const float percent = float(std::clamp(input::g_mouse_sensitivity_percent, 10u, 400u)) * 0.01f;
-    const float vertical = float(std::clamp(input::g_mouse_vertical_sensitivity_percent, 10u, 400u)) * 0.01f;
-    const uint32_t game = Rd(base, kGame);
-    const float yaw_sign = Rd8(base, game + kInvertX) ? -1.0f : 1.0f;
-    const float pitch_sign = Rd8(base, game + kInvertY) ? -1.0f : 1.0f;
-
-    g_unarmed_yaw += dx * kRadiansPerPixel * percent * yaw_sign;
-    const float pitch =
-        std::clamp(RdF(base, kPitch) + dy * kRadiansPerPixel * percent * vertical * pitch_sign, pitch_min, pitch_max);
-    std::memcpy(base + kPitch, &pitch, sizeof(pitch));
-}
-
 // Widen a look controller's pitch clamp for one update, so the controller's own
 // clamp does not undo the PC range.  The stock fields are restored by the
 // caller before it returns, keeping the gamepad path original.
@@ -212,50 +181,26 @@ void RestorePitch(uint8_t *base, uint32_t controller, uint32_t old_min, uint32_t
 // calls its virtual methods; injecting here, before those methods, covers the
 // on-foot, precision aim, crosshair, drive-by and mission cameras in one place.
 // The vehicle path is left to sub_0001FD40 below because it rebuilds its chase
-// yaw every frame. The unarmed mode keeps the raw counts as an offset on top
-// of that target angle, because the controller replaces the accumulator with
-// the target's forward angle.
+// yaw every frame. Controllers using the shared orientation builder also get
+// the requested yaw there, after their own target/transition calculations.
 X86_EXTERN_FUNC(__imp__sub_0002E200);
 X86_FUNC(sub_0002E200) {
     const uint32_t camera = ctx.ecx;
     const uint32_t controller = camera ? Rd(base, camera + kActive) : 0;
     const uint8_t mode = camera ? Rd8(base, camera + kMode) : 0;
 
-    static uint8_t last_mode = 0xFF;
-    if (mode != last_mode) {
-        last_mode = mode;
-        // the unarmed view starts centred on the target again
-        if (mode == kModeUnarmed) {
-            g_unarmed_yaw = 0;
-            g_unarmed_base_valid = false;
-        }
-    }
     const bool owned = controller && Rd(base, controller + kOwner) == camera;
     if (input::g_direct_mouse_aim && owned && mode != kModeVehicle && IsGameplayCamera(base, camera)) {
         uint32_t old_min = 0, old_max = 0;
-        const bool widen = input::DirectAimRecent() &&
+        ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
+        const bool recent = input::DirectAimRecent();
+        const bool widen = recent &&
                            WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
-        if (mode == kModeUnarmed) {
-            if (!g_unarmed_base_valid) {
-                // seed from the live camera while the transition has no target
-                g_unarmed_base = RdF(base, kYaw);
-                g_unarmed_base_valid = true;
-            }
-            ApplyUnarmedAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
-        } else {
-            ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
-        }
+        const CameraAim previous = g_camera_aim;
+        g_camera_aim = {controller, RdF(base, kYaw), recent};
         __imp__sub_0002E200(ctx, base);
+        g_camera_aim = previous;
         if (widen) RestorePitch(base, controller, old_min, old_max);
-        if (mode == kModeUnarmed) {
-            // When the controller ran it replaced the yaw with the target's
-            // angle, which becomes the new base. While a transition has no
-            // target it bails out before touching the yaw, so the cached base
-            // keeps the offset from stacking on itself.
-            if (Rd(base, camera + kTarget)) g_unarmed_base = RdF(base, kYaw);
-            const float yaw = g_unarmed_base + g_unarmed_yaw;
-            std::memcpy(base + kYaw, &yaw, sizeof(yaw));
-        }
         return;
     }
     __imp__sub_0002E200(ctx, base);
@@ -268,24 +213,36 @@ X86_FUNC(sub_0002E200) {
 // of a per-frame nudge that the chase camera would erase.
 //
 // The method is shared by every look controller, so it only touches the
-// gameplay camera when mode 13 is active and the caller is that mode's active
-// controller.
+// active gameplay controller. Non-vehicle updates carry a scoped requested
+// heading from sub_0002E200, including unarmed and transition controllers.
 X86_EXTERN_FUNC(__imp__sub_0001FD40);
 X86_FUNC(sub_0001FD40) {
     static bool held = false;
     static float yaw = 0, pitch = 0;
     static uint64_t last_vehicle_at = 0;
+    static uint32_t last_vehicle_camera = 0, last_vehicle_controller = 0;
 
     const uint32_t controller = ctx.ecx;
+    if (input::g_direct_mouse_aim && g_camera_aim.active && g_camera_aim.controller == controller) {
+        // Applying this after sub_0002E200 returns is too late: this method
+        // has already used the controller's replacement yaw to build the view.
+        std::memcpy(base + kYaw, &g_camera_aim.yaw, sizeof(g_camera_aim.yaw));
+    }
     if (input::g_direct_mouse_aim) {
         const uint32_t camera = GameplayCamera(base, controller);
+        if (camera && Rd(base, camera + kActive) == controller && Rd8(base, camera + kMode) != kModeVehicle)
+            held = false;
         if (camera && Rd8(base, camera + kMode) == kModeVehicle && Rd(base, camera + kActive) == controller) {
             // every look controller calls this shared method, so only the
             // vehicle controller updates the hold; an unrelated call must not
             // clear it and force the chase pitch back in
             const uint64_t now = NowMs();
-            if (now - last_vehicle_at > 500) held = false;
+            if (now - last_vehicle_at > 500 || !input::DirectAimRecent() ||
+                camera != last_vehicle_camera || controller != last_vehicle_controller)
+                held = false;
             last_vehicle_at = now;
+            last_vehicle_camera = camera;
+            last_vehicle_controller = controller;
             input::UseDirectMouseAim();
 
             float dx = 0, dy = 0;

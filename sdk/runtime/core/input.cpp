@@ -81,6 +81,15 @@ float g_pending_aim_x = 0, g_pending_aim_y = 0;
 constexpr float kPendingAimLimit = 150.0f;
 constexpr float kPendingAimStep = 20.0f;
 
+// A camera can stop just after its heartbeat. Counts already queued during
+// that 100 ms grace period belong to the transition too, not the discard path.
+// Caller holds g_mouse_lock.
+void DeferMouseAim() {
+    g_pending_aim_x = std::clamp(g_pending_aim_x + g_aim_x, -kPendingAimLimit, kPendingAimLimit);
+    g_pending_aim_y = std::clamp(g_pending_aim_y + g_aim_y, -kPendingAimLimit, kPendingAimLimit);
+    g_aim_x = g_aim_y = 0;
+}
+
 bool ReadKeyboardMouse(Pad& pad) {
     const auto window = static_cast<HWND>(app::Window());
     static std::atomic<bool> had_focus{true};
@@ -93,6 +102,8 @@ bool ReadKeyboardMouse(Pad& pad) {
         g_hold_rx = g_hold_ry = 0;
         g_aim_x = g_aim_y = 0;
         g_pending_aim_x = g_pending_aim_y = 0;
+        g_aim_at = 0;
+        g_direct_used_at.store(0, std::memory_order_relaxed);
         return false;
     }
     auto held = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
@@ -146,9 +157,8 @@ bool ReadKeyboardMouse(Pad& pad) {
             g_mouse_ry = shape(-g_mouse_y);
             g_mouse_x = g_mouse_y = 0;
         }
-        // raw samples belong to the direct camera; another mode falls back to
-        // the stick, so discard anything the direct camera did not take
-        if (!direct || ui) g_aim_x = g_aim_y = 0;
+        if (ui) g_aim_x = g_aim_y = 0;
+        else if (!direct && g_direct_mouse_aim) DeferMouseAim();
         // A pad holds its deflection for as long as the stick is pushed, while
         // a mouse flick only produces one 16 ms sample. Hold the fallback stick
         // briefly so a quick move gives the transition camera the same
@@ -160,7 +170,11 @@ bool ReadKeyboardMouse(Pad& pad) {
         } else if (direct || ui || now - g_hold_at > 150) {
             g_hold_rx = g_hold_ry = 0;
         }
-        mouse_active = g_mouse_rx || g_mouse_ry || g_hold_rx || g_hold_ry;
+        // Even a one-count direct sample must select mouse input. The stick
+        // fallback's jitter threshold must not keep a connected pad in charge.
+        mouse_active = g_mouse_rx || g_mouse_ry || g_hold_rx || g_hold_ry || g_aim_x || g_aim_y ||
+                       (g_direct_mouse_aim && g_direct_confirmed.load(std::memory_order_relaxed) &&
+                        g_aim_at && now - g_aim_at < 150);
         // the camera applies the pixels itself while direct aim is live
         pad.rx = (direct || ui) ? 0 : g_hold_rx;
         pad.ry = (direct || ui) ? 0 : g_hold_ry;
@@ -236,11 +250,12 @@ void ReadMouse(void* raw_input) {
         // direct aim takes the full raw delta, like the PC fix's raw input path
         g_aim_x = std::clamp(g_aim_x + float(dx), -10000.0f, 10000.0f);
         g_aim_y = std::clamp(g_aim_y + float(dy), -10000.0f, 10000.0f);
-    } else if (g_direct_confirmed.load(std::memory_order_relaxed)) {
+    } else if (g_direct_mouse_aim && g_direct_confirmed.load(std::memory_order_relaxed)) {
         // no camera is updating: keep a bounded amount so the view catches up
         // when the transition ends instead of dropping the movement
-        g_pending_aim_x = std::clamp(g_pending_aim_x + float(dx), -kPendingAimLimit, kPendingAimLimit);
-        g_pending_aim_y = std::clamp(g_pending_aim_y + float(dy), -kPendingAimLimit, kPendingAimLimit);
+        g_aim_x += float(dx);
+        g_aim_y += float(dy);
+        DeferMouseAim();
     }
 }
 
@@ -257,6 +272,8 @@ void SetUiActive(bool active) {
     g_hold_rx = g_hold_ry = 0;
     g_aim_x = g_aim_y = 0; // the menu moved the pointer, not the camera
     g_pending_aim_x = g_pending_aim_y = 0;
+    g_aim_at = 0;
+    g_direct_used_at.store(0, std::memory_order_relaxed);
 }
 
 bool ConsumeMouseAim(float& dx, float& dy) {
@@ -265,10 +282,9 @@ bool ConsumeMouseAim(float& dx, float& dy) {
         g_aim_x = g_aim_y = 0;
         return false;
     }
-    // a sample the camera never looked at is stale: drop it rather than turn
-    // the view by a jump when gameplay resumes. Movement buffered during a
-    // camera stall is separate and is released gradually below.
-    if (GetTickCount64() - g_aim_at > 200) g_aim_x = g_aim_y = 0;
+    // If no pad poll ran during the stall, preserve the grace-period counts
+    // here as well. Release them through the same bounded transition buffer.
+    if (GetTickCount64() - g_aim_at > 200) DeferMouseAim();
 
     float px = 0, py = 0;
     if (g_pending_aim_x != 0 || g_pending_aim_y != 0) {
@@ -354,7 +370,14 @@ Pad Poll(int port) {
                                        std::any_of(std::begin(p.analog), std::end(p.analog),
                                                    [](uint8_t value) { return value > 32; });
         if (active || !p.connected) g_keyboard_mouse_active.store(true, std::memory_order_relaxed);
-        else if (controller_active) g_keyboard_mouse_active.store(false, std::memory_order_relaxed);
+        else if (controller_active) {
+            g_keyboard_mouse_active.store(false, std::memory_order_relaxed);
+            // Relinquish held camera angles immediately. The next mouse
+            // sample starts from the controller's current heading.
+            std::lock_guard lock(g_mouse_lock);
+            g_direct_used_at.store(0, std::memory_order_relaxed);
+            g_pending_aim_x = g_pending_aim_y = 0;
+        }
         if (active || !p.connected) {
             keyboard_mouse.connected = true;
             p = keyboard_mouse;

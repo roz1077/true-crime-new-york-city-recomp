@@ -15,11 +15,39 @@ measurements in `PERFORMANCE.md`, and the build, checks and diagnostics in `DEVE
 - `TrueCrimeNYC.exe` opens an ISO picker before the game starts; `release.bat` packages a release.
 - The modified SDK is tracked in this repository under `sdk/`. `patches/xboxxberecomp-local.patch` is the same
   change set as a diff against upstream XboxXBERecomp `f7b13fd` (see `DEVELOPMENT.md`).
-- Ten regression checks (`scripts/run_checks.py`) cover the runtime fixes and the menu rules.
+- Seventeen regression checks (`scripts/run_checks.py`) cover the runtime fixes and the menu rules.
 - Mouse and keyboard play is supported: raw mouse aim on foot and in vehicles, rebindable
   keyboard actions, digital WASD with normalized diagonals, and automatic Xbox/PlayStation/
   keyboard-mouse prompts (see the 2026-11-03 mouse aim section).
 - Open: traffic variety after free roam (below), draw distance, HDR and ambient occlusion.
+
+## Horizontal mouse movement through transitions — follow-up (2026-11-05)
+
+- The user reports the earlier fix is incomplete: horizontal mouse movement still fails during
+  vehicle entry/exit, area transitions, and controller-to-mouse switching. The 2026-11-03 mouse
+  section below records the previous implementation, not verified resolution of those cases.
+- The shared camera hook injected yaw before controller methods, but unarmed/transition
+  controllers can replace that yaw before calling the shared orientation builder `0x1FD40`.
+  The unarmed correction after `0x2E200` returned was too late for the view already built.
+  It also assumed the controller always replaced yaw; branches that retain it could stack the offset.
+- Replaced the unarmed offset/cache with a heading scoped to the current gameplay camera update.
+  Inline camera builders still receive the pre-step yaw; the shared builder restores that heading
+  immediately before consuming it. No post-update offset is reapplied. Other cameras and calls
+  outside the update retain their own yaw.
+- The input fallback discarded raw counts collected within the last heartbeat's 100 ms grace
+  period. Those counts now join the existing bounded transition buffer, including when no pad
+  poll ran during the load. The existing 150-count cap and 20-count release steps remain.
+- Single raw counts select mouse input even when the camera consumes them before the next pad
+  poll. Actual controller input releases the recent mouse hold and pending transition counts;
+  vehicle aim reseeds from the current chase heading on the next mouse sample. UI/focus changes
+  clear the hold, and leaving the vehicle controller invalidates its cached heading.
+- `scripts/test_mouse_aim.py` compiles the actual hooks/input routines with deterministic camera,
+  clock and device fixtures. `--baseline` reproduces failures against HEAD's previous code.
+  Covers same-update yaw, missing targets, changing camera modes, inline builders, isolated
+  camera calls, grace-period/stale counts, one-count handoff, vehicle handoff and focus/UI reset.
+  All 17 regression checks pass. Release build: `logs/codex-mouse-transition-build.log`.
+  **User confirmed the fix in live gameplay on 2026-11-05**, following the reports of
+  vehicle/area transitions and controller-to-mouse switching.
 
 ## Scripted voice-over through the car radio (2026-11-04)
 
@@ -78,19 +106,36 @@ measurements in `PERFORMANCE.md`, and the build, checks and diagnostics in `DEVE
 
 ## Mouse aim, keyboard movement and controller prompts (2026-11-03)
 
-- Mouse look is no longer folded into the right stick. `WM_INPUT` raw counts are applied directly
-  to the gameplay camera's yaw/pitch accumulators (`0x348B20` / `0x348A80`) at the PC
-  WidescreenFix scale (`fMouseSens 4.0 * RawInputMouse 1.0 / 1000 = 0.004 rad/count`), with the
-  game's invert-X/invert-Y options and the new `mouse_sensitivity_percent` /
+The unarmed offset and transition claims here describe the earlier attempt, superseded by the
+2026-11-05 follow-up above. The user confirmed the issue remained after this implementation.
+
+- Mouse look is no longer folded into the right stick. `WM_INPUT` raw counts are applied at the
+  PC WidescreenFix scale (`fMouseSens 4.0 * RawInputMouse 1.0 / 1000 = 0.004 rad/count`), with the
+  game's invert-X/invert-Y options and the `mouse_sensitivity_percent` /
   `mouse_vertical_sensitivity_percent` settings.
-- Camera modes follow the PC enum: on foot `sub_000205A0` (modes 0/6/11) and `sub_00025910`
-  (mode 5), in vehicle `sub_00024040` (mode 13). On foot the PC pitch range is -89..+60 degrees;
-  in vehicle it is -89..+10. `sub_0001FD40` is the shared orientation builder for the vehicle
-  path and negates the pitch accumulator, so that path keeps its own sign and clamp. The look
-  controller's own pitch limits are widened only for the direct update and restored afterwards.
+- The shared camera update `sub_0002E200` is the injection point for every mode except vehicle
+  (13) and unarmed (23). It reads the active controller from `camera+0x174`, checks that
+  `controller+0x34` owns the gameplay camera, and writes yaw/pitch before the controller's
+  virtual methods run. Per-controller hooks miss the armed modes because those bodies run after
+  the camera pre-step has already rebuilt the angles.
+- Unarmed `sub_0002D230` (mode 23, vtable `0x2D3A38`) is target-driven: it replaces `0x348B20`
+  with the followed target's forward angle (`atan2(row+0x60.z, row+0x60.x)`), and that mapping
+  has a negative sign. The raw yaw is therefore kept as `g_unarmed_yaw` and added back after the
+  controller; the target-derived base is cached while a transition clears `camera+0x17C`, so the
+  offset neither stacks nor resets. On foot the PC pitch range is -89..+60 degrees; in vehicle
+  it is -89..+10. `sub_0001FD40` is the shared orientation builder for the vehicle path and
+  negates the pitch accumulator, so that path keeps its own sign and clamp. The controller's
+  pitch limits are widened only for the direct update and restored afterwards.
 - The vehicle path holds absolute yaw/pitch while the mouse is active and hands back to the
   game's chase camera after 5 s without a sample, matching the PC fix. If the look controller
-  stops running, input falls back to the right stick after 250 ms.
+  stops running, input falls back to the right stick after 100 ms.
+- A zone load or car exit stops the camera update entirely: `sub_0002E200` is not called for any
+  camera object and the game does not read the look stick during that window. The fallback curve
+  still matters because the look controllers cube the stick, so a linear mouse sample sits near
+  zero. The fallback now applies the inverse curve with a 45% floor, ignores one-count jitter, and
+  holds the sample for 150 ms so a flick behaves like a held pad. Movement made while no camera
+  is updating is also kept in a bounded 150-count (per axis) buffer and released in 20-count
+  steps over the first camera frames after the transition.
 - The cursor is hidden and confined to the focused game window; it is released while the F10
   Graphics menu owns the pointer and on focus loss.
 - Keyboard movement is digital full-speed WASD with normalized diagonals; a real controller keeps
