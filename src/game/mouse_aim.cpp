@@ -66,13 +66,6 @@ constexpr uint32_t kPitch = 0x348A80;  // radians
 constexpr uint32_t kInvertX = 0xFEF;   // game + 0xFEF
 constexpr uint32_t kInvertY = 0xFEE;   // game + 0xFEE
 
-// The camera modes whose look controller the direct path replaces, matching
-// the PC fix's CameraOnFoot / CameraPrecisionAim / CameraCrosshair and
-// CameraInVehicle. Mode 5 is the Xbox build's own on-foot profile.
-constexpr uint8_t kModeOnFoot = 0;
-constexpr uint8_t kModeXboxOnFoot = 5;
-constexpr uint8_t kModePrecisionAim = 6;
-constexpr uint8_t kModeCrosshair = 11;
 constexpr uint8_t kModeVehicle = 13;
 
 // The PC WidescreenFix takes raw counts straight to camera angles:
@@ -124,13 +117,6 @@ bool IsGameplayCamera(uint8_t *base, uint32_t camera) {
     const uint32_t game = Rd(base, kGame);
     if (!camera || !game || camera != Rd(base, game + kCamera)) return false;
     return Rd(base, camera + kTarget) && Rd8(base, camera + kActiveFlag);
-}
-
-// Modes with a controller that builds its orientation after the shared camera
-// update starts. Those keep their own direct-aim injection; the shared hook is
-// for the additional modes only.
-bool KnownControllerMode(uint8_t mode) {
-    return mode == kModeOnFoot || mode == kModeXboxOnFoot || mode == kModePrecisionAim || mode == kModeCrosshair;
 }
 
 // The unarmed camera, sub_0002D230. It does not accumulate the look stick into
@@ -186,52 +172,13 @@ void RestorePitch(uint8_t *base, uint32_t controller, uint32_t old_min, uint32_t
 
 } // namespace
 
-// The Xbox build's on-foot look controller, confirmed by the earlier tests.
-X86_EXTERN_FUNC(__imp__sub_00025910);
-X86_FUNC(sub_00025910) {
-    const uint32_t controller = ctx.ecx;
-    const uint32_t camera = input::g_direct_mouse_aim ? GameplayCamera(base, controller) : 0;
-    if (camera) ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
-
-    // The PC raw path allowed -89..+60 degrees while the mouse was active; the
-    // original Xbox camera clamps to -40..+60.  Widen the controller's own
-    // limits for this update and put them back before returning, so the gamepad
-    // path keeps its normal range.
-    uint32_t old_min = 0, old_max = 0;
-    const bool widen = camera && input::DirectAimRecent() &&
-                       WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
-
-    __imp__sub_00025910(ctx, base);
-
-    if (widen) RestorePitch(base, controller, old_min, old_max);
-}
-
-// On foot / precision aim / crosshair.  This controller accumulates the stick
-// into the same two globals, so injecting before it runs has the same effect as
-// on the on-foot controller above.
-X86_EXTERN_FUNC(__imp__sub_000205A0);
-X86_FUNC(sub_000205A0) {
-    const uint32_t controller = ctx.ecx;
-    uint32_t camera = input::g_direct_mouse_aim ? GameplayCamera(base, controller) : 0;
-    if (camera && !KnownControllerMode(Rd8(base, camera + kMode))) camera = 0;
-    if (camera) ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
-
-    uint32_t old_min = 0, old_max = 0;
-    const bool widen = camera && input::DirectAimRecent() &&
-                       WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
-
-    __imp__sub_000205A0(ctx, base);
-
-    if (widen) RestorePitch(base, controller, old_min, old_max);
-}
-
 // Every camera mode. The camera update reads the active look controller and
-// calls its virtual methods. Injecting here, before those methods, replaces the
-// per-mode controller hooks: on-foot, precision aim, crosshair, drive-by and
-// mission cameras all go through this. The vehicle path is left to
-// sub_0001FD40 below because it rebuilds its chase yaw every frame, and the
-// unarmed mode is left to the game's pad path because its controller derives
-// yaw from the followed target instead of accumulating it.
+// calls its virtual methods; injecting here, before those methods, covers the
+// on-foot, precision aim, crosshair, drive-by and mission cameras in one place.
+// The vehicle path is left to sub_0001FD40 below because it rebuilds its chase
+// yaw every frame, and the unarmed mode is left to the game's pad path because
+// its controller derives yaw from the followed target instead of accumulating
+// it.
 X86_EXTERN_FUNC(__imp__sub_0002E200);
 X86_FUNC(sub_0002E200) {
     const uint32_t camera = ctx.ecx;
@@ -239,7 +186,7 @@ X86_FUNC(sub_0002E200) {
     const uint8_t mode = camera ? Rd8(base, camera + kMode) : 0;
     const bool owned = controller && Rd(base, controller + kOwner) == camera;
     if (input::g_direct_mouse_aim && owned && mode != kModeVehicle && mode != kModeUnarmed &&
-        !KnownControllerMode(mode) && IsGameplayCamera(base, camera)) {
+        IsGameplayCamera(base, camera)) {
         uint32_t old_min = 0, old_max = 0;
         const bool widen = input::DirectAimRecent() &&
                            WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
