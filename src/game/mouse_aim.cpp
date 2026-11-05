@@ -2,25 +2,23 @@
 //
 // The camera object is [[0x360E00] + 0xAC]. It owns one look controller per
 // camera mode in an array at +0x114, indexed by the mode byte at +0x19; the
-// active controller is also cached at +0x174. Three of those controllers
-// matter here:
+// active controller is cached at +0x174. The shared per-frame camera update
+// sub_0002E200 reads that active controller and calls its virtual methods, so
+// injecting the mouse there covers every camera mode: on foot (mode 5), on foot
+// / precision aim / crosshair (modes 0/6/11), drive-by, sniper and the other
+// mission cameras, not just the four modes the PC fix names.
 //
-//   mode 5            sub_00025910  on foot (the path this port already used)
-//   modes 0/6/11      sub_000205A0  on foot, precision aim and crosshair
-//   mode 13           sub_00024040  in vehicle
-//
-// The PC fix's camera modes are OnFoot=0, PrecisionAim=6, Crosshair=11 and
-// InVehicle=13, so the same set. The look controllers accumulate a yaw and a
-// pitch in 0x348B20 (yaw) and 0x348A80 (pitch); the camera update turns those
-// globals into the final orientation later in the frame.
+// The look controllers accumulate a yaw and a pitch in 0x348B20 (yaw) and
+// 0x348A80 (pitch); the camera update turns those globals into the final
+// orientation later in the frame.
 //
 // Mouse motion is already sampled on the host, but folding it into the pad's
 // right stick loses most of it: the guest reads the stick as a signed byte, so
 // small movements quantise away and the stick's dead zone throws away the rest.
 // With direct aim the host no longer feeds the mouse into the stick; instead
-// this hook adds the raw count delta straight to the two accumulators, before
-// the original controller runs, so the camera keeps its own clamps and
-// smoothing.
+// the shared camera update adds the raw count delta straight to the two
+// accumulators before the active controller runs, so the camera keeps its own
+// clamps and smoothing.
 //
 // The feel follows the PC version's WidescreenFix (RawInput.ixx): raw counts
 // are scaled by fMouseSens (4.0) * RawInputMouse (1.0) / 1000 = 0.004 rad per
@@ -117,8 +115,12 @@ uint32_t GameplayCamera(uint8_t *base, uint32_t controller) {
     return camera;
 }
 
-bool OnFootMode(uint8_t mode) {
-    return mode == kModeOnFoot || mode == kModeXboxOnFoot || mode == kModePrecisionAim || mode == kModeCrosshair;
+// The shared camera object itself (not a look controller): the per-frame update
+// asks it for the active controller and runs that controller's virtual methods.
+bool IsGameplayCamera(uint8_t *base, uint32_t camera) {
+    const uint32_t game = Rd(base, kGame);
+    if (!camera || !game || camera != Rd(base, game + kCamera)) return false;
+    return Rd(base, camera + kTarget) && Rd8(base, camera + kActiveFlag);
 }
 
 // Adds the pending raw mouse delta to the camera angles.  The caller injects
@@ -166,43 +168,42 @@ void RestorePitch(uint8_t *base, uint32_t controller, uint32_t old_min, uint32_t
 
 } // namespace
 
-// The Xbox build's on-foot look controller, confirmed by the earlier tests.
+// The Xbox build's on-foot look controller. The shared camera update below
+// applies the direct aim for every mode, so this remains only the original
+// controller body.
 X86_EXTERN_FUNC(__imp__sub_00025910);
 X86_FUNC(sub_00025910) {
-    const uint32_t controller = ctx.ecx;
-    const uint32_t camera = input::g_direct_mouse_aim ? GameplayCamera(base, controller) : 0;
-    if (camera) ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
-
-    // The PC raw path allowed -89..+60 degrees while the mouse was active; the
-    // original Xbox camera clamps to -40..+60.  Widen the controller's own
-    // limits for this update and put them back before returning, so the gamepad
-    // path keeps its normal range.
-    uint32_t old_min = 0, old_max = 0;
-    const bool widen = camera && input::DirectAimRecent() &&
-                       WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
-
     __imp__sub_00025910(ctx, base);
-
-    if (widen) RestorePitch(base, controller, old_min, old_max);
 }
 
-// On foot / precision aim / crosshair.  This controller accumulates the stick
-// into the same two globals, so injecting before it runs has the same effect as
-// on the on-foot controller above.
+// On foot / precision aim / crosshair controller. The shared camera update
+// applies the direct aim for every mode; this keeps the original body.
 X86_EXTERN_FUNC(__imp__sub_000205A0);
 X86_FUNC(sub_000205A0) {
-    const uint32_t controller = ctx.ecx;
-    uint32_t camera = input::g_direct_mouse_aim ? GameplayCamera(base, controller) : 0;
-    if (camera && !OnFootMode(Rd8(base, camera + kMode))) camera = 0;
-    if (camera) ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
-
-    uint32_t old_min = 0, old_max = 0;
-    const bool widen = camera && input::DirectAimRecent() &&
-                       WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
-
     __imp__sub_000205A0(ctx, base);
+}
 
-    if (widen) RestorePitch(base, controller, old_min, old_max);
+// Every camera mode. The camera update reads the active look controller and
+// calls its virtual methods. Injecting here, before those methods, replaces the
+// per-mode controller hooks: on-foot, precision aim, crosshair, drive-by and
+// mission cameras all go through this. The vehicle path is left to
+// sub_0001FD40 below because it rebuilds its chase yaw every frame.
+X86_EXTERN_FUNC(__imp__sub_0002E200);
+X86_FUNC(sub_0002E200) {
+    const uint32_t camera = ctx.ecx;
+    const uint32_t controller = camera ? Rd(base, camera + kActive) : 0;
+    const uint8_t mode = camera ? Rd8(base, camera + kMode) : 0;
+    const bool owned = controller && Rd(base, controller + kOwner) == camera;
+    if (input::g_direct_mouse_aim && owned && mode != kModeVehicle && IsGameplayCamera(base, camera)) {
+        uint32_t old_min = 0, old_max = 0;
+        const bool widen = input::DirectAimRecent() &&
+                           WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
+        ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
+        __imp__sub_0002E200(ctx, base);
+        if (widen) RestorePitch(base, controller, old_min, old_max);
+        return;
+    }
+    __imp__sub_0002E200(ctx, base);
 }
 
 // In vehicle.  sub_00024040 (mode 13) rebuilds its chase yaw each frame and
