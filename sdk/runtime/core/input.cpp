@@ -65,6 +65,10 @@ std::mutex g_mouse_lock;
 int g_mouse_x = 0, g_mouse_y = 0;
 uint64_t g_mouse_sample_at = 0;
 int16_t g_mouse_rx = 0, g_mouse_ry = 0;
+// last fallback stick value, held briefly so a mouse flick is not a one-frame
+// pulse to the transition cameras
+int16_t g_hold_rx = 0, g_hold_ry = 0;
+uint64_t g_hold_at = 0;
 // raw counts waiting for the camera, taken straight from WM_INPUT so a fast
 // flick is not limited by the right-stick path's small clamp; the camera clears
 // them once per frame
@@ -80,6 +84,7 @@ bool ReadKeyboardMouse(Pad& pad) {
     if (!focused) {
         std::lock_guard lock(g_mouse_lock);
         g_mouse_x = g_mouse_y = g_mouse_rx = g_mouse_ry = 0;
+        g_hold_rx = g_hold_ry = 0;
         g_aim_x = g_aim_y = 0;
         return false;
     }
@@ -137,10 +142,21 @@ bool ReadKeyboardMouse(Pad& pad) {
         // raw samples belong to the direct camera; another mode falls back to
         // the stick, so discard anything the direct camera did not take
         if (!direct || ui) g_aim_x = g_aim_y = 0;
-        mouse_active = g_mouse_rx || g_mouse_ry;
+        // A pad holds its deflection for as long as the stick is pushed, while
+        // a mouse flick only produces one 16 ms sample. Hold the fallback stick
+        // briefly so a quick move gives the transition camera the same
+        // sustained input a controller would.
+        if (g_mouse_rx || g_mouse_ry) {
+            g_hold_rx = g_mouse_rx;
+            g_hold_ry = g_mouse_ry;
+            g_hold_at = now;
+        } else if (direct || ui || now - g_hold_at > 150) {
+            g_hold_rx = g_hold_ry = 0;
+        }
+        mouse_active = g_mouse_rx || g_mouse_ry || g_hold_rx || g_hold_ry;
         // the camera applies the pixels itself while direct aim is live
-        pad.rx = (direct || ui) ? 0 : g_mouse_rx;
-        pad.ry = (direct || ui) ? 0 : g_mouse_ry;
+        pad.rx = (direct || ui) ? 0 : g_hold_rx;
+        pad.ry = (direct || ui) ? 0 : g_hold_ry;
     }
     return pad.lx || pad.ly || mouse_active || pad.buttons ||
            std::any_of(std::begin(pad.analog), std::end(pad.analog), [](uint8_t value) { return value != 0; });
@@ -223,6 +239,7 @@ void SetUiActive(bool active) {
     if (!active) return;
     std::lock_guard lock(g_mouse_lock);
     g_mouse_x = g_mouse_y = g_mouse_rx = g_mouse_ry = 0;
+    g_hold_rx = g_hold_ry = 0;
     g_aim_x = g_aim_y = 0; // the menu moved the pointer, not the camera
 }
 
