@@ -119,13 +119,15 @@ bool ReadKeyboardMouse(Pad& pad) {
     const int move_scale = move_x && move_y ? 23170 : 32767;
     pad.lx = int16_t(move_x * move_scale);
     pad.ly = int16_t(move_y * move_scale);
-    constexpr int digital[] = {VK_UP,     VK_DOWN,   VK_LEFT,          VK_RIGHT,
-                               VK_ESCAPE, VK_TAB,    kLeftStickClickKey, kRightStickClickKey};
+    // The keyboard right-stick key is gone: target lock is the PC's right mouse
+    // button, so V would be a duplicate for the same pad action.
+    constexpr int digital[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_TAB, kLeftStickClickKey, 0};
     for (int i = 0; i < 8; ++i) {
-        if (held(digital[i])) pad.buttons |= uint16_t(1 << i);
+        if (digital[i] && held(digital[i])) pad.buttons |= uint16_t(1 << i);
     }
-    // Shift is the PC target lock; on the pad that is the right-stick click.
-    if (held(VK_SHIFT)) pad.buttons |= uint16_t(1 << 7);
+    // PC target lock, on the pad's right-stick click. Caps Lock stealth is a
+    // toggle in the PC version, so it is not mapped onto a held pad button.
+    if (held(VK_RBUTTON)) pad.buttons |= uint16_t(1 << 7);
 
     auto press = [&](int button, bool on) {
         if (on) pad.analog[button] = 255;
@@ -140,7 +142,9 @@ bool ReadKeyboardMouse(Pad& pad) {
     press(3, held(VK_NUMPAD9) || held(VK_XBUTTON2));                                    // Y: heavy attack / handbrake
     if (char k = LetterKey(g_use_key, 'E')) press(4, held(k));                          // black: use/action/car door
     if (char k = LetterKey(g_climb_key, 'G')) press(5, held(k));                        // white: climb
-    press(6, held(VK_RBUTTON) || held(VK_MBUTTON));                                     // LT: precision aim
+    // PC precision aim is middle mouse and Num 5; Shift is the fallback for
+    // people without a middle button.
+    press(6, held(VK_MBUTTON) || held(VK_NUMPAD5) || held(VK_SHIFT));                   // LT: precision aim
     const bool heavy_is_f = LetterKey(g_heavy_attack_key, 0) == 'F';
     press(7, held(VK_LBUTTON) || (!heavy_is_f && held('F')));                           // RT: fire
     bool mouse_active;
