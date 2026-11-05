@@ -61,7 +61,7 @@ cmake --build out\build\release --target recompile_%GAME_EXE% || goto :fail
 if exist tools\venv\Scripts\python.exe (
     tools\venv\Scripts\python.exe scripts\patch_grid_offset.py >nul || goto :fail
 ) else (
-    python scripts\patch_grid_offset.py >nul 2>nul || echo       Python not found: city-grid fix not applied
+    python scripts\patch_grid_offset.py >nul 2>nul || (echo       Python is required to apply the city-grid fix. & goto :fail)
 )
 cmake --build out\build\release || goto :fail
 
