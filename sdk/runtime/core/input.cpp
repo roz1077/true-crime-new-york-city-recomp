@@ -74,6 +74,12 @@ uint64_t g_hold_at = 0;
 // them once per frame
 float g_aim_x = 0, g_aim_y = 0;
 uint64_t g_aim_at = 0; // last raw mouse event
+// movement made while no camera is updating (zone load, car exit). It is
+// released over the first camera frames after the transition instead of being
+// dropped, matching a pad that is still deflected when control returns.
+float g_pending_aim_x = 0, g_pending_aim_y = 0;
+constexpr float kPendingAimLimit = 150.0f;
+constexpr float kPendingAimStep = 20.0f;
 
 bool ReadKeyboardMouse(Pad& pad) {
     const auto window = static_cast<HWND>(app::Window());
@@ -86,6 +92,7 @@ bool ReadKeyboardMouse(Pad& pad) {
         g_mouse_x = g_mouse_y = g_mouse_rx = g_mouse_ry = 0;
         g_hold_rx = g_hold_ry = 0;
         g_aim_x = g_aim_y = 0;
+        g_pending_aim_x = g_pending_aim_y = 0;
         return false;
     }
     auto held = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
@@ -223,10 +230,18 @@ void ReadMouse(void* raw_input) {
     // the stick path keeps its small clamp
     g_mouse_x = std::clamp(g_mouse_x + dx, -100L, 100L);
     g_mouse_y = std::clamp(g_mouse_y + dy, -100L, 100L);
-    // direct aim takes the full raw delta, like the PC fix's raw input path
-    g_aim_x = std::clamp(g_aim_x + float(dx), -10000.0f, 10000.0f);
-    g_aim_y = std::clamp(g_aim_y + float(dy), -10000.0f, 10000.0f);
-    g_aim_at = GetTickCount64();
+    const uint64_t now = GetTickCount64();
+    g_aim_at = now;
+    if (DirectAimLive(now)) {
+        // direct aim takes the full raw delta, like the PC fix's raw input path
+        g_aim_x = std::clamp(g_aim_x + float(dx), -10000.0f, 10000.0f);
+        g_aim_y = std::clamp(g_aim_y + float(dy), -10000.0f, 10000.0f);
+    } else if (g_direct_confirmed.load(std::memory_order_relaxed)) {
+        // no camera is updating: keep a bounded amount so the view catches up
+        // when the transition ends instead of dropping the movement
+        g_pending_aim_x = std::clamp(g_pending_aim_x + float(dx), -kPendingAimLimit, kPendingAimLimit);
+        g_pending_aim_y = std::clamp(g_pending_aim_y + float(dy), -kPendingAimLimit, kPendingAimLimit);
+    }
 }
 
 void UseDirectMouseAim() {
@@ -241,6 +256,7 @@ void SetUiActive(bool active) {
     g_mouse_x = g_mouse_y = g_mouse_rx = g_mouse_ry = 0;
     g_hold_rx = g_hold_ry = 0;
     g_aim_x = g_aim_y = 0; // the menu moved the pointer, not the camera
+    g_pending_aim_x = g_pending_aim_y = 0;
 }
 
 bool ConsumeMouseAim(float& dx, float& dy) {
@@ -250,14 +266,20 @@ bool ConsumeMouseAim(float& dx, float& dy) {
         return false;
     }
     // a sample the camera never looked at is stale: drop it rather than turn
-    // the view by a jump when gameplay resumes
-    if (GetTickCount64() - g_aim_at > 200) {
-        g_aim_x = g_aim_y = 0;
-        return false;
+    // the view by a jump when gameplay resumes. Movement buffered during a
+    // camera stall is separate and is released gradually below.
+    if (GetTickCount64() - g_aim_at > 200) g_aim_x = g_aim_y = 0;
+
+    float px = 0, py = 0;
+    if (g_pending_aim_x != 0 || g_pending_aim_y != 0) {
+        px = std::clamp(g_pending_aim_x, -kPendingAimStep, kPendingAimStep);
+        py = std::clamp(g_pending_aim_y, -kPendingAimStep, kPendingAimStep);
+        g_pending_aim_x -= px;
+        g_pending_aim_y -= py;
     }
-    if (g_aim_x == 0 && g_aim_y == 0) return false;
-    dx = g_aim_x;
-    dy = g_aim_y;
+    if (g_aim_x == 0 && g_aim_y == 0 && px == 0 && py == 0) return false;
+    dx = g_aim_x + px;
+    dy = g_aim_y + py;
     g_aim_x = g_aim_y = 0;
     g_direct_used_at.store(GetTickCount64(), std::memory_order_relaxed);
     return true;
