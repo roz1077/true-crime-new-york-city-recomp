@@ -7,9 +7,9 @@
 // injecting the mouse there covers the camera modes that accumulate the globals:
 // on foot (mode 5), precision aim / crosshair (modes 0/6/11), drive-by, sniper
 // and the other mission cameras, not just the four modes the PC fix names. The
-// unarmed camera (mode 23) is the exception, because it derives its yaw from the
-// followed target instead of accumulating it; that mode keeps the game's pad
-// look path.
+// unarmed camera (mode 23) derives its yaw from the followed target instead of
+// accumulating it, so there the raw counts turn the target itself; that skips
+// the character-turn dead zone that used to swallow small horizontal steps.
 //
 // The look controllers accumulate a yaw and a pitch in 0x348B20 (yaw) and
 // 0x348A80 (pitch); the camera update turns those globals into the final
@@ -122,10 +122,13 @@ bool IsGameplayCamera(uint8_t *base, uint32_t camera) {
 // The unarmed camera, sub_0002D230. It does not accumulate the look stick into
 // the globals and does not read them back either: it derives yaw from the
 // followed target's forward vector and overwrites 0x348B20 with that value
-// every frame. Writing the accumulator there is therefore discarded before the
-// camera is built, which is why this mode keeps the game's own pad look path
-// (the mouse arrives as the right stick) instead of the direct path.
+// every frame. So this mode turns the camera by rotating the target itself,
+// which is also what the pad look path ends up doing; doing it from the raw
+// counts skips the character-turn dead zone that made small mouse movements
+// disappear.
 constexpr uint8_t kModeUnarmed = 23;
+constexpr uint32_t kTargetRight = 0x40;    // local basis rows, copied by sub_0021EC70
+constexpr uint32_t kTargetForward = 0x60;  // yaw is atan2(forward.z, forward.x)
 
 // Adds the pending raw mouse delta to the camera angles.  The caller injects
 // before the controller runs and widens that controller's own pitch clamp, so
@@ -153,6 +156,50 @@ void ApplyAim(uint8_t *base, uint32_t controller, float pitch_min, float pitch_m
     std::memcpy(base + kPitch, &pitch, sizeof(pitch));
 }
 
+// Turns the target's local basis by angle around Y. The unarmed controller reads
+// the forward row's x/z as the camera yaw, so this is the same angle its own
+// controller would have produced from the pad, without the stick's dead zone.
+void RotateTargetYaw(uint8_t *base, uint32_t target, float angle) {
+    const float c = std::cos(angle), s = std::sin(angle);
+    const uint32_t rows[] = {kTargetRight, kTargetForward};
+    for (uint32_t off : rows) {
+        if (!mem::IsCommitted(target + off) || !mem::IsCommitted(target + off + 8)) continue;
+        const float x = RdF(base, target + off);
+        const float z = RdF(base, target + off + 8);
+        const float nx = x * c - z * s;
+        const float nz = x * s + z * c;
+        std::memcpy(base + target + off, &nx, sizeof(nx));
+        std::memcpy(base + target + off + 8, &nz, sizeof(nz));
+    }
+}
+
+// Unarmed camera: turn the followed target and write the pitch accumulator.
+// The pitch survives the controller; the yaw does not, because the controller
+// derives it from the target the call above just rotated.
+bool ApplyUnarmedAim(uint8_t *base, uint32_t camera, uint32_t controller, float pitch_min, float pitch_max) {
+    const uint32_t target = Rd(base, camera + kTarget);
+    if (!target || !mem::IsCommitted(target + kTargetForward + 8)) return false;
+
+    input::UseDirectMouseAim();
+    float dx = 0, dy = 0;
+    if (!input::ConsumeMouseAim(dx, dy)) return false;
+
+    const float percent = float(std::clamp(input::g_mouse_sensitivity_percent, 10u, 400u)) * 0.01f;
+    const float vertical = float(std::clamp(input::g_mouse_vertical_sensitivity_percent, 10u, 400u)) * 0.01f;
+    const uint32_t game = Rd(base, kGame);
+    const float yaw_sign = Rd8(base, game + kInvertX) ? -1.0f : 1.0f;
+    const float pitch_sign = Rd8(base, game + kInvertY) ? -1.0f : 1.0f;
+
+    // The controller maps the target's forward angle to the camera yaw with a
+    // negative sign, so a positive mouse step has to turn the target back to
+    // make the view turn the same way it does in the armed modes.
+    RotateTargetYaw(base, target, -dx * kRadiansPerPixel * percent * yaw_sign);
+    const float pitch =
+        std::clamp(RdF(base, kPitch) + dy * kRadiansPerPixel * percent * vertical * pitch_sign, pitch_min, pitch_max);
+    std::memcpy(base + kPitch, &pitch, sizeof(pitch));
+    return true;
+}
+
 // Widen a look controller's pitch clamp for one update, so the controller's own
 // clamp does not undo the PC range.  The stock fields are restored by the
 // caller before it returns, keeping the gamepad path original.
@@ -176,21 +223,24 @@ void RestorePitch(uint8_t *base, uint32_t controller, uint32_t old_min, uint32_t
 // calls its virtual methods; injecting here, before those methods, covers the
 // on-foot, precision aim, crosshair, drive-by and mission cameras in one place.
 // The vehicle path is left to sub_0001FD40 below because it rebuilds its chase
-// yaw every frame, and the unarmed mode is left to the game's pad path because
-// its controller derives yaw from the followed target instead of accumulating
-// it.
+// yaw every frame. The unarmed mode gets the same raw counts but turns its
+// followed target instead of the accumulator, because that controller replaces
+// the accumulator with the target's forward angle.
 X86_EXTERN_FUNC(__imp__sub_0002E200);
 X86_FUNC(sub_0002E200) {
     const uint32_t camera = ctx.ecx;
     const uint32_t controller = camera ? Rd(base, camera + kActive) : 0;
     const uint8_t mode = camera ? Rd8(base, camera + kMode) : 0;
     const bool owned = controller && Rd(base, controller + kOwner) == camera;
-    if (input::g_direct_mouse_aim && owned && mode != kModeVehicle && mode != kModeUnarmed &&
-        IsGameplayCamera(base, camera)) {
+    if (input::g_direct_mouse_aim && owned && mode != kModeVehicle && IsGameplayCamera(base, camera)) {
         uint32_t old_min = 0, old_max = 0;
         const bool widen = input::DirectAimRecent() &&
                            WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
-        ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
+        if (mode == kModeUnarmed) {
+            ApplyUnarmedAim(base, camera, controller, kOnFootPitchMin, kOnFootPitchMax);
+        } else {
+            ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
+        }
         __imp__sub_0002E200(ctx, base);
         if (widen) RestorePitch(base, controller, old_min, old_max);
         return;
