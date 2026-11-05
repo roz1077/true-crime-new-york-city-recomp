@@ -140,7 +140,9 @@ source = r'''
 #define LOGE(...) ((void)0)
 using HWND=void*; using HRAWINPUT=void*; using UINT=unsigned; using LONG=long;
 constexpr int VK_UP=1,VK_DOWN=2,VK_LEFT=3,VK_RIGHT=4,VK_ESCAPE=5,VK_TAB=6,
- VK_SPACE=7,VK_RBUTTON=8,VK_LBUTTON=9,VK_RETURN=10,VK_BACK=11;
+ VK_SPACE=7,VK_RBUTTON=8,VK_LBUTTON=9,VK_RETURN=10,VK_BACK=11,
+ VK_MBUTTON=12,VK_XBUTTON1=13,VK_XBUTTON2=14,VK_CONTROL=15,VK_SHIFT=16,
+ VK_NUMPAD7=17,VK_NUMPAD9=18;
 uint64_t now=1000;
 uint64_t GetTickCount64() { return now; }
 bool focus=true;
@@ -148,8 +150,8 @@ void* GetForegroundWindow() { return focus ? reinterpret_cast<void*>(1) : nullpt
 short GetAsyncKeyState(int) { return 0; }
 namespace app { void* Window() { return reinterpret_cast<void*>(1); } }
 struct RAWINPUTHEADER { unsigned dwType; };
-struct RAWINPUT { RAWINPUTHEADER header; struct { struct { unsigned usFlags; LONG lLastX,lLastY; } mouse; } data; };
-constexpr unsigned RID_INPUT=1,RIM_TYPEMOUSE=0,MOUSE_MOVE_ABSOLUTE=1;
+struct RAWINPUT { RAWINPUTHEADER header; struct { struct { unsigned usFlags; LONG lLastX,lLastY; unsigned short usButtonFlags,usButtonData; } mouse; } data; };
+constexpr unsigned RID_INPUT=1,RIM_TYPEMOUSE=0,MOUSE_MOVE_ABSOLUTE=1,RI_MOUSE_WHEEL=0x0800;
 UINT GetRawInputData(HRAWINPUT r, UINT, RAWINPUT* p, UINT*, UINT) { *p=*static_cast<RAWINPUT*>(r); return sizeof(*p); }
 struct SDL_Gamepad {};
 enum SDL_GamepadType { SDL_GAMEPAD_TYPE_UNKNOWN,SDL_GAMEPAD_TYPE_PS3,SDL_GAMEPAD_TYPE_PS4,SDL_GAMEPAD_TYPE_PS5,SDL_GAMEPAD_TYPE_XBOX360,SDL_GAMEPAD_TYPE_XBOXONE };

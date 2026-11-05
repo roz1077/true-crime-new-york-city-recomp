@@ -20,7 +20,9 @@ namespace input {
 
 uint32_t g_mouse_sensitivity_percent = 100;
 uint32_t g_mouse_vertical_sensitivity_percent = 100;
-uint32_t g_reload_key = 'R', g_heavy_attack_key = 'F', g_use_key = 'G', g_climb_key = 'E';
+// PC defaults: R reload, E use/action, G climb (the port's own action), and no
+// configurable heavy key because the PC uses Num 9 and mouse Button 4.
+uint32_t g_reload_key = 'R', g_heavy_attack_key = 0, g_use_key = 'E', g_climb_key = 'G';
 bool g_direct_mouse_aim = true;
 
 namespace {
@@ -69,6 +71,8 @@ int16_t g_mouse_rx = 0, g_mouse_ry = 0;
 // pulse to the transition cameras
 int16_t g_hold_rx = 0, g_hold_ry = 0;
 uint64_t g_hold_at = 0;
+// mouse wheel notches waiting to be turned into D-pad taps (weapon select / camera)
+int g_wheel_steps = 0;
 // raw counts waiting for the camera, taken straight from WM_INPUT so a fast
 // flick is not limited by the right-stick path's small clamp; the camera clears
 // them once per frame
@@ -117,14 +121,28 @@ bool ReadKeyboardMouse(Pad& pad) {
     pad.ly = int16_t(move_y * move_scale);
     constexpr int digital[] = {VK_UP,     VK_DOWN,   VK_LEFT,          VK_RIGHT,
                                VK_ESCAPE, VK_TAB,    kLeftStickClickKey, kRightStickClickKey};
-    const int analog[] = {VK_SPACE, 'Q', LetterKey(g_reload_key, 'R'), LetterKey(g_heavy_attack_key, 'F'),
-                          LetterKey(g_use_key, 'G'), LetterKey(g_climb_key, 'E'), VK_RBUTTON, VK_LBUTTON};
     for (int i = 0; i < 8; ++i) {
         if (held(digital[i])) pad.buttons |= uint16_t(1 << i);
-        if (held(analog[i])) pad.analog[i] = 255;
     }
-    if (held(VK_RETURN)) pad.analog[0] = 255;
-    if (held(VK_BACK)) pad.analog[1] = 255;
+    // Shift is the PC target lock; on the pad that is the right-stick click.
+    if (held(VK_SHIFT)) pad.buttons |= uint16_t(1 << 7);
+
+    auto press = [&](int button, bool on) {
+        if (on) pad.analog[button] = 255;
+    };
+    // The PC layout from its default mapper. Several actions share a pad button
+    // because the Xbox build context decides what A/B/Y and the shoulders do.
+    press(0, held(VK_SPACE) || held(VK_RETURN));                                        // A: jump/action
+    press(1, held('Q') || held(VK_BACK) || held(VK_NUMPAD7) || held(VK_XBUTTON1) ||
+                 held(VK_CONTROL));                                                     // B: light attack / brake / siren
+    if (char k = LetterKey(g_reload_key, 'R')) press(2, held(k));                       // X: reload/block
+    if (char k = LetterKey(g_heavy_attack_key, 0)) press(3, held(k));                   // Y: optional custom heavy key
+    press(3, held(VK_NUMPAD9) || held(VK_XBUTTON2));                                    // Y: heavy attack / handbrake
+    if (char k = LetterKey(g_use_key, 'E')) press(4, held(k));                          // black: use/action/car door
+    if (char k = LetterKey(g_climb_key, 'G')) press(5, held(k));                        // white: climb
+    press(6, held(VK_RBUTTON) || held(VK_MBUTTON));                                     // LT: precision aim
+    const bool heavy_is_f = LetterKey(g_heavy_attack_key, 0) == 'F';
+    press(7, held(VK_LBUTTON) || (!heavy_is_f && held('F')));                           // RT: fire
     bool mouse_active;
     {
         std::lock_guard lock(g_mouse_lock);
@@ -178,6 +196,15 @@ bool ReadKeyboardMouse(Pad& pad) {
         // the camera applies the pixels itself while direct aim is live
         pad.rx = (direct || ui) ? 0 : g_hold_rx;
         pad.ry = (direct || ui) ? 0 : g_hold_ry;
+        // The PC wheel changes weapon on foot and camera in a vehicle; the pad
+        // reaches both through the D-pad.
+        if (g_wheel_steps > 0) {
+            pad.buttons |= uint16_t(1 << 0);
+            g_wheel_steps--;
+        } else if (g_wheel_steps < 0) {
+            pad.buttons |= uint16_t(1 << 1);
+            g_wheel_steps++;
+        }
     }
     return pad.lx || pad.ly || mouse_active || pad.buttons ||
            std::any_of(std::begin(pad.analog), std::end(pad.analog), [](uint8_t value) { return value != 0; });
@@ -240,6 +267,10 @@ void ReadMouse(void* raw_input) {
     // the menu moves the pointer, not the camera: do not queue that motion
     if (g_ui_active.load(std::memory_order_relaxed)) return;
     std::lock_guard lock(g_mouse_lock);
+    if (input.data.mouse.usButtonFlags & RI_MOUSE_WHEEL) {
+        const int step = int16_t(input.data.mouse.usButtonData);
+        g_wheel_steps = std::clamp(g_wheel_steps + (step > 0 ? 1 : -1), -8, 8);
+    }
     const LONG dx = input.data.mouse.lLastX, dy = input.data.mouse.lLastY;
     // the stick path keeps its small clamp
     g_mouse_x = std::clamp(g_mouse_x + dx, -100L, 100L);

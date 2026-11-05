@@ -2223,7 +2223,7 @@ void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::Pr
             {'Z', {7, 1, 2, 4, 7}},
         };
         const struct { int x, y, w, h; char text[4]; } keys[] = {
-            {19, 234, 15, 14, {input::LetterKey(input::g_heavy_attack_key, 'F')}},
+            {19, 234, 15, 14, {input::LetterKey(input::g_heavy_attack_key, '9')}},
             {37, 234, 15, 14, "Q"}, {55, 234, 15, 14, {input::LetterKey(input::g_reload_key, 'R')}},
             {1, 279, 14, 15, {input::LetterKey(input::g_climb_key, 'E')}}, {37, 279, 13, 15, {input::LetterKey(input::g_use_key, 'G')}},
             {101, 256, 13, 18, "RMB"}, {19, 279, 13, 18, "LMB"},
