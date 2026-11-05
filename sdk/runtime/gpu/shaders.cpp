@@ -984,7 +984,7 @@ namespace {
 // already rounded away; a z buffer's is 1 - z. zparams.z is the polygon offset in the units of each
 const char* kReversedClipHlsl = R"(float ReversedClip(float z, float w) {
     if (zparams.x != 0) return zparams.x * (zparams.y - (w + zparams.z));
-    return w - z - zparams.z * w;
+    return w - z * zparams.w - zparams.z * w;
 }
 )";
 

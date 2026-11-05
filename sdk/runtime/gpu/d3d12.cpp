@@ -551,7 +551,6 @@ struct DrawShaders {
     bool prog = false;  // a vertex program, else the fixed function pipeline
     bool quad = false;
     bool fixed_transform = false;  // fixed function on untransformed vertices: the shader reads matrices and lights
-    bool city_shadow_fill = false;  // ambient fill variant of an opaque city wall program
     bool sprite = false;           // a program's points drawn as point sprites (SpriteHlsl)
     FixedKey fk;
     uint64_t vkey = 0;
@@ -2626,31 +2625,6 @@ uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
 
 // Recognize the city's prelit material family in the translated program. The light count
 // and declaration vary, but the normal, ambient mask and texture scale use the same inputs.
-bool IsCityPrelitProgram(std::string_view source, bool streamed_mask) {
-    const std::string_view mask = streamed_mask ? "mac_mul(((i.v4)." : "mac_mul(((vdef[4]).";
-    for (const std::string_view swizzle : {std::string_view{"xyzz"}, std::string_view{"xyzw"}}) {
-        std::string ambient(mask);
-        ambient += swizzle;
-        ambient += "), ((c[186]).";
-        ambient += swizzle;
-        ambient += "))";
-        if (source.find(ambient) != std::string_view::npos) {
-            return (source.find("dot(((i.v1).xyzz).xyz,") != std::string_view::npos ||
-                    source.find("dot(((i.v1).xyzw).xyz,") != std::string_view::npos) &&
-                   source.find("mac_mul(((i.v2).xyzw), ((c[179]).zzxy))") != std::string_view::npos &&
-                   source.find("oD0.xyz = mr.xyz;") != std::string_view::npos;
-        }
-    }
-    return false;
-}
-
-bool IsOpaqueWallDraw(const State& s) {
-    if (s.ps || !s.textures[0] || !s.rs[kRsZEnable] || !SimpleState(s, kMZWriteEnable)) return false;
-    return !SimpleState(s, kMBlendEnable) ||
-           (SimpleState(s, kMSrcBlend) == 1 && SimpleState(s, kMDestBlend) == 0 &&
-            BlendOp(SimpleState(s, kMBlendOp)) == D3D12_BLEND_OP_ADD);
-}
-
 // a point sprite's program hands its point size to SpriteHlsl in tc3, whose coordinates the sprite makes
 std::string SpriteSizeHlsl(std::string s) {
     const char* tc3 = "    o.tc3 = oT3;\n";
@@ -2666,27 +2640,6 @@ std::string SpriteSizeHlsl(std::string s) {
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
     if (sh.prog) {
         std::string src = VertexProgramHlsl(s.vs->program, a.regs, a.decode);
-        const bool streamed_mask = (a.regs & (1u << 4)) != 0;
-        if (sh.city_shadow_fill && IsCityPrelitProgram(src, streamed_mask)) {
-            constexpr std::string_view output = "o.d0 = saturate(oD0);";
-            const size_t at = src.find(output);
-            if (at != std::string::npos) {
-                // Some wall variants stream their ambient mask while others use the retained
-                // attribute. Preserve the material's mask contrast and the original light terms.
-                std::string fill = R"(
-    float3 wallAmbient = saturate(c[186].xyz);
-    float ambientLevel = max(wallAmbient.r, max(wallAmbient.g, wallAmbient.b));
-    float exteriorWeight = smoothstep(0.14, 0.19, ambientLevel) *
-                           (1.0 - smoothstep(0.35, 0.55, ambientLevel));
-    float3 wallMask = saturate()";
-                fill += streamed_mask ? "i.v4.xyz" : "vdef[4].xyz";
-                fill += R"();
-    float3 ambientFill = min(wallAmbient * 1.4 * (1.0 - 0.65 * wallMask), 0.27);
-    oD0.rgb += ambientFill * (1.0 - saturate(oD0.rgb)) * exteriorWeight;
-    )";
-                src.insert(at, fill);
-            }
-        }
         return sh.sprite ? SpriteSizeHlsl(std::move(src)) : src;
     }
     return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
@@ -3040,6 +2993,7 @@ void D3D12Backend::FillDepthConstants(const State& s, const DrawShaders& sh, con
     float units = offset ? Bits(SimpleState(s, kMDepthOffset)) : 0;
     if (s.rs[kRsZEnable] != kZUseW) {
         c.zparams[2] = units / s.zscale;
+        c.zparams[3] = sh.prog ? s.program_depth_scale : 1.0f;
         return;
     }
     WRange r = DrawWRange(s, sh.prog);
@@ -3164,6 +3118,7 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
         fprintf(cap_, " vp %u %u %u %u sc %u %u %u %u %u", s.viewport.x, s.viewport.y, s.viewport.w, s.viewport.h,
                 s.scissor_count, s.scissors[0], s.scissors[1], s.scissors[2], s.scissors[3]);
     fprintf(cap_, " v3 %.3f %.3f %.3f %.3f zclip %g %g %u bcol %08X", s.vdef[3][0], s.vdef[3][1], s.vdef[3][2], s.vdef[3][3], s.zclip[0], s.zclip[1], s.zclip_on, SimpleState(s, kMBlendColor));
+    if (c.zparams[3] > 0 && c.zparams[3] != 1.0f) fprintf(cap_, " depthscale %g", c.zparams[3]);
     // the lighting constants the vertex programs read; a camera-dependent flip here explains walls that change brightness
     fprintf(cap_, " amb %.4f %.4f %.4f L0 %.4f %.4f %.4f i0 %.4f i1 %.4f i2 %.4f L1 %.4f %.4f %.4f L2 %.4f %.4f %.4f"
                    " mat %.4f %.4f %.4f spec %.4f %.4f %.4f pow %.4f",
@@ -3505,10 +3460,6 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     DrawShaders sh = ClassifyShaders(s, a, count);
     if (sh.prog) EnsureProgramHash(s);
     sh.vkey = VertexKey(s, a, sh);
-    sh.city_shadow_fill = sh.prog && render_.city_shadow_fill &&
-                          bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ &&
-                          IsOpaqueWallDraw(s);
-    if (sh.city_shadow_fill) sh.vkey ^= 0xED92F1CA356B0748ull;
     EnsureVertexShader(s, a, sh);
 
     // stage textures, then the pixel shader made for them

@@ -31,7 +31,6 @@ closes.
 - **Anisotropic filtering** - Game default, 2x, 4x, 8x or 16x.
 - **MSAA** - Off, 2x, 4x or 8x multisample anti-aliasing.
 - **SMAA** - SMAA 1x anti-aliasing on the finished frame.
-- **City shadow fill** - lifts shadows on prelit city materials. On by default.
 - **Bloom** - optional bright-pass bloom over the game’s own lighting. Off by default.
 - **PC contrast** - PC-inspired tone curve with a softer shadow roll-off. On by default.
 - **Depth of field** - optional distance blur for 3D scenes with MSAA enabled. Off by default.

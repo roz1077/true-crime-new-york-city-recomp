@@ -25,6 +25,7 @@
 #include "common/graphics_menu.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
+#include "xdk/d3d8.h"
 #include "xdk/hle.h"
 
 namespace {
@@ -104,3 +105,38 @@ X86_FUNC(sub_00245BB0) { RunProjection(ctx, base, "projection", __imp__sub_00245
 
 X86_EXTERN_FUNC(__imp__sub_00245CE0);
 X86_FUNC(sub_00245CE0) { RunProjection(ctx, base, "infinite projection", __imp__sub_00245CE0); }
+
+// Apply the depth priority after the guest's vertex program, which can
+// upload its own viewport constants after the viewport is set. The guest
+// depth clip still sees the original depth and preserves the mesh coverage.
+X86_EXTERN_FUNC(__imp__sub_002453C0);
+X86_FUNC(sub_002453C0) {
+    constexpr uint32_t kDistantCityViewportReturn = 0x13F188;
+    constexpr uint32_t kRestoreCityViewportReturn = 0x13F3DA;
+    const uint32_t caller = X86_MEM32(ctx.esp);
+    if (caller == kDistantCityViewportReturn || caller == kRestoreCityViewportReturn) {
+        std::lock_guard lock(d3d::Lock());
+        auto &state = d3d::State();
+        // A full-range pass includes scenery that needs its original depth.
+        const bool distant = caller == kDistantCityViewportReturn && state.zclip_on &&
+                             state.zclip[0] >= 0 && state.zclip[1] > state.zclip[0] &&
+                             state.zclip[1] < state.zscale;
+        state.program_depth_scale = distant ? 1.0f / 32.0f : 1.0f;
+    }
+    __imp__sub_002453C0(ctx, base);
+}
+
+// Comparison mode for the scene submission's distant-city pass.
+X86_EXTERN_FUNC(__imp__sub_0013F090);
+X86_FUNC(sub_0013F090) {
+    static const bool hide = [] {
+        const char *value = std::getenv("XBE_HIDE_DISTANT_CITY");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (hide && X86_MEM32(ctx.esp) == 0x142CEE) {
+        ctx.eax = 0;
+        ctx.esp += 8; // Return address and the renderer argument.
+        return;
+    }
+    __imp__sub_0013F090(ctx, base);
+}

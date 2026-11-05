@@ -3,6 +3,7 @@
 // The cutscene clock and replay hooks are in timing.cpp.
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 #include "core/log.h"
@@ -138,4 +139,54 @@ X86_FUNC(sub_00258EB0) {
         X86_MEM32(data + kHiddenKey + 4) == 0x10000 &&
         X86_MEM32(data + kHiddenKey + 8) == uint32_t(-64))
         X86_MEM32(data + kHiddenKey + 8) = uint32_t(-65);
+}
+
+// 0x13C8F0 is the effect slot activation virtual method. After it runs, an
+// active slot must have a data pointer that is a committed guest address. This
+// check only logs; it never changes the game. If it fires, activation derived a
+// bad pointer from its data block; if it does not, the slot is overwritten later.
+X86_EXTERN_FUNC(__imp__sub_0013C8F0);
+X86_FUNC(sub_0013C8F0) {
+    const uint32_t self = ctx.ecx;
+    __imp__sub_0013C8F0(ctx, base);
+    if (!mem::IsCommitted(self + 0x7Cu)) return;
+    const uint32_t active = X86_MEM32(self + 0x70u);
+    if (!active) return;
+    const uint32_t data = X86_MEM32(self + 0x74u);
+    if (data && mem::IsCommitted(data)) return;  // contiguous guest memory (0x8xxxxxxx) is valid too
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+    const uint32_t block = X86_MEM32(self + 0x1Cu);
+    const uint32_t o18 = mem::IsCommitted(block + 0x18u) ? X86_MEM32(block + 0x18u) : 0;
+    const uint32_t o20 = mem::IsCommitted(block + 0x20u) ? X86_MEM32(block + 0x20u) : 0;
+    LOGR("effect activate %08X block %08X +18 %08X +20 %08X -> +70 %08X +74 %08X", self, block, o18, o20, active,
+         data);
+}
+
+// XBE_EFFECT_WATCH=1: put a hardware write watchpoint on effect slot 8 (+0x70),
+// the slot that crashed, so the next run logs the instruction that overwrites it.
+// The address is taken from the renderer the first time a batch builder runs; the
+// watch itself is installed by a helper thread and never changes game state.
+namespace {
+void WatchEffectSlot8IfRequested() {
+    if (!std::getenv("XBE_EFFECT_WATCH") || kernel::GuestWatchActive()) return;
+    if (!mem::IsCommitted(0x37F8FCu)) return;
+    const uint32_t renderer = kernel::R32(0x37F8FCu);
+    if (!renderer || !mem::IsCommitted(renderer + 0x55C0u)) return;
+    const uint32_t slot = renderer + 0x55C0u + 8u * 0x80u;
+    if (!mem::IsCommitted(slot + 0x7Cu)) return;
+    kernel::InstallGuestWatch(slot + 0x70u, 8);
+}
+}  // namespace
+
+X86_EXTERN_FUNC(__imp__sub_00141D40);
+X86_FUNC(sub_00141D40) {
+    WatchEffectSlot8IfRequested();
+    __imp__sub_00141D40(ctx, base);
+}
+
+X86_EXTERN_FUNC(__imp__sub_00141660);
+X86_FUNC(sub_00141660) {
+    WatchEffectSlot8IfRequested();
+    __imp__sub_00141660(ctx, base);
 }

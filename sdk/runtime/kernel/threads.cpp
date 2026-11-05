@@ -127,6 +127,133 @@ Thread* Current() { return t_current.get(); }
 ThreadRef CurrentRef() { return t_current; }
 X86Context& CurrentContext() { return *t_current->ctx; }
 
+// XBE_SERIAL_GUEST=1: emulate the Xbox's single CPU by letting only one guest thread execute guest code at a time.
+// The lock is released for the whole of every HLE function, so kernel waits, file I/O and blocking calls still let
+// other guest threads run (those calls are where the Xbox scheduler would switch threads anyway).
+namespace {
+std::mutex g_guest_run_lock;
+thread_local int t_guest_run_depth = 0;
+std::atomic<uint32_t> g_guest_run_holder{0};
+std::atomic<int64_t> g_guest_run_since{0};
+std::once_flag g_guest_watchdog_once;
+
+int64_t NowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+void GuestRunWatchdog() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        const int64_t since = g_guest_run_since.load();
+        if (!since) continue;
+        const int64_t ms = NowMs() - since;
+        if (ms >= 5000)
+            LOGR("guest run lock held %lld ms by thread %X (serial guest mode)", (long long)ms, g_guest_run_holder.load());
+    }
+}
+}  // namespace
+
+bool GuestRunSerial() {
+    static const bool on = [] {
+        const char* v = std::getenv("XBE_SERIAL_GUEST");
+        return v && *v && *v != '0';
+    }();
+    if (on) std::call_once(g_guest_watchdog_once, [] { std::thread(GuestRunWatchdog).detach(); });
+    return on;
+}
+
+void GuestRunAcquire() {
+    if (!GuestRunSerial()) return;
+    if (t_guest_run_depth++ == 0) {
+        g_guest_run_lock.lock();
+        g_guest_run_holder = t_current ? t_current->id : 0;
+        g_guest_run_since = NowMs();
+    }
+}
+
+void GuestRunRelease() {
+    if (!GuestRunSerial()) return;
+    if (t_guest_run_depth > 0 && --t_guest_run_depth == 0) {
+        g_guest_run_since = 0;
+        g_guest_run_lock.unlock();
+    }
+}
+
+HleRunScope::HleRunScope() : saved(0) {
+    if (!GuestRunSerial() || t_guest_run_depth == 0) return;
+    saved = t_guest_run_depth;
+    t_guest_run_depth = 0;
+    g_guest_run_since = 0;
+    g_guest_run_lock.unlock();
+}
+
+HleRunScope::~HleRunScope() {
+    if (!saved) return;
+    g_guest_run_lock.lock();
+    g_guest_run_holder = t_current ? t_current->id : 0;
+    g_guest_run_since = NowMs();
+    t_guest_run_depth = saved;
+}
+
+// Hardware write watchpoint (diagnostic). Debug registers are per host thread, so the watch is applied to
+// every guest thread from a helper thread; threads started later apply it themselves.
+namespace {
+std::atomic<uint32_t> g_watch_addr{0};
+std::atomic<uint32_t> g_watch_len{0};
+
+void ApplyWatchToHostThread(uint32_t host_tid, uint32_t guest_addr, uint32_t len) {
+#ifdef _WIN32
+    if (!host_tid || !guest_addr) return;
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, host_tid);
+    if (!h) return;
+    if (SuspendThread(h) == DWORD(-1)) {
+        ::CloseHandle(h);
+        return;
+    }
+    CONTEXT c{};
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (GetThreadContext(h, &c)) {
+        c.Dr0 = reinterpret_cast<uintptr_t>(g_base) + guest_addr;
+        c.Dr6 = 0;
+        c.Dr7 |= 0x1ull;                                   // L0: local enable for DR0
+        c.Dr7 = (c.Dr7 & ~0x30000ull) | 0x10000ull;        // RW0 = write
+        const uint64_t length = len >= 8 ? 3 : len >= 4 ? 2 : len >= 2 ? 1 : 0;
+        c.Dr7 = (c.Dr7 & ~0xC0000ull) | (length << 18);    // LEN0
+        SetThreadContext(h, &c);
+    }
+    ResumeThread(h);
+    ::CloseHandle(h);
+#endif
+}
+
+uint32_t HostThreadId() {
+#ifdef _WIN32
+    return uint32_t(GetCurrentThreadId());
+#else
+    return 0;
+#endif
+}
+}  // namespace
+
+bool GuestWatchActive() { return g_watch_addr.load() != 0; }
+uint32_t GuestWatchAddress() { return g_watch_addr.load(); }
+
+void InstallGuestWatch(uint32_t guest_addr, uint32_t len) {
+#ifdef _WIN32
+    if (!guest_addr || g_watch_addr.load() != 0) return;
+    g_watch_addr = guest_addr;
+    g_watch_len = len;
+    std::thread([guest_addr, len] {
+        // let the calling thread leave this function before it is suspended
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        for (const ThreadRef& t : Threads())
+            if (t->host_tid) ApplyWatchToHostThread(t->host_tid, guest_addr, len);
+        LOGR("watch: hardware write watchpoint on guest %08X (%u bytes)", guest_addr, len);
+    }).detach();
+#endif
+}
+
 std::vector<ThreadRef> Threads() {
     std::lock_guard<std::mutex> lock(g_threads_lock);
     return g_threads;
@@ -154,6 +281,11 @@ void StartThread(ThreadRef t) {
     Register(t);
     Spawn([t] {
         t_current = t;
+        t->host_tid = HostThreadId();
+        if (GuestWatchActive()) {
+            const uint32_t tid = t->host_tid, addr = g_watch_addr.load(), len = g_watch_len.load();
+            std::thread([tid, addr, len] { ApplyWatchToHostThread(tid, addr, len); }).detach();
+        }
         char name[32];
         std::snprintf(name, sizeof(name), "guest %X", t->id);
         NameHostThread(name);
@@ -191,6 +323,11 @@ void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
     std::string n = name;
     Spawn([t, fn, n] {
         t_current = t;
+        t->host_tid = HostThreadId();
+        if (GuestWatchActive()) {
+            const uint32_t tid = t->host_tid, addr = g_watch_addr.load(), len = g_watch_len.load();
+            std::thread([tid, addr, len] { ApplyWatchToHostThread(tid, addr, len); }).detach();
+        }
         NameHostThread(n.c_str());
         X86Context ctx;
         InitContext(*t, ctx);

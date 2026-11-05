@@ -267,7 +267,10 @@ the opening cutscene or free roam. The earlier `captures-intro5` and `shots/ps2-
 remain historical references for the opening. See NOTES.md for the open Xbox light-balance
 comparison and the verified blend, retained-attribute and scissor fixes.
 
-### Precinct shadow fill
+### Precinct shadow fill (removed)
+
+The City Shadow Fill setting and shader variant were removed on 2026-11-05.
+PC Contrast still defaults to On.
 
 The wall variants observed in the precinct exterior use a capped ambient fill after the
 guest diffuse calculation. The fill is weighted by the actual ambient mask, including streamed

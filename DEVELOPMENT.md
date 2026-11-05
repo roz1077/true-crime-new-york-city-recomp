@@ -83,6 +83,8 @@ Set variables before launching; the runtime reads most of them once per process.
 | `XBE_TRACE_FRAME_TIMING=1` | Log frame and simulation tick rates every 2 s. |
 | `XBE_TRACE_OPTIONS_PAGE=1` | Log native Options page queries, dispatcher input and the tab renderer. |
 | `XBE_TRACE_TRAFFIC=1` | Log traffic candidate pools, selections and vehicle spawns. |
+| `XBE_SERIAL_GUEST=1` | Experimental: run only one guest thread at a time (single-core Xbox model), releasing the lock around HLE calls. Used to test guest-thread race hypotheses. |
+| `XBE_EFFECT_WATCH=1` | Diagnostic: hardware write watchpoint on cell slot 8 +0x70. Logs the writing instruction's module offset plus the guest registers and stack frame. |
 
 Ordinary recording does not enable deterministic overrides. Input replay alone cannot guarantee identical
 asynchronous streaming or time of day. Keep captures and heavy logging off when measuring frame times.

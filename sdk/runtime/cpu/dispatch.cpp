@@ -9,9 +9,11 @@
 #endif
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <unordered_set>
@@ -156,6 +158,7 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
             if (i < dispatch::g_host_thunks.size()) f = dispatch::g_host_thunks[i];
         }
         if (f) {
+            kernel::HleRunScope hle_scope;
             f(ctx, base);
             return;
         }
@@ -167,12 +170,14 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
 }
 
 void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r) {
+    kernel::GuestRunScope run_scope;  // a continuation resumes guest code outside CallGuest
     ctx.esp = r.esp;
     dispatch::Find(r.target)(ctx, base);
 }
 
 void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal) {
     if (ordinal < 400 && g_exports[ordinal].fn) {
+        kernel::HleRunScope hle_scope;  // kernel exports block (waits, sleeps, file I/O); let other guest threads run
         g_exports[ordinal].fn(ctx, base);
         return;
     }
@@ -210,6 +215,7 @@ uint32_t CallGuest(X86Context& ctx, uint32_t fn, const uint32_t* args, size_t co
     struct {
         uint32_t eax, ecx, edx, ebx, esi, edi, ebp;
     } saved{ctx.eax, ctx.ecx, ctx.edx, ctx.ebx, ctx.esi, ctx.edi, ctx.ebp};
+    GuestRunScope run_scope;  // no-op unless XBE_SERIAL_GUEST is set
     uint32_t esp = ctx.esp;
     for (const uint32_t* p = args + count; p != args;) {
         ctx.esp -= 4;
@@ -237,12 +243,52 @@ namespace kernel {
 void LogGuestStack(X86Context& ctx, int words) {
     LOGE("  eax %08X ecx %08X edx %08X ebx %08X esp %08X ebp %08X esi %08X edi %08X", ctx.eax, ctx.ecx, ctx.edx, ctx.ebx,
          ctx.esp, ctx.ebp, ctx.esi, ctx.edi);
+    LogGuestFrames(ctx);
     for (int i = 0; i < words; i++) {
         uint32_t a = ctx.esp + uint32_t(i) * 4;
         if (!mem::IsCommitted(a)) break;
         uint32_t v = R32(a);
         if (dispatch::InCode(v)) LOGE("  [esp+%03X] %08X", i * 4, v);
     }
+}
+
+// Recompiled functions keep the guest frame pointer, so the EBP chain is the reliable call stack. The raw stack scan
+// above can report stale return addresses left over from earlier calls through the same stack slots.
+void LogGuestFrames(X86Context& ctx) {
+    uint32_t ebp = ctx.ebp;
+    int frames = 0;
+    for (; frames < 64; frames++) {
+        if (ebp < mem::kUserLow || ebp >= mem::kUserHigh - 8) break;
+        if (!mem::IsCommitted(ebp) || !mem::IsCommitted(ebp + 4)) break;
+        const uint32_t ret = R32(ebp + 4);
+        const uint32_t next = R32(ebp);
+        if (!dispatch::InCode(ret)) break;
+        LOGE("  frame %02d ebp %08X ret %08X", frames, ebp, ret);
+        if (next <= ebp) break;  // the guest stack grows downwards; the chain must move up
+        ebp = next;
+    }
+    if (!frames) LOGE("  frame chain: none");
+}
+
+bool DumpGuestRegion(uint32_t va, uint32_t len, const char* path) {
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return false;
+    bool any = false;
+    static const uint8_t zeros[mem::kPage] = {};
+    for (uint32_t off = 0; off < len;) {
+        const uint32_t a = va + off;
+        const uint32_t page_left = mem::kPage - (a & (mem::kPage - 1));
+        const uint32_t chunk = std::min<uint32_t>(len - off, page_left);
+        if (mem::IsCommitted(a)) {
+            std::fwrite(g_base + a, 1, chunk, f);
+            any = true;
+        } else {
+            std::fwrite(zeros, 1, chunk, f);
+        }
+        off += chunk;
+    }
+    std::fclose(f);
+    return any;
 }
 }  // namespace kernel
 

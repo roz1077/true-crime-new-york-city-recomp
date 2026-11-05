@@ -155,6 +155,7 @@ bool CancelTimer(Object& timer);
 struct Thread : Object {
     uint32_t id = 0;
     uint32_t kpcr = 0, ethread = 0, stack_top = 0, stack_size = 0, tls = 0;
+    uint32_t host_tid = 0;  // host thread id, for debug-register watchpoints
     uint32_t exit_code = 0;
     int priority = 0;
     std::atomic<int> suspend{0};
@@ -172,6 +173,34 @@ void StartHostThread(const char* name, std::function<void(X86Context&)> fn);
 void RunDpcs(X86Context& ctx);
 void InitKernelData();
 void LogGuestStack(X86Context& ctx, int words);
+// EBP-chain walk for the reliable guest call stack (the raw stack scan can hit stale return addresses)
+void LogGuestFrames(X86Context& ctx);
+// writes committed guest bytes (unmapped pages become zeros) for crash analysis
+bool DumpGuestRegion(uint32_t va, uint32_t len, const char* path);
+// XBE_SERIAL_GUEST=1: only one guest thread executes guest code at a time, matching the single-core Xbox.
+// HLE calls release the lock so blocking kernel calls still make progress.
+bool GuestRunSerial();
+void GuestRunAcquire();
+void GuestRunRelease();
+// Diagnostic: hardware write watchpoint on a guest address, set in every guest thread's debug registers.
+// InstallGuestWatch is safe to call repeatedly; the interval is logged by the process VEH.
+void InstallGuestWatch(uint32_t guest_addr, uint32_t len);
+bool GuestWatchActive();
+uint32_t GuestWatchAddress();
+struct GuestRunScope {
+    GuestRunScope() { GuestRunAcquire(); }
+    ~GuestRunScope() { GuestRunRelease(); }
+    GuestRunScope(const GuestRunScope&) = delete;
+    GuestRunScope& operator=(const GuestRunScope&) = delete;
+};
+// releases the guest run lock for the duration of one host implementation of a guest function
+struct HleRunScope {
+    int saved;
+    HleRunScope();
+    ~HleRunScope();
+    HleRunScope(const HleRunScope&) = delete;
+    HleRunScope& operator=(const HleRunScope&) = delete;
+};
 X86Context& CurrentContext();
 ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_routine, uint32_t start_routine,
                        uint32_t start_context, bool suspended);

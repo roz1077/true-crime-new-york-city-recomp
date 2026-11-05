@@ -105,7 +105,7 @@ struct DrawConstants {
     float amb[4];        // D3DRS_AMBIENT
     float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
     float rtshift[4];    // per kTexTarget stage: console pixels its reads move along x and y, negative up and left
-    float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
+    float zparams[4];    // ReversedDepthHlsl: W scale (0 for Z), far W, polygon offset, Z scale
     float zclips[4];     // depth clip planes: near, far in screen z, 1 when on
     float vdef[16][4];   // vertex program inputs no stream feeds: State::vdef
     float tscale[4];     // host pixels per console pixel of the bound target along x and y; z scales screen x

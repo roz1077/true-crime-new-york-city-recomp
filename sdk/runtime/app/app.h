@@ -26,7 +26,6 @@ struct Settings {
     uint32_t aniso = 0;              // 0 as the game asks
     uint32_t msaa = 0;               // 0, 2, 4 or 8 samples
     bool smaa = false;               // SMAA 1x on the finished frame
-    bool city_shadow_fill = true;    // ambient fill on the city wall shader variants
     bool bloom = false;               // bright-pass bloom on the finished frame
     bool dof = false;                 // distance blur on the finished frame
     bool pc_contrast = true;         // PC contrast curve on the finished frame

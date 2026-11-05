@@ -62,7 +62,6 @@ Settings Snapshot() {
     s.vsync = g.vsync;
     s.aniso = g.aniso;
     s.smaa = g.smaa;
-    s.city_shadow_fill = g.city_shadow_fill;
     s.bloom = g.bloom;
     s.dof = g.dof;
     s.pc_contrast = g.pc_contrast;
@@ -102,7 +101,6 @@ void Load() {
     const auto samples = t["msaa"].value_or(t["msaa"].value_or(false) ? 4u : 0u);
     SetMsaaSamples(samples == 2 || samples == 4 || samples == 8 ? samples : 0);
     s.smaa = t["smaa"].value_or(s.smaa);
-    s.city_shadow_fill = t["city_shadow_fill"].value_or(s.city_shadow_fill);
     s.bloom = t["bloom"].value_or(s.bloom);
     s.dof = t["dof"].value_or(s.dof);
     s.pc_contrast = t["pc_contrast"].value_or(s.pc_contrast);
@@ -134,7 +132,6 @@ toml::table Table() {
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"msaa", MsaaSamples()},
                   {"smaa", s.smaa},
-                  {"city_shadow_fill", s.city_shadow_fill},
                   {"bloom", s.bloom},
                   {"dof", s.dof},
                   {"pc_contrast", s.pc_contrast},

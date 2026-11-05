@@ -100,7 +100,11 @@ inline uint32_t Call(X86Context& ctx, uint32_t fn, const Map& m, std::initialize
     X86_FUNC(guest) {                                    \
         (void)base;                                      \
         A args{ctx};                                     \
-        uint32_t r = fn(ctx, args);                      \
+        uint32_t r;                                      \
+        {                                                \
+            ::kernel::HleRunScope hle_scope;             \
+            r = fn(ctx, args);                           \
+        }                                                \
         ::kernel::Return(ctx, r, pops);                  \
     }                                                    \
     static uint32_t fn([[maybe_unused]] X86Context& ctx, [[maybe_unused]] const A& a)

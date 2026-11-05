@@ -64,6 +64,7 @@ struct Queue {
     void push_back(Apc a) { data[last++] = a; }
 };
 struct Thread { X86Context* ctx; std::mutex apc_lock; Queue apcs; };
+struct GuestRunScope {};
 uint8_t memory[4096];
 uint8_t* g_base = memory;
 void W32(uint32_t a, uint32_t v) { memcpy(memory + a, &v, 4); }

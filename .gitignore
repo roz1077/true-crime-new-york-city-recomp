@@ -33,3 +33,6 @@ settings.toml
 *.iso
 /tools/
 __pycache__/
+
+# packaged zips
+/dist/

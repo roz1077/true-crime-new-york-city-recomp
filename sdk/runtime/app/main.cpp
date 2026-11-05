@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <cwchar>
+#include <string>
 #include <thread>
 
 #include <imgui.h>
@@ -77,18 +79,69 @@ void ApplyCapture(HWND hwnd, bool active) {
     }
 }
 
+// Guest pages worth keeping when the guest faults: the pages around the faulting address, the faulting thread's
+// stack (the minidump only has host memory) and the nine renderer effect slots at renderer+0x55C0.
+void WriteGuestCrashPages(kernel::Thread& thread, EXCEPTION_POINTERS* e) {
+    auto* r = e ? e->ExceptionRecord : nullptr;
+    if (!r || !thread.ctx) return;
+    auto dir = ExeDir() / "CrashDumps";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t stamp[64];
+    swprintf(stamp, 64, L"%04u.%02u.%02u_%02u.%02u.%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    const std::wstring base = (dir / (std::wstring(L"guest-") + stamp)).wstring();
+    auto dump = [&](const wchar_t* suffix, uint32_t va, uint32_t len) {
+        const std::filesystem::path p = base + suffix;
+        if (kernel::DumpGuestRegion(va, len, p.string().c_str()))
+            LOGE("  guest dump %ls at %08X (%u bytes)", p.c_str(), va, len);
+    };
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
+        const uint32_t guest = uint32_t(r->ExceptionInformation[1] - uintptr_t(kernel::g_base));
+        if (guest >= 0x4000) dump(L"-fault.bin", (guest & ~0xFFFu) - 0x3000u, 0x6000u);
+    }
+    const uint32_t esp_page = thread.ctx->esp & ~0xFFFu;
+    if (esp_page >= 0x20000) dump(L"-stack.bin", esp_page - 0x20000u, 0x21000u);
+    if (mem::IsCommitted(0x37F8FCu)) {
+        const uint32_t renderer = kernel::R32(0x37F8FCu);
+        if (renderer && mem::IsCommitted(renderer + 0x55C0u)) {
+            dump(L"-renderer55c0.bin", renderer + 0x55C0u, 9 * 0x80u);
+            // effect manager fields before the slot table (0x5540 is referenced by a corrupt slot) and the slots
+            if (renderer >= 0x5400u && mem::IsCommitted(renderer + 0x5400u))
+                dump(L"-effectmanager.bin", renderer + 0x5400u, 0x0C00u);
+            // first bytes of the data block each active slot derived its pointers from
+            for (int i = 0; i < 9; i++) {
+                const uint32_t slot = renderer + 0x55C0u + uint32_t(i) * 0x80u;
+                if (!mem::IsCommitted(slot + 0x74u) || kernel::R32(slot + 0x70u) == 0) continue;
+                const uint32_t block = kernel::R32(slot + 0x1Cu);
+                if (!block || !mem::IsCommitted(block)) continue;
+                wchar_t suffix[32];
+                swprintf(suffix, 32, L"-block%d.bin", i);
+                dump(suffix, block, 0x200u);
+            }
+        }
+    }
+}
+
 // crash dump in CrashDumps beside the exe
 LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
-    // the dump holds no guest memory: the guest registers and return addresses go to the log
+    // the dump holds no guest memory: the guest registers and return addresses go to the log, key pages to .bin files
     if (kernel::Thread* t = kernel::Current(); e && t && t->ctx) {
         auto* r = e->ExceptionRecord;
         LOGE("exception %08lX at %p on guest thread %X", r->ExceptionCode, r->ExceptionAddress, t->id);
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(r->ExceptionAddress), &mod) &&
+            mod)
+            LOGE("  fault module base %p, offset +%llX", (void*)mod,
+                 (unsigned long long)(uintptr_t(r->ExceptionAddress) - uintptr_t(mod)));
         if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
             uint64_t va = r->ExceptionInformation[1], g = uint64_t(reinterpret_cast<uintptr_t>(kernel::g_base));
             LOGE("  %s %llX, guest %08llX", r->ExceptionInformation[0] ? "write" : "read", (unsigned long long)va,
                  (unsigned long long)(va - g));
         }
         kernel::LogGuestStack(*t->ctx, 256);
+        WriteGuestCrashPages(*t, e);
     }
     auto dir = ExeDir() / "CrashDumps";
     CreateDirectoryW(dir.c_str(), nullptr);
@@ -245,6 +298,47 @@ std::filesystem::path ExeDir() {
     return std::filesystem::path(p).parent_path();
 }
 
+// Hardware write watchpoint diagnostic (XBE_EFFECT_WATCH). The exception carries the host instruction that
+// performed the write; logging the module offset lets it be symbolized against the shipped PDB. The guest
+// registers are the current thread's context. Read-only: no game state is changed.
+LONG CALLBACK GuestWatchHandler(EXCEPTION_POINTERS* e) {
+    auto* r = e ? e->ExceptionRecord : nullptr;
+    auto* c = e ? e->ContextRecord : nullptr;
+    if (!r || !c || r->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if (!kernel::GuestWatchActive()) return EXCEPTION_CONTINUE_SEARCH;
+    const uint32_t watched = kernel::GuestWatchAddress();
+    const uint32_t value = mem::IsCommitted(watched) ? kernel::R32(watched) : 0;
+    static std::atomic<int> hits{0};
+    if (hits.fetch_add(1, std::memory_order_relaxed) < 32) {
+        HMODULE mod = nullptr;
+        uint64_t rva = 0;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(c->Rip), &mod) &&
+            mod)
+            rva = uint64_t(c->Rip) - uint64_t(mod);
+        if (kernel::Thread* t = kernel::Current(); t && t->ctx) {
+            auto& g = *t->ctx;
+            LOGE("watch: hit +%llX value %08X guest eax %08X ecx %08X edx %08X ebx %08X esi %08X edi %08X esp %08X",
+                 (unsigned long long)rva, value, g.eax, g.ecx, g.edx, g.ebx, g.esi, g.edi, g.esp);
+            // the writer's frame: the grid routines keep the coordinate and remainders in the first locals
+            if (mem::IsCommitted(g.esp) && mem::IsCommitted(g.esp + 0x5C)) {
+                uint32_t w[24];
+                for (int i = 0; i < 24; i++) w[i] = kernel::R32(g.esp + uint32_t(i) * 4);
+                LOGE("  stack+00 %08X %08X %08X %08X %08X %08X %08X %08X", w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+                     w[7]);
+                LOGE("  stack+20 %08X %08X %08X %08X %08X %08X %08X %08X", w[8], w[9], w[10], w[11], w[12], w[13],
+                     w[14], w[15]);
+                LOGE("  stack+40 %08X %08X %08X %08X %08X %08X %08X %08X", w[16], w[17], w[18], w[19], w[20], w[21],
+                     w[22], w[23]);
+            }
+        } else {
+            LOGE("watch: hit +%llX value %08X (no guest thread)", (unsigned long long)rva, value);
+        }
+    }
+    c->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 int Instance() {
     static const int n = [] {
         const wchar_t* p = std::wcsstr(GetCommandLineW(), L"--instance");
@@ -311,6 +405,7 @@ void Pace(uint32_t max_fps) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetUnhandledExceptionFilter(app::WriteCrashDump);
+    AddVectoredExceptionHandler(1, app::GuestWatchHandler);
     std::signal(SIGABRT, [](int) { app::WriteCrashDump(nullptr); });
     timeBeginPeriod(1);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -323,6 +418,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (app::kGame.init) app::kGame.init();
     if (relaunched && !logx::kVerbose) LOGR("Relaunched: %s", IMAGE_XBE);
     else app::LogSystem();
+    LOGR("diagnostics: effect watch %s", std::getenv("XBE_EFFECT_WATCH") ? "enabled" : "off");
 
     app::GameFiles game;
     if (!app::FindGame(game)) return 1;

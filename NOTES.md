@@ -1103,6 +1103,41 @@ figure in the 4:3 capture `214508`). It does not change with aspect, FOV, Bloom,
 and other pedestrians look normal. The user believes it is draw distance or LOD.
 
 **Character LOD in the Xbox build.**
+- Updated with captures `002209` and `002217`. The woman in the white top
+  and gold trousers uses the same atlas address `811CF680` and shader in
+  both frames. Draw 1547 submits 621 indices, while draw 1252 submits
+  2004. Both counts occur in different mesh blocks of
+  `LResChar/Bodies/Body_F_Sporty.xb2`. This confirms an in-asset mesh
+  switch and supersedes the earlier conclusion that asset-set selection
+  was the only switch.
+- The optional `Play With High Detail NPCs.cmd` comparison redirected the
+  ordinary low-detail body request at `0x7D976` to the retail `Char`
+  body. All 98 installed low-detail bodies have a counterpart. The
+  Sporty counterpart has one mesh block with 3469 indices. Seven of the
+  98 counterparts have two blocks, so this is an asset-set experiment,
+  rather than a general change to the LOD threshold. Heads and the
+  separate low-pedestrian asset are outside this hook.
+- The first comparison build crashed at `0x7D97B` on a null guest path.
+  This loader also accepts a file ID with a null filename. The hook now
+  checks the guest address before translating it and leaves those calls
+  to the original loader.
+- The comparison was removed after capture `003040` still showed a
+  598-index body (draw 1561, atlas `81170180`, matched to
+  `Body_F_Casual_Heavy`) and the user reported fewer or disappearing
+  pedestrians. The frame and session log do not establish the cause of
+  that population change. The normal loader is restored. The next
+  investigation should trace selection among the loaded body meshes.
+- The shader draw trace led through `0x21CF50` and `0x21DC00`.
+  The scene walker compares camera-space depth to entries in the node's
+  mesh list, following the next entry when depth exceeds a threshold.
+  The standalone selector at `0x21C330` does the same. The opt-in
+  `Play With Longer NPC Detail.cmd` test halves the depth passed to
+  these selectors for body loader slots 28–39. It keeps the current
+  assets and streaming path. The user still saw low-detail NPCs with
+  this build. Investigation is pinned at the user's request. Both NPC
+  experiments and the temporary draw trace were removed from the release.
+  The captures and selector addresses above are the starting point if
+  the work resumes.
 - The game asks the file layer for `D:\Data\Lreschar\Bodies\BODY_*.XB2` and `\Heads\HEAD_*.XB2` when pedestrians
   spawn. This was proven by logging the open paths (see the hook note below).
 - `uLODStart` in the `BodyHeadInfo` table (`0x3520F0 + (id-0x85)*0x58 + 0x14`) is read only by `0x7D350`, whose
@@ -1174,3 +1209,239 @@ D3D8 draw tracer:
   or a texture edge, not geometry LOD.
 - Hook and tracer removed again; no source change remains.
 
+### Broadway / W 46th façade seam (capture 231610)
+
+- The marked façade is below the purple billboard. The dividing line is near x=333 in the
+  640x480 capture, with the lower-detail surface to its right.
+- The whole façade has visible detail before the distant-city pass. Compare
+  `1685_83DA4000_s.bmp` and `1686_83DA4000_s.bmp`. The change occurs across the
+  `B0000C21` depth and colour pair (draws 1686–1687), using the 128x128
+  texture `82AC4A00` and the restricted screen-depth range 0–70749. The seam is
+  already in the scene target before post-processing.
+- Earlier detailed geometry writes depth to the same surface. The distant pass uses a
+  different mesh and a 0.99 viewport depth scale. The title sets up the restricted
+  clip range in `0x13F090` and later restores the full range. The capture isolates
+  the overwrite, but does not establish whether the original Xbox shows it.
+- A rendering change needs a matched comparison that checks both the overlap and
+  distant areas where only the simplified geometry is resident.
+
+- The user confirmed the seam also occurs in the original game and verified that
+  moving the clipped distant-city pass farther back fixes it at Broadway.
+- Opening cutscene capture `234912` exposed a regression. Draws 995–1008 use
+  the distant-city program with a clip maximum of 524288, the original full
+  24-bit depth range divided by 32. The dark wedge appears in the main scene
+  target by draw 1025, before bloom and the final composite. The port now
+  applies the façade adjustment only to the restricted pass outside
+  audio-clock cutscenes. The cutscene and unrestricted passes use their
+  original depth. In-game confirmation of this correction is pending.
+
+- For a fix that also works in cutscenes, `scripts/trace_city_meshes.py`
+  matches packed positions from a frame capture to retail mesh containers.
+  Broadway draws 1152–1154 and 1941 match the detailed container at
+  `Brick_NYC.exm+0x6CA800`. The overwrite at draw 1686 matches
+  `Brick_NYC/0_-5.xb2+0x348`; another batch from that tile begins at
+  `+0x3AB0` in draw 1688. The detailed container and the tile use different
+  node identifiers. The adjacent draw 1685 matches `-1_-5.xb2`.
+  Matching a whole tile would affect multiple batches, so it does not
+  establish which individual surfaces should have priority.
+- The opening capture `234912` lacks vertex inputs for draws 995–1008.
+  Collect the same shot with `XBE_CAPTURE_INPUTS=1` to identify the
+  opening geometry and separate it from the façades that need priority.
+- Opening capture `235803` shows the skyline and hillside without the
+  dark wedge. The adjustment was active in this cutscene frame. Draws
+  997–1010 use the scaled clip maximum 17685 and match five city tiles
+  spanning `-2_11`, `-1_9`, `-2_9`, `-1_10` and `-2_10`.
+  The earlier dark frame used the scaled full depth range. Scope the
+  adjustment by the pass's clip range in both gameplay and cutscenes.
+  The full-range pass retains original depth because it includes geometry
+  outside the restricted distant band. This is a pass-based rule, with
+  no inferred pairing between individual mesh surfaces.
+- Capture `000135` shows the reported left façade before the adjusted
+  distant-city draws 739–752. Sampled façade pixels change by draw 600,
+  with little change across the adjusted pass. This differs from the
+  Broadway overwrite. The installed PC widescreen and DX wrapper INIs
+  expose distant blur and mip generation, but no city LOD or streaming
+  controls. The PC city tiles have corresponding node IDs and different
+  mesh payloads. For example, `0_-5.pcf` is 356352 bytes versus 248448
+  bytes for `0_-5.xb2`. The PC city index differs too. A matched PC
+  opening shot is needed to establish whether the façade differs there.
+- The user clarified that the PC reference is the building immediately
+  right of the fire escape. In capture `000135`, the neighboring wall
+  behind the streetlamp appears between snapshots 575 and 600, already
+  showing the dark stretch beside the poster. It remains visible through
+  snapshots 725 and 750, across the adjusted distant-city draws. Draw
+  593 uses the matching Expression poster texture `82887000`, an anchor
+  for tracing the neighboring wall draws. The capture saves every 25
+  draws, so it does not isolate the wall's exact draw yet.
+- The user's red outline identifies the lower brick row in front of the
+  poster wall. In `000135` the red end wall and near windows are present
+  by draw 600. Between snapshots 725 and 750 the restricted distant-city
+  pass changes pixels on the receding end of the row and the roofline.
+  The near end remains visible. The earlier poster-wall finding does
+  not identify the draw responsible for this row's transition.
+- Every-draw capture `001129` isolates the overwrite to draw 747. The
+  snapshot numbered 748 is the first image after that draw. The mesh
+  comes from `-1_10.xb2+0x3E00`. At (426,263), detailed draw 567 writes
+  brick and depth from `Brick_NYC.exm+0x8D3800`; draw 747 replaces the
+  resulting RGB (41,28,24) with (18,19,19). The earlier clip adjustment
+  was active (maximum 17685), but c-38 still held the stock 0.99 viewport
+  scale. The new adjustment scales host Z after vertex-program depth
+  clipping for the restricted pass. This preserves the guest clip
+  coverage and actually moves overlapping proxy geometry behind the
+  detailed geometry. Capture logs mark affected draws with `depthscale`.
+  The user reported that the brick-row issue appears fixed in-game
+  with this build.
+
+
+## 2026-11-05 - Effect-batch crash: guest-thread race investigation
+
+A release build crashed after ~16 minutes of play (`C0000005`, guest thread 0x14). The log and the
+minidump (`TrueCrimeNYC.2026.11.05_02.12.22.dmp`) agree on the fault:
+
+- Read of guest address `FFFFFFF8` (i.e. -8), in guest function `sub_00141D40` at `00141EF0`
+  (`mov al, [edx]`). DLL-relative fault address `+0x3DFD49`.
+- The function walks up to nine polymorphic objects at `renderer+0x55C0` (stride 0x80; reset by
+  `0x13D880` through the virtual `0x137420`). Each object carries a count `+0x70`, a data pointer
+  `+0x74`, a world box `+0x30`, a vertex base `+0x54`, and walks 32-byte element records. It is an
+  effect/particle-style batch builder, not the city mesh LOD path.
+- The computed figure was `+0x74 + index*32 + 2`; host registers show the `+0x74` field held
+  `FFFFFFF6` (-10), so the first byte read landed at -8. Nothing in the image writes -10 as a
+  pointer, so the object's field was corrupt or the object was reinterpreted as another subclass.
+- 0x80000000 in the guest index register is the shifted index term; it does not by itself prove a
+  NaN conversion.
+
+**Root-cause candidates, in order**
+
+1. Guest threads run in parallel: the runtime gives every guest thread its own host thread
+   (`kernel/threads.cpp`), while the Xbox is a single-core Pentium III and never runs two guest
+   threads simultaneously. A thread that recycles one of the nine polymorphic effect objects
+   (count update, vtable swap, subclass field layout) while the frame thread iterates it makes
+   `+0x74` a different field - exactly the small integer seen here. The 16-minute delay and the
+   absence of a fixed scene fit a timing race.
+2. A genuine use-after-free in the title's effect lifecycle (same signature, but expected to
+   reproduce at a fixed scene).
+3. Uninitialised/stale effect data producing an out-of-range index.
+
+**Diagnostics added**
+
+- `LogGuestStack` now walks the EBP chain (`LogGuestFrames`) and prints real guest frames; the raw
+  stack scan it also keeps reports stale return addresses and should not be read as a call stack.
+- The crash handler logs the module base and DLL-relative fault offset, and writes three guest
+  snapshots beside the minidump: `guest-<time>-fault.bin` (pages around the fault address),
+  `-stack.bin` (128 KB below the faulting thread's stack) and `-renderer55c0.bin` (the nine effect
+  objects) so the post-mortem no longer depends on guest RAM being absent from the dump.
+- Experimental `XBE_SERIAL_GUEST=1`: only one guest thread executes guest code at a time, with the
+  lock released for HLE calls (where the console scheduler would switch). A watchdog reports a lock
+  held for more than 5 s. Default off; enable it to test the race hypothesis.
+
+**Next step.** Reproduce on the user's save with and without `XBE_SERIAL_GUEST=1`. If serial mode
+removes the crash, choose between keeping serialisation (measure the frame-time cost) and locking
+only the effect-object lifecycle. If the crash is deterministic at one scene, treat it as a
+data/lifecycle bug instead and add a validity check before the batch traversal.
+
+### Update (same day): the crash is deterministic, not a race
+
+The user's second and third runs (normal and `XBE_SERIAL_GUEST=1`) crashed with identical registers,
+stack pointer and effect-slot contents; the serial run's dump even has one extra thread (the
+serial-mode watchdog), confirming the mode was active. So guest-thread parallelism is not the cause.
+
+- The corrupt slot is slot 8; only +0x70..+0x7C differ. The activation method `0x13C8F0`
+  derives +0x70/+0x74 from the data block at +0x1C: `+0x70 = block + [block+0x18]`,
+  `+0x74 = block + [block+0x20]`. Slot 8's block is `City\Brick_NYC\1_-8.g` (id 201) and its real
+  fields are `+0x18 = 0x80`, `+0x20 = 0x15C0`, so activation should have produced
+  `0x8150E080`/`0x8150F5C0` - the same pattern every healthy slot has. The other derived
+  fields (+0x54/+0x5C/+0x68/+0x6C) match that same block exactly.
+- Therefore the last 16 bytes were overwritten after activation. +0x78/+0x7C are not written by
+  any effect method (padding), so the runtime values there are stale allocation content; the
+  meaningful corruption is +0x70/+0x74.
+- Diagnostic-only additions (no game changes): the crash dump now also keeps the effect manager
+  region (`-effectmanager.bin`) and the first 0x200 bytes of each active slot's data block
+  (`-blockN.bin`); the activation method logs when it produces an invalid pointer; and
+  `XBE_EFFECT_WATCH=1` installs a hardware write watchpoint (debug register DR0) on slot 8 +0x70
+  in every guest thread. The process VEH logs the writing instruction's module offset plus the
+  guest stack, so the writer can be symbolized against the shipped PDB. No guard or state change
+  is shipped.
+
+**Watchpoint verification on the developer machine.** With `XBE_EFFECT_WATCH=1` the batch builder arm
+points DR0 at slot 8 +0x70 in every guest thread. The log then showed the expected activation and
+deactivation writers (`0x13C8F0` at module +0x3C73F7, `0x13C840` at module +0x3C71A9), and the
+activation log printed correct pointers (`block+0x80` / `block+0x15C0`) for every slot, confirming
+that a bad slot comes from a write *after* activation. The activation validity test was corrected to
+use `mem::IsCommitted` alone: effect blocks live in the contiguous 0x8xxxxxxx alias, which is valid
+guest memory but outside the user range 0x10000..0x7FFE0000.
+
+**Diagnostic packaging gotcha (same day).** The first two diagnostic zips shipped the exe, DLL and pdb
+but not `TrueCrimeNYC.dll.stamp`. Without the stamp the launcher rebuilt the DLL from the XBE using the
+user's existing `compiler/TrueCrimeNYC.lib`, which predates these hooks: lld then bound the generated
+`sub_...` symbols locally instead of importing the executable's exports, so every hook in the EXE was
+silently bypassed (and no `watch:` line appeared). The fix is to ship the regenerated
+`TrueCrimeNYC.dll.stamp` (host/XBE/DLL SHA-1s) so the launcher loads the shipped DLL, plus the current
+`compiler/TrueCrimeNYC.lib` as a fallback if a rebuild is ever forced. The EXE now logs
+`diagnostics: effect watch enabled|off` at startup so this is unambiguous. This also explains why the
+earlier city-LOD hook had no visible effect: its strong override was never called in the user's
+install.
+
+**Root cause found and fixed (same day).** The hardware watchpoint on slot 8 +0x70 caught the writer at
+module +0x3F6CA8, i.e. guest `0x1472E0` at `0x1473EE..0x147403`:
+
+    index = ((coordA + 1000) % 3) + 3 * ((coordB + 1000) % 3)
+    dest  = cellManager + (index + 0x49) * 16
+
+`cellManager` is the nine-cell object at renderer+0x55B0 and `+0x490` is its 3x3 table of 16-byte cell
+records (right after the nine 0x80-byte cell slots). At the crash spot `coordA` is below -1000, so the
+signed `idiv` remainder is -1 and `index` becomes -1: the record is written at `manager+0x480`, which is
+exactly slot 8 +0x70. That overwrites the slot's data pointer with `[esp+0x1C]`/`esi+ebx` from the record
+(0x80000000 / 0xFFFFFFF6), and the cell batch builder then faults at guest -8. The values in the record
+match the other records of that table; the tile blocks and activation are intact.
+
+Only the remainders are consumed (the quotients are overwritten immediately), so the fix widens the
+offset instead of adding a guard: `+1000` becomes `+0x100000` in all ten copies of the routine
+(`0x146CA0`, `0x146CC8`, `0x146D66`, `0x146FC0`, `0x146FE8`, `0x1472E0`, `0x147308`, `0x138B90`,
+`0x13F090`, `0x14A240`; 20 sites). `0x100000-1000` is a multiple of three, so every coordinate that
+worked before yields exactly the same remainder, while coordinates down to -1,000,000 now produce the
+correct 0..2 index. `scripts/patch_grid_offset.py` reapplies the edit after a clean recompile of the XBE.
+Build `2026-11-05-r4` contains the patched DLL; the user is testing the crash spot.
+
+**Offset widening was not enough (watch run).** With the r4 DLL loaded (verified from the module
+timestamp in the dump), the watchpoint fired at the same store and its frame showed the reason:
+
+    watch: hit +3F6CA8 value 80000000
+    guest eax 00577E40 ecx FFFFFFFF ... esp D007AC90
+    stack+18 005779C0 80000000
+    stack+20 FFFFFFFF 3E94672C FFFFFFF7 ...
+
+`ecx = -1` is the computed index and `[esp+0x20] = -1` is the signed `idiv` remainder. The cell
+coordinate here is far below -1,000,000, so moving the +1000 offset to +0x100000 did not make the
+dividend positive. The correct fix is the remainder itself: the grid wants the mathematical modulo
+(0..2), but signed `idiv` returns a negative remainder for a negative dividend.
+
+All 27 `idiv` blocks in the ten grid routines now add the divisor when the remainder is negative.
+For every non-negative dividend this is byte-for-byte the same value as before; for a negative one
+it yields the intended 0..2 bucket instead of a negative index. The original +1000 constants are
+restored. `scripts/patch_grid_offset.py` applies this after a clean recompile; build
+`2026-11-05-r6` contains the corrected DLL.
+
+**Final fix for the grid index (build 6).** The watch frame on the r5 build showed `ecx = -1` and
+`[esp+0x20] = -1`: the first division's signed remainder is negative. Widening the +1000 offset only
+moves the boundary. The fix now makes the two **index** divisions use the mathematical remainder
+(add the divisor when the signed remainder is negative). This is identical to the original for every
+non-negative dividend and yields the intended 0..2 bucket for a negative one; the quotients are
+discarded. The sub-position division (`A/3` used for a float offset) and all `value * 1000` divisions
+are deliberately left signed - changing them produced a new null-pointer crash at 0x3BC90 during
+level load in local testing, so only the index divisions are corrected (20 sites in the ten grid
+routines). `scripts/patch_grid_offset.py` applies this after a clean recompile. Local 55 s smoke test
+is clean; build `2026-11-05-r6` is with the user for the crash-spot test.
+
+**Confirmed fixed (same day).** The user played the crash spot with build r6 and it no longer crashes. Build 6 corrects the
+signed remainder only for the two divisions whose dividend is `coordinate + 1000`, which the 3x3 index uses; the
+sub-position division and unrelated `*1000` divisions stay signed. Local A/B testing had shown that correcting those
+other divisions caused a new null-pointer crash at 0x3BC90 during level load.
+
+**Durable fix for rebuilt game code.** `generated/` is ignored and is regenerated from the XBE, so the source edit alone
+would not survive a clean build. The correction is now applied in two places:
+- `runtime/app/game_code.cpp` (`PatchGridRemainders`) rewrites the generated `x86_recomp.*.cpp` in the compiler work
+  folder after `xbe_recomp` finishes and before clang compiles them. This covers every first-launch/rebuild on a
+  player's PC and needs no Python.
+- `build.bat` builds the `recompile_<game>` target first, runs `scripts/patch_grid_offset.py`, then the normal build.
+  The script is idempotent and only touches the +1000 dividend divisions.
+`scripts/patch_grid_offset.py` remains the reference implementation for the transformation.

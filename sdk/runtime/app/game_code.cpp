@@ -15,8 +15,10 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <toml++/toml.hpp>
 
@@ -304,6 +306,49 @@ private:
     HANDLE log_ = INVALID_HANDLE_VALUE;
 };
 
+// The city-cell grid routines divide (coordinate + 1000) with signed idiv and use the remainder as a
+// 3x3 bucket. A negative coordinate gives a negative remainder; the index becomes -1 and the 16-byte
+// record is written over the end of cell slot 8, corrupting its pointers and crashing the renderer.
+// Make the remainder the mathematical modulo for the divisions whose dividend is coordinate + 1000:
+// identical for non-negative dividends, and the intended 0..2 bucket for a negative one. The quotient
+// is discarded in these routines. Mirrors sdk/cmake/PatchGrid.cmake for the first-launch build.
+static void PatchGridRemainders(const fs::path& work) {
+    constexpr std::string_view plain = "ctx.edx = (uint32_t)(n % d); }";
+    constexpr std::string_view fixed =
+        "ctx.edx = (uint32_t)(n % d); if ((int32_t)ctx.edx < 0) ctx.edx += (uint32_t)d; }";
+    std::error_code ec;
+    for (uint32_t i = 0;; i++) {
+        const fs::path file = work / ("x86_recomp." + std::to_string(i) + ".cpp");
+        if (!fs::exists(file, ec)) break;
+        std::ifstream in(file, std::ios::binary);
+        if (!in) continue;
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line)) lines.push_back(line);
+        in.close();
+        bool changed = false;
+        for (size_t n = 0; n < lines.size(); n++) {
+            if (lines[n].find(plain) == std::string::npos) continue;
+            std::string dividend;
+            for (size_t k = n; k > 0 && n - k <= 20;) {
+                --k;
+                if (lines[k].find("ctx.eax =") != std::string::npos) {
+                    dividend = lines[k];
+                    break;
+                }
+            }
+            if (dividend.find("0x3E8u") == std::string::npos || dividend.find('*') != std::string::npos) continue;
+            const size_t at = lines[n].find(plain);
+            lines[n].replace(at, plain.size(), fixed);
+            changed = true;
+        }
+        if (changed) {
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            for (const std::string& l : lines) out << l << '\n';
+        }
+    }
+}
+
 // xbe_recomp writes each image's C++ into its work folder, the images side by side
 bool Translate(std::vector<Target>& targets, Processes& run) {
     std::vector<HANDLE> processes;
@@ -330,6 +375,8 @@ bool Translate(std::vector<Target>& targets, Processes& run) {
         if (code == kDllNotFound) ok = RecordFailure(missing_runtime);
         else if (code) ok = RecordFailure(L"Translating " + std::wstring(xbe.begin(), xbe.end()) + L" failed.");
     }
+    if (ok)
+        for (Target& target : targets) PatchGridRemainders(WorkDir(*target.image));
     return ok;
 }
 
