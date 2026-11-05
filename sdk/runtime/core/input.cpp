@@ -139,7 +139,9 @@ bool ReadKeyboardMouse(Pad& pad) {
                  held(VK_CONTROL));                                                     // B: light attack / brake / siren
     if (char k = LetterKey(g_reload_key, 'R')) press(2, held(k));                       // X: reload/block
     if (char k = LetterKey(g_heavy_attack_key, 0)) press(3, held(k));                   // Y: optional custom heavy key
-    press(3, held(VK_NUMPAD9) || held(VK_XBUTTON2));                                    // Y: heavy attack / handbrake
+    // Y is the pad's heavy attack, grapple and human-shield button; the PC's
+    // dedicated Grapple key is +, so it joins Num 9 and mouse Button 4.
+    press(3, held(VK_NUMPAD9) || held(VK_XBUTTON2) || held(VK_ADD) || held(VK_OEM_PLUS)); // Y: heavy attack / grapple
     if (char k = LetterKey(g_use_key, 'E')) press(4, held(k));                          // black: use/action/car door
     if (char k = LetterKey(g_climb_key, 'G')) press(5, held(k));                        // white: climb
     // Precision aim stays on the right mouse button; middle mouse is the PC's
