@@ -20,7 +20,7 @@ using uint32_t = unsigned int;
 struct X86Context { uint32_t eax, ebx, ecx, edx, esp, ebp, esi, edi; };
 struct Thread { uint32_t stack_top = 0, stack_size = 0; };
 Thread g_thread;
-Thread* Current() { return &g_thread; }
+Thread* Current() { return nullptr; } // F3 runs outside the inspected guest thread
 struct Word { uint32_t address, value; };
 Word g_words[32];
 int g_word_count = 0;
@@ -64,7 +64,7 @@ void Reset() { g_word_count = 0; g_logged = 0; g_none = false; g_thread = Thread
 bool Walk(uint32_t ebp, int expected_frames, bool expected_none) {
     X86Context ctx{};
     ctx.ebp = ebp;
-    LogGuestFrames(ctx);
+    LogGuestFrames(ctx, &g_thread);
     if (g_logged != expected_frames || g_none != expected_none) {
         fprintf(stderr, "ebp %08X: logged %d (expected %d), none %d (expected %d)\n",
                 ebp, g_logged, expected_frames, int(g_none), int(expected_none));

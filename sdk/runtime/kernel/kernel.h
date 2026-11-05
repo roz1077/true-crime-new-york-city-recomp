@@ -155,7 +155,7 @@ bool CancelTimer(Object& timer);
 struct Thread : Object {
     uint32_t id = 0;
     uint32_t kpcr = 0, ethread = 0, stack_top = 0, stack_size = 0, tls = 0;
-    uint32_t host_tid = 0;  // host thread id, for debug-register watchpoints
+    std::atomic<uint32_t> host_tid{0};  // host thread id, for debug-register watchpoints
     uint32_t exit_code = 0;
     int priority = 0;
     std::atomic<int> suspend{0};
@@ -172,9 +172,9 @@ ThreadRef CurrentRef();
 void StartHostThread(const char* name, std::function<void(X86Context&)> fn);
 void RunDpcs(X86Context& ctx);
 void InitKernelData();
-void LogGuestStack(X86Context& ctx, int words);
+void LogGuestStack(X86Context& ctx, int words, const Thread* thread = nullptr);
 // EBP-chain walk for the reliable guest call stack (the raw stack scan can hit stale return addresses)
-void LogGuestFrames(X86Context& ctx);
+void LogGuestFrames(X86Context& ctx, const Thread* thread);
 // writes committed guest bytes (unmapped pages become zeros) for crash analysis
 bool DumpGuestRegion(uint32_t va, uint32_t len, const char* path);
 // XBE_SERIAL_GUEST=1: only one guest thread executes guest code at a time, matching the single-core Xbox.

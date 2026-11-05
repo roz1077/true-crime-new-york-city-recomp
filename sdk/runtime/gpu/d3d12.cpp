@@ -734,7 +734,7 @@ private:
     // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
     void FinishCapture(const Surface& front);
     void StartCapture();
-    void ResizeSwap();
+    bool ResizeSwap();
     void UploadGammaRamp();
     void DrawFrame(Target* t, uint32_t bi, ID3D12Resource* aa);
     void BlitFrame(Target& t, ID3D12Resource* aa);
@@ -3832,13 +3832,13 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
     }
 }
 
-void D3D12Backend::ResizeSwap() {
+bool D3D12Backend::ResizeSwap() {
     HWND hwnd = static_cast<HWND>(app::Window());
     RECT rc;
     GetClientRect(hwnd, &rc);
     uint32_t w = std::max<LONG>(rc.right - rc.left, 1);
     uint32_t h = std::max<LONG>(rc.bottom - rc.top, 1);
-    if (w == bb_w_ && h == bb_h_) return;
+    if (w == bb_w_ && h == bb_h_) return std::all_of(std::begin(bb_), std::end(bb_), [](const auto& buffer) { return bool(buffer); });
     Flush();
     for (auto& f : frames_) {
         if (f.fence) WaitFence(f.fence);
@@ -3851,16 +3851,16 @@ void D3D12Backend::ResizeSwap() {
         // frame can continue at the previous size, and report device loss explicitly.
         LOGE("d3d12: ResizeBuffers(%ux%u) failed: 0x%08lX (device removed: 0x%08lX)", w, h, hr,
              dev_->GetDeviceRemovedReason());
-        if (!CreateBackBufferViews())
-            LOGE("d3d12: back buffers are unavailable after a failed resize");
-        return;
+        if (FAILED(dev_->GetDeviceRemovedReason())) return false;
+        return CreateBackBufferViews();
     }
     if (!CreateBackBufferViews()) {
-        LOGE("d3d12: back buffer views failed after resize to %ux%u; keeping the old size", w, h);
-        return;
+        LOGE("d3d12: back buffer views failed after resize to %ux%u; rendering cannot continue", w, h);
+        return false;
     }
     bb_w_ = w;
     bb_h_ = h;
+    return true;
 }
 
 void D3D12Backend::FinishCapture(const Surface& front) {
@@ -4252,7 +4252,10 @@ void D3D12Backend::Present(const Surface& front) {
     } else if (g_capture.exchange(false) && CaptureOn()) {
         StartCapture();
     }
-    ResizeSwap();
+    if (!ResizeSwap()) {
+        LOGE("d3d12: stopping because swap-chain back buffers are unavailable");
+        kernel::Shutdown(1);
+    }
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (t) Resolve(*t);

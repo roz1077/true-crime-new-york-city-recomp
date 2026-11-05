@@ -13,6 +13,8 @@
 // guest address, the idiv operand, the divisor load and the divide-error trap in the generated
 // block. It also requires the exact number of occurrences, so a recompiler change that moves or
 // splits these routines fails the build instead of patching an unrelated division.
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -22,6 +24,13 @@
 #include <string>
 #include <system_error>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace xbe {
 
@@ -98,6 +107,19 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
     const std::string plain = "ctx.edx = (uint32_t)(n % d); }";
     const std::string fixed =
         "ctx.edx = (uint32_t)(n % d); if ((int32_t)ctx.edx < 0) ctx.edx += (uint32_t)d; }";
+    struct Change {
+        std::filesystem::path file, temp;
+        std::string text;
+    };
+    struct Changes : std::vector<Change> {
+        ~Changes() {
+            for (const auto& change : *this) {
+                if (change.temp.empty()) continue;
+                std::error_code ignored;
+                std::filesystem::remove(change.temp, ignored);
+            }
+        }
+    } changes;
     std::vector<uint32_t> seen(kGridSiteCount, 0);
     for (uint32_t part = 0; part < partitions; part++) {
         const std::filesystem::path file = dir / ("x86_recomp." + std::to_string(part) + ".cpp");
@@ -107,6 +129,10 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
             return result;
         }
         std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (in.bad()) {
+            result.error = "read failed for " + file.string();
+            return result;
+        }
         in.close();
         const bool trailing_newline = !text.empty() && text.back() == '\n';
         std::vector<std::string> lines;
@@ -167,37 +193,12 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
             result.occurrences++;
         }
         if (changed) {
-            std::filesystem::path temp = file;
-            temp += ".gridtmp";
-            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-            if (!out) {
-                result.error = "cannot write " + temp.string();
-                return result;
-            }
+            std::string patched;
             for (size_t i = 0; i < lines.size(); i++) {
-                out << lines[i];
-                if (i + 1 < lines.size() || trailing_newline) out << '\n';
+                patched += lines[i];
+                if (i + 1 < lines.size() || trailing_newline) patched += '\n';
             }
-            out.close();
-            if (!out) {
-                result.error = "write failed for " + temp.string();
-                std::error_code ignored;
-                std::filesystem::remove(temp, ignored);
-                return result;
-            }
-            std::error_code ec;
-            std::filesystem::remove(file, ec);
-            if (ec) {
-                result.error = "removing " + file.string() + " failed: " + ec.message();
-                std::filesystem::remove(temp, ec);
-                return result;
-            }
-            std::filesystem::rename(temp, file, ec);
-            if (ec) {
-                result.error = "replacing " + file.string() + " failed: " + ec.message();
-                std::filesystem::remove(temp, ec);
-                return result;
-            }
+            changes.push_back({file, {}, std::move(patched)});
         }
         result.files++;
     }
@@ -212,6 +213,50 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
         result.error = "patched " + std::to_string(result.occurrences) + " sites, expected " +
                        std::to_string(kGridExpectedOccurrences);
         return result;
+    }
+    // Validate the whole image before staging anything. Exclusive staging files also make a
+    // retry safe after interruption: a previous run's leftovers are never opened for truncation.
+    static std::atomic<uint64_t> serial{0};
+    for (auto& change : changes) {
+        std::FILE* out = nullptr;
+        for (int attempt = 0; attempt < 64 && !out; attempt++) {
+            const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
+            change.temp = change.file;
+            change.temp += ".gridtmp." + std::to_string(tick) + "." + std::to_string(serial.fetch_add(1));
+#ifdef _WIN32
+            out = _wfopen(change.temp.c_str(), L"wbx");
+#else
+            out = std::fopen(change.temp.c_str(), "wbx");
+#endif
+            if (!out) change.temp.clear();  // never clean up a file owned by another run
+        }
+        if (!out) {
+            result.error = "cannot stage " + change.file.string();
+            return result;
+        }
+        const bool wrote = std::fwrite(change.text.data(), 1, change.text.size(), out) == change.text.size();
+        const bool closed = std::fclose(out) == 0;
+        if (!wrote || !closed) {
+            result.error = "write failed for " + change.temp.string();
+            return result;
+        }
+    }
+    for (auto& change : changes) {
+#ifdef _WIN32
+        if (!MoveFileExW(change.temp.c_str(), change.file.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            result.error = "replacing " + change.file.string() + " failed: " + std::to_string(GetLastError());
+            return result;
+        }
+#else
+        std::error_code ec;
+        std::filesystem::rename(change.temp, change.file, ec);
+        if (ec) {
+            result.error = "replacing " + change.file.string() + " failed: " + ec.message();
+            return result;
+        }
+#endif
+        change.temp.clear();
     }
     return result;
 }

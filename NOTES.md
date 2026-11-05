@@ -1451,3 +1451,15 @@ temporary file. Any missing file, changed instruction or wrong count stops the b
 patch. `scripts/test_grid_patch.py` exercises the fixture, idempotency and drift failures; `scripts/test_guest_frames.py`
 covers the guest frame walker and the `0xD0...` stack range. The earlier `scripts/patch_grid_offset.py` reference script
 was removed so there is no second, divergent transformation.
+
+### 2026-11-05 · Review completion and failure-path verification
+
+The renderer now reports whether swap-chain back buffers remain usable after resize. A recoverable resize failure reacquires the original buffers and retains their dimensions. Failure to acquire views or device loss stops the process before further frame commands are submitted.
+
+Grid patching validates every partition and all expected occurrences before staging changed files. Staging uses exclusive temporary files. Each original is replaced atomically without first deleting it. If publication stops partway through, each partition remains complete and retry accepts already-corrected partitions. The fixture checks that rejected inputs remain untouched and that a blocked replacement preserves sources and can be retried.
+
+F3 stack logging explicitly passes the inspected guest thread to the frame walker. It therefore uses that thread's allocated stack bounds even when called from the window thread. The frame fixture models a caller with no current guest thread.
+
+Watchpoint thread IDs are atomic, cleared before thread exit, and checked again after suspension before debug registers are changed. Helpers retain the thread object while installing the watch. The debug-register length encoding was also corrected so an 8-byte watch covers 8 bytes. A native Windows fixture installs the watch on live worker threads and skips workers that have exited.
+
+Verification completed with the release build, all 16 regression checks, a matching executable/XBE/DLL stamp, and a reverse-apply check of the regenerated SDK patch. The grid failure/retry test was also run separately after its assertions were extended. In-game F3 capture and window/display-mode changes remain manual checks.

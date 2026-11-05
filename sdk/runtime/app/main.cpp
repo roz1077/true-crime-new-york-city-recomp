@@ -140,7 +140,7 @@ LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
             LOGE("  %s %llX, guest %08llX", r->ExceptionInformation[0] ? "write" : "read", (unsigned long long)va,
                  (unsigned long long)(va - g));
         }
-        kernel::LogGuestStack(*t->ctx, 256);
+        kernel::LogGuestStack(*t->ctx, 256, t);
         WriteGuestCrashPages(*t, e);
     }
     auto dir = ExeDir() / "CrashDumps";
@@ -167,7 +167,7 @@ void DumpThreads() {
     for (auto& t : kernel::Threads())
         if (t->ctx) {
             LOGI("thread %X", t->id);
-            kernel::LogGuestStack(*t->ctx, 32);
+            kernel::LogGuestStack(*t->ctx, 32, t.get());
         }
 }
 

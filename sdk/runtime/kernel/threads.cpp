@@ -202,12 +202,20 @@ namespace {
 std::atomic<uint32_t> g_watch_addr{0};
 std::atomic<uint32_t> g_watch_len{0};
 
-void ApplyWatchToHostThread(uint32_t host_tid, uint32_t guest_addr, uint32_t len) {
+void ApplyWatchToHostThread(const ThreadRef& thread, uint32_t guest_addr, uint32_t len) {
+    const uint32_t host_tid = thread->host_tid.load();
 #ifdef _WIN32
     if (!host_tid || !guest_addr) return;
-    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, host_tid);
+    HANDLE h = OpenThread(SYNCHRONIZE | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, host_tid);
     if (!h) return;
-    if (SuspendThread(h) == DWORD(-1)) {
+    if (WaitForSingleObject(h, 0) != WAIT_TIMEOUT || SuspendThread(h) == DWORD(-1)) {
+        ::CloseHandle(h);
+        return;
+    }
+    // The thread may have exited and its ID been reused before OpenThread. Its published
+    // ID is cleared before exit, and a suspended thread cannot race this final ownership check.
+    if (thread->host_tid.load() != host_tid) {
+        ResumeThread(h);
         ::CloseHandle(h);
         return;
     }
@@ -218,7 +226,7 @@ void ApplyWatchToHostThread(uint32_t host_tid, uint32_t guest_addr, uint32_t len
         c.Dr6 = 0;
         c.Dr7 |= 0x1ull;                                   // L0: local enable for DR0
         c.Dr7 = (c.Dr7 & ~0x30000ull) | 0x10000ull;        // RW0 = write
-        const uint64_t length = len >= 8 ? 3 : len >= 4 ? 2 : len >= 2 ? 1 : 0;
+        const uint64_t length = len >= 8 ? 2 : len >= 4 ? 3 : len >= 2 ? 1 : 0;
         c.Dr7 = (c.Dr7 & ~0xC0000ull) | (length << 18);    // LEN0
         SetThreadContext(h, &c);
     }
@@ -247,8 +255,9 @@ void InstallGuestWatch(uint32_t guest_addr, uint32_t len) {
     std::thread([guest_addr, len] {
         // let the calling thread leave this function before it is suspended
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        for (const ThreadRef& t : Threads())
-            if (t->host_tid) ApplyWatchToHostThread(t->host_tid, guest_addr, len);
+        for (const ThreadRef& t : Threads()) {
+            ApplyWatchToHostThread(t, guest_addr, len);
+        }
         LOGR("watch: hardware write watchpoint on guest %08X (%u bytes)", guest_addr, len);
     }).detach();
 #endif
@@ -283,8 +292,8 @@ void StartThread(ThreadRef t) {
         t_current = t;
         t->host_tid = HostThreadId();
         if (GuestWatchActive()) {
-            const uint32_t tid = t->host_tid, addr = g_watch_addr.load(), len = g_watch_len.load();
-            std::thread([tid, addr, len] { ApplyWatchToHostThread(tid, addr, len); }).detach();
+            const uint32_t addr = g_watch_addr.load(), len = g_watch_len.load();
+            std::thread([t, addr, len] { ApplyWatchToHostThread(t, addr, len); }).detach();
         }
         char name[32];
         std::snprintf(name, sizeof(name), "guest %X", t->id);
@@ -311,6 +320,7 @@ void StartThread(ThreadRef t) {
         LOGI("thread %X returned %08X", t->id, code);
         MarkExited(*t, code);
         Unregister(t.get());
+        t->host_tid.store(0);
         t_current.reset();
     });
 }
@@ -325,13 +335,14 @@ void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
         t_current = t;
         t->host_tid = HostThreadId();
         if (GuestWatchActive()) {
-            const uint32_t tid = t->host_tid, addr = g_watch_addr.load(), len = g_watch_len.load();
-            std::thread([tid, addr, len] { ApplyWatchToHostThread(tid, addr, len); }).detach();
+            const uint32_t addr = g_watch_addr.load(), len = g_watch_len.load();
+            std::thread([t, addr, len] { ApplyWatchToHostThread(t, addr, len); }).detach();
         }
         NameHostThread(n.c_str());
         X86Context ctx;
         InitContext(*t, ctx);
         fn(ctx);
+        t->host_tid.store(0);
         t_current.reset();
     });
 }
@@ -341,6 +352,7 @@ void ExitThread(uint32_t code) {
     if (t) {
         LOGI("thread %X exits with %08X", t->id, code);
         MarkExited(*t, code);
+        t->host_tid.store(0);
         Unregister(t);
     }
     t_current.reset();

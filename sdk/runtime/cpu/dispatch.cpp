@@ -240,10 +240,10 @@ uint32_t CallGuest(X86Context& ctx, uint32_t fn, const uint32_t* args, size_t co
 
 namespace kernel {
 // return addresses found on the guest stack, the cheapest way to place a guest event
-void LogGuestStack(X86Context& ctx, int words) {
+void LogGuestStack(X86Context& ctx, int words, const Thread* thread) {
     LOGE("  eax %08X ecx %08X edx %08X ebx %08X esp %08X ebp %08X esi %08X edi %08X", ctx.eax, ctx.ecx, ctx.edx, ctx.ebx,
          ctx.esp, ctx.ebp, ctx.esi, ctx.edi);
-    LogGuestFrames(ctx);
+    LogGuestFrames(ctx, thread ? thread : Current());
     for (int i = 0; i < words; i++) {
         uint32_t a = ctx.esp + uint32_t(i) * 4;
         if (!mem::IsCommitted(a)) break;
@@ -255,10 +255,10 @@ void LogGuestStack(X86Context& ctx, int words) {
 // Recompiled functions keep the guest frame pointer, so the EBP chain is the reliable call stack. The raw stack scan
 // above can report stale return addresses left over from earlier calls through the same stack slots. Guest stacks are
 // allocated around 0xD0000000, outside the user-image range, so validate against this thread's stack bounds.
-void LogGuestFrames(X86Context& ctx) {
+void LogGuestFrames(X86Context& ctx, const Thread* thread) {
     uint32_t low = mem::kUserLow;
     uint32_t high = mem::kUserHigh;
-    if (Thread* thread = Current(); thread && thread->stack_top && thread->stack_size) {
+    if (thread && thread->stack_top && thread->stack_size) {
         low = thread->stack_top - thread->stack_size;
         high = thread->stack_top;
     }

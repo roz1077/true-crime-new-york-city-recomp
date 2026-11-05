@@ -118,6 +118,8 @@ try:
 
     cases = [(good, 3, True), (missing, 3, False), (operand, 3, False), (trap, 3, False),
              (count, 3, False), (remainder, 3, False), (good, 0, False)]
+    originals = {path: path.read_bytes() for directory, _, ok in cases if not ok and directory != good
+                 for path in directory.glob('x86_recomp.*.cpp')}
     # Embed the temporary paths and expected outcomes in the harness.
     entries = ',\n'.join(
         '    {L"%s", %d, %s}' % (str(path).replace('\\', '\\\\'), partitions, 'true' if ok else 'false')
@@ -137,6 +139,28 @@ extern "C" __declspec(dllexport) int run() {
         }
         if (kCases[i].expected && (result.files != %d || result.occurrences != 20)) return 100 + int(i);
     }
+    // Simulate publication failure after one partition was replaced, then retry.
+    auto retry = std::filesystem::path(kCases[0].directory).parent_path() / "retry";
+    std::filesystem::create_directory(retry);
+    for (unsigned p = 0; p < 3; ++p) {
+        auto name = "x86_recomp." + std::to_string(p) + ".cpp";
+        std::ifstream input(std::filesystem::path(kCases[0].directory) / name, std::ios::binary);
+        std::string text((std::istreambuf_iterator<char>(input)), {});
+        const std::string fix = " if ((int32_t)ctx.edx < 0) ctx.edx += (uint32_t)d;";
+        for (size_t at; (at = text.find(fix)) != std::string::npos;) text.erase(at, fix.size());
+        std::ofstream(retry / name, std::ios::binary) << text;
+    }
+    HANDLE blocker = CreateFileW((retry / "x86_recomp.1.cpp").c_str(), GENERIC_READ,
+                                 FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (blocker == INVALID_HANDLE_VALUE) return 201;
+    auto blocked = xbe::PatchGridSources(retry, 3);
+    CloseHandle(blocker);
+    if (blocked.ok()) return 202;
+    for (unsigned p = 0; p < 3; ++p)
+        if (!std::filesystem::exists(retry / ("x86_recomp." + std::to_string(p) + ".cpp"))) return 203;
+    if (!xbe::PatchGridSources(retry, 3).ok()) return 204;
+    for (const auto& file : std::filesystem::directory_iterator(retry))
+        if (file.path().extension() != ".cpp") return 205;
     // The first case is patched above; a second run must accept the already-corrected sources.
     const xbe::GridPatchResult again = xbe::PatchGridSources(L"%s", %d);
     if (!again.ok() || again.files != %d || again.occurrences != 20) return 200;
@@ -147,6 +171,8 @@ extern "C" __declspec(dllexport) int run() {
     result = run_native(header + check, prefix='tcnyc-grid-patch-native-', needs_crt=True)
     assert result == 0, f'grid patch fixture regression {result}'
 
+    for path, original in originals.items():
+        assert path.read_bytes() == original, f'rejected patch modified {path}'
     expected = fixture(fixed=True)
     for index, text in enumerate(expected):
         actual = (good / f'x86_recomp.{index}.cpp').read_text(encoding='utf-8')

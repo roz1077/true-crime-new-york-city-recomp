@@ -525,7 +525,7 @@ index 0582ed9..2742398 100644
                  MB_ICONERROR);
      return false;
 diff --git a/runtime/app/main.cpp b/runtime/app/main.cpp
-index e36f7ac..67cabea 100644
+index e36f7ac..ae210ee 100644
 --- a/runtime/app/main.cpp
 +++ b/runtime/app/main.cpp
 @@ -12,7 +12,9 @@
@@ -650,12 +650,20 @@ index e36f7ac..67cabea 100644
              LOGE("  %s %llX, guest %08llX", r->ExceptionInformation[0] ? "write" : "read", (unsigned long long)va,
                   (unsigned long long)(va - g));
          }
-         kernel::LogGuestStack(*t->ctx, 256);
+-        kernel::LogGuestStack(*t->ctx, 256);
++        kernel::LogGuestStack(*t->ctx, 256, t);
 +        WriteGuestCrashPages(*t, e);
      }
      auto dir = ExeDir() / "CrashDumps";
      CreateDirectoryW(dir.c_str(), nullptr);
-@@ -79,7 +173,7 @@ void DumpThreads() {
+@@ -73,13 +167,13 @@ void DumpThreads() {
+     for (auto& t : kernel::Threads())
+         if (t->ctx) {
+             LOGI("thread %X", t->id);
+-            kernel::LogGuestStack(*t->ctx, 32);
++            kernel::LogGuestStack(*t->ctx, 32, t.get());
+         }
+ }
  
  // window thread only
  void ApplyNow() {
@@ -1402,7 +1410,7 @@ index 7e6507d..31232a7 100644
      va_list ap;
      va_start(ap, fmt);
 diff --git a/runtime/cpu/dispatch.cpp b/runtime/cpu/dispatch.cpp
-index c810896..c54b37e 100644
+index c810896..2fa1627 100644
 --- a/runtime/cpu/dispatch.cpp
 +++ b/runtime/cpu/dispatch.cpp
 @@ -9,9 +9,11 @@
@@ -1448,11 +1456,15 @@ index c810896..c54b37e 100644
      uint32_t esp = ctx.esp;
      for (const uint32_t* p = args + count; p != args;) {
          ctx.esp -= 4;
-@@ -237,6 +243,7 @@ namespace kernel {
- void LogGuestStack(X86Context& ctx, int words) {
+@@ -234,9 +240,10 @@ uint32_t CallGuest(X86Context& ctx, uint32_t fn, const uint32_t* args, size_t co
+ 
+ namespace kernel {
+ // return addresses found on the guest stack, the cheapest way to place a guest event
+-void LogGuestStack(X86Context& ctx, int words) {
++void LogGuestStack(X86Context& ctx, int words, const Thread* thread) {
      LOGE("  eax %08X ecx %08X edx %08X ebx %08X esp %08X ebp %08X esi %08X edi %08X", ctx.eax, ctx.ecx, ctx.edx, ctx.ebx,
           ctx.esp, ctx.ebp, ctx.esi, ctx.edi);
-+    LogGuestFrames(ctx);
++    LogGuestFrames(ctx, thread ? thread : Current());
      for (int i = 0; i < words; i++) {
          uint32_t a = ctx.esp + uint32_t(i) * 4;
          if (!mem::IsCommitted(a)) break;
@@ -1464,10 +1476,10 @@ index c810896..c54b37e 100644
 +// Recompiled functions keep the guest frame pointer, so the EBP chain is the reliable call stack. The raw stack scan
 +// above can report stale return addresses left over from earlier calls through the same stack slots. Guest stacks are
 +// allocated around 0xD0000000, outside the user-image range, so validate against this thread's stack bounds.
-+void LogGuestFrames(X86Context& ctx) {
++void LogGuestFrames(X86Context& ctx, const Thread* thread) {
 +    uint32_t low = mem::kUserLow;
 +    uint32_t high = mem::kUserHigh;
-+    if (Thread* thread = Current(); thread && thread->stack_top && thread->stack_size) {
++    if (thread && thread->stack_top && thread->stack_size) {
 +        low = thread->stack_top - thread->stack_size;
 +        high = thread->stack_top;
 +    }
@@ -1512,7 +1524,7 @@ index c810896..c54b37e 100644
  
  void x86_trap(X86Context& ctx, uint32_t va, const char* what) {
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index fe65837..2cb944d 100644
+index fe65837..8c808f1 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
 @@ -9,6 +9,7 @@
@@ -1805,7 +1817,8 @@ index fe65837..2cb944d 100644
      // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
      void FinishCapture(const Surface& front);
      void StartCapture();
-     void ResizeSwap();
+-    void ResizeSwap();
++    bool ResizeSwap();
      void UploadGammaRamp();
 -    void DrawFrame(Target* t, uint32_t bi);
 -    void BlitFrame(Target& t);
@@ -3069,7 +3082,21 @@ index fe65837..2cb944d 100644
      if (cap_) {
          char name[32];
          snprintf(name, sizeof(name), "%04u_copy_%08X", cap_i_, dst_t->data);
-@@ -3161,8 +3844,21 @@ void D3D12Backend::ResizeSwap() {
+@@ -3149,22 +3832,35 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
+     }
+ }
+ 
+-void D3D12Backend::ResizeSwap() {
++bool D3D12Backend::ResizeSwap() {
+     HWND hwnd = static_cast<HWND>(app::Window());
+     RECT rc;
+     GetClientRect(hwnd, &rc);
+     uint32_t w = std::max<LONG>(rc.right - rc.left, 1);
+     uint32_t h = std::max<LONG>(rc.bottom - rc.top, 1);
+-    if (w == bb_w_ && h == bb_h_) return;
++    if (w == bb_w_ && h == bb_h_) return std::all_of(std::begin(bb_), std::end(bb_), [](const auto& buffer) { return bool(buffer); });
+     Flush();
+     for (auto& f : frames_) {
          if (f.fence) WaitFence(f.fence);
      }
      for (auto& b : bb_) b.Reset();
@@ -3082,17 +3109,19 @@ index fe65837..2cb944d 100644
 +        // frame can continue at the previous size, and report device loss explicitly.
 +        LOGE("d3d12: ResizeBuffers(%ux%u) failed: 0x%08lX (device removed: 0x%08lX)", w, h, hr,
 +             dev_->GetDeviceRemovedReason());
-+        if (!CreateBackBufferViews())
-+            LOGE("d3d12: back buffers are unavailable after a failed resize");
-+        return;
++        if (FAILED(dev_->GetDeviceRemovedReason())) return false;
++        return CreateBackBufferViews();
 +    }
 +    if (!CreateBackBufferViews()) {
-+        LOGE("d3d12: back buffer views failed after resize to %ux%u; keeping the old size", w, h);
-+        return;
++        LOGE("d3d12: back buffer views failed after resize to %ux%u; rendering cannot continue", w, h);
++        return false;
 +    }
      bb_w_ = w;
      bb_h_ = h;
++    return true;
  }
+ 
+ void D3D12Backend::FinishCapture(const Surface& front) {
 @@ -3223,10 +3919,15 @@ void D3D12Backend::UploadGammaRamp() {
      cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
  }
@@ -3368,7 +3397,18 @@ index fe65837..2cb944d 100644
          g_perf = Perf{};
          perf_start = PerfClock::now();
          perf_frames = 0;
-@@ -3358,15 +4259,31 @@ void D3D12Backend::Present(const Surface& front) {
+@@ -3351,22 +4252,41 @@ void D3D12Backend::Present(const Surface& front) {
+     } else if (g_capture.exchange(false) && CaptureOn()) {
+         StartCapture();
+     }
+-    ResizeSwap();
++    if (!ResizeSwap()) {
++        LOGE("d3d12: stopping because swap-chain back buffers are unavailable");
++        kernel::Shutdown(1);
++    }
+     Target* t = EnsureTarget(front, false);
+     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
+     if (t) Resolve(*t);
      if (ramp_dirty_) UploadGammaRamp();
      Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
  
@@ -3405,7 +3445,7 @@ index fe65837..2cb944d 100644
  
      presents_++;
      presents_seen_.store(presents_);
-@@ -3376,6 +4293,7 @@ void D3D12Backend::Present(const Surface& front) {
+@@ -3376,6 +4296,7 @@ void D3D12Backend::Present(const Surface& front) {
      CountFps();
      if (diag::Perf()) LogPerf();
      ApplySettings();
@@ -3413,7 +3453,7 @@ index fe65837..2cb944d 100644
  }
  
  // the slot is not reused before the caller's wait: the title runs at most one present ahead
-@@ -3384,29 +4302,116 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
+@@ -3384,29 +4305,116 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
      if (fence > fence_->GetCompletedValue()) fence_->SetEventOnCompletion(fence, nullptr);
  }
  
@@ -3536,7 +3576,7 @@ index fe65837..2cb944d 100644
      }
      return out;
  }
-@@ -3651,14 +4656,28 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
+@@ -3651,14 +4659,28 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
  }
  
  void D3D12Backend::CapSave(Target& t, const char* name) {
@@ -3567,7 +3607,7 @@ index fe65837..2cb944d 100644
      if (d == cap_rt_) return;
      auto it = targets_.find(TargetMapKey(cap_rt_, false));
      if (cap_rt_ && it != targets_.end()) {
-@@ -3677,9 +4696,12 @@ void D3D12Backend::CapStep(const Surface& rt) {
+@@ -3677,9 +4699,12 @@ void D3D12Backend::CapStep(const Surface& rt) {
  
  void D3D12Backend::Capture(Target& t, const char* tag, float mul) {
      if (!cap_) return;
@@ -4336,7 +4376,7 @@ index 5644ea7..f413107 100644
      uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], out = a[5], len = a[6], cls = a[7],
               mask = a[8], restart = a[9];
 diff --git a/runtime/kernel/kernel.h b/runtime/kernel/kernel.h
-index 163ea09..bf5a346 100644
+index 163ea09..9020a4e 100644
 --- a/runtime/kernel/kernel.h
 +++ b/runtime/kernel/kernel.h
 @@ -126,6 +126,9 @@ bool CloseHandle(uint32_t handle);
@@ -4353,16 +4393,18 @@ index 163ea09..bf5a346 100644
  struct Thread : Object {
      uint32_t id = 0;
      uint32_t kpcr = 0, ethread = 0, stack_top = 0, stack_size = 0, tls = 0;
-+    uint32_t host_tid = 0;  // host thread id, for debug-register watchpoints
++    std::atomic<uint32_t> host_tid{0};  // host thread id, for debug-register watchpoints
      uint32_t exit_code = 0;
      int priority = 0;
      std::atomic<int> suspend{0};
-@@ -169,6 +173,34 @@ void StartHostThread(const char* name, std::function<void(X86Context&)> fn);
+@@ -168,7 +172,35 @@ ThreadRef CurrentRef();
+ void StartHostThread(const char* name, std::function<void(X86Context&)> fn);
  void RunDpcs(X86Context& ctx);
  void InitKernelData();
- void LogGuestStack(X86Context& ctx, int words);
+-void LogGuestStack(X86Context& ctx, int words);
++void LogGuestStack(X86Context& ctx, int words, const Thread* thread = nullptr);
 +// EBP-chain walk for the reliable guest call stack (the raw stack scan can hit stale return addresses)
-+void LogGuestFrames(X86Context& ctx);
++void LogGuestFrames(X86Context& ctx, const Thread* thread);
 +// writes committed guest bytes (unmapped pages become zeros) for crash analysis
 +bool DumpGuestRegion(uint32_t va, uint32_t len, const char* path);
 +// XBE_SERIAL_GUEST=1: only one guest thread executes guest code at a time, matching the single-core Xbox.
@@ -4551,10 +4593,10 @@ index 4974985..eb354ac 100644
              bool all = std::all_of(objs.begin(), objs.end(), [&](const ObjectRef& o) { return o && Satisfied(*o, me); });
              if (all) {
 diff --git a/runtime/kernel/threads.cpp b/runtime/kernel/threads.cpp
-index a8acfd6..1b63a1b 100644
+index a8acfd6..d6a8c81 100644
 --- a/runtime/kernel/threads.cpp
 +++ b/runtime/kernel/threads.cpp
-@@ -127,6 +127,133 @@ Thread* Current() { return t_current.get(); }
+@@ -127,6 +127,142 @@ Thread* Current() { return t_current.get(); }
  ThreadRef CurrentRef() { return t_current; }
  X86Context& CurrentContext() { return *t_current->ctx; }
  
@@ -4633,12 +4675,20 @@ index a8acfd6..1b63a1b 100644
 +std::atomic<uint32_t> g_watch_addr{0};
 +std::atomic<uint32_t> g_watch_len{0};
 +
-+void ApplyWatchToHostThread(uint32_t host_tid, uint32_t guest_addr, uint32_t len) {
++void ApplyWatchToHostThread(const ThreadRef& thread, uint32_t guest_addr, uint32_t len) {
++    const uint32_t host_tid = thread->host_tid.load();
 +#ifdef _WIN32
 +    if (!host_tid || !guest_addr) return;
-+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, host_tid);
++    HANDLE h = OpenThread(SYNCHRONIZE | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, host_tid);
 +    if (!h) return;
-+    if (SuspendThread(h) == DWORD(-1)) {
++    if (WaitForSingleObject(h, 0) != WAIT_TIMEOUT || SuspendThread(h) == DWORD(-1)) {
++        ::CloseHandle(h);
++        return;
++    }
++    // The thread may have exited and its ID been reused before OpenThread. Its published
++    // ID is cleared before exit, and a suspended thread cannot race this final ownership check.
++    if (thread->host_tid.load() != host_tid) {
++        ResumeThread(h);
 +        ::CloseHandle(h);
 +        return;
 +    }
@@ -4649,7 +4699,7 @@ index a8acfd6..1b63a1b 100644
 +        c.Dr6 = 0;
 +        c.Dr7 |= 0x1ull;                                   // L0: local enable for DR0
 +        c.Dr7 = (c.Dr7 & ~0x30000ull) | 0x10000ull;        // RW0 = write
-+        const uint64_t length = len >= 8 ? 3 : len >= 4 ? 2 : len >= 2 ? 1 : 0;
++        const uint64_t length = len >= 8 ? 2 : len >= 4 ? 3 : len >= 2 ? 1 : 0;
 +        c.Dr7 = (c.Dr7 & ~0xC0000ull) | (length << 18);    // LEN0
 +        SetThreadContext(h, &c);
 +    }
@@ -4678,8 +4728,9 @@ index a8acfd6..1b63a1b 100644
 +    std::thread([guest_addr, len] {
 +        // let the calling thread leave this function before it is suspended
 +        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-+        for (const ThreadRef& t : Threads())
-+            if (t->host_tid) ApplyWatchToHostThread(t->host_tid, guest_addr, len);
++        for (const ThreadRef& t : Threads()) {
++            ApplyWatchToHostThread(t, guest_addr, len);
++        }
 +        LOGR("watch: hardware write watchpoint on guest %08X (%u bytes)", guest_addr, len);
 +    }).detach();
 +#endif
@@ -4688,31 +4739,52 @@ index a8acfd6..1b63a1b 100644
  std::vector<ThreadRef> Threads() {
      std::lock_guard<std::mutex> lock(g_threads_lock);
      return g_threads;
-@@ -154,6 +281,11 @@ void StartThread(ThreadRef t) {
+@@ -154,6 +290,11 @@ void StartThread(ThreadRef t) {
      Register(t);
      Spawn([t] {
          t_current = t;
 +        t->host_tid = HostThreadId();
 +        if (GuestWatchActive()) {
-+            const uint32_t tid = t->host_tid, addr = g_watch_addr.load(), len = g_watch_len.load();
-+            std::thread([tid, addr, len] { ApplyWatchToHostThread(tid, addr, len); }).detach();
++            const uint32_t addr = g_watch_addr.load(), len = g_watch_len.load();
++            std::thread([t, addr, len] { ApplyWatchToHostThread(t, addr, len); }).detach();
 +        }
          char name[32];
          std::snprintf(name, sizeof(name), "guest %X", t->id);
          NameHostThread(name);
-@@ -191,6 +323,11 @@ void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
+@@ -179,6 +320,7 @@ void StartThread(ThreadRef t) {
+         LOGI("thread %X returned %08X", t->id, code);
+         MarkExited(*t, code);
+         Unregister(t.get());
++        t->host_tid.store(0);
+         t_current.reset();
+     });
+ }
+@@ -191,10 +333,16 @@ void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
      std::string n = name;
      Spawn([t, fn, n] {
          t_current = t;
 +        t->host_tid = HostThreadId();
 +        if (GuestWatchActive()) {
-+            const uint32_t tid = t->host_tid, addr = g_watch_addr.load(), len = g_watch_len.load();
-+            std::thread([tid, addr, len] { ApplyWatchToHostThread(tid, addr, len); }).detach();
++            const uint32_t addr = g_watch_addr.load(), len = g_watch_len.load();
++            std::thread([t, addr, len] { ApplyWatchToHostThread(t, addr, len); }).detach();
 +        }
          NameHostThread(n.c_str());
          X86Context ctx;
          InitContext(*t, ctx);
-@@ -252,7 +389,13 @@ bool RunApcs(Thread& t) {
+         fn(ctx);
++        t->host_tid.store(0);
+         t_current.reset();
+     });
+ }
+@@ -204,6 +352,7 @@ void ExitThread(uint32_t code) {
+     if (t) {
+         LOGI("thread %X exits with %08X", t->id, code);
+         MarkExited(*t, code);
++        t->host_tid.store(0);
+         Unregister(t);
+     }
+     t_current.reset();
+@@ -252,7 +401,13 @@ bool RunApcs(Thread& t) {
              a = t.apcs.front();
              t.apcs.pop_front();
          }
@@ -4804,10 +4876,10 @@ index bec6e36..0fbb735 100644
  KERNEL_EXPORT(29, ExSaveNonVolatileSetting, 4) {
 diff --git a/runtime/xbe/grid_patch.h b/runtime/xbe/grid_patch.h
 new file mode 100644
-index 0000000..537634f
+index 0000000..aa7c9d6
 --- /dev/null
 +++ b/runtime/xbe/grid_patch.h
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,264 @@
 +#pragma once
 +// City-cell grid remainder fix, shared by the CMake generation step (tools/grid_patch) and the
 +// first-launch compiler (runtime/app/game_code.cpp), so both paths produce identical code.
@@ -4823,6 +4895,8 @@ index 0000000..537634f
 +// guest address, the idiv operand, the divisor load and the divide-error trap in the generated
 +// block. It also requires the exact number of occurrences, so a recompiler change that moves or
 +// splits these routines fails the build instead of patching an unrelated division.
++#include <atomic>
++#include <chrono>
 +#include <cstdint>
 +#include <cstdio>
 +#include <filesystem>
@@ -4832,6 +4906,13 @@ index 0000000..537634f
 +#include <string>
 +#include <system_error>
 +#include <vector>
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
 +
 +namespace xbe {
 +
@@ -4908,6 +4989,19 @@ index 0000000..537634f
 +    const std::string plain = "ctx.edx = (uint32_t)(n % d); }";
 +    const std::string fixed =
 +        "ctx.edx = (uint32_t)(n % d); if ((int32_t)ctx.edx < 0) ctx.edx += (uint32_t)d; }";
++    struct Change {
++        std::filesystem::path file, temp;
++        std::string text;
++    };
++    struct Changes : std::vector<Change> {
++        ~Changes() {
++            for (const auto& change : *this) {
++                if (change.temp.empty()) continue;
++                std::error_code ignored;
++                std::filesystem::remove(change.temp, ignored);
++            }
++        }
++    } changes;
 +    std::vector<uint32_t> seen(kGridSiteCount, 0);
 +    for (uint32_t part = 0; part < partitions; part++) {
 +        const std::filesystem::path file = dir / ("x86_recomp." + std::to_string(part) + ".cpp");
@@ -4917,6 +5011,10 @@ index 0000000..537634f
 +            return result;
 +        }
 +        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++        if (in.bad()) {
++            result.error = "read failed for " + file.string();
++            return result;
++        }
 +        in.close();
 +        const bool trailing_newline = !text.empty() && text.back() == '\n';
 +        std::vector<std::string> lines;
@@ -4977,37 +5075,12 @@ index 0000000..537634f
 +            result.occurrences++;
 +        }
 +        if (changed) {
-+            std::filesystem::path temp = file;
-+            temp += ".gridtmp";
-+            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-+            if (!out) {
-+                result.error = "cannot write " + temp.string();
-+                return result;
-+            }
++            std::string patched;
 +            for (size_t i = 0; i < lines.size(); i++) {
-+                out << lines[i];
-+                if (i + 1 < lines.size() || trailing_newline) out << '\n';
++                patched += lines[i];
++                if (i + 1 < lines.size() || trailing_newline) patched += '\n';
 +            }
-+            out.close();
-+            if (!out) {
-+                result.error = "write failed for " + temp.string();
-+                std::error_code ignored;
-+                std::filesystem::remove(temp, ignored);
-+                return result;
-+            }
-+            std::error_code ec;
-+            std::filesystem::remove(file, ec);
-+            if (ec) {
-+                result.error = "removing " + file.string() + " failed: " + ec.message();
-+                std::filesystem::remove(temp, ec);
-+                return result;
-+            }
-+            std::filesystem::rename(temp, file, ec);
-+            if (ec) {
-+                result.error = "replacing " + file.string() + " failed: " + ec.message();
-+                std::filesystem::remove(temp, ec);
-+                return result;
-+            }
++            changes.push_back({file, {}, std::move(patched)});
 +        }
 +        result.files++;
 +    }
@@ -5022,6 +5095,50 @@ index 0000000..537634f
 +        result.error = "patched " + std::to_string(result.occurrences) + " sites, expected " +
 +                       std::to_string(kGridExpectedOccurrences);
 +        return result;
++    }
++    // Validate the whole image before staging anything. Exclusive staging files also make a
++    // retry safe after interruption: a previous run's leftovers are never opened for truncation.
++    static std::atomic<uint64_t> serial{0};
++    for (auto& change : changes) {
++        std::FILE* out = nullptr;
++        for (int attempt = 0; attempt < 64 && !out; attempt++) {
++            const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
++            change.temp = change.file;
++            change.temp += ".gridtmp." + std::to_string(tick) + "." + std::to_string(serial.fetch_add(1));
++#ifdef _WIN32
++            out = _wfopen(change.temp.c_str(), L"wbx");
++#else
++            out = std::fopen(change.temp.c_str(), "wbx");
++#endif
++            if (!out) change.temp.clear();  // never clean up a file owned by another run
++        }
++        if (!out) {
++            result.error = "cannot stage " + change.file.string();
++            return result;
++        }
++        const bool wrote = std::fwrite(change.text.data(), 1, change.text.size(), out) == change.text.size();
++        const bool closed = std::fclose(out) == 0;
++        if (!wrote || !closed) {
++            result.error = "write failed for " + change.temp.string();
++            return result;
++        }
++    }
++    for (auto& change : changes) {
++#ifdef _WIN32
++        if (!MoveFileExW(change.temp.c_str(), change.file.c_str(),
++                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
++            result.error = "replacing " + change.file.string() + " failed: " + std::to_string(GetLastError());
++            return result;
++        }
++#else
++        std::error_code ec;
++        std::filesystem::rename(change.temp, change.file, ec);
++        if (ec) {
++            result.error = "replacing " + change.file.string() + " failed: " + ec.message();
++            return result;
++        }
++#endif
++        change.temp.clear();
 +    }
 +    return result;
 +}
