@@ -20,9 +20,9 @@ New-Item -ItemType Directory -Path (Join-Path $stage 'compiler') -Force | Out-Nu
 Copy-Item -LiteralPath (Join-Path $BuildDir 'compiler\TrueCrimeNYC.lib') -Destination (Join-Path $stage 'compiler\TrueCrimeNYC.lib') -Force
 
 $readme = @'
-True Crime NYC - diagnostic build 6 (2026-11-05)
+True Crime NYC - diagnostic build 7 (2026-11-05)
 
-This build contains the FIX for the crash you reproduced, plus the diagnostics.
+This build contains the confirmed grid crash fix, plus the diagnostics.
 
 WHAT WAS WRONG
 The city-cell grid code maps a cell coordinate with (coordinate + 1000) / 3 and
@@ -37,6 +37,18 @@ remainder is negative it adds the divisor (3), so the index is always 0..8. For
 every non-negative coordinate this produces exactly the same value as before;
 only the previously impossible negative case changes, and it can no longer write
 outside the table. Nothing is skipped and no state is guessed.
+
+CHANGES IN BUILD 7 (review follow-up)
+- The frame-chain log validates the guest stack range (around 0xD0000000), so
+  normal frames are shown. It also no longer prints "frame chain: none" after a
+  one-frame chain.
+- The watchpoint only consumes its own DR0 single-step hit and preserves other
+  debug status bits.
+- Grid-code generation verifies the 12 confirmed sites and all 20 occurrences,
+  and stops the build on any mismatch instead of partially patching.
+- Compiler process errors and swap-chain resize failures are reported instead
+  of being ignored. Concurrent settings saves use unique temporary files and an
+  atomic replace.
 
 INSTALL
 1. Close the game completely (check Task Manager for TrueCrimeNYC.exe).
