@@ -46,11 +46,10 @@ Supports Xbox, PlayStation and Switch controllers, with hot plugging and rumble.
 
 ### Keyboard and mouse
 Mouse look uses raw input and applies the PC version's camera scale on foot and in vehicles.
-Defaults follow the PC version: WASD move, left mouse fire, middle mouse / Num 5 precision aim
-(Shift also aims for mice without a middle button), right mouse target lock, R reload, E use/action,
-G climb, Space jump or handbrake, C crouch, Q badge or siren, F fire, Num 7 / Button 3 / Ctrl
-light attack, Num 9 / Button 4 heavy attack, wheel weapon or camera, and Esc pause/map. Use,
-climb, reload and the optional heavy-attack key are rebindable
+Defaults follow the PC version: WASD move, left mouse fire, middle or right mouse precision aim,
+R reload, E use/action, G climb, Space jump or handbrake, C crouch, Shift target lock, Q badge or
+siren, F fire, Num 7 / Button 3 / Ctrl light attack, Num 9 / Button 4 heavy attack, wheel weapon
+or camera, and Esc pause/map. Use, climb, reload and the optional heavy-attack key are rebindable
 in `settings.toml` (set `heavy_attack_key = 0` to use only Num 9 / Button 4). Mouse sensitivity
 and a separate vertical sensitivity are in the F10 Graphics menu. Inline controller glyphs switch
 automatically between Xbox, PlayStation and keyboard/mouse prompts. The cursor is confined to the
