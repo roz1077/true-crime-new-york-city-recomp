@@ -115,10 +115,14 @@ X86_FUNC(sub_002453C0) {
     constexpr uint32_t kRestoreCityViewportReturn = 0x13F3DA;
     const uint32_t caller = X86_MEM32(ctx.esp);
     if (caller == kDistantCityViewportReturn || caller == kRestoreCityViewportReturn) {
+        const bool enabled = [] {
+            app::SettingsLock settings_lock;
+            return app::Get().building_seam_fix;
+        }();
         std::lock_guard lock(d3d::Lock());
         auto &state = d3d::State();
         // A full-range pass includes scenery that needs its original depth.
-        const bool distant = caller == kDistantCityViewportReturn && state.zclip_on &&
+        const bool distant = enabled && caller == kDistantCityViewportReturn && state.zclip_on &&
                              state.zclip[0] >= 0 && state.zclip[1] > state.zclip[0] &&
                              state.zclip[1] < state.zscale;
         state.program_depth_scale = distant ? 1.0f / 32.0f : 1.0f;

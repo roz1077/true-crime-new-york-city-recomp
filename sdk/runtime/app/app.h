@@ -28,6 +28,7 @@ struct Settings {
     bool smaa = false;               // SMAA 1x on the finished frame
     bool bloom = false;               // bright-pass bloom on the finished frame
     bool dof = false;                 // distance blur on the finished frame
+    bool building_seam_fix = true;   // experimental priority for detailed city geometry
     bool pc_contrast = true;         // PC contrast curve on the finished frame
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
@@ -127,6 +128,7 @@ struct GameInfo {
     void (*pad)(int port, input::Pad& pad);  // a polled pad before the game gets it
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
     uint32_t (*swap_interval)(uint32_t interval) = nullptr;
+    bool (*keyboard_driving)() = nullptr; // title camera context for keyboard pedals
 };
 extern const GameInfo kGame;
 

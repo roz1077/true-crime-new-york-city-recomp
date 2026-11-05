@@ -9,9 +9,14 @@ $name = "TrueCrimeNYC-diagnostics-$Stamp"
 $stage = Join-Path $OutDir $name
 $zip = Join-Path $OutDir "$name.zip"
 
-if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-New-Item -ItemType Directory -Path $stage -Force | Out-Null
+if ($Stamp -notmatch '^[A-Za-z0-9._-]+$') { throw 'Stamp must be a filename component.' }
+foreach ($required in 'TrueCrimeNYC.exe', 'TrueCrimeNYC.dll', 'TrueCrimeNYC.pdb', 'TrueCrimeNYC.dll.stamp', 'compiler/TrueCrimeNYC.lib') {
+    if (!(Test-Path -LiteralPath (Join-Path $BuildDir $required) -PathType Leaf)) { throw "Missing build input $required" }
+}
+New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+$stage = Join-Path $OutDir ($name + '-' + [guid]::NewGuid().ToString('N'))
+$stagedZip = "$stage.zip"
+New-Item -ItemType Directory -Path $stage | Out-Null
 
 foreach ($file in 'TrueCrimeNYC.exe', 'TrueCrimeNYC.dll', 'TrueCrimeNYC.pdb', 'TrueCrimeNYC.dll.stamp') {
     Copy-Item -LiteralPath (Join-Path $BuildDir $file) -Destination (Join-Path $stage $file) -Force
@@ -95,7 +100,13 @@ start "" "%~dp0TrueCrimeNYC.exe"
 '@
 Set-Content -LiteralPath (Join-Path $stage 'run-watch.cmd') -Value $watch -Encoding ascii
 
-Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $stagedZip
+if (Test-Path -LiteralPath $zip) {
+    [IO.File]::Replace([IO.Path]::GetFullPath($stagedZip), [IO.Path]::GetFullPath($zip), [IO.Path]::GetFullPath("$stage.previous.zip"))
+    Remove-Item -LiteralPath "$stage.previous.zip"
+} else {
+    [IO.File]::Move([IO.Path]::GetFullPath($stagedZip), [IO.Path]::GetFullPath($zip))
+}
 $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
 Set-Content -LiteralPath (Join-Path $OutDir "$name.sha256.txt") -Value "$hash  $name.zip" -Encoding ascii
 Write-Output "Created $zip"

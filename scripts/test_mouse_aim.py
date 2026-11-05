@@ -142,13 +142,14 @@ using HWND=void*; using HRAWINPUT=void*; using UINT=unsigned; using LONG=long;
 constexpr int VK_UP=1,VK_DOWN=2,VK_LEFT=3,VK_RIGHT=4,VK_ESCAPE=5,VK_TAB=6,
  VK_SPACE=7,VK_RBUTTON=8,VK_LBUTTON=9,VK_RETURN=10,VK_BACK=11,
  VK_MBUTTON=12,VK_XBUTTON1=13,VK_XBUTTON2=14,VK_CONTROL=15,VK_SHIFT=16,
- VK_NUMPAD7=17,VK_NUMPAD9=18,VK_NUMPAD5=19,VK_CAPITAL=20,VK_ADD=21,VK_OEM_PLUS=22;
+ VK_LCONTROL=23,VK_LMENU=24,VK_NUMPAD7=17,VK_NUMPAD9=18,VK_NUMPAD5=19,VK_CAPITAL=20,VK_ADD=21,VK_OEM_PLUS=22;
 uint64_t now=1000;
 uint64_t GetTickCount64() { return now; }
 bool focus=true;
 void* GetForegroundWindow() { return focus ? reinterpret_cast<void*>(1) : nullptr; }
-short GetAsyncKeyState(int) { return 0; }
-namespace app { void* Window() { return reinterpret_cast<void*>(1); } }
+bool keys[256]{};
+short GetAsyncKeyState(int key) { return key >= 0 && key < 256 && keys[key] ? short(0x8000) : 0; }
+namespace app { struct { bool (*keyboard_driving)() = nullptr; } kGame; void* Window() { return reinterpret_cast<void*>(1); } }
 struct RAWINPUTHEADER { unsigned dwType; };
 struct RAWINPUT { RAWINPUTHEADER header; struct { struct { unsigned usFlags; LONG lLastX,lLastY; unsigned short usButtonFlags,usButtonData; } mouse; } data; };
 constexpr unsigned RID_INPUT=1,RIM_TYPEMOUSE=0,MOUSE_MOVE_ABSOLUTE=1,RI_MOUSE_WHEEL=0x0800;
@@ -212,6 +213,33 @@ extern "C" __declspec(dllexport) int run() {
     if(ConsumeMouseAim(x,y) || DirectAimRecent()) return 28;
     Move(30); focus=false; Poll(0); focus=true;
     if(ConsumeMouseAim(x,y)) return 29;
+    // Actual keyboard polling must translate actions to the Xbox layout.
+    Reset();
+    const int keycodes[] = {VK_SPACE, VK_LCONTROL, VK_LMENU, 'R', 'E', 'G', 'V', VK_RETURN, VK_BACK, VK_XBUTTON1, VK_XBUTTON2};
+    const int buttons[] = {3, 0, 2, 4, 5, 3, 1, 0, 1, 0, 2};
+    for (unsigned i=0;i<sizeof(keycodes)/sizeof(keycodes[0]);++i) {
+        keys[keycodes[i]]=true;
+        Pad report; ReadKeyboardMouse(report);
+        keys[keycodes[i]]=false;
+        for(int button=0;button<8;++button)
+            if(report.analog[button] != (button==buttons[i] ? 255 : 0))return 40+int(i);
+    }
+    keys['F']=true; Pad unused;ReadKeyboardMouse(unused);keys['F']=false;
+    for(auto value:unused.analog) if(value)return 55;
+    keys['Q']=true; Pad badge;ReadKeyboardMouse(badge);keys['Q']=false;
+    if(!(badge.buttons&(1<<5)) || badge.analog[1])return 50;
+    keys[VK_SHIFT]=true;keys[VK_RBUTTON]=true;
+    Pad aim;ReadKeyboardMouse(aim);
+    keys[VK_SHIFT]=keys[VK_RBUTTON]=false;
+    if(!(aim.buttons&(1<<7)) || aim.analog[6]!=255)return 51;
+    app::kGame.keyboard_driving=+[] { return true; };
+    keys['W']=true;keys['S']=true;keys[VK_SPACE]=true;
+    Pad driving;ReadKeyboardMouse(driving);
+    keys['W']=keys['S']=keys[VK_SPACE]=false;
+    app::kGame.keyboard_driving=nullptr;
+    if(driving.analog[0]!=255 || driving.analog[2]!=255 || driving.analog[1]!=255 ||
+       driving.analog[3] || driving.ly)return 52;
+
     return 0;
 }
 '''
@@ -224,3 +252,23 @@ if old:
 if result:
     raise SystemExit(f'Mouse input regression {result} failed')
 print('Mouse transition and controller handoff regressions passed.')
+
+
+# Exercise the actual window-message filter used while Alt is held for combat.
+window_source = read('src/common/graphics_options.cpp')
+start = window_source.index('bool GraphicsMenuMessage(')
+handler = window_source[start:window_source.index('\n}\n', start) + 3]
+window_check = r"""
+#include <windows.h>
+#include <cstdint>
+""" + handler + r"""
+extern "C" __declspec(dllexport) int run() {
+ intptr_t result=123;
+ if(!GraphicsMenuMessage(nullptr,WM_SYSKEYUP,VK_MENU,0,&result)||result!=0)return 1;
+ if(!GraphicsMenuMessage(nullptr,WM_SYSCOMMAND,SC_KEYMENU,0,&result))return 2;
+ if(GraphicsMenuMessage(nullptr,WM_SYSCOMMAND,SC_CLOSE,0,&result))return 3;
+ if(GraphicsMenuMessage(nullptr,WM_SYSKEYDOWN,VK_F4,0,&result))return 4;
+ return 0;
+}
+"""
+assert run_native(window_check, prefix='combat-alt-', needs_crt=True) == 0

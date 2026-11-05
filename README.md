@@ -32,6 +32,7 @@ closes.
 - **MSAA** - Off, 2x, 4x or 8x multisample anti-aliasing.
 - **SMAA** - SMAA 1x anti-aliasing on the finished frame.
 - **Bloom** - optional bright-pass bloom over the game’s own lighting. Off by default.
+- **Building seam fix (Experimental)** - gives detailed buildings priority over overlapping simplified city meshes. On by default and can be toggled live.
 - **PC contrast** - PC-inspired tone curve with a softer shadow roll-off. On by default.
 - **Depth of field** - optional distance blur for 3D scenes with MSAA enabled. Off by default.
 - **V-Sync** and **Frame rate limit** (30 or 60 FPS; the game's timing is built for at most 60).
@@ -47,11 +48,14 @@ Supports Xbox, PlayStation and Switch controllers, with hot plugging and rumble.
 ### Keyboard and mouse
 Mouse look uses raw input and applies the PC version's camera scale on foot and in vehicles.
 Defaults follow the PC version: WASD move, left mouse fire, middle or right mouse precision aim,
-R reload, E use/action, G climb, Space jump or handbrake, C crouch, Shift target lock, Q badge or
-siren, F fire, Num 7 / Button 3 / Ctrl light attack, Num 9 / Button 4 heavy attack, + grapple,
-wheel weapon or camera, and Esc pause/map. Use, climb, reload and the optional heavy-attack key
+R reload/block, E use/action, G jump/climb, Space jump or handbrake, C crouch, Shift target lock, Q badge or
+siren, Left Ctrl / mouse side button 1 light attack, Left Alt / mouse side button 2 heavy attack,
+V frisk/grapple/arrest,
+wheel weapon or camera, and Esc pause/map. Enter confirms menus and Backspace cancels.
+When the active gameplay camera is in vehicle mode, W accelerates, S brakes/reverses,
+and A/D steer. Use, climb, reload and the optional heavy-attack key
 are rebindable
-in `settings.toml` (set `heavy_attack_key = 0` to use only Num 9 / Button 4). Mouse sensitivity
+in `settings.toml` (set `heavy_attack_key = 0` to use only Left Alt / mouse side button 2). Mouse sensitivity
 and a separate vertical sensitivity are in the F10 Graphics menu. Inline controller glyphs switch
 automatically between Xbox, PlayStation and keyboard/mouse prompts. The cursor is confined to the
 game while focused and released for the F10 menu.

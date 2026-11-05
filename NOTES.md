@@ -18,12 +18,28 @@ measurements in `PERFORMANCE.md`, and the build, checks and diagnostics in `DEVE
 - Seventeen regression checks (`scripts/run_checks.py`) cover the runtime fixes and the menu rules.
 - Mouse and keyboard play is supported: raw mouse aim on foot and in vehicles, rebindable
   keyboard actions, digital WASD with normalized diagonals, and automatic Xbox/PlayStation/
-  keyboard-mouse prompts (see the 2026-11-03 mouse aim section).
+  keyboard-mouse prompts (see the 2026-11-05 mouse transition follow-up and the 2026-11-03
+  mouse aim section).
 - Open: traffic variety after free roam (below), draw distance, HDR and ambient occlusion.
+
+## PC default keybinds for keyboard/mouse (2026-11-05)
+
+- The keyboard/mouse defaults now follow the PC version's mapper: WASD movement, left mouse
+  fire, middle or right mouse precision aim, R reload, E use/action, G climb, Space jump or
+  handbrake, C crouch, Shift target lock, Q badge or siren, F fire, Num 7 / Button 3 / Ctrl
+  light attack, Num 9 / Button 4 heavy attack, + grapple, wheel weapon or camera, and Esc
+  pause/map.
+- `use_key` now defaults to E (69) and `climb_key` to G (71). `heavy_attack_key` defaults to 0,
+  which disables the custom heavy key; Num 9 and Button 4 still select heavy attack. Existing
+  settings files keep their own values, so an old `heavy_attack_key = 70` keeps F on heavy
+  attack and suppresses F as a fire alias.
+- Middle mouse feeds the aim trigger, the side mouse buttons feed the light/heavy pad buttons,
+  and wheel notches become D-pad taps (weapon select on foot, camera in a vehicle). The keyboard
+  V right-stick-click duplicate was removed; Shift is target lock.
 
 ## Horizontal mouse movement through transitions — follow-up (2026-11-05)
 
-- The user reports the earlier fix is incomplete: horizontal mouse movement still fails during
+- The user reported the earlier fix was incomplete: horizontal mouse movement still failed during
   vehicle entry/exit, area transitions, and controller-to-mouse switching. The 2026-11-03 mouse
   section below records the previous implementation, not verified resolution of those cases.
 - The shared camera hook injected yaw before controller methods, but unarmed/transition
@@ -37,8 +53,8 @@ measurements in `PERFORMANCE.md`, and the build, checks and diagnostics in `DEVE
 - The input fallback discarded raw counts collected within the last heartbeat's 100 ms grace
   period. Those counts now join the existing bounded transition buffer, including when no pad
   poll ran during the load. The existing 150-count cap and 20-count release steps remain.
-- Single raw counts select mouse input even when the camera consumes them before the next pad
-  poll. Actual controller input releases the recent mouse hold and pending transition counts;
+- A single raw count selects mouse input even when the camera consumes it before the next pad
+  poll. Actual controller input releases the recent direct-aim hold and pending transition counts;
   vehicle aim reseeds from the current chase heading on the next mouse sample. UI/focus changes
   clear the hold, and leaving the vehicle controller invalidates its cached heading.
 - `scripts/test_mouse_aim.py` compiles the actual hooks/input routines with deterministic camera,
@@ -1508,3 +1524,41 @@ F3 stack logging explicitly passes the inspected guest thread to the frame walke
 Watchpoint thread IDs are atomic, cleared before thread exit, and checked again after suspension before debug registers are changed. Helpers retain the thread object while installing the watch. The debug-register length encoding was also corrected so an 8-byte watch covers 8 bytes. A native Windows fixture installs the watch on live worker threads and skips workers that have exited.
 
 Verification completed with the release build, all 16 regression checks, a matching executable/XBE/DLL stamp, and a reverse-apply check of the regenerated SDK patch. The grid failure/retry test was also run separately after its assertions were extended. In-game F3 capture and window/display-mode changes remain manual checks.
+
+## 2026-11-05 — Experimental building seam toggle
+
+The F10 Graphics menu now includes Building seam fix (Experimental), default On.
+It saves as building_seam_fix in settings.toml and applies on the next city pass.
+Off restores the original depth scale. Reset defaults enables it again.
+The native Options > Display tab has no additional row.
+Release build and all 16 regression checks passed. Live switching remains a manual check.
+
+### 2026-11-05 · Experiment removal and folder cleanup
+
+Removed the five PC character conversion/matching scripts after retiring the experiment. Compared all 465 installed character body/head assets against the retail ISO and found no differences. Original asset backups remain available for recovery.
+
+Fixed fallback mouse vertical sensitivity, bounded loaded output/render settings and checked target dimensions against D3D12 limits, and made the compiler process owner close every child handle on completion or failure. Diagnostic packaging validates inputs before staging and publishes a completed ZIP from unique staging, preserving an existing package when required inputs are missing.
+
+Moved 106 historical capture/log folders and old diagnostic package files into archive/2026-11-05. cleanup-manifest.csv maps every original path to its archive location and identifies retained current captures and r6/r7 comparison packages. The archive is ignored by Git. This reorganizes evidence on the same drive and does not reclaim its disk space. Saves, asset backups, active release files, reference tools and both game installations remain available.
+
+Verification completed with the release build, all 17 regression checks, SDK patch reverse application and a packaging check that missing inputs preserve the previous ZIP. Existing uncommitted graphics-option changes were retained. Further deletion or consolidation of installations requires choosing which evidence and saves to retain.
+
+### 2026-11-05 · Correct PC keyboard actions for the Xbox layout
+
+Corrected keyboard action translation after checking the documented Xbox button functions. Space and G now send Y for jump/climb, Num 7 / Ctrl / side mouse button 1 send A for light attack, Num 9 / side mouse button 2 and the optional heavy key send X, and + sends B for grapple. R sends Black for reload/block, E sends White for use/vehicle entry, and Q sends Back for badge/horn/siren. Enter confirms menus and Backspace cancels.
+
+The title supplies active gameplay camera vehicle mode to the keyboard reader. In that mode W sends A for acceleration, S sends X for brake/reverse, Space sends B for handbrake, and A/D steer. Shift right-stick click and middle/right mouse left-trigger assignments were explicitly retained at the user's request. Prompt glyphs now match the corrected buttons, including Shift instead of the removed V alias.
+
+The release build and the keyboard/mouse fixture passed, including checks of every corrected button, badge, the retained aim keys and driving pedals. Live gameplay verification remains needed for vehicle transitions and contextual actions.
+
+### 2026-11-05 · Approved combat keyboard layout
+
+Light attack now uses Left Ctrl or mouse side button 1. Heavy attack uses Left Alt or mouse side button 2, with the existing optional custom heavy key still available. V sends the contextual frisk/grapple/arrest/human-shield action. Removed the previous Num 7, Num 9 and + combat defaults and the F fire alias. E use, R reload/block, C crouch and the user's preferred aim/lock assignments remain available. Menu confirmation/cancellation use Enter/Backspace.
+
+Updated combat glyphs to CTL, ALT and V. Suppressed Windows Alt menu activation while preserving Alt+F4. The keyboard fixture verifies both side buttons, the primary keys, the absence of the F fire alias, and the window-message handling. Gameplay verification remains needed for contextual frisk and grapple behavior.
+
+### 2026-11-05 · Cleanup deletion and combat verification
+
+At the user's explicit request, all 109 entries in cleanup-manifest.csv were subsequently deleted, including the 106 archived entries and the three entries originally marked retain (the capture directory and diagnostic r6/r7 staging directories). Verified that every listed target is absent. The manifest now records the deleted paths; the earlier archive-only description above is historical.
+
+The final Left Ctrl / Left Alt / V combat layout passed the release build and all 17 regression checks. Keyboard fixtures exercise the mouse side-button alternatives, primary combat keys, badge, driving pedals, preserved aim/lock keys, and Alt menu suppression with Alt+F4 still available. The SDK patch passed reverse application. README.md describes the resulting bindings. In-game contextual frisk/grapple and vehicle transitions remain manual checks.

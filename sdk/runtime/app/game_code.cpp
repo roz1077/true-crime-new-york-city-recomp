@@ -271,6 +271,7 @@ public:
     }
     ~Processes() {
         if (job_) CloseHandle(job_);
+        for (HANDLE process : children_) CloseHandle(process);
         if (log_ != INVALID_HANDLE_VALUE) CloseHandle(log_);
     }
 
@@ -306,20 +307,21 @@ public:
             return nullptr;
         }
         CloseHandle(pi.hThread);
+        children_.push_back(pi.hProcess);
         return pi.hProcess;
     }
 
     // closes the process; 0 when it exited cleanly
-    static DWORD ExitCode(HANDLE process) {
+    DWORD ExitCode(HANDLE process) {
         DWORD code = 1;
         if (!GetExitCodeProcess(process, &code)) {
             LOGE("game code: could not read a process exit code (%lu)", GetLastError());
             code = 1;
         }
-        CloseHandle(process);
+        // Processes owns every child handle until the build scope ends.
         return code;
     }
-    static bool Succeeded(HANDLE process) { return ExitCode(process) == 0; }
+    bool Succeeded(HANDLE process) { return ExitCode(process) == 0; }
 
     // false when cancelled or when waiting fails, which ends every process of the build
     bool WaitAll(std::vector<HANDLE>& processes) {
@@ -357,6 +359,7 @@ private:
         CloseHandle(pi.hProcess);
     }
 
+    std::vector<HANDLE> children_;
     HANDLE job_ = nullptr;
     HANDLE log_ = INVALID_HANDLE_VALUE;
     std::wstring failure_;
@@ -383,7 +386,7 @@ bool Translate(std::vector<Target>& targets, Processes& run) {
     constexpr DWORD kDllNotFound = 0xC0000135;  // STATUS_DLL_NOT_FOUND, the process never started
     const wchar_t* missing_runtime = L"xbe_recomp.exe needs msvcp140.dll and vcruntime140.dll beside it in the compiler folder. Extract the whole release again, then start the game.";
     for (size_t i = 0; i < processes.size(); i++) {
-        DWORD code = Processes::ExitCode(processes[i]);
+        DWORD code = run.ExitCode(processes[i]);
         const std::string& xbe = targets[i].image->xbe;
         if (code == kDllNotFound) ok = RecordFailure(missing_runtime);
         else if (code) ok = RecordFailure(L"Translating " + std::wstring(xbe.begin(), xbe.end()) + L" failed.");
@@ -410,9 +413,9 @@ std::wstring CompileCommand(const Job& job) {
 }
 
 // an object is written beside its final name and moved there once whole
-bool FinishJob(const Job& job, HANDLE process) {
+bool FinishJob(const Job& job, HANDLE process, Processes& run) {
     std::wstring name = job.source.parent_path().filename().wstring() + L"\\" + job.source.filename().wstring();
-    if (!Processes::Succeeded(process)) return RecordFailure(L"Compiling " + name + L" failed.");
+    if (!run.Succeeded(process)) return RecordFailure(L"Compiling " + name + L" failed.");
     fs::path temp = job.object;
     temp += ".tmp";
     std::error_code ec;
@@ -455,7 +458,7 @@ bool Compile(std::vector<Job>& jobs, Processes& run) {
             RecordFailure(L"Waiting on the compilers failed.");
             return run.Cancel();
         }
-        if (!FinishJob(*running_jobs[done], running[done])) return run.Cancel();
+        if (!FinishJob(*running_jobs[done], running[done], run)) return run.Cancel();
         running.erase(running.begin() + done);
         running_jobs.erase(running_jobs.begin() + done);
     }
@@ -482,7 +485,7 @@ bool Link(const Target& target, Processes& run) {
     std::vector<HANDLE> process{run.Start(command, work)};
     if (!process[0]) return RecordFailure(L"lld-link.exe could not be started.");
     if (!run.WaitAll(process)) return false;
-    if (!Processes::Succeeded(process[0])) {
+    if (!run.Succeeded(process[0])) {
         fs::remove(staged, ec);
         std::wstring hint = L" If the game is already running, close it, then start it again.";
         return RecordFailure(L"Linking " + name + L" failed." + hint);

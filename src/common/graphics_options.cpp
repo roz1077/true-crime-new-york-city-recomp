@@ -58,6 +58,7 @@ enum class Row {
     Smaa,
     Bloom,
     DepthOfField,
+    BuildingSeamFix,
     PcContrast,
     VSync,
     FrameCap,
@@ -79,6 +80,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::Smaa,
                          Row::Bloom,
                          Row::DepthOfField,
+                         Row::BuildingSeamFix,
                          Row::PcContrast,
                          Row::VSync,
                          Row::FrameCap,
@@ -186,6 +188,7 @@ void RestoreDefaults() {
     s.smaa = d.smaa;
     s.bloom = d.bloom;
     s.dof = d.dof;
+    s.building_seam_fix = d.building_seam_fix;
     s.pc_contrast = d.pc_contrast;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
@@ -212,6 +215,7 @@ Kind KindOf(Row row) {
     case Row::Smaa:
     case Row::Bloom:
     case Row::DepthOfField:
+    case Row::BuildingSeamFix:
     case Row::PcContrast:
     case Row::VSync:
     case Row::ShowFps:
@@ -253,6 +257,8 @@ const char *Label(Row row) {
         return "Bloom";
     case Row::DepthOfField:
         return "Depth of field";
+    case Row::BuildingSeamFix:
+        return "Building seam fix (Experimental)";
     case Row::PcContrast:
         return "PC contrast";
     case Row::VSync:
@@ -321,6 +327,8 @@ const char *Help(Row row) {
         return "Adds extra bright-pass bloom over the game's own lighting.";
     case Row::DepthOfField:
         return "Adds distance blur to the finished 3D frame when MSAA is enabled.";
+    case Row::BuildingSeamFix:
+        return "Experimental: keeps detailed buildings visible where simplified city meshes overlap. Takes effect immediately.";
     case Row::PcContrast:
         return "Applies a PC-inspired contrast curve to the finished 3D frame.";
     case Row::VSync:
@@ -403,6 +411,8 @@ std::string Value(Row row) {
         return s.bloom ? "On" : "Off";
     case Row::DepthOfField:
         return s.dof ? "On" : "Off";
+    case Row::BuildingSeamFix:
+        return s.building_seam_fix ? "On" : "Off";
     case Row::PcContrast:
         return s.pc_contrast ? "On" : "Off";
     case Row::VSync:
@@ -505,6 +515,9 @@ void Activate(Row row) {
             break;
         case Row::DepthOfField:
             s.dof = !s.dof;
+            break;
+        case Row::BuildingSeamFix:
+            s.building_seam_fix = !s.building_seam_fix;
             break;
         case Row::PcContrast:
             s.pc_contrast = !s.pc_contrast;
@@ -728,9 +741,14 @@ void FilterMenuPad(int port, input::Pad &pad) {
 }
 
 bool GraphicsMenuMessage(void *, uint32_t msg, uintptr_t wp, intptr_t, intptr_t *result) {
+    // Left Alt is heavy attack. Prevent its release from entering window-menu mode.
+    if (msg == WM_SYSCOMMAND && (wp & 0xFFF0u) == SC_KEYMENU) {
+        *result = 0;
+        return true;
+    }
     // F10 is the Windows menu key: on its release Windows enters menu mode, and in Windowed mode the arrow keys
     // then open the system menu instead of reaching the Graphics menu
-    if ((msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) && wp == VK_F10) {
+    if ((msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) && (wp == VK_F10 || wp == VK_MENU)) {
         *result = 0;
         return true;
     }

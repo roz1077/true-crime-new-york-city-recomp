@@ -1246,6 +1246,11 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
     if (ext_) ext_->MakeTarget(s, t.depth, t.gw, t.gh, sc, t.fmt);
     t.w = std::max(1u, uint32_t(std::lround(t.gw * sc * stretch_)));
     t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
+    if (t.w > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || t.h > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
+        LOGE("d3d12: requested render target is too large: %ux%u", t.w, t.h);
+        return false;
+    }
+
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_UNKNOWN, t.w, t.h);
     D3D12_CLEAR_VALUE cv{};
@@ -2220,15 +2225,15 @@ void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::Pr
             {'J', {1, 1, 1, 5, 7}}, {'K', {5, 5, 6, 5, 5}}, {'N', {5, 7, 7, 7, 5}},
             {'O', {7, 5, 5, 5, 7}}, {'U', {5, 5, 5, 5, 7}}, {'V', {5, 5, 5, 5, 2}},
             {'W', {5, 5, 7, 7, 5}}, {'X', {5, 5, 2, 5, 5}}, {'Y', {5, 5, 2, 2, 2}},
-            {'Z', {7, 1, 2, 4, 7}},
+            {'Z', {7, 1, 2, 4, 7}}, {'7', {7, 1, 2, 2, 2}}, {'9', {7, 5, 7, 1, 7}}, {'+', {0, 2, 7, 2, 0}},
         };
         const struct { int x, y, w, h; char text[4]; } keys[] = {
-            {19, 234, 15, 14, {input::LetterKey(input::g_heavy_attack_key, '9')}},
-            {37, 234, 15, 14, "Q"}, {55, 234, 15, 14, {input::LetterKey(input::g_reload_key, 'R')}},
-            {1, 279, 14, 15, {input::LetterKey(input::g_climb_key, 'E')}}, {37, 279, 13, 15, {input::LetterKey(input::g_use_key, 'G')}},
+            {1, 234, 15, 14, "CTL"}, {19, 234, 15, 14, "SPC"},
+            {37, 234, 15, 14, "V"}, {55, 234, 15, 14, "ALT"},
+            {1, 279, 14, 15, {input::LetterKey(input::g_use_key, 'E')}}, {37, 279, 13, 15, {input::LetterKey(input::g_reload_key, 'R')}},
             {101, 256, 13, 18, "RMB"}, {19, 279, 13, 18, "LMB"},
-            {101, 279, 22, 19, "TAB"}, {1, 301, 25, 20, "ESC"},
-            {53, 279, 26, 19, {input::kLeftStickClickKey}}, {73, 233, 28, 19, {input::kRightStickClickKey}},
+            {101, 279, 22, 19, "Q"}, {1, 301, 25, 20, "ESC"},
+            {53, 279, 26, 19, {input::kLeftStickClickKey}}, {73, 233, 28, 19, "SHF"},
         };
         for (const auto& key : keys) {
             for (int y = 0; y < key.h; ++y)
@@ -2245,14 +2250,6 @@ void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::Pr
                             if (glyph.rows[y / 2] & (4 >> x))
                                 std::fill_n(pixel(left + 4 * i + x, top + y), 4, 255);
                 }
-            }
-        }
-        // Spacebar symbol centered inside the original A glyph's sampled area.
-        for (int y = 234; y <= 247; ++y) {
-            for (int x = 1; x <= 15; ++x) {
-                const bool bar = x >= 4 && x <= 12 && y >= 238 && y <= 243 &&
-                                 (y >= 242 || x == 4 || x == 12);
-                std::fill_n(pixel(x, y), 4, bar ? 255 : 0);
             }
         }
         // The individual D-pad slots become keyboard arrows.

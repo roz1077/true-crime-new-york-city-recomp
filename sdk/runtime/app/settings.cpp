@@ -64,6 +64,7 @@ Settings Snapshot() {
     s.smaa = g.smaa;
     s.bloom = g.bloom;
     s.dof = g.dof;
+    s.building_seam_fix = g.building_seam_fix;
     s.pc_contrast = g.pc_contrast;
     s.custom_textures = g.custom_textures;
     s.dump_textures = g.dump_textures;
@@ -94,6 +95,10 @@ void Load() {
     s.height = t["height"].value_or(s.height);
     s.render_percent = t["render_percent"].value_or(s.render_percent);
     s.aspect = t["aspect_ratio"].value_or(s.aspect);
+    if (s.width > 16384 || s.height > 16384 || !s.width || !s.height) s.width = s.height = 0;
+    s.render_percent = std::clamp(s.render_percent, 25u, 400u);
+    if (s.aspect && (s.aspect < 500 || s.aspect > 8000)) s.aspect = 0;
+
     SetFrameCap(t["fps_cap"].value_or(FrameCap()));
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
@@ -103,6 +108,7 @@ void Load() {
     s.smaa = t["smaa"].value_or(s.smaa);
     s.bloom = t["bloom"].value_or(s.bloom);
     s.dof = t["dof"].value_or(s.dof);
+    s.building_seam_fix = t["building_seam_fix"].value_or(s.building_seam_fix);
     s.pc_contrast = t["pc_contrast"].value_or(s.pc_contrast);
     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
@@ -134,6 +140,7 @@ toml::table Table() {
                   {"smaa", s.smaa},
                   {"bloom", s.bloom},
                   {"dof", s.dof},
+                  {"building_seam_fix", s.building_seam_fix},
                   {"pc_contrast", s.pc_contrast},
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},

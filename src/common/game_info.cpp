@@ -2,12 +2,23 @@
 #include "core/input.h"
 #include "graphics_menu.h"
 #include "pad_tools.h"
+#include "kernel/kernel.h"
+#include "kernel/memory.h"
 
 namespace game {
 uint32_t MainLoopSwapInterval(uint32_t interval);
 }
 
 namespace {
+
+bool KeyboardDriving() {
+    if (!mem::Base() || !mem::IsCommitted(0x360E00)) return false;
+    const uint32_t game = kernel::R32(0x360E00);
+    if (!game || !mem::IsCommitted(game + 0xAC)) return false;
+    const uint32_t camera = kernel::R32(game + 0xAC);
+    if (!camera || !mem::IsCommitted(camera + 0x18C)) return false;
+    return kernel::G<uint8_t>(camera + 0x18C) && kernel::G<uint8_t>(camera + 0x19) == 13;
+}
 
 // scripted or replayed input first, so the Graphics menu sees what the game would
 void FilterPad(int port, input::Pad &pad) {
@@ -44,4 +55,5 @@ const app::GameInfo app::kGame = {
     .pad = FilterPad,                     // changes a polled pad
     .rumble = nullptr,                    // changes a rumble before it is set
     .swap_interval = game::MainLoopSwapInterval,
+    .keyboard_driving = KeyboardDriving,
 };

@@ -21,7 +21,7 @@ namespace input {
 uint32_t g_mouse_sensitivity_percent = 100;
 uint32_t g_mouse_vertical_sensitivity_percent = 100;
 // PC defaults: R reload, E use/action, G climb (the port's own action), and no
-// configurable heavy key because the PC uses Num 9 and mouse Button 4.
+// configurable heavy key because Left Alt and mouse side button 2 are the defaults.
 uint32_t g_reload_key = 'R', g_heavy_attack_key = 0, g_use_key = 'E', g_climb_key = 'G';
 bool g_direct_mouse_aim = true;
 
@@ -119,36 +119,36 @@ bool ReadKeyboardMouse(Pad& pad) {
     const int move_scale = move_x && move_y ? 23170 : 32767;
     pad.lx = int16_t(move_x * move_scale);
     pad.ly = int16_t(move_y * move_scale);
-    // The keyboard right-stick key is gone: target lock is Shift, so V would be
-    // a duplicate for the same pad action.
     constexpr int digital[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_TAB, kLeftStickClickKey, 0};
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 8; ++i)
         if (digital[i] && held(digital[i])) pad.buttons |= uint16_t(1 << i);
-    }
-    // PC target lock is Shift; Caps Lock stealth is a toggle in the PC version,
-    // so it is not mapped onto a held pad button.
+    // Preserve the user's preferred aim/lock layout.
     if (held(VK_SHIFT)) pad.buttons |= uint16_t(1 << 7);
+    if (held('Q')) pad.buttons |= uint16_t(1 << 5); // Back: badge / horn / siren
 
     auto press = [&](int button, bool on) {
         if (on) pad.analog[button] = 255;
     };
-    // The PC layout from its default mapper. Several actions share a pad button
-    // because the Xbox build context decides what A/B/Y and the shoulders do.
-    press(0, held(VK_SPACE) || held(VK_RETURN));                                        // A: jump/action
-    press(1, held('Q') || held(VK_BACK) || held(VK_NUMPAD7) || held(VK_XBUTTON1) ||
-                 held(VK_CONTROL));                                                     // B: light attack / brake / siren
-    if (char k = LetterKey(g_reload_key, 'R')) press(2, held(k));                       // X: reload/block
-    if (char k = LetterKey(g_heavy_attack_key, 0)) press(3, held(k));                   // Y: optional custom heavy key
-    // Y is the pad's heavy attack, grapple and human-shield button; the PC's
-    // dedicated Grapple key is +, so it joins Num 9 and mouse Button 4.
-    press(3, held(VK_NUMPAD9) || held(VK_XBUTTON2) || held(VK_ADD) || held(VK_OEM_PLUS)); // Y: heavy attack / grapple
-    if (char k = LetterKey(g_use_key, 'E')) press(4, held(k));                          // black: use/action/car door
-    if (char k = LetterKey(g_climb_key, 'G')) press(5, held(k));                        // white: climb
-    // Precision aim stays on the right mouse button; middle mouse is the PC's
-    // binding and also works.
-    press(6, held(VK_MBUTTON) || held(VK_RBUTTON));                                     // LT: precision aim
-    const bool heavy_is_f = LetterKey(g_heavy_attack_key, 0) == 'F';
-    press(7, held(VK_LBUTTON) || (!heavy_is_f && held('F')));                           // RT: fire
+    const bool driving = app::kGame.keyboard_driving && app::kGame.keyboard_driving();
+    press(0, held(VK_RETURN)); // A: menu confirmation
+    press(1, held(VK_BACK));   // B: menu cancel
+    if (driving) {
+        press(0, held('W')); // A: accelerate
+        press(2, held('S')); // X: brake / reverse
+        press(1, held(VK_SPACE)); // B: handbrake
+        pad.ly = 0; // steering uses the horizontal stick axis
+    } else {
+        press(0, held(VK_LCONTROL) || held(VK_XBUTTON1)); // A: light attack
+        press(2, held(VK_LMENU) || held(VK_XBUTTON2)); // X: heavy attack
+        if (char key = LetterKey(g_heavy_attack_key, 0)) press(2, held(key));
+        press(1, held('V')); // B: grapple / human shield
+        press(3, held(VK_SPACE)); // Y: jump
+        if (char key = LetterKey(g_climb_key, 'G')) press(3, held(key)); // Y: jump / climb
+    }
+    if (char key = LetterKey(g_reload_key, 'R')) press(4, held(key)); // Black: reload / block
+    if (char key = LetterKey(g_use_key, 'E')) press(5, held(key)); // White: use / enter vehicle
+    press(6, held(VK_MBUTTON) || held(VK_RBUTTON));
+    press(7, held(VK_LBUTTON));
     bool mouse_active;
     {
         std::lock_guard lock(g_mouse_lock);
@@ -169,7 +169,7 @@ bool ReadKeyboardMouse(Pad& pad) {
             // produces the same stick deflection a pad does, including while a
             // cutscene or a zone transition owns the camera.
             const float gain = float(std::clamp(g_mouse_sensitivity_percent, 10u, 400u)) * 0.01f;
-            auto shape = [gain](int counts) {
+            auto shape = [](int counts, float gain) {
                 // ignore one-count sensor jitter, then keep every real move
                 // above the guest's stick dead zone
                 if (counts > -2 && counts < 2) return int16_t(0);
@@ -177,8 +177,8 @@ bool ReadKeyboardMouse(Pad& pad) {
                 const float s = std::min(std::max(std::cbrt(t), 0.45f), 1.0f) * gain;
                 return int16_t(std::clamp((counts < 0 ? -s : s) * 32767.0f, -32767.0f, 32767.0f));
             };
-            g_mouse_rx = shape(g_mouse_x);
-            g_mouse_ry = shape(-g_mouse_y);
+            g_mouse_rx = shape(g_mouse_x, gain);
+            g_mouse_ry = shape(-g_mouse_y, gain * float(std::clamp(g_mouse_vertical_sensitivity_percent, 10u, 400u)) * 0.01f);
             g_mouse_x = g_mouse_y = 0;
         }
         if (ui) g_aim_x = g_aim_y = 0;
