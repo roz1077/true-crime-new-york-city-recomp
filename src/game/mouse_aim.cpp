@@ -114,10 +114,13 @@ uint32_t GameplayCamera(uint8_t *base, uint32_t controller) {
 
 // The shared camera object itself (not a look controller): the per-frame update
 // asks it for the active controller and runs that controller's virtual methods.
+// A zone load or a car exit clears the followed target for a moment, so the
+// target cannot be part of this test: the direct path has to stay live through
+// that window or the mouse drops to the pad and its horizontal dead zone.
 bool IsGameplayCamera(uint8_t *base, uint32_t camera) {
     const uint32_t game = Rd(base, kGame);
     if (!camera || !game || camera != Rd(base, game + kCamera)) return false;
-    return Rd(base, camera + kTarget) && Rd8(base, camera + kActiveFlag);
+    return Rd8(base, camera + kActiveFlag) != 0;
 }
 
 // The unarmed camera, sub_0002D230. It does not accumulate the look stick into
@@ -132,6 +135,10 @@ constexpr uint8_t kModeUnarmed = 23;
 
 // radians of raw mouse yaw on top of the unarmed controller's target angle
 float g_unarmed_yaw = 0;
+// last yaw the target-driven controller produced; kept while a zone load or a
+// car exit temporarily clears the target so the raw offset still has a base
+float g_unarmed_base = 0;
+bool g_unarmed_base_valid = false;
 
 // Adds the pending raw mouse delta to the camera angles.  The caller injects
 // before the controller runs and widens that controller's own pitch clamp, so
@@ -213,11 +220,15 @@ X86_FUNC(sub_0002E200) {
     const uint32_t camera = ctx.ecx;
     const uint32_t controller = camera ? Rd(base, camera + kActive) : 0;
     const uint8_t mode = camera ? Rd8(base, camera + kMode) : 0;
+
     static uint8_t last_mode = 0xFF;
     if (mode != last_mode) {
         last_mode = mode;
         // the unarmed view starts centred on the target again
-        if (mode == kModeUnarmed) g_unarmed_yaw = 0;
+        if (mode == kModeUnarmed) {
+            g_unarmed_yaw = 0;
+            g_unarmed_base_valid = false;
+        }
     }
     const bool owned = controller && Rd(base, controller + kOwner) == camera;
     if (input::g_direct_mouse_aim && owned && mode != kModeVehicle && IsGameplayCamera(base, camera)) {
@@ -225,6 +236,11 @@ X86_FUNC(sub_0002E200) {
         const bool widen = input::DirectAimRecent() &&
                            WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
         if (mode == kModeUnarmed) {
+            if (!g_unarmed_base_valid) {
+                // seed from the live camera while the transition has no target
+                g_unarmed_base = RdF(base, kYaw);
+                g_unarmed_base_valid = true;
+            }
             ApplyUnarmedAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
         } else {
             ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
@@ -232,8 +248,12 @@ X86_FUNC(sub_0002E200) {
         __imp__sub_0002E200(ctx, base);
         if (widen) RestorePitch(base, controller, old_min, old_max);
         if (mode == kModeUnarmed) {
-            // the controller just replaced the yaw with the target's angle
-            const float yaw = RdF(base, kYaw) + g_unarmed_yaw;
+            // When the controller ran it replaced the yaw with the target's
+            // angle, which becomes the new base. While a transition has no
+            // target it bails out before touching the yaw, so the cached base
+            // keeps the offset from stacking on itself.
+            if (Rd(base, camera + kTarget)) g_unarmed_base = RdF(base, kYaw);
+            const float yaw = g_unarmed_base + g_unarmed_yaw;
             std::memcpy(base + kYaw, &yaw, sizeof(yaw));
         }
         return;

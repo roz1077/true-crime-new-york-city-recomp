@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <iterator>
 #include <mutex>
@@ -42,8 +43,10 @@ std::atomic<bool> g_ui_active{false};
 // different camera mode falls back to the right stick instead of losing the
 // mouse for the rest of the session
 bool DirectAimLive(uint64_t now) {
+    // a short window: the camera calls this every frame, so the pad fallback
+    // should take over quickly when a transition camera stops updating
     return g_direct_mouse_aim && g_direct_confirmed.load(std::memory_order_relaxed) &&
-           now - g_direct_at.load(std::memory_order_relaxed) < 250;
+           now - g_direct_at.load(std::memory_order_relaxed) < 100;
 }
 
 void UpdatePromptType() {
@@ -112,9 +115,23 @@ bool ReadKeyboardMouse(Pad& pad) {
         }
         if (now - g_mouse_sample_at >= 16) {
             g_mouse_sample_at = now;
-            const int scale = 18 * int(std::clamp(g_mouse_sensitivity_percent, 10u, 400u));
-            g_mouse_rx = int16_t(std::clamp(g_mouse_x * scale, -32767, 32767));
-            g_mouse_ry = int16_t(std::clamp(-g_mouse_y * scale, -32767, 32767));
+            // The guest's look controllers cube the stick, so a linear mouse
+            // sample (a few counts per frame) lands near zero and the camera
+            // appears dead until the mouse is thrown a long way. Shape the
+            // sample with the inverse curve and a small floor so a normal move
+            // produces the same stick deflection a pad does, including while a
+            // cutscene or a zone transition owns the camera.
+            const float gain = float(std::clamp(g_mouse_sensitivity_percent, 10u, 400u)) * 0.01f;
+            auto shape = [gain](int counts) {
+                // ignore one-count sensor jitter, then keep every real move
+                // above the guest's stick dead zone
+                if (counts > -2 && counts < 2) return int16_t(0);
+                const float t = std::min(std::fabs(float(counts)) / 100.0f, 1.0f);
+                const float s = std::min(std::max(std::cbrt(t), 0.45f), 1.0f) * gain;
+                return int16_t(std::clamp((counts < 0 ? -s : s) * 32767.0f, -32767.0f, 32767.0f));
+            };
+            g_mouse_rx = shape(g_mouse_x);
+            g_mouse_ry = shape(-g_mouse_y);
             g_mouse_x = g_mouse_y = 0;
         }
         // raw samples belong to the direct camera; another mode falls back to
