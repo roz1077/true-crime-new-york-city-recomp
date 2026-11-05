@@ -725,7 +725,7 @@ private:
     bool CreateSwapChain(HWND hwnd);
     void CreateHeaps();
     uint32_t CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool visible, ComPtr<ID3D12DescriptorHeap>& out);
-    void CreateBackBufferViews();
+    bool CreateBackBufferViews();
     bool CreateRootSignature();
     void CreateFrames();
     void CreateGammaLut();
@@ -962,7 +962,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     if (!CreateDevice()) return false;
     if (!CreateSwapChain(hwnd)) return false;
     CreateHeaps();
-    CreateBackBufferViews();
+    if (!CreateBackBufferViews()) return false;
     if (!CreateRootSignature()) return false;
     CreateFrames();
     CreateGammaLut();
@@ -1038,11 +1038,18 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
     return dev_->GetDescriptorHandleIncrementSize(t);
 }
 
-void D3D12Backend::CreateBackBufferViews() {
+bool D3D12Backend::CreateBackBufferViews() {
     for (int i = 0; i < kFrames; i++) {
-        swap_->GetBuffer(i, IID_PPV_ARGS(&bb_[i]));
+        const HRESULT hr = swap_->GetBuffer(i, IID_PPV_ARGS(&bb_[i]));
+        if (FAILED(hr) || !bb_[i]) {
+            LOGE("d3d12: GetBuffer(%d) failed: 0x%08lX (device removed: 0x%08lX)", i, hr,
+                 dev_->GetDeviceRemovedReason());
+            for (auto& buffer : bb_) buffer.Reset();
+            return false;
+        }
         dev_->CreateRenderTargetView(bb_[i].Get(), nullptr, Cpu(rtv_heap_.Get(), kRtvCount + i, rtv_inc_));
     }
+    return true;
 }
 
 void D3D12Backend::CreateHeaps() {
@@ -3837,8 +3844,21 @@ void D3D12Backend::ResizeSwap() {
         if (f.fence) WaitFence(f.fence);
     }
     for (auto& b : bb_) b.Reset();
-    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
-    CreateBackBufferViews();
+    const HRESULT hr =
+        swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    if (FAILED(hr)) {
+        // ResizeBuffers leaves the swap chain as it was when it fails; rebuild the views so the
+        // frame can continue at the previous size, and report device loss explicitly.
+        LOGE("d3d12: ResizeBuffers(%ux%u) failed: 0x%08lX (device removed: 0x%08lX)", w, h, hr,
+             dev_->GetDeviceRemovedReason());
+        if (!CreateBackBufferViews())
+            LOGE("d3d12: back buffers are unavailable after a failed resize");
+        return;
+    }
+    if (!CreateBackBufferViews()) {
+        LOGE("d3d12: back buffer views failed after resize to %ux%u; keeping the old size", w, h);
+        return;
+    }
     bb_w_ = w;
     bb_h_ = h;
 }

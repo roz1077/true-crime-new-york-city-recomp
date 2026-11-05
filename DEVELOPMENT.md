@@ -38,8 +38,9 @@ tools/venv/Scripts/python.exe scripts/run_checks.py
 The checks compile isolated harnesses around the actual runtime implementations. They cover full CPU
 context preservation across APCs, file-object reference lifetimes, retained vertex attributes, converted
 strip assembly, viewport/scissor behavior, disabled profiler overhead, audio lane equivalence, shader-cache
-IO/compiler fingerprints, and the Graphics menu and Display row rules. They do not replace gameplay or
-visual verification. Windows, LLVM clang++
+IO/compiler fingerprints, the Graphics menu and Display row rules, the explicit city-grid patch (confirmed
+sites, idempotency and drift rejection) and the guest frame walker over the `0xD0...` stack range. They do
+not replace gameplay or visual verification. Windows, LLVM clang++
 and Visual Studio C++ tools are needed; the CRT-based checks locate Visual Studio using `vswhere`.
 
 After a host-only change, if the guest partitions already exist, this avoids recompiling them:
@@ -51,6 +52,11 @@ tools/venv/Scripts/python.exe scripts/relink_game.py
 That helper reads the configured partition count and library name; use the normal compiler path for
 changes to the original image, recompiler configuration or generated partitions. Python 3.11+ is required
 for the helper's TOML reader. The repository's local venv is a convenience, not a shipped dependency.
+
+CMake generation recompiles the XBE and then runs `grid_patch` over the generated sources before they are
+compiled or linked, so `generated/` should never be patched by hand. The same header is used by the
+first-launch compiler. A mismatch in the confirmed city-grid sites fails the build rather than producing
+partially corrected code.
 
 Commit SDK edits from the project root alongside the game changes that depend on them.
 `patches/xboxxberecomp-local.patch` records the same SDK changes as a diff against upstream XboxXBERecomp

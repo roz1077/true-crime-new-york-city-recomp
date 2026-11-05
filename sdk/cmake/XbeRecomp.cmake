@@ -58,6 +58,13 @@ target_include_directories(xbe_recomp PRIVATE ${XBE_SDK_DIR}/runtime ${XBE_SDK_D
 target_compile_definitions(xbe_recomp PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(xbe_recomp PRIVATE Zydis tomlplusplus::tomlplusplus)
 
+# Applies the city-cell grid remainder fix to the generated sources. It is part of the generation
+# step, so every build (CMake, IDE, release target) produces the corrected code and changes to the
+# fix rerun generation. The same header drives the first-launch compiler.
+add_executable(grid_patch ${XBE_SDK_DIR}/tools/grid_patch/main.cpp)
+target_include_directories(grid_patch PRIVATE ${XBE_SDK_DIR}/runtime)
+set_target_properties(grid_patch PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${XBE_COMPILER_DIR})
+
 # XDK signature scanner that writes a new title's config
 add_executable(xbe_symbols ${XBE_SDK_DIR}/tools/symbols/main.cpp)
 target_include_directories(xbe_symbols PRIVATE ${XBE_SDK_DIR}/runtime)
@@ -95,9 +102,16 @@ function(add_xbe_image target xbe config partitions game_dir)
         BYPRODUCTS ${GEN_SOURCES} ${GEN}/x86_recomp_shared.h ${GEN}/image_symbols.h ${GEN}/hook_exports.h
                    ${GEN}/exports.def ${GEN}/imports.def ${GEN}/code.lib
         COMMAND xbe_recomp config/${config} --xdk ${XBE_SDK_DIR}/xdk
+        COMMAND $<TARGET_FILE:grid_patch> ${GEN} ${partitions}
         COMMAND ${XBE_LLVM_BIN}/lld-link.exe /lib /machine:x64 /def:${GEN}/imports.def /out:${GEN}/code.lib
         COMMAND ${CMAKE_COMMAND} -E touch ${GEN}/codegen.stamp
-        DEPENDS xbe_recomp ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe}
+        # The executable targets below are order-only in CMake, so name the patch implementation as
+        # files as well: editing either one must regenerate the sources and rebuild the game code.
+        DEPENDS xbe_recomp grid_patch
+                ${XBE_RECOMP_SOURCES}
+                ${XBE_SDK_DIR}/runtime/xbe/grid_patch.h
+                ${XBE_SDK_DIR}/tools/grid_patch/main.cpp
+                ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         COMMENT "Recompiling ${xbe}"
         VERBATIM)

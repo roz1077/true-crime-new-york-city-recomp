@@ -1437,11 +1437,17 @@ signed remainder only for the two divisions whose dividend is `coordinate + 1000
 sub-position division and unrelated `*1000` divisions stay signed. Local A/B testing had shown that correcting those
 other divisions caused a new null-pointer crash at 0x3BC90 during level load.
 
-**Durable fix for rebuilt game code.** `generated/` is ignored and is regenerated from the XBE, so the source edit alone
-would not survive a clean build. The correction is now applied in two places:
-- `runtime/app/game_code.cpp` (`PatchGridRemainders`) rewrites the generated `x86_recomp.*.cpp` in the compiler work
-  folder after `xbe_recomp` finishes and before clang compiles them. This covers every first-launch/rebuild on a
-  player's PC and needs no Python.
-- `build.bat` builds the `recompile_<game>` target first, runs `scripts/patch_grid_offset.py`, then the normal build.
-  The script is idempotent and only touches the +1000 dividend divisions.
-`scripts/patch_grid_offset.py` remains the reference implementation for the transformation.
+**Durable fix for rebuilt game code (review follow-up).** `generated/` is ignored and is regenerated from the XBE, so the
+source edit alone would not survive a clean build. The correction now has one implementation,
+`sdk/runtime/xbe/grid_patch.h`, used by both paths:
+- `sdk/tools/grid_patch` runs in the CMake generation step after `xbe_recomp` and before compilation, with the tool
+  itself as a dependency, so every CMake/IDE/release build produces corrected sources and changes to the fix rerun
+  generation.
+- `runtime/app/game_code.cpp` calls the same header after `xbe_recomp` finishes in the first-launch compiler, before
+  clang compiles the sources. No Python is involved.
+The patcher names the 12 confirmed guest sites explicitly, verifies the idiv operand and divide-error trap at every
+occurrence, requires the expected 20 occurrences across the configured partitions, and publishes each file through a
+temporary file. Any missing file, changed instruction or wrong count stops the build instead of producing a partial
+patch. `scripts/test_grid_patch.py` exercises the fixture, idempotency and drift failures; `scripts/test_guest_frames.py`
+covers the guest frame walker and the `0xD0...` stack range. The earlier `scripts/patch_grid_offset.py` reference script
+was removed so there is no second, divergent transformation.

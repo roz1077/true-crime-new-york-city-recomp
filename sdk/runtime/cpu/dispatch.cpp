@@ -253,17 +253,26 @@ void LogGuestStack(X86Context& ctx, int words) {
 }
 
 // Recompiled functions keep the guest frame pointer, so the EBP chain is the reliable call stack. The raw stack scan
-// above can report stale return addresses left over from earlier calls through the same stack slots.
+// above can report stale return addresses left over from earlier calls through the same stack slots. Guest stacks are
+// allocated around 0xD0000000, outside the user-image range, so validate against this thread's stack bounds.
 void LogGuestFrames(X86Context& ctx) {
+    uint32_t low = mem::kUserLow;
+    uint32_t high = mem::kUserHigh;
+    if (Thread* thread = Current(); thread && thread->stack_top && thread->stack_size) {
+        low = thread->stack_top - thread->stack_size;
+        high = thread->stack_top;
+    }
     uint32_t ebp = ctx.ebp;
     int frames = 0;
-    for (; frames < 64; frames++) {
-        if (ebp < mem::kUserLow || ebp >= mem::kUserHigh - 8) break;
+    for (; frames < 64;) {
+        if (ebp < low || ebp >= high || (ebp & 3u) != 0) break;
+        if (high - ebp < 8) break;
         if (!mem::IsCommitted(ebp) || !mem::IsCommitted(ebp + 4)) break;
         const uint32_t ret = R32(ebp + 4);
         const uint32_t next = R32(ebp);
         if (!dispatch::InCode(ret)) break;
         LOGE("  frame %02d ebp %08X ret %08X", frames, ebp, ret);
+        frames++;
         if (next <= ebp) break;  // the guest stack grows downwards; the chain must move up
         ebp = next;
     }

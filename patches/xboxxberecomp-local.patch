@@ -46,10 +46,42 @@ index 0000000..60ca878
 +file(WRITE "${DLL}.stamp.tmp" "${host_sha1} ${XBE_SHA1} ${dll_sha1}\n")
 +file(RENAME "${DLL}.stamp.tmp" "${DLL}.stamp")
 diff --git a/cmake/XbeRecomp.cmake b/cmake/XbeRecomp.cmake
-index 22e033f..809499c 100644
+index 22e033f..984f107 100644
 --- a/cmake/XbeRecomp.cmake
 +++ b/cmake/XbeRecomp.cmake
-@@ -134,7 +134,11 @@ function(add_xbe_image target xbe config partitions game_dir)
+@@ -58,6 +58,13 @@ target_include_directories(xbe_recomp PRIVATE ${XBE_SDK_DIR}/runtime ${XBE_SDK_D
+ target_compile_definitions(xbe_recomp PRIVATE _CRT_SECURE_NO_WARNINGS)
+ target_link_libraries(xbe_recomp PRIVATE Zydis tomlplusplus::tomlplusplus)
+ 
++# Applies the city-cell grid remainder fix to the generated sources. It is part of the generation
++# step, so every build (CMake, IDE, release target) produces the corrected code and changes to the
++# fix rerun generation. The same header drives the first-launch compiler.
++add_executable(grid_patch ${XBE_SDK_DIR}/tools/grid_patch/main.cpp)
++target_include_directories(grid_patch PRIVATE ${XBE_SDK_DIR}/runtime)
++set_target_properties(grid_patch PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${XBE_COMPILER_DIR})
++
+ # XDK signature scanner that writes a new title's config
+ add_executable(xbe_symbols ${XBE_SDK_DIR}/tools/symbols/main.cpp)
+ target_include_directories(xbe_symbols PRIVATE ${XBE_SDK_DIR}/runtime)
+@@ -95,9 +102,16 @@ function(add_xbe_image target xbe config partitions game_dir)
+         BYPRODUCTS ${GEN_SOURCES} ${GEN}/x86_recomp_shared.h ${GEN}/image_symbols.h ${GEN}/hook_exports.h
+                    ${GEN}/exports.def ${GEN}/imports.def ${GEN}/code.lib
+         COMMAND xbe_recomp config/${config} --xdk ${XBE_SDK_DIR}/xdk
++        COMMAND $<TARGET_FILE:grid_patch> ${GEN} ${partitions}
+         COMMAND ${XBE_LLVM_BIN}/lld-link.exe /lib /machine:x64 /def:${GEN}/imports.def /out:${GEN}/code.lib
+         COMMAND ${CMAKE_COMMAND} -E touch ${GEN}/codegen.stamp
+-        DEPENDS xbe_recomp ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe}
++        # The executable targets below are order-only in CMake, so name the patch implementation as
++        # files as well: editing either one must regenerate the sources and rebuild the game code.
++        DEPENDS xbe_recomp grid_patch
++                ${XBE_RECOMP_SOURCES}
++                ${XBE_SDK_DIR}/runtime/xbe/grid_patch.h
++                ${XBE_SDK_DIR}/tools/grid_patch/main.cpp
++                ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe}
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+         COMMENT "Recompiling ${xbe}"
+         VERBATIM)
+@@ -134,7 +148,11 @@ function(add_xbe_image target xbe config partitions game_dir)
      target_link_libraries(${target}_code PRIVATE ${target})
      target_link_options(${target}_code PRIVATE -fuse-ld=lld -Wl,/noentry,/nodefaultlib,/opt:noicf
          -Wl,/def:${GEN}/exports.def)
@@ -145,7 +177,7 @@ index e1c1254..dce9116 100644
  
  }  // namespace app
 diff --git a/runtime/app/game_code.cpp b/runtime/app/game_code.cpp
-index 0582ed9..2b0f3af 100644
+index 0582ed9..2742398 100644
 --- a/runtime/app/game_code.cpp
 +++ b/runtime/app/game_code.cpp
 @@ -15,8 +15,10 @@
@@ -159,7 +191,15 @@ index 0582ed9..2b0f3af 100644
  
  #include <toml++/toml.hpp>
  
-@@ -112,7 +114,8 @@ std::vector<Image> Images() {
+@@ -26,6 +28,7 @@
+ #include "hook_exports.h"
+ #include "image_symbols.h"
+ #include "kernel/disc.h"
++#include "xbe/grid_patch.h"
+ 
+ namespace dispatch {
+ bool Load(const std::filesystem::path& dll);  // cpu/dispatch.cpp
+@@ -112,7 +115,8 @@ std::vector<Image> Images() {
  
  fs::path WorkDir(const Image& image) { return CompilerDir() / "work" / image.exe; }
  fs::path CodeDll(const Image& image) { return ExeDir() / (image.exe + L".dll"); }
@@ -169,7 +209,7 @@ index 0582ed9..2b0f3af 100644
  std::wstring Quote(const fs::path& path) { return L"\"" + path.wstring() + L"\""; }
  fs::path CompileLog() { return ExeDir() / "logs" / "compile.log"; }
  
-@@ -130,26 +133,35 @@ struct Target {
+@@ -130,26 +134,35 @@ struct Target {
      std::string stamp;
  };
  
@@ -218,56 +258,130 @@ index 0582ed9..2b0f3af 100644
  }
  
  // an image's xbe from the game in assets: the extracted file, else the mounted disc image
-@@ -294,13 +306,59 @@ private:
+@@ -237,21 +250,39 @@ class Processes {
+ public:
+     Processes() {
+         job_ = CreateJobObjectW(nullptr, nullptr);
++        if (!job_) {
++            failure_ = L"Could not create the build job object (error " + std::to_wstring(GetLastError()) + L").";
++            return;
++        }
+         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limit{};
+         limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+-        SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &limit, sizeof(limit));
++        if (!SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &limit, sizeof(limit))) {
++            failure_ = L"Could not configure the build job object (error " + std::to_wstring(GetLastError()) + L").";
++            CloseHandle(job_);
++            job_ = nullptr;
++            return;
++        }
+         SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+         DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+         DWORD attributes = FILE_ATTRIBUTE_NORMAL;
+         log_ = CreateFileW(CompileLog().c_str(), FILE_APPEND_DATA, share, &inherit, CREATE_ALWAYS, attributes, nullptr);
++        if (log_ == INVALID_HANDLE_VALUE)
++            failure_ = L"Could not open " + CompileLog().wstring() + L" (error " + std::to_wstring(GetLastError()) + L").";
+     }
+     ~Processes() {
+-        CloseHandle(job_);
++        if (job_) CloseHandle(job_);
+         if (log_ != INVALID_HANDLE_VALUE) CloseHandle(log_);
+     }
+ 
++    // empty when the job object and compile log are ready
++    const std::wstring& Failure() const { return failure_; }
++
+     // null when it did not start; its output goes to logs\compile.log
+     HANDLE Start(std::wstring command, const fs::path& dir) {
++        if (!job_ || log_ == INVALID_HANDLE_VALUE) {
++            LOGE("game code: the build process environment is not ready (%ls)", failure_.c_str());
++            return nullptr;
++        }
+         STARTUPINFOW si{sizeof(si)};
+         si.dwFlags = STARTF_USESTDHANDLES;
+         si.hStdOutput = log_;
+@@ -262,8 +293,18 @@ public:
+             LOGE("game code: could not start %ls (%lu)", command.c_str(), GetLastError());
+             return nullptr;
+         }
+-        AssignProcessToJobObject(job_, pi.hProcess);
+-        ResumeThread(pi.hThread);
++        if (!AssignProcessToJobObject(job_, pi.hProcess)) {
++            const DWORD error = GetLastError();
++            LOGE("game code: could not add %ls to the build job (%lu)", command.c_str(), error);
++            Discard(pi);
++            return nullptr;
++        }
++        if (ResumeThread(pi.hThread) == DWORD(-1)) {
++            const DWORD error = GetLastError();
++            LOGE("game code: could not resume %ls (%lu)", command.c_str(), error);
++            Discard(pi);
++            return nullptr;
++        }
+         CloseHandle(pi.hThread);
+         return pi.hProcess;
+     }
+@@ -271,27 +312,54 @@ public:
+     // closes the process; 0 when it exited cleanly
+     static DWORD ExitCode(HANDLE process) {
+         DWORD code = 1;
+-        GetExitCodeProcess(process, &code);
++        if (!GetExitCodeProcess(process, &code)) {
++            LOGE("game code: could not read a process exit code (%lu)", GetLastError());
++            code = 1;
++        }
+         CloseHandle(process);
+         return code;
+     }
+     static bool Succeeded(HANDLE process) { return ExitCode(process) == 0; }
+ 
+-    // false when cancelled, which ends every process of the build
++    // false when cancelled or when waiting fails, which ends every process of the build
+     bool WaitAll(std::vector<HANDLE>& processes) {
+-        while (WaitForMultipleObjects(DWORD(processes.size()), processes.data(), TRUE, 250) == WAIT_TIMEOUT)
+-            if (g_progress.cancel) return Cancel();
++        while (!processes.empty()) {
++            const DWORD wait = WaitForMultipleObjects(DWORD(processes.size()), processes.data(), TRUE, 250);
++            if (wait == WAIT_TIMEOUT) {
++                if (g_progress.cancel) return Cancel();
++                continue;
++            }
++            if (wait == WAIT_FAILED) {
++                const DWORD error = GetLastError();
++                LOGE("game code: waiting on the build processes failed (%lu)", error);
++                RecordFailure(L"Waiting on the build processes failed (error " + std::to_wstring(error) + L").");
++                return Cancel();
++            }
++            return true;  // WAIT_OBJECT_0: every process has ended
++        }
+         return true;
+     }
+ 
+     bool Cancel() {
+-        TerminateJobObject(job_, 1);
++        if (job_ && !TerminateJobObject(job_, 1))
++            LOGE("game code: could not end the build processes (%lu)", GetLastError());
+         return false;
+     }
+ 
+ private:
++    static void Discard(PROCESS_INFORMATION& pi) {
++        // The child is still suspended, so it has run none of its own cleanup.
++        if (TerminateProcess(pi.hProcess, 1))
++            WaitForSingleObject(pi.hProcess, INFINITE);
++        else
++            LOGE("game code: could not terminate a suspended build process (%lu)", GetLastError());
++        CloseHandle(pi.hThread);
++        CloseHandle(pi.hProcess);
++    }
++
+     HANDLE job_ = nullptr;
      HANDLE log_ = INVALID_HANDLE_VALUE;
++    std::wstring failure_;
  };
  
-+// The city-cell grid routines divide (coordinate + 1000) with signed idiv and use the remainder as a
-+// 3x3 bucket. A negative coordinate gives a negative remainder; the index becomes -1 and the 16-byte
-+// record is written over the end of cell slot 8, corrupting its pointers and crashing the renderer.
-+// Make the remainder the mathematical modulo for the divisions whose dividend is coordinate + 1000:
-+// identical for non-negative dividends, and the intended 0..2 bucket for a negative one. The quotient
-+// is discarded in these routines. Mirrors sdk/cmake/PatchGrid.cmake for the first-launch build.
-+static void PatchGridRemainders(const fs::path& work) {
-+    constexpr std::string_view plain = "ctx.edx = (uint32_t)(n % d); }";
-+    constexpr std::string_view fixed =
-+        "ctx.edx = (uint32_t)(n % d); if ((int32_t)ctx.edx < 0) ctx.edx += (uint32_t)d; }";
-+    std::error_code ec;
-+    for (uint32_t i = 0;; i++) {
-+        const fs::path file = work / ("x86_recomp." + std::to_string(i) + ".cpp");
-+        if (!fs::exists(file, ec)) break;
-+        std::ifstream in(file, std::ios::binary);
-+        if (!in) continue;
-+        std::vector<std::string> lines;
-+        std::string line;
-+        while (std::getline(in, line)) lines.push_back(line);
-+        in.close();
-+        bool changed = false;
-+        for (size_t n = 0; n < lines.size(); n++) {
-+            if (lines[n].find(plain) == std::string::npos) continue;
-+            std::string dividend;
-+            for (size_t k = n; k > 0 && n - k <= 20;) {
-+                --k;
-+                if (lines[k].find("ctx.eax =") != std::string::npos) {
-+                    dividend = lines[k];
-+                    break;
-+                }
-+            }
-+            if (dividend.find("0x3E8u") == std::string::npos || dividend.find('*') != std::string::npos) continue;
-+            const size_t at = lines[n].find(plain);
-+            lines[n].replace(at, plain.size(), fixed);
-+            changed = true;
-+        }
-+        if (changed) {
-+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
-+            for (const std::string& l : lines) out << l << '\n';
-+        }
-+    }
-+}
-+
  // xbe_recomp writes each image's C++ into its work folder, the images side by side
- bool Translate(std::vector<Target>& targets, Processes& run) {
-     std::vector<HANDLE> processes;
+@@ -300,7 +368,10 @@ bool Translate(std::vector<Target>& targets, Processes& run) {
      for (Target& target : targets) {
          fs::path work = WorkDir(*target.image);
          fs::path xbe = work / target.image->xbe;
@@ -279,16 +393,25 @@ index 0582ed9..2b0f3af 100644
          std::wstring command = Quote(CompilerDir() / "xbe_recomp.exe") + L" " + Quote(target.image->config);
          command += L" " + Quote(xbe) + L" " + Quote(work) + L" --xdk " + Quote(CompilerDir() / "xdk");
          HANDLE process = run.Start(command, work);
-@@ -317,6 +375,8 @@ bool Translate(std::vector<Target>& targets, Processes& run) {
+@@ -317,6 +388,17 @@ bool Translate(std::vector<Target>& targets, Processes& run) {
          if (code == kDllNotFound) ok = RecordFailure(missing_runtime);
          else if (code) ok = RecordFailure(L"Translating " + std::wstring(xbe.begin(), xbe.end()) + L" failed.");
      }
-+    if (ok)
-+        for (Target& target : targets) PatchGridRemainders(WorkDir(*target.image));
++    if (ok) {
++        for (Target& target : targets) {
++            const xbe::GridPatchResult patch =
++                xbe::PatchGridSources(WorkDir(*target.image), PartitionCount(*target.image));
++            if (!patch.ok()) {
++                ok = RecordFailure(L"Applying the city-grid fix failed: " +
++                                   std::wstring(patch.error.begin(), patch.error.end()));
++                break;
++            }
++        }
++    }
      return ok;
  }
  
-@@ -384,19 +444,69 @@ bool Compile(std::vector<Job>& jobs, Processes& run) {
+@@ -384,24 +466,75 @@ bool Compile(std::vector<Job>& jobs, Processes& run) {
  bool Link(const Target& target, Processes& run) {
      const Image& image = *target.image;
      fs::path work = WorkDir(image);
@@ -362,7 +485,13 @@ index 0582ed9..2b0f3af 100644
      return true;
  }
  
-@@ -737,16 +847,28 @@ bool PrepareGameCode(const GameFiles& game) {
+ bool Build(std::vector<Target>& targets) {
+     Processes run;
++    if (!run.Failure().empty()) return RecordFailure(run.Failure());
+     if (!Translate(targets, run)) return false;
+     std::vector<Job> jobs;
+     for (const Target& target : targets) AddJobs(*target.image, jobs);
+@@ -737,16 +870,28 @@ bool PrepareGameCode(const GameFiles& game) {
      // one build at a time: a second copy of the game started meanwhile waits for it, then finds the DLL current
      std::wstring mutex_name = std::wstring(kGame.name) + L"-GameCode";
      HANDLE lock = CreateMutexW(nullptr, FALSE, mutex_name.c_str());
@@ -396,7 +525,7 @@ index 0582ed9..2b0f3af 100644
                  MB_ICONERROR);
      return false;
 diff --git a/runtime/app/main.cpp b/runtime/app/main.cpp
-index e36f7ac..cc42d94 100644
+index e36f7ac..67cabea 100644
 --- a/runtime/app/main.cpp
 +++ b/runtime/app/main.cpp
 @@ -12,7 +12,9 @@
@@ -592,7 +721,7 @@ index e36f7ac..cc42d94 100644
              PostQuitMessage(0);
              return 0;
      }
-@@ -179,6 +298,47 @@ std::filesystem::path ExeDir() {
+@@ -179,6 +298,50 @@ std::filesystem::path ExeDir() {
      return std::filesystem::path(p).parent_path();
  }
  
@@ -604,6 +733,9 @@ index e36f7ac..cc42d94 100644
 +    auto* c = e ? e->ContextRecord : nullptr;
 +    if (!r || !c || r->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
 +    if (!kernel::GuestWatchActive()) return EXCEPTION_CONTINUE_SEARCH;
++    // DR0 is the only breakpoint this project sets: ignore unrelated single-step exceptions and
++    // leave their status bits for whoever owns them.
++    if (!(c->Dr6 & 0x1ull)) return EXCEPTION_CONTINUE_SEARCH;
 +    const uint32_t watched = kernel::GuestWatchAddress();
 +    const uint32_t value = mem::IsCommitted(watched) ? kernel::R32(watched) : 0;
 +    static std::atomic<int> hits{0};
@@ -633,14 +765,14 @@ index e36f7ac..cc42d94 100644
 +            LOGE("watch: hit +%llX value %08X (no guest thread)", (unsigned long long)rva, value);
 +        }
 +    }
-+    c->Dr6 = 0;
++    c->Dr6 &= ~0x1ull;
 +    return EXCEPTION_CONTINUE_EXECUTION;
 +}
 +
  int Instance() {
      static const int n = [] {
          const wchar_t* p = std::wcsstr(GetCommandLineW(), L"--instance");
-@@ -196,6 +356,9 @@ std::recursive_mutex& UiLock() {
+@@ -196,6 +359,9 @@ std::recursive_mutex& UiLock() {
  
  void ApplyDisplay() { PostMessageW(g_hwnd, kApplyDisplay, 0, 0); }
  void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
@@ -650,7 +782,7 @@ index e36f7ac..cc42d94 100644
  
  namespace {
  
-@@ -220,11 +383,12 @@ uint32_t RefreshRate() {
+@@ -220,11 +386,12 @@ uint32_t RefreshRate() {
  
  }  // namespace
  
@@ -665,7 +797,7 @@ index e36f7ac..cc42d94 100644
      auto now = clock::now();
      if (!cap) {
          next = now;
-@@ -241,6 +405,7 @@ void Pace() {
+@@ -241,6 +408,7 @@ void Pace() {
  
  int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
      SetUnhandledExceptionFilter(app::WriteCrashDump);
@@ -673,7 +805,7 @@ index e36f7ac..cc42d94 100644
      std::signal(SIGABRT, [](int) { app::WriteCrashDump(nullptr); });
      timeBeginPeriod(1);
      SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-@@ -253,6 +418,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+@@ -253,6 +421,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
      if (app::kGame.init) app::kGame.init();
      if (relaunched && !logx::kVerbose) LOGR("Relaunched: %s", IMAGE_XBE);
      else app::LogSystem();
@@ -681,7 +813,7 @@ index e36f7ac..cc42d94 100644
  
      app::GameFiles game;
      if (!app::FindGame(game)) return 1;
-@@ -276,6 +442,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+@@ -276,6 +445,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
      } else if (!splash) {
          app::ApplyNow();
          ShowWindow(app::g_hwnd, SW_SHOW);
@@ -692,7 +824,7 @@ index e36f7ac..cc42d94 100644
      }
  
      IMGUI_CHECKVERSION();
-@@ -285,6 +455,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+@@ -285,6 +458,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
      io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
      ImGui_ImplWin32_Init(app::g_hwnd);
  
@@ -701,7 +833,7 @@ index e36f7ac..cc42d94 100644
      if (app::kGame.window) app::kGame.window(app::g_hwnd);
      std::wstring hdd = app::Instance() > 1 ? L"hdd" + std::to_wstring(app::Instance()) : L"hdd";
 diff --git a/runtime/app/settings.cpp b/runtime/app/settings.cpp
-index 075b3b7..3a216d0 100644
+index 075b3b7..35c10e2 100644
 --- a/runtime/app/settings.cpp
 +++ b/runtime/app/settings.cpp
 @@ -25,15 +25,61 @@ namespace {
@@ -819,48 +951,74 @@ index 075b3b7..3a216d0 100644
          else t.insert(o.key, int64_t(*o.value));
      }
      if (kGame.save) kGame.save(&t);
-@@ -87,8 +150,38 @@ toml::table Table() {
+@@ -87,8 +150,64 @@ toml::table Table() {
  }  // namespace
  
  void Save() {
 -    std::ofstream f(File());
 -    f << Table() << "\n";
 +    // Two menus can save at once, and a failed write must not leave the live file truncated.
++    // Separate game instances share this file: every save uses its own exclusively created temporary
++    // file and publications are serialized by a named mutex. The last writer wins.
 +    SettingsLock guard;
 +    std::ostringstream out;
 +    out << Table() << "\n";
 +    const std::string text = out.str();
 +    const std::filesystem::path path = File();
-+    const std::filesystem::path temp = path.wstring() + L".tmp";
-+    {
-+        std::ofstream f(temp, std::ios::binary | std::ios::trunc);
-+        if (!f) {
-+            LOGE("Settings: could not open %s", temp.string().c_str());
-+            return;
++    const std::wstring path_text = path.wstring();
++
++    // Serialize publication between processes in this session.
++    uint32_t hash = 2166136261u;
++    for (wchar_t c : path_text) hash = (hash ^ uint32_t(c)) * 16777619u;
++    const std::wstring mutex_name = L"Local\\TrueCrimeNYCSettings-" + std::to_wstring(hash);
++    HANDLE mutex = CreateMutexW(nullptr, FALSE, mutex_name.c_str());
++    const DWORD wait = mutex ? WaitForSingleObject(mutex, 5000) : WAIT_FAILED;
++    // WAIT_ABANDONED also grants ownership: the previous owner died while holding the mutex.
++    const bool locked = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
++    if (mutex && !locked) LOGE("Settings: could not serialize publishing %s", path.string().c_str());
++
++    std::filesystem::path temp;
++    HANDLE file = INVALID_HANDLE_VALUE;
++    static std::atomic<uint32_t> serial{0};
++    const DWORD pid = GetCurrentProcessId();
++    for (int attempt = 0; attempt < 64 && file == INVALID_HANDLE_VALUE; attempt++) {
++        temp = path_text + L".tmp." + std::to_wstring(pid) + L"." + std::to_wstring(serial.fetch_add(1));
++        file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
++        if (file == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_EXISTS) break;
++    }
++    if (file == INVALID_HANDLE_VALUE) {
++        LOGE("Settings: could not create a temporary file for %s (error %lu)", path.string().c_str(), GetLastError());
++        if (mutex) {
++            if (locked) ReleaseMutex(mutex);
++            CloseHandle(mutex);
 +        }
-+        f.write(text.data(), std::streamsize(text.size()));
-+        f.flush();
-+        if (!f) {
-+            LOGE("Settings: could not write %s", temp.string().c_str());
-+            f.close();
-+            DeleteFileW(temp.c_str());
-+            return;
++        return;
++    }
++    DWORD written = 0;
++    const bool wrote = WriteFile(file, text.data(), DWORD(text.size()), &written, nullptr) &&
++                       written == DWORD(text.size()) && FlushFileBuffers(file);
++    CloseHandle(file);
++    if (!wrote) {
++        LOGE("Settings: could not write %s (error %lu)", temp.string().c_str(), GetLastError());
++        DeleteFileW(temp.c_str());
++        if (mutex) {
++            if (locked) ReleaseMutex(mutex);
++            CloseHandle(mutex);
 +        }
-+        f.close();
-+        if (f.fail()) {
-+            LOGE("Settings: could not close %s", temp.string().c_str());
-+            DeleteFileW(temp.c_str());
-+            return;
-+        }
++        return;
 +    }
 +    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
 +        LOGE("Settings: could not replace %s (error %lu)", path.string().c_str(), GetLastError());
 +        DeleteFileW(temp.c_str());
 +    }
++    if (mutex) {
++        if (locked) ReleaseMutex(mutex);
++        CloseHandle(mutex);
++    }
  }
  
  void LogSettings() {
-@@ -112,24 +205,11 @@ Mode Desktop() {
+@@ -112,24 +231,11 @@ Mode Desktop() {
  }
  
  Mode Output() {
@@ -886,7 +1044,7 @@ index 075b3b7..3a216d0 100644
  // Output for every frame: the desktop mode lookup reads the registry, so it runs again only when the resolution
  // setting or the window's monitor changes
  Mode CachedOutput() {
-@@ -142,18 +222,39 @@ Mode CachedOutput() {
+@@ -142,18 +248,39 @@ Mode CachedOutput() {
      static std::mutex lock;
      static Key key{};
      static Mode mode{};
@@ -1244,7 +1402,7 @@ index 7e6507d..31232a7 100644
      va_list ap;
      va_start(ap, fmt);
 diff --git a/runtime/cpu/dispatch.cpp b/runtime/cpu/dispatch.cpp
-index c810896..63f02a2 100644
+index c810896..c54b37e 100644
 --- a/runtime/cpu/dispatch.cpp
 +++ b/runtime/cpu/dispatch.cpp
 @@ -9,9 +9,11 @@
@@ -1298,23 +1456,32 @@ index c810896..63f02a2 100644
      for (int i = 0; i < words; i++) {
          uint32_t a = ctx.esp + uint32_t(i) * 4;
          if (!mem::IsCommitted(a)) break;
-@@ -244,6 +251,45 @@ void LogGuestStack(X86Context& ctx, int words) {
+@@ -244,6 +251,54 @@ void LogGuestStack(X86Context& ctx, int words) {
          if (dispatch::InCode(v)) LOGE("  [esp+%03X] %08X", i * 4, v);
      }
  }
 +
 +// Recompiled functions keep the guest frame pointer, so the EBP chain is the reliable call stack. The raw stack scan
-+// above can report stale return addresses left over from earlier calls through the same stack slots.
++// above can report stale return addresses left over from earlier calls through the same stack slots. Guest stacks are
++// allocated around 0xD0000000, outside the user-image range, so validate against this thread's stack bounds.
 +void LogGuestFrames(X86Context& ctx) {
++    uint32_t low = mem::kUserLow;
++    uint32_t high = mem::kUserHigh;
++    if (Thread* thread = Current(); thread && thread->stack_top && thread->stack_size) {
++        low = thread->stack_top - thread->stack_size;
++        high = thread->stack_top;
++    }
 +    uint32_t ebp = ctx.ebp;
 +    int frames = 0;
-+    for (; frames < 64; frames++) {
-+        if (ebp < mem::kUserLow || ebp >= mem::kUserHigh - 8) break;
++    for (; frames < 64;) {
++        if (ebp < low || ebp >= high || (ebp & 3u) != 0) break;
++        if (high - ebp < 8) break;
 +        if (!mem::IsCommitted(ebp) || !mem::IsCommitted(ebp + 4)) break;
 +        const uint32_t ret = R32(ebp + 4);
 +        const uint32_t next = R32(ebp);
 +        if (!dispatch::InCode(ret)) break;
 +        LOGE("  frame %02d ebp %08X ret %08X", frames, ebp, ret);
++        frames++;
 +        if (next <= ebp) break;  // the guest stack grows downwards; the chain must move up
 +        ebp = next;
 +    }
@@ -1345,7 +1512,7 @@ index c810896..63f02a2 100644
  
  void x86_trap(X86Context& ctx, uint32_t va, const char* what) {
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index fe65837..e9c340e 100644
+index fe65837..2cb944d 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
 @@ -9,6 +9,7 @@
@@ -1616,7 +1783,7 @@ index fe65837..e9c340e 100644
      void SetBlendFactorStencilRef(const State& s);
      void UpdateTargetUsed(uint32_t data);
      void DrawGeometry(const Assembled& a);
-@@ -597,7 +718,7 @@ private:
+@@ -597,25 +718,29 @@ private:
      // shaders by source hash: Compile returns the bytecode and sets hash
      ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
      // Blit's pipeline
@@ -1625,7 +1792,12 @@ index fe65837..e9c340e 100644
      D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv) const;
      // Init, in order, each callee right after its caller
      bool CreateDevice();
-@@ -609,13 +730,17 @@ private:
+     bool CreateSwapChain(HWND hwnd);
+     void CreateHeaps();
+     uint32_t CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool visible, ComPtr<ID3D12DescriptorHeap>& out);
+-    void CreateBackBufferViews();
++    bool CreateBackBufferViews();
+     bool CreateRootSignature();
      void CreateFrames();
      void CreateGammaLut();
      void LoadSettings();
@@ -1702,7 +1874,35 @@ index fe65837..e9c340e 100644
      g_reversed_depth = true;
      guest_w_ = width;
      guest_h_ = height;
-@@ -901,7 +1048,7 @@ void D3D12Backend::CreateBackBufferViews() {
+@@ -815,7 +962,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
+     if (!CreateDevice()) return false;
+     if (!CreateSwapChain(hwnd)) return false;
+     CreateHeaps();
+-    CreateBackBufferViews();
++    if (!CreateBackBufferViews()) return false;
+     if (!CreateRootSignature()) return false;
+     CreateFrames();
+     CreateGammaLut();
+@@ -891,17 +1038,24 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
+     return dev_->GetDescriptorHandleIncrementSize(t);
+ }
+ 
+-void D3D12Backend::CreateBackBufferViews() {
++bool D3D12Backend::CreateBackBufferViews() {
+     for (int i = 0; i < kFrames; i++) {
+-        swap_->GetBuffer(i, IID_PPV_ARGS(&bb_[i]));
++        const HRESULT hr = swap_->GetBuffer(i, IID_PPV_ARGS(&bb_[i]));
++        if (FAILED(hr) || !bb_[i]) {
++            LOGE("d3d12: GetBuffer(%d) failed: 0x%08lX (device removed: 0x%08lX)", i, hr,
++                 dev_->GetDeviceRemovedReason());
++            for (auto& buffer : bb_) buffer.Reset();
++            return false;
++        }
+         dev_->CreateRenderTargetView(bb_[i].Get(), nullptr, Cpu(rtv_heap_.Get(), kRtvCount + i, rtv_inc_));
+     }
++    return true;
+ }
+ 
  void D3D12Backend::CreateHeaps() {
      srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
      smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
@@ -1711,7 +1911,7 @@ index fe65837..e9c340e 100644
      dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
      CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
      for (uint32_t i = kRtvCount; i-- > 0;) free_rtv_.push_back(i);
-@@ -959,7 +1106,10 @@ void D3D12Backend::CreateGammaLut() {
+@@ -959,7 +1113,10 @@ void D3D12Backend::CreateGammaLut() {
  }
  
  void D3D12Backend::LoadSettings() {
@@ -1722,7 +1922,7 @@ index fe65837..e9c340e 100644
      texturedumper::Update();
      ext_ = g_extension.get();
      if (ext_) {
-@@ -1068,9 +1218,14 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
+@@ -1068,9 +1225,14 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
  
  // a resized target gives back its view and its resources
  void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
@@ -1737,7 +1937,7 @@ index fe65837..e9c340e 100644
      if (it->second.fb) CurrentFrame().garbage.push_back(it->second.fb);
      targets_.erase(it);
  }
-@@ -1078,8 +1233,11 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator
+@@ -1078,8 +1240,11 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator
  // the host texture of a new target, at render scale or the extension's
  bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
      float sc = scale_;
@@ -1750,7 +1950,7 @@ index fe65837..e9c340e 100644
      t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
      D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
      D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_UNKNOWN, t.w, t.h);
-@@ -1096,6 +1254,23 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
+@@ -1096,6 +1261,23 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
          cv.Format = td.Format;
          t.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
      }
@@ -1774,7 +1974,7 @@ index fe65837..e9c340e 100644
      return SUCCEEDED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.state, &cv,
                                                     IID_PPV_ARGS(&t.res)));
  }
-@@ -1109,7 +1284,8 @@ bool D3D12Backend::CreateTargetView(Target& t) {
+@@ -1109,7 +1291,8 @@ bool D3D12Backend::CreateTargetView(Target& t) {
      if (t.depth) {
          D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
          dv.Format = kDepthFormat;
@@ -1784,7 +1984,7 @@ index fe65837..e9c340e 100644
          dev_->CreateDepthStencilView(t.res.Get(), &dv, Cpu(dsv_heap_.Get(), t.view, dsv_inc_));
          cl_->ClearDepthStencilView(Cpu(dsv_heap_.Get(), t.view, dsv_inc_),
                                     D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, kDepthFar, 0, 0, nullptr);
-@@ -1165,8 +1341,16 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
+@@ -1165,8 +1348,16 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
      if (ext_ && !ext_->TargetKey(s, depth, alt)) return nullptr;
      TargetSlot slot = FindTargetSlot(s, depth, alt);
      UpdateTargetUsed(slot.data);
@@ -1803,7 +2003,7 @@ index fe65837..e9c340e 100644
      Target t;
      t.depth = depth;
      t.gw = slot.gw;
-@@ -1195,7 +1379,9 @@ void D3D12Backend::UpdateTargetUsed(uint32_t data) {
+@@ -1195,7 +1386,9 @@ void D3D12Backend::UpdateTargetUsed(uint32_t data) {
  bool D3D12Backend::BindTargets(const State& s) {
      Target* rt = EnsureTarget(s.rt, false);
      Target* ds = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? EnsureTarget(s.zs, true) : nullptr;
@@ -1814,7 +2014,7 @@ index fe65837..e9c340e 100644
      if (!rt && !ds) return false;
      if (rt) {
          if (LatchCpuWrite(*rt)) UploadTarget(*rt, s.rt);
-@@ -1219,8 +1405,8 @@ bool D3D12Backend::BindTargets(const State& s) {
+@@ -1219,8 +1412,8 @@ bool D3D12Backend::BindTargets(const State& s) {
  constexpr uint64_t kDepthCopyKey = ~0ull;  // DepthCopy's pipeline in blit_psos_
  
  // DepthCopy's pipeline, kept in blit_psos_: writes depth only, always passing; null when it can't be made
@@ -1825,7 +2025,7 @@ index fe65837..e9c340e 100644
      if (pso) return pso.Get();
      uint64_t h;
      ID3DBlob* vs = Compile(kDepthHlsl, "vs", "vs_5_0", h);
-@@ -1239,30 +1425,35 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline() {
+@@ -1239,30 +1432,35 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline() {
      p.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
      p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
      p.DSVFormat = kDepthFormat;
@@ -1867,7 +2067,7 @@ index fe65837..e9c340e 100644
  }
  
  // a depth buffer drawn as colour into another depth buffer's memory: copied as depth
-@@ -1280,10 +1471,9 @@ bool D3D12Backend::DepthCopy(const State& s) {
+@@ -1280,10 +1478,9 @@ bool D3D12Backend::DepthCopy(const State& s) {
      if (di == targets_.end() || si == targets_.end() || di == si) return false;
      Target& dst = di->second;
      Target& src = si->second;
@@ -1880,7 +2080,7 @@ index fe65837..e9c340e 100644
  }
  
  // the pixels the CPU changed since the last Sync, opaque, the rest 0; t.read takes them
-@@ -1346,8 +1536,14 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
+@@ -1346,8 +1543,14 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
      SetBlitTarget(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), t.w, t.h);
      float uv[4] = {0, 0, 1, 1};
      float mul = 1 / t.range;
@@ -1896,7 +2096,7 @@ index fe65837..e9c340e 100644
      t.epoch = DirtyEpoch(t.data);
      t.sig = MemSig(t.data, t.bytes);
  }
-@@ -1397,7 +1593,9 @@ void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_AD
+@@ -1397,7 +1600,9 @@ void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_AD
  }
  
  void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o) {
@@ -1907,7 +2107,7 @@ index fe65837..e9c340e 100644
      D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
      sv.Format = fmt;
      sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-@@ -1406,12 +1604,103 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
+@@ -1406,12 +1611,103 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
      dev_->CreateShaderResourceView(src, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
      sv.Format = kBgra;
      dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
@@ -2014,7 +2214,7 @@ index fe65837..e9c340e 100644
  }
  
  ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
-@@ -1423,16 +1712,34 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
+@@ -1423,16 +1719,34 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
      if (it != blobs_.end()) return it->second.Get();
      ComPtr<ID3DBlob> code;
      ComPtr<ID3DBlob> err;
@@ -2050,7 +2250,7 @@ index fe65837..e9c340e 100644
      blobs_[hash] = code;
      return code.Get();
  }
-@@ -1456,13 +1763,14 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC D3D12Backend::FullScreenPipelineDesc(ID3DBlob
+@@ -1456,13 +1770,14 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC D3D12Backend::FullScreenPipelineDesc(ID3DBlob
      return d;
  }
  
@@ -2067,7 +2267,7 @@ index fe65837..e9c340e 100644
      if (over) {
          auto& blend = d.BlendState.RenderTarget[0];
          // premultiplied colour, the target keeps its alpha
-@@ -1473,7 +1781,7 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
+@@ -1473,7 +1788,7 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
          blend.DestBlendAlpha = D3D12_BLEND_ONE;
          blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
      }
@@ -2076,7 +2276,7 @@ index fe65837..e9c340e 100644
      return pso.Get();
  }
  
-@@ -1496,7 +1804,7 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
+@@ -1496,7 +1811,7 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
          b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_INV_BLEND_FACTOR;
          b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
      }
@@ -2085,7 +2285,7 @@ index fe65837..e9c340e 100644
      return pso.Get();
  }
  
-@@ -1509,9 +1817,10 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
+@@ -1509,9 +1824,10 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
      for (int i = 0; i < 4; i++) {
          D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
          sv.Format = i < 3 && src[i] ? fmt[i] : kBgra;
@@ -2098,7 +2298,7 @@ index fe65837..e9c340e 100644
          dev_->CreateShaderResourceView(i < 3 ? src[i] : nullptr, &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
      }
      Alloc cb = Upload(256, 256);
-@@ -1607,13 +1916,15 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
+@@ -1607,13 +1923,15 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
      d.RasterizerState.FrontCounterClockwise = k.ccw;
      d.RasterizerState.DepthBias = k.zbias;
      d.RasterizerState.SlopeScaledDepthBias = k.zslope;
@@ -2116,7 +2316,7 @@ index fe65837..e9c340e 100644
  }
  
  // A point sprite is a square of the program's point size in console pixels (oPts, which SpriteSizeHlsl passes in
-@@ -1649,17 +1960,86 @@ void D3D12Backend::ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool spri
+@@ -1649,17 +1967,86 @@ void D3D12Backend::ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool spri
      d.RasterizerState.FrontCounterClockwise = FALSE;
  }
  
@@ -2204,7 +2404,7 @@ index fe65837..e9c340e 100644
  }
  
  ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps) {
-@@ -1672,9 +2052,21 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
+@@ -1672,9 +2059,21 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
      d.InputLayout = {el, n};
      FillPipelineDesc(k, vs, ps, d);
      if (k.topo == uint32_t(Topology::Points)) ExpandPoints(d, k.sprite);
@@ -2228,7 +2428,7 @@ index fe65837..e9c340e 100644
      psos_[h] = pso;
      return pso.Get();
  }
-@@ -1710,10 +2102,16 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
+@@ -1710,10 +2109,16 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
      }
      if (ext_) ext_->Sampled(d, &t, 0, info);
      sv.Format = t.depth ? kDepthRead : t.fmt;
@@ -2246,7 +2446,7 @@ index fe65837..e9c340e 100644
      info.kind = kTex2D;
      return t.res.Get();
  }
-@@ -1791,6 +2189,161 @@ void D3D12Backend::UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std
+@@ -1791,6 +2196,161 @@ void D3D12Backend::UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std
      cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
  }
  
@@ -2408,7 +2608,7 @@ index fe65837..e9c340e 100644
  void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p,
                                   const uint32_t* colours, bool same) {
      D3D12_RESOURCE_STATES st = same ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_DEST;
-@@ -1802,6 +2355,7 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
+@@ -1802,6 +2362,7 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
              uint32_t pitch;
              DecodeLevel(d, l, f, p, colours, px, pitch);
              if (ext_) ext_->Decoded(d, fi, f, l, px, pitch, tx.flags);
@@ -2416,7 +2616,7 @@ index fe65837..e9c340e 100644
              UploadTextureLevel(tx, f, l, px, pitch);
          }
      }
-@@ -1852,18 +2406,22 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const
+@@ -1852,18 +2413,22 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const
      const uint64_t key = uint64_t(palette.va) << 32 | d.data;
      const uint32_t* colours = palette.va ? palette.colours : nullptr;
      Tex& tx = textures_[key];
@@ -2445,7 +2645,7 @@ index fe65837..e9c340e 100644
              PerfScope perf_up{g_perf.texup};
              g_perf.texups++;
              g_perf.texup_bytes += total;
-@@ -1947,6 +2505,7 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
+@@ -1947,6 +2512,7 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
      sv.Texture2D.MipLevels = 1;
      TextureDesc d;
      if (!s.textures[size_t(stage)] || !Describe(s.textures[size_t(stage)], d)) return nullptr;
@@ -2453,7 +2653,7 @@ index fe65837..e9c340e 100644
      const FormatInfo& fi = Format(d.format);
      info.kind = TextureKind(d);
      info.rect = d.linear;
-@@ -2008,7 +2567,7 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
+@@ -2008,7 +2574,7 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
  
  uint32_t D3D12Backend::EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp) {
      D3D12_SAMPLER_DESC sd[4];
@@ -2462,7 +2662,7 @@ index fe65837..e9c340e 100644
      for (int i = 0; i < 4; i++) sd[i] = StageSampler(s, i, stages, clamp, aniso);
      uint64_t key = Hash(sd, sizeof(sd));
      auto it = samplers_.find(key);
-@@ -2064,6 +2623,8 @@ uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
+@@ -2064,6 +2630,8 @@ uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
      return vkey;
  }
  
@@ -2471,7 +2671,7 @@ index fe65837..e9c340e 100644
  // a point sprite's program hands its point size to SpriteHlsl in tc3, whose coordinates the sprite makes
  std::string SpriteSizeHlsl(std::string s) {
      const char* tc3 = "    o.tc3 = oT3;\n";
-@@ -2189,6 +2750,8 @@ void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
+@@ -2189,6 +2757,8 @@ void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
      k.topo = uint32_t(a.topology);
      k.has_rt = bound_rt_ != nullptr;
      k.has_ds = bound_ds_ != nullptr;
@@ -2480,7 +2680,7 @@ index fe65837..e9c340e 100644
      k.rtfmt = bound_rt_ ? bound_rt_->fmt : 0;
      KeyBlend(s, k);
      if (k.has_ds) KeyDepthStencil(s, a, k);
-@@ -2258,8 +2821,9 @@ void D3D12Backend::FillTexelConstants(int i, const TextureDesc& d, const DrawTex
+@@ -2258,8 +2828,9 @@ void D3D12Backend::FillTexelConstants(int i, const TextureDesc& d, const DrawTex
  void D3D12Backend::FillTextureConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages,
                                          DrawConstants& c) {
      for (int i = 0; i < 4; i++) {
@@ -2492,7 +2692,7 @@ index fe65837..e9c340e 100644
          if (stages.rt[i]) c.rtshift[i] = RenderTargetShift(s, sh);
          const auto& t = s.tss[size_t(i)];
          c.bump[i][0] = Bits(t[kTssBumpEnvMat00]);
-@@ -2421,10 +2985,15 @@ WRange DrawWRange(const State& s, bool program) {
+@@ -2421,10 +2992,15 @@ WRange DrawWRange(const State& s, bool program) {
  // ReversedDepthHlsl's zparams: x the w buffer's scale (0 for a z buffer), y its far w, z the polygon offset in units of
  // the clip w for a w buffer, of depth for a z buffer
  void D3D12Backend::FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const {
@@ -2508,7 +2708,7 @@ index fe65837..e9c340e 100644
          return;
      }
      WRange r = DrawWRange(s, sh.prog);
-@@ -2450,6 +3019,8 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+@@ -2450,6 +3026,8 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
      FillSurfaceConstants(s, size, c);
      // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
      if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
@@ -2517,7 +2717,7 @@ index fe65837..e9c340e 100644
      FillFogConstants(s, sh.prog, c);
      FillCombinerConstants(s, c);
      if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vsc), c.ext, bound_rt_, k.blend ? k.src : 1);
-@@ -2474,11 +3045,15 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+@@ -2474,11 +3052,15 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
  void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
      for (int i = 0; i < 4; i++) {
          ID3D12Resource* res = stages.res[i];
@@ -2537,7 +2737,7 @@ index fe65837..e9c340e 100644
          if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
              cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
          }
-@@ -2498,6 +3073,22 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
+@@ -2498,6 +3080,22 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
          for (uint32_t k = 0; k < n * 4; k++) fprintf(cap_, " %g", a.vertices[v * n * 4 + k]);
          fprintf(cap_, " ]");
      }
@@ -2560,7 +2760,7 @@ index fe65837..e9c340e 100644
      for (int r = 0; r < kVsConstants; r++) {
          const auto& v = s.vsc[r];
          if (v[0] || v[1] || v[2] || v[3]) {
-@@ -2512,19 +3103,46 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
+@@ -2512,19 +3110,46 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
  
  // the draw's line: its state, then its textures
  void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
@@ -2611,7 +2811,7 @@ index fe65837..e9c340e 100644
      fputc('\n', cap_);
  }
  
-@@ -2617,21 +3235,30 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
+@@ -2617,21 +3242,30 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
      binds_.samplers = samplers;
  }
  
@@ -2653,7 +2853,7 @@ index fe65837..e9c340e 100644
      }
      D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                      std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
-@@ -2648,6 +3275,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+@@ -2648,6 +3282,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
  void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
      float bf[4];
      Color(SimpleState(s, kMBlendColor), bf);
@@ -2669,7 +2869,7 @@ index fe65837..e9c340e 100644
      uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
      if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
      cl_->OMSetBlendFactor(bf);
-@@ -2849,18 +3485,34 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2849,18 +3492,34 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
      GuestExtent size;
      SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
      DrawConstants c{};
@@ -2706,7 +2906,7 @@ index fe65837..e9c340e 100644
      SetBlendFactorStencilRef(s);
  
      // geometry, counted while the title runs a visibility test
-@@ -2871,9 +3523,9 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2871,9 +3530,9 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
  
  // a guest rect scaled to the target and clamped to it
  D3D12_RECT ScaledRect(const Target& t, int x0, int y0, int x1, int y1) {
@@ -2719,7 +2919,7 @@ index fe65837..e9c340e 100644
  }
  
  // rs: the rects buffer, reused across targets
-@@ -2890,6 +3542,8 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
+@@ -2890,6 +3549,8 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
          rs.push_back(ScaledRect(t, int(v.x), int(v.y), int(v.x + v.w), int(v.y + v.h)));
      }
      if (t.depth) {
@@ -2728,7 +2928,7 @@ index fe65837..e9c340e 100644
          Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
          D3D12_CLEAR_FLAGS cf = D3D12_CLEAR_FLAGS(((c.flags & kClearZ) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
                                                   ((c.flags & kClearStencil) ? D3D12_CLEAR_FLAG_STENCIL : 0));
-@@ -2905,6 +3559,7 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
+@@ -2905,6 +3566,7 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
          for (int i = 0; t.range != 1 && i < 3; i++) col[i] /= t.range;
          // D3DCLEAR_TARGET_R/G/B/A are bits 4 to 7, D3D12's write mask has the same order
          uint8_t mask = uint8_t((c.flags & kClearTarget) >> 4);
@@ -2736,7 +2936,7 @@ index fe65837..e9c340e 100644
          if (mask == D3D12_COLOR_WRITE_ENABLE_ALL) {
              cl_->ClearRenderTargetView(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), col, UINT(rs.size()), rs.data());
          } else {
-@@ -2912,11 +3567,12 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
+@@ -2912,11 +3574,12 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
          }
      }
      t.drawn = true;
@@ -2751,7 +2951,7 @@ index fe65837..e9c340e 100644
      auto& pso = blit_psos_[Hash(kClearHlsl, std::strlen(kClearHlsl), seed)];
      if (pso) return pso.Get();
      uint64_t h;
-@@ -2924,14 +3580,15 @@ ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t
+@@ -2924,14 +3587,15 @@ ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t
      ID3DBlob* ps = Compile(kClearHlsl, "psmain", "ps_5_0", h);
      if (!vs || !ps) return nullptr;
      D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
@@ -2769,7 +2969,7 @@ index fe65837..e9c340e 100644
      if (!pso) {
          LOG_FIRST(4, "d3d12: channel clear pipeline failed, mask %X", mask);
          return;
-@@ -3048,8 +3705,8 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3048,8 +3712,8 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
      Transition(dst_t.res.Get(), dst_t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
      D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), dst_t.view, rtv_inc_);
      cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
@@ -2780,7 +2980,7 @@ index fe65837..e9c340e 100644
      bool listed = l.count && l.src_rects;
      uint32_t n = listed ? l.count : 1;
      for (uint32_t i = 0; i < n; i++) {
-@@ -3058,8 +3715,8 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3058,8 +3722,8 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
          DrawnRect r{.x0 = 0, .y0 = 0, .x1 = whole_w, .y1 = whole_h};
          if (listed) r = ReadDrawnRect(l.src_rects, l.dst_points, i);
          if (r.x1 <= r.x0 || r.y1 <= r.y0) continue;
@@ -2791,7 +2991,7 @@ index fe65837..e9c340e 100644
          LONG right = std::min(LONG(vp.TopLeftX + vp.Width), LONG(dst_t.w));
          LONG bottom = std::min(LONG(vp.TopLeftY + vp.Height), LONG(dst_t.h));
          D3D12_RECT scissor{LONG(vp.TopLeftX), LONG(vp.TopLeftY), right, bottom};
-@@ -3068,9 +3725,11 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3068,9 +3732,11 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
          cl_->RSSetScissorRects(1, &scissor);
          binds_ = {};
          float uv[4] = {r.x0 / src_t.gw, r.y0 / src_t.gh, (r.x1 - r.x0) / src_t.gw, (r.y1 - r.y0) / src_t.gh};
@@ -2805,7 +3005,7 @@ index fe65837..e9c340e 100644
          Blit(src_res, src_t.fmt, uv, o);
      }
      dst_t.drawn = true;
-@@ -3084,7 +3743,7 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
+@@ -3084,7 +3750,7 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
      Transition(dst_t.res.Get(), dst_t.state, D3D12_RESOURCE_STATE_COPY_DEST);
      D3D12_TEXTURE_COPY_LOCATION dl{dst_t.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
      D3D12_TEXTURE_COPY_LOCATION sl{src_res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
@@ -2814,7 +3014,7 @@ index fe65837..e9c340e 100644
      bool listed = l.count && l.src_rects;
      uint32_t n = listed ? l.count : 1;
      for (uint32_t i = 0; i < n; i++) {
-@@ -3094,15 +3753,15 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
+@@ -3094,15 +3760,15 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
          if (listed) {
              GuestRect r = ReadGuestRect(l.src_rects, i);
              b.left = ScaleUnsigned(r.left, dst_scale);
@@ -2833,7 +3033,7 @@ index fe65837..e9c340e 100644
              }
          }
          if (b.right <= b.left || b.bottom <= b.top || dx >= dst_t.w || dy >= dst_t.h) continue;
-@@ -3135,13 +3794,30 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
+@@ -3135,13 +3801,30 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
      Resolve(*src_t);
      Target* dst_t = EnsureTarget(dst, false);
      if (!dst_t || src_t == dst_t) return;
@@ -2869,7 +3069,31 @@ index fe65837..e9c340e 100644
      if (cap_) {
          char name[32];
          snprintf(name, sizeof(name), "%04u_copy_%08X", cap_i_, dst_t->data);
-@@ -3223,10 +3899,15 @@ void D3D12Backend::UploadGammaRamp() {
+@@ -3161,8 +3844,21 @@ void D3D12Backend::ResizeSwap() {
+         if (f.fence) WaitFence(f.fence);
+     }
+     for (auto& b : bb_) b.Reset();
+-    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+-    CreateBackBufferViews();
++    const HRESULT hr =
++        swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
++    if (FAILED(hr)) {
++        // ResizeBuffers leaves the swap chain as it was when it fails; rebuild the views so the
++        // frame can continue at the previous size, and report device loss explicitly.
++        LOGE("d3d12: ResizeBuffers(%ux%u) failed: 0x%08lX (device removed: 0x%08lX)", w, h, hr,
++             dev_->GetDeviceRemovedReason());
++        if (!CreateBackBufferViews())
++            LOGE("d3d12: back buffers are unavailable after a failed resize");
++        return;
++    }
++    if (!CreateBackBufferViews()) {
++        LOGE("d3d12: back buffer views failed after resize to %ux%u; keeping the old size", w, h);
++        return;
++    }
+     bb_w_ = w;
+     bb_h_ = h;
+ }
+@@ -3223,10 +3919,15 @@ void D3D12Backend::UploadGammaRamp() {
      cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
  }
  
@@ -2889,7 +3113,7 @@ index fe65837..e9c340e 100644
      float w = float(bb_w_);
      float h = float(bb_h_);
      float vw = std::min(w, h * aspect);
-@@ -3237,8 +3918,20 @@ void D3D12Backend::BlitFrame(Target& t) {
+@@ -3237,8 +3938,20 @@ void D3D12Backend::BlitFrame(Target& t) {
      cl_->RSSetViewports(1, &vp);
      cl_->RSSetScissorRects(1, &scissor);
      binds_ = {};
@@ -2912,7 +3136,7 @@ index fe65837..e9c340e 100644
  }
  
  void D3D12Backend::RenderUi() {
-@@ -3253,7 +3946,195 @@ void D3D12Backend::RenderUi() {
+@@ -3253,7 +3966,195 @@ void D3D12Backend::RenderUi() {
      ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_.Get());
  }
  
@@ -3109,7 +3333,7 @@ index fe65837..e9c340e 100644
      D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
      Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
      D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
-@@ -3261,7 +4142,7 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
+@@ -3261,7 +4162,7 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
      cl_->ClearRenderTargetView(rh, black, 0, nullptr);
      cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
      bound_rt_ = bound_ds_ = nullptr;
@@ -3118,7 +3342,7 @@ index fe65837..e9c340e 100644
      RenderUi();
      Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
  }
-@@ -3285,9 +4166,8 @@ void D3D12Backend::ReleaseOldTextures() {
+@@ -3285,9 +4186,8 @@ void D3D12Backend::ReleaseOldTextures() {
  void D3D12Backend::ResetFrame() {
      Frame& f = CurrentFrame();
      if (f.fence && fence_->GetCompletedValue() < f.fence) {
@@ -3129,7 +3353,7 @@ index fe65837..e9c340e 100644
      }
      f.alloc->Reset();
      f.garbage.clear();
-@@ -3333,11 +4213,12 @@ void LogPerf() {
+@@ -3333,11 +4233,12 @@ void LogPerf() {
               g_perf_sync_late.exchange(0) / n);
          LOGI("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB "
               "hashed | %.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f shrinks, "
@@ -3144,7 +3368,7 @@ index fe65837..e9c340e 100644
          g_perf = Perf{};
          perf_start = PerfClock::now();
          perf_frames = 0;
-@@ -3358,15 +4239,31 @@ void D3D12Backend::Present(const Surface& front) {
+@@ -3358,15 +4259,31 @@ void D3D12Backend::Present(const Surface& front) {
      if (ramp_dirty_) UploadGammaRamp();
      Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
  
@@ -3181,7 +3405,7 @@ index fe65837..e9c340e 100644
  
      presents_++;
      presents_seen_.store(presents_);
-@@ -3376,6 +4273,7 @@ void D3D12Backend::Present(const Surface& front) {
+@@ -3376,6 +4293,7 @@ void D3D12Backend::Present(const Surface& front) {
      CountFps();
      if (diag::Perf()) LogPerf();
      ApplySettings();
@@ -3189,7 +3413,7 @@ index fe65837..e9c340e 100644
  }
  
  // the slot is not reused before the caller's wait: the title runs at most one present ahead
-@@ -3384,29 +4282,116 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
+@@ -3384,29 +4302,116 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
      if (fence > fence_->GetCompletedValue()) fence_->SetEventOnCompletion(fence, nullptr);
  }
  
@@ -3312,7 +3536,7 @@ index fe65837..e9c340e 100644
      }
      return out;
  }
-@@ -3651,14 +4636,28 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
+@@ -3651,14 +4656,28 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
  }
  
  void D3D12Backend::CapSave(Target& t, const char* name) {
@@ -3343,7 +3567,7 @@ index fe65837..e9c340e 100644
      if (d == cap_rt_) return;
      auto it = targets_.find(TargetMapKey(cap_rt_, false));
      if (cap_rt_ && it != targets_.end()) {
-@@ -3677,9 +4676,12 @@ void D3D12Backend::CapStep(const Surface& rt) {
+@@ -3677,9 +4696,12 @@ void D3D12Backend::CapStep(const Surface& rt) {
  
  void D3D12Backend::Capture(Target& t, const char* tag, float mul) {
      if (!cap_) return;
@@ -4578,6 +4802,231 @@ index bec6e36..0fbb735 100644
  
  // the settings are fixed, a write changes nothing
  KERNEL_EXPORT(29, ExSaveNonVolatileSetting, 4) {
+diff --git a/runtime/xbe/grid_patch.h b/runtime/xbe/grid_patch.h
+new file mode 100644
+index 0000000..537634f
+--- /dev/null
++++ b/runtime/xbe/grid_patch.h
+@@ -0,0 +1,219 @@
++#pragma once
++// City-cell grid remainder fix, shared by the CMake generation step (tools/grid_patch) and the
++// first-launch compiler (runtime/app/game_code.cpp), so both paths produce identical code.
++//
++// The grid routines divide (coordinate + 1000) with signed idiv and use the remainder as a 3x3
++// bucket. A negative coordinate gives a negative remainder; the index becomes -1 and the 16-byte
++// record is written over the end of cell slot 8 (+0x70/+0x74), corrupting its pointers and crashing
++// the renderer. Only the divisions at the guest addresses below feed that index; make their
++// remainder the mathematical modulo by adding the divisor when it is negative. Non-negative
++// dividends are unchanged and the quotient is discarded in these routines.
++//
++// The sites are explicit. Before changing anything the patcher verifies, for every occurrence, the
++// guest address, the idiv operand, the divisor load and the divide-error trap in the generated
++// block. It also requires the exact number of occurrences, so a recompiler change that moves or
++// splits these routines fails the build instead of patching an unrelated division.
++#include <cstdint>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <sstream>
++#include <string>
++#include <system_error>
++#include <vector>
++
++namespace xbe {
++
++// Guest idiv instructions whose remainder feeds the 3x3 cell index. The recompiler emits
++// continuation entries for some functions, so the same address appears in more than one host
++// function; `occurrences` is the count across the configured partitions for this title.
++struct GridSite {
++    uint32_t address;
++    const char* operand;  // idiv operand, which must also be the divisor loaded into d
++    uint32_t occurrences;
++};
++
++inline constexpr GridSite kGridSites[] = {
++    {0x00138BCD, "ecx", 1},
++    {0x00138BE4, "edi", 1},
++    {0x0013F212, "ecx", 1},
++    {0x0013F229, "edi", 1},
++    {0x00146D30, "esi", 3},
++    {0x00146D7D, "ecx", 3},
++    {0x00147053, "esi", 2},
++    {0x0014709D, "ecx", 2},
++    {0x00147373, "edi", 2},
++    {0x001473BD, "ecx", 2},
++    {0x0014A5D1, "ecx", 1},
++    {0x0014A5F8, "esi", 1},
++};
++inline constexpr uint32_t kGridSiteCount = sizeof(kGridSites) / sizeof(kGridSites[0]);
++inline constexpr uint32_t kGridExpectedOccurrences = 20;
++
++struct GridPatchResult {
++    uint32_t files = 0;
++    uint32_t occurrences = 0;
++    std::string error;
++    bool ok() const { return error.empty(); }
++};
++
++inline std::string ToHex(uint32_t value, int digits = 8) {
++    char text[16];
++    std::snprintf(text, sizeof(text), "%0*X", digits, value);
++    return text;
++}
++
++inline bool ParseHex(const std::string& text, size_t at, size_t count, uint32_t& out) {
++    if (at + count > text.size()) return false;
++    uint32_t value = 0;
++    for (size_t i = 0; i < count; i++) {
++        const char ch = text[at + i];
++        const int digit = ch >= '0' && ch <= '9' ? ch - '0'
++                            : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10
++                            : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
++                                                     : -1;
++        if (digit < 0) return false;
++        value = value * 16 + uint32_t(digit);
++    }
++    out = value;
++    return true;
++}
++
++inline const GridSite* GridSiteAt(uint32_t address) {
++    for (const GridSite& site : kGridSites)
++        if (site.address == address) return &site;
++    return nullptr;
++}
++
++// Applies the fix to dir/x86_recomp.0..partitions-1.cpp. Every expected partition, site and
++// occurrence is required; files are replaced through a temporary file, and any mismatch is an
++// error. Calling it again on already-corrected sources verifies and accepts them.
++inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32_t partitions) {
++    GridPatchResult result;
++    if (!partitions) {
++        result.error = "the image has no recompiled partitions";
++        return result;
++    }
++    const std::string plain = "ctx.edx = (uint32_t)(n % d); }";
++    const std::string fixed =
++        "ctx.edx = (uint32_t)(n % d); if ((int32_t)ctx.edx < 0) ctx.edx += (uint32_t)d; }";
++    std::vector<uint32_t> seen(kGridSiteCount, 0);
++    for (uint32_t part = 0; part < partitions; part++) {
++        const std::filesystem::path file = dir / ("x86_recomp." + std::to_string(part) + ".cpp");
++        std::ifstream in(file, std::ios::binary);
++        if (!in) {
++            result.error = "cannot read " + file.string();
++            return result;
++        }
++        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++        in.close();
++        const bool trailing_newline = !text.empty() && text.back() == '\n';
++        std::vector<std::string> lines;
++        {
++            std::istringstream stream(text);
++            std::string line;
++            while (std::getline(stream, line)) lines.push_back(line);
++        }
++        bool changed = false;
++        for (size_t i = 0; i < lines.size(); i++) {
++            const std::string& line = lines[i];
++            const size_t comment = line.find("// ");
++            if (comment == std::string::npos) continue;
++            uint32_t address = 0;
++            if (!ParseHex(line, comment + 3, 8, address)) continue;
++            if (line.compare(comment + 12, 4, "idiv") != 0) continue;
++            const GridSite* site = GridSiteAt(address);
++            if (!site) continue;
++            const size_t operand_at = comment + 16;
++            if (operand_at >= line.size() || line[operand_at] != ' ') {
++                result.error = "malformed idiv comment at guest " + ToHex(address);
++                return result;
++            }
++            const size_t operand_end = line.find_first_of(" \t\r", operand_at + 1);
++            const std::string operand =
++                line.substr(operand_at + 1, operand_end == std::string::npos ? std::string::npos
++                                                                             : operand_end - operand_at - 1);
++            if (operand != site->operand) {
++                result.error = "guest " + ToHex(address) + " divides by " + operand + ", expected " +
++                               site->operand;
++                return result;
++            }
++            size_t target = i + 1;
++            while (target < lines.size() && lines[target].find_first_not_of(" \t\r") == std::string::npos) target++;
++            if (target == lines.size()) {
++                result.error = "the idiv block after guest " + ToHex(address) + " is missing";
++                return result;
++            }
++            const std::string& block = lines[target];
++            const std::string divisor = "int32_t d = (int32_t)ctx." + operand + ";";
++            const std::string trap = "x86_trap(ctx, 0x" + ToHex(address, 1) + ", \"divide error\");";
++            if (block.find("int64_t n = (int64_t)") == std::string::npos ||
++                block.find(divisor) == std::string::npos || block.find(trap) == std::string::npos) {
++                result.error = "guest " + ToHex(address) + " does not match the expected idiv block";
++                return result;
++            }
++            const size_t at = block.find(plain);
++            const size_t already = block.find(fixed);
++            if (at != std::string::npos) {
++                lines[target].replace(at, plain.size(), fixed);
++                changed = true;
++            } else if (already == std::string::npos) {
++                result.error = "unexpected idiv remainder after guest " + ToHex(address);
++                return result;
++            }
++            const size_t index = size_t(site - kGridSites);
++            seen[index]++;
++            result.occurrences++;
++        }
++        if (changed) {
++            std::filesystem::path temp = file;
++            temp += ".gridtmp";
++            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
++            if (!out) {
++                result.error = "cannot write " + temp.string();
++                return result;
++            }
++            for (size_t i = 0; i < lines.size(); i++) {
++                out << lines[i];
++                if (i + 1 < lines.size() || trailing_newline) out << '\n';
++            }
++            out.close();
++            if (!out) {
++                result.error = "write failed for " + temp.string();
++                std::error_code ignored;
++                std::filesystem::remove(temp, ignored);
++                return result;
++            }
++            std::error_code ec;
++            std::filesystem::remove(file, ec);
++            if (ec) {
++                result.error = "removing " + file.string() + " failed: " + ec.message();
++                std::filesystem::remove(temp, ec);
++                return result;
++            }
++            std::filesystem::rename(temp, file, ec);
++            if (ec) {
++                result.error = "replacing " + file.string() + " failed: " + ec.message();
++                std::filesystem::remove(temp, ec);
++                return result;
++            }
++        }
++        result.files++;
++    }
++    for (uint32_t i = 0; i < kGridSiteCount; i++) {
++        if (seen[i] != kGridSites[i].occurrences) {
++            result.error = "guest " + ToHex(kGridSites[i].address) + " appears " + std::to_string(seen[i]) +
++                           " time(s), expected " + std::to_string(kGridSites[i].occurrences);
++            return result;
++        }
++    }
++    if (result.occurrences != kGridExpectedOccurrences) {
++        result.error = "patched " + std::to_string(result.occurrences) + " sites, expected " +
++                       std::to_string(kGridExpectedOccurrences);
++        return result;
++    }
++    return result;
++}
++
++}  // namespace xbe
 diff --git a/runtime/xbe/xbe.h b/runtime/xbe/xbe.h
 index 3bdfad2..5f5d4de 100644
 --- a/runtime/xbe/xbe.h
@@ -23243,6 +23692,33 @@ index 0000000..20b96e6
 +};
 +
 +#endif
+diff --git a/tools/grid_patch/main.cpp b/tools/grid_patch/main.cpp
+new file mode 100644
+index 0000000..a20014f
+--- /dev/null
++++ b/tools/grid_patch/main.cpp
+@@ -0,0 +1,21 @@
++// Applies the city-cell grid remainder fix to the generated recompiled sources.
++// Used by the CMake generation step so every build produces the corrected code.
++#include <cstdio>
++#include <cstdlib>
++
++#include "xbe/grid_patch.h"
++
++int main(int argc, char** argv) {
++    if (argc != 3) {
++        std::fprintf(stderr, "usage: grid_patch <generated-dir> <partitions>\n");
++        return 2;
++    }
++    const uint32_t partitions = static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 10));
++    const xbe::GridPatchResult result = xbe::PatchGridSources(argv[1], partitions);
++    if (!result.ok()) {
++        std::fprintf(stderr, "grid_patch: %s\n", result.error.c_str());
++        return 1;
++    }
++    std::printf("grid_patch: %u file(s), %u site(s)\n", result.files, result.occurrences);
++    return 0;
++}
 diff --git a/xdk/5849/layout.toml b/xdk/5849/layout.toml
 index bb4f861..22fa1f0 100644
 --- a/xdk/5849/layout.toml

@@ -28,6 +28,7 @@
 #include "hook_exports.h"
 #include "image_symbols.h"
 #include "kernel/disc.h"
+#include "xbe/grid_patch.h"
 
 namespace dispatch {
 bool Load(const std::filesystem::path& dll);  // cpu/dispatch.cpp
@@ -249,21 +250,39 @@ class Processes {
 public:
     Processes() {
         job_ = CreateJobObjectW(nullptr, nullptr);
+        if (!job_) {
+            failure_ = L"Could not create the build job object (error " + std::to_wstring(GetLastError()) + L").";
+            return;
+        }
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limit{};
         limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &limit, sizeof(limit));
+        if (!SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &limit, sizeof(limit))) {
+            failure_ = L"Could not configure the build job object (error " + std::to_wstring(GetLastError()) + L").";
+            CloseHandle(job_);
+            job_ = nullptr;
+            return;
+        }
         SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
         DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
         DWORD attributes = FILE_ATTRIBUTE_NORMAL;
         log_ = CreateFileW(CompileLog().c_str(), FILE_APPEND_DATA, share, &inherit, CREATE_ALWAYS, attributes, nullptr);
+        if (log_ == INVALID_HANDLE_VALUE)
+            failure_ = L"Could not open " + CompileLog().wstring() + L" (error " + std::to_wstring(GetLastError()) + L").";
     }
     ~Processes() {
-        CloseHandle(job_);
+        if (job_) CloseHandle(job_);
         if (log_ != INVALID_HANDLE_VALUE) CloseHandle(log_);
     }
 
+    // empty when the job object and compile log are ready
+    const std::wstring& Failure() const { return failure_; }
+
     // null when it did not start; its output goes to logs\compile.log
     HANDLE Start(std::wstring command, const fs::path& dir) {
+        if (!job_ || log_ == INVALID_HANDLE_VALUE) {
+            LOGE("game code: the build process environment is not ready (%ls)", failure_.c_str());
+            return nullptr;
+        }
         STARTUPINFOW si{sizeof(si)};
         si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdOutput = log_;
@@ -274,8 +293,18 @@ public:
             LOGE("game code: could not start %ls (%lu)", command.c_str(), GetLastError());
             return nullptr;
         }
-        AssignProcessToJobObject(job_, pi.hProcess);
-        ResumeThread(pi.hThread);
+        if (!AssignProcessToJobObject(job_, pi.hProcess)) {
+            const DWORD error = GetLastError();
+            LOGE("game code: could not add %ls to the build job (%lu)", command.c_str(), error);
+            Discard(pi);
+            return nullptr;
+        }
+        if (ResumeThread(pi.hThread) == DWORD(-1)) {
+            const DWORD error = GetLastError();
+            LOGE("game code: could not resume %ls (%lu)", command.c_str(), error);
+            Discard(pi);
+            return nullptr;
+        }
         CloseHandle(pi.hThread);
         return pi.hProcess;
     }
@@ -283,71 +312,55 @@ public:
     // closes the process; 0 when it exited cleanly
     static DWORD ExitCode(HANDLE process) {
         DWORD code = 1;
-        GetExitCodeProcess(process, &code);
+        if (!GetExitCodeProcess(process, &code)) {
+            LOGE("game code: could not read a process exit code (%lu)", GetLastError());
+            code = 1;
+        }
         CloseHandle(process);
         return code;
     }
     static bool Succeeded(HANDLE process) { return ExitCode(process) == 0; }
 
-    // false when cancelled, which ends every process of the build
+    // false when cancelled or when waiting fails, which ends every process of the build
     bool WaitAll(std::vector<HANDLE>& processes) {
-        while (WaitForMultipleObjects(DWORD(processes.size()), processes.data(), TRUE, 250) == WAIT_TIMEOUT)
-            if (g_progress.cancel) return Cancel();
+        while (!processes.empty()) {
+            const DWORD wait = WaitForMultipleObjects(DWORD(processes.size()), processes.data(), TRUE, 250);
+            if (wait == WAIT_TIMEOUT) {
+                if (g_progress.cancel) return Cancel();
+                continue;
+            }
+            if (wait == WAIT_FAILED) {
+                const DWORD error = GetLastError();
+                LOGE("game code: waiting on the build processes failed (%lu)", error);
+                RecordFailure(L"Waiting on the build processes failed (error " + std::to_wstring(error) + L").");
+                return Cancel();
+            }
+            return true;  // WAIT_OBJECT_0: every process has ended
+        }
         return true;
     }
 
     bool Cancel() {
-        TerminateJobObject(job_, 1);
+        if (job_ && !TerminateJobObject(job_, 1))
+            LOGE("game code: could not end the build processes (%lu)", GetLastError());
         return false;
     }
 
 private:
+    static void Discard(PROCESS_INFORMATION& pi) {
+        // The child is still suspended, so it has run none of its own cleanup.
+        if (TerminateProcess(pi.hProcess, 1))
+            WaitForSingleObject(pi.hProcess, INFINITE);
+        else
+            LOGE("game code: could not terminate a suspended build process (%lu)", GetLastError());
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+
     HANDLE job_ = nullptr;
     HANDLE log_ = INVALID_HANDLE_VALUE;
+    std::wstring failure_;
 };
-
-// The city-cell grid routines divide (coordinate + 1000) with signed idiv and use the remainder as a
-// 3x3 bucket. A negative coordinate gives a negative remainder; the index becomes -1 and the 16-byte
-// record is written over the end of cell slot 8, corrupting its pointers and crashing the renderer.
-// Make the remainder the mathematical modulo for the divisions whose dividend is coordinate + 1000:
-// identical for non-negative dividends, and the intended 0..2 bucket for a negative one. The quotient
-// is discarded in these routines. Mirrors sdk/cmake/PatchGrid.cmake for the first-launch build.
-static void PatchGridRemainders(const fs::path& work) {
-    constexpr std::string_view plain = "ctx.edx = (uint32_t)(n % d); }";
-    constexpr std::string_view fixed =
-        "ctx.edx = (uint32_t)(n % d); if ((int32_t)ctx.edx < 0) ctx.edx += (uint32_t)d; }";
-    std::error_code ec;
-    for (uint32_t i = 0;; i++) {
-        const fs::path file = work / ("x86_recomp." + std::to_string(i) + ".cpp");
-        if (!fs::exists(file, ec)) break;
-        std::ifstream in(file, std::ios::binary);
-        if (!in) continue;
-        std::vector<std::string> lines;
-        std::string line;
-        while (std::getline(in, line)) lines.push_back(line);
-        in.close();
-        bool changed = false;
-        for (size_t n = 0; n < lines.size(); n++) {
-            if (lines[n].find(plain) == std::string::npos) continue;
-            std::string dividend;
-            for (size_t k = n; k > 0 && n - k <= 20;) {
-                --k;
-                if (lines[k].find("ctx.eax =") != std::string::npos) {
-                    dividend = lines[k];
-                    break;
-                }
-            }
-            if (dividend.find("0x3E8u") == std::string::npos || dividend.find('*') != std::string::npos) continue;
-            const size_t at = lines[n].find(plain);
-            lines[n].replace(at, plain.size(), fixed);
-            changed = true;
-        }
-        if (changed) {
-            std::ofstream out(file, std::ios::binary | std::ios::trunc);
-            for (const std::string& l : lines) out << l << '\n';
-        }
-    }
-}
 
 // xbe_recomp writes each image's C++ into its work folder, the images side by side
 bool Translate(std::vector<Target>& targets, Processes& run) {
@@ -375,8 +388,17 @@ bool Translate(std::vector<Target>& targets, Processes& run) {
         if (code == kDllNotFound) ok = RecordFailure(missing_runtime);
         else if (code) ok = RecordFailure(L"Translating " + std::wstring(xbe.begin(), xbe.end()) + L" failed.");
     }
-    if (ok)
-        for (Target& target : targets) PatchGridRemainders(WorkDir(*target.image));
+    if (ok) {
+        for (Target& target : targets) {
+            const xbe::GridPatchResult patch =
+                xbe::PatchGridSources(WorkDir(*target.image), PartitionCount(*target.image));
+            if (!patch.ok()) {
+                ok = RecordFailure(L"Applying the city-grid fix failed: " +
+                                   std::wstring(patch.error.begin(), patch.error.end()));
+                break;
+            }
+        }
+    }
     return ok;
 }
 
@@ -512,6 +534,7 @@ bool Link(const Target& target, Processes& run) {
 
 bool Build(std::vector<Target>& targets) {
     Processes run;
+    if (!run.Failure().empty()) return RecordFailure(run.Failure());
     if (!Translate(targets, run)) return false;
     std::vector<Job> jobs;
     for (const Target& target : targets) AddJobs(*target.image, jobs);

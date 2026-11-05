@@ -306,6 +306,9 @@ LONG CALLBACK GuestWatchHandler(EXCEPTION_POINTERS* e) {
     auto* c = e ? e->ContextRecord : nullptr;
     if (!r || !c || r->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
     if (!kernel::GuestWatchActive()) return EXCEPTION_CONTINUE_SEARCH;
+    // DR0 is the only breakpoint this project sets: ignore unrelated single-step exceptions and
+    // leave their status bits for whoever owns them.
+    if (!(c->Dr6 & 0x1ull)) return EXCEPTION_CONTINUE_SEARCH;
     const uint32_t watched = kernel::GuestWatchAddress();
     const uint32_t value = mem::IsCommitted(watched) ? kernel::R32(watched) : 0;
     static std::atomic<int> hits{0};
@@ -335,7 +338,7 @@ LONG CALLBACK GuestWatchHandler(EXCEPTION_POINTERS* e) {
             LOGE("watch: hit +%llX value %08X (no guest thread)", (unsigned long long)rva, value);
         }
     }
-    c->Dr6 = 0;
+    c->Dr6 &= ~0x1ull;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 

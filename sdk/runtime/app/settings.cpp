@@ -151,36 +151,62 @@ toml::table Table() {
 
 void Save() {
     // Two menus can save at once, and a failed write must not leave the live file truncated.
+    // Separate game instances share this file: every save uses its own exclusively created temporary
+    // file and publications are serialized by a named mutex. The last writer wins.
     SettingsLock guard;
     std::ostringstream out;
     out << Table() << "\n";
     const std::string text = out.str();
     const std::filesystem::path path = File();
-    const std::filesystem::path temp = path.wstring() + L".tmp";
-    {
-        std::ofstream f(temp, std::ios::binary | std::ios::trunc);
-        if (!f) {
-            LOGE("Settings: could not open %s", temp.string().c_str());
-            return;
+    const std::wstring path_text = path.wstring();
+
+    // Serialize publication between processes in this session.
+    uint32_t hash = 2166136261u;
+    for (wchar_t c : path_text) hash = (hash ^ uint32_t(c)) * 16777619u;
+    const std::wstring mutex_name = L"Local\\TrueCrimeNYCSettings-" + std::to_wstring(hash);
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, mutex_name.c_str());
+    const DWORD wait = mutex ? WaitForSingleObject(mutex, 5000) : WAIT_FAILED;
+    // WAIT_ABANDONED also grants ownership: the previous owner died while holding the mutex.
+    const bool locked = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+    if (mutex && !locked) LOGE("Settings: could not serialize publishing %s", path.string().c_str());
+
+    std::filesystem::path temp;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    static std::atomic<uint32_t> serial{0};
+    const DWORD pid = GetCurrentProcessId();
+    for (int attempt = 0; attempt < 64 && file == INVALID_HANDLE_VALUE; attempt++) {
+        temp = path_text + L".tmp." + std::to_wstring(pid) + L"." + std::to_wstring(serial.fetch_add(1));
+        file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_EXISTS) break;
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        LOGE("Settings: could not create a temporary file for %s (error %lu)", path.string().c_str(), GetLastError());
+        if (mutex) {
+            if (locked) ReleaseMutex(mutex);
+            CloseHandle(mutex);
         }
-        f.write(text.data(), std::streamsize(text.size()));
-        f.flush();
-        if (!f) {
-            LOGE("Settings: could not write %s", temp.string().c_str());
-            f.close();
-            DeleteFileW(temp.c_str());
-            return;
+        return;
+    }
+    DWORD written = 0;
+    const bool wrote = WriteFile(file, text.data(), DWORD(text.size()), &written, nullptr) &&
+                       written == DWORD(text.size()) && FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!wrote) {
+        LOGE("Settings: could not write %s (error %lu)", temp.string().c_str(), GetLastError());
+        DeleteFileW(temp.c_str());
+        if (mutex) {
+            if (locked) ReleaseMutex(mutex);
+            CloseHandle(mutex);
         }
-        f.close();
-        if (f.fail()) {
-            LOGE("Settings: could not close %s", temp.string().c_str());
-            DeleteFileW(temp.c_str());
-            return;
-        }
+        return;
     }
     if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         LOGE("Settings: could not replace %s (error %lu)", path.string().c_str(), GetLastError());
         DeleteFileW(temp.c_str());
+    }
+    if (mutex) {
+        if (locked) ReleaseMutex(mutex);
+        CloseHandle(mutex);
     }
 }
 
