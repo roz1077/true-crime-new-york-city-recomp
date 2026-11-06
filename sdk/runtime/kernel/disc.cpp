@@ -63,6 +63,7 @@ Disc::~Disc() {
 uint32_t Disc::ReadAt(uint64_t at, void* out, uint32_t len) const {
 #ifdef _WIN32
     thread_local HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (event) ResetEvent(event);
     OVERLAPPED o{};
     o.Offset = DWORD(at);
     o.OffsetHigh = DWORD(at >> 32);

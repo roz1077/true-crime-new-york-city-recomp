@@ -426,9 +426,12 @@ KERNEL_EXPORT(327, XeLoadSection, 1) {
     uint32_t refs = R32(sec + 0x18);
     if (refs == 0) {
         uint32_t va = R32(sec + 4), vsize = R32(sec + 8), raw = R32(sec + 12), rsize = R32(sec + 16);
-        mem::Commit(va, vsize);
+        if (!g_image || va < g_image->base ||
+            uint64_t(va) + vsize > uint64_t(g_image->base) + g_image->image_size)
+            return kInvalidParameter;
+        if (!mem::Commit(va, vsize)) return kNoMemory;
         std::memset(HostPtr(va), 0, vsize);
-        if (g_image && raw + rsize <= g_image->file.size())
+        if (uint64_t(raw) + rsize <= g_image->file.size() && rsize)
             std::memcpy(HostPtr(va), g_image->file.data() + raw, std::min(rsize, vsize));
         LOGI("XeLoadSection %s at %08X", ReadCString(R32(sec + 0x14)).c_str(), va);
     }
@@ -780,6 +783,7 @@ KERNEL_EXPORT(119, KeInsertQueueDpc, 3) {
 KERNEL_EXPORT(137, KeRemoveQueueDpc, 1) {
     uint8_t was = G<uint8_t>(a[0] + 2);
     G<uint8_t>(a[0] + 2) = 0;
+    CancelDpc(a[0]);
     return was;
 }
 
@@ -799,6 +803,7 @@ KERNEL_EXPORT(255, PsCreateSystemThreadEx, 10) {
     bool suspended = a[7] & 0xFF;
     uint32_t system = a[9];
     ThreadRef t = CreateThread(stack ? stack : 0x10000, tls, system, start, context, suspended);
+    if (!t) return kNoMemory;
     if (handle_out) W32(handle_out, NewHandle(t));
     if (id_out) W32(id_out, t->id);
     StartThread(t);
@@ -853,6 +858,7 @@ KERNEL_EXPORT(104, KeGetCurrentThread, 0) { return Current()->ethread; }
 
 KERNEL_EXPORT(254, PsCreateSystemThread, 5) {
     ThreadRef t = CreateThread(0x10000, 0, 0, a[2], a[3], false);
+    if (!t) return kNoMemory;
     if (a[0]) W32(a[0], NewHandle(t));
     if (a[1]) W32(a[1], t->id);
     StartThread(t);

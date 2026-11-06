@@ -126,7 +126,7 @@ code = read('sdk/runtime/core/input.cpp')
 # Keep actual state, fallback sampling and raw/direct routines. SDL device
 # enumeration is irrelevant to these deterministic clock/focus fixtures.
 state = code[code.index('uint32_t g_mouse_sensitivity_percent'):code.index('\nvoid AddPad(')]
-methods = code[code.index('void ReadMouse('):code.index('\nvoid Init()')]
+methods = code[code.index('void ApplyMouseDelta('):code.index('\nvoid Init()')]
 arbitration = code[code.index('    if (port == 0) {', code.index('Pad Poll(')):code.index('    if (app::kGame.pad)', code.index('Pad Poll('))]
 source = r'''
 #include <algorithm>
@@ -142,7 +142,7 @@ using HWND=void*; using HRAWINPUT=void*; using UINT=unsigned; using LONG=long;
 constexpr int VK_UP=1,VK_DOWN=2,VK_LEFT=3,VK_RIGHT=4,VK_ESCAPE=5,VK_TAB=6,
  VK_SPACE=7,VK_RBUTTON=8,VK_LBUTTON=9,VK_RETURN=10,VK_BACK=11,
  VK_MBUTTON=12,VK_XBUTTON1=13,VK_XBUTTON2=14,VK_CONTROL=15,VK_SHIFT=16,
- VK_LCONTROL=23,VK_LMENU=24,VK_NUMPAD7=17,VK_NUMPAD9=18,VK_NUMPAD5=19,VK_CAPITAL=20,VK_ADD=21,VK_OEM_PLUS=22;
+ VK_LCONTROL=23,VK_RCONTROL=25,VK_LMENU=24,VK_RMENU=26,VK_RSHIFT=27,VK_NUMPAD7=17,VK_NUMPAD9=18,VK_NUMPAD5=19,VK_CAPITAL=20,VK_ADD=21,VK_OEM_PLUS=22;
 uint64_t now=1000;
 uint64_t GetTickCount64() { return now; }
 bool focus=true;
@@ -150,6 +150,8 @@ void* GetForegroundWindow() { return focus ? reinterpret_cast<void*>(1) : nullpt
 bool keys[256]{};
 short GetAsyncKeyState(int key) { return key >= 0 && key < 256 && keys[key] ? short(0x8000) : 0; }
 namespace app { struct { bool (*keyboard_driving)() = nullptr; } kGame; void* Window() { return reinterpret_cast<void*>(1); } }
+struct RAWINPUTDEVICE { unsigned short usUsagePage, usUsage; unsigned long dwFlags; HWND hwndTarget; };
+bool RegisterRawInputDevices(const RAWINPUTDEVICE*, unsigned, unsigned) { return true; }
 struct RAWINPUTHEADER { unsigned dwType; };
 struct RAWINPUT { RAWINPUTHEADER header; struct { struct { unsigned usFlags; LONG lLastX,lLastY; unsigned short usButtonFlags,usButtonData; } mouse; } data; };
 constexpr unsigned RID_INPUT=1,RIM_TYPEMOUSE=0,MOUSE_MOVE_ABSOLUTE=1,RI_MOUSE_WHEEL=0x0800;
@@ -215,8 +217,9 @@ extern "C" __declspec(dllexport) int run() {
     if(ConsumeMouseAim(x,y)) return 29;
     // Actual keyboard polling must translate actions to the Xbox layout.
     Reset();
-    const int keycodes[] = {VK_SPACE, VK_LCONTROL, VK_LMENU, 'R', 'E', 'G', 'V', VK_RETURN, VK_BACK, VK_XBUTTON1, VK_XBUTTON2};
-    const int buttons[] = {3, 0, 2, 4, 5, 3, 1, 0, 1, 0, 2};
+    const int keycodes[] = {VK_SPACE, VK_LCONTROL, VK_LMENU, 'R', 'E', 'G', 'V', VK_RETURN, VK_BACK, VK_XBUTTON1,
+                            VK_XBUTTON2, VK_RCONTROL, VK_RMENU};
+    const int buttons[] = {3, 0, 2, 4, 5, 3, 1, 0, 1, 0, 2, 0, 2};
     for (unsigned i=0;i<sizeof(keycodes)/sizeof(keycodes[0]);++i) {
         keys[keycodes[i]]=true;
         Pad report; ReadKeyboardMouse(report);

@@ -401,7 +401,10 @@ void Pace(uint32_t max_fps) {
     next += period;
     if (next < now - period) next = now;
     while (clock::now() + std::chrono::milliseconds(2) < next) Sleep(1);
-    while (clock::now() < next) std::this_thread::yield();
+    // sleep the last short span instead of burning a core with yield()
+    if (const auto left = next - clock::now(); left > clock::duration::zero())
+        std::this_thread::sleep_for(std::min(left, std::chrono::duration_cast<clock::duration>(
+                                                             std::chrono::milliseconds(2))));
 }
 
 }  // namespace app

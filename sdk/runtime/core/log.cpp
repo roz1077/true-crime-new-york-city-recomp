@@ -66,6 +66,7 @@ void Write(Level lv, const char* fmt, ...) {
     char line[4300];
     int n = kVerbose ? std::snprintf(line, sizeof(line), "[%9.3f] [%s] [t%04zx] %s\n", t, names[int(lv)], size_t(tid), msg)
                      : std::snprintf(line, sizeof(line), "[%9.3f] %s%s\n", t, lv == Level::Error ? "error: " : "", msg);
+    if (n < 0) return;
     n = std::min(n, int(sizeof(line)) - 1);
     if (g_file) {
         std::fwrite(line, 1, size_t(n), g_file);

@@ -217,7 +217,7 @@ X86_FUNC(sub_0007DBD0) {
     __imp__sub_0007DBD0(ctx, base);
     const uint32_t world = X86_MEM32(kWorld);
     if (!world || index < 0 || index >= int(kTrafficRefCount)) return;
-    uint8_t *entry = base + world + 0x27A0 + uint32_t(index) * kTrafficRefStride;
+    const uint32_t entry = world + 0x27A0 + uint32_t(index) * kTrafficRefStride;
     // The scripted/random-crime vehicle queue reserves a model record at
     // weight 0. Left at 0, the availability mask no longer matches the
     // civilian refs and only police can spawn (the "Copland" state). The
@@ -227,7 +227,7 @@ X86_FUNC(sub_0007DBD0) {
     if (weight <= 0 && (caller == 0x1CC6Cu || caller == 0x1E492u)) {
         const int8_t slot = int8_t(X86_MEM8(entry + 2));
         for (uint32_t i = 0; i < kTrafficRefCount; i++) {
-            const uint8_t *ref = base + world + kTrafficRefs + i * kTrafficRefStride;
+            const uint32_t ref = world + kTrafficRefs + i * kTrafficRefStride;
             if (int16_t(X86_MEM16(ref + 6)) != slot) continue;
             const int16_t ref_weight = int16_t(X86_MEM16(ref + 8));
             if (ref_weight <= 0) continue;

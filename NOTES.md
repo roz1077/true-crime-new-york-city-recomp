@@ -1562,3 +1562,128 @@ Updated combat glyphs to CTL, ALT and V. Suppressed Windows Alt menu activation 
 At the user's explicit request, all 109 entries in cleanup-manifest.csv were subsequently deleted, including the 106 archived entries and the three entries originally marked retain (the capture directory and diagnostic r6/r7 staging directories). Verified that every listed target is absent. The manifest now records the deleted paths; the earlier archive-only description above is historical.
 
 The final Left Ctrl / Left Alt / V combat layout passed the release build and all 17 regression checks. Keyboard fixtures exercise the mouse side-button alternatives, primary combat keys, badge, driving pedals, preserved aim/lock keys, and Alt menu suppression with Alt+F4 still available. The SDK patch passed reverse application. README.md describes the resulting bindings. In-game contextual frisk/grapple and vehicle transitions remain manual checks.
+
+## 2026-11-06 - Native Linux port: current package and road-artifact investigation
+
+### Delivered package
+
+The native port is the delivery path: an SDL3 + Vulkan ELF that boots the recompiled game from `assets/`, an ISO, `--assets`, `--iso` or a positional path. The current package is:
+
+- `dist/TrueCrimeNYC-linux-x86_64.tar.gz`
+- size 11,098,881 bytes
+- SHA-256 `e3749a0c936e1c22a90e6c23424b3952f19922286fa29074b6e1ef5f63e26bcd`
+- requires glibc 2.38+, so SteamOS 3.6+; bundles `lib/libshaderc.so.1` with an `$ORIGIN/lib` runpath
+- validation runs: 0 Vulkan validation errors through the title and gameplay, including 4x MSAA,
+  SMAA, bloom, DOF and a 21:9 aspect
+
+The Windows executable is unchanged (`SHA-1 8511AD8588F0CA6A569D6D47B508DF00805C4A1E`); `TrueCrimeNYC.zip` was refreshed only for the updated docs (74,667,561 bytes).
+
+### Renderer parity work in this pass
+
+- Blend factors now follow the console GL values, including the constant-alpha factors `0x8003`/`0x8004` the light-buffer/road chain uses. The dynamic blend colour (`D3DRS_BLENDCOLOR`) is supplied for every draw and the pipeline includes `VK_DYNAMIC_STATE_BLEND_CONSTANTS`. This corrected the original white road band on the title screen.
+- Solid polygon offset (depth bias) and the D3D12 sampler behaviour (mip LOD bias, anisotropic setting, shadow samplers without anisotropy) match the Windows renderer.
+- Raw guest vertices (`XBE_RAW_VERTICES`), the render thread (`XBE_RENDER_THREAD`), descriptor-set ring reuse, target recreation only on size/format/pitch changes, full mip-chain uploads, BC block alignment, content-signature texture refresh, render-target feedback copies and the render-target sampling offset (`kTexTarget`/`rtshift`) are in place.
+- The present pass applies the title gamma ramp and the PC contrast curve; CPU-written frames (movies, legal screen) wait for the render thread before the guest decodes the next one.
+
+### Diagnostics added
+
+- `TCNYC_TRACE=1` plus **F3** saves `logs/trace_<frame>.tga` (guest front buffer), `logs/trace_<frame>_present.tga` (the finished swapchain image, after gamma, contrast and the overlay) and `logs/trace_<frame>.txt` (every draw with target, textures, blend factors/constants, depth and cull state).
+- `TCNYC_TRACE_AT=<frame>` captures a frame without pressing F3; `TCNYC_TRACE_EVERY=<n>` samples a run.
+- `TCNYC_DUMP_TARGETS=1` writes every live render target for a capture. `TCNYC_DUMP_TEX=<hex,...>` writes named source textures.
+
+### Road-artifact findings
+
+The earliest 11 F3 captures (frames 262, 646, 882, 961, 974, 1155, 1185, 1320, 1345, 1425, 1465) had correctly textured roads and no white band. Later captures reproduce the bad frames, but the cause is not the road texture draw:
+
+- In the worst frames the whole road is a flat gray/white band. The 320x240 downsample (e.g. `813A9000`) and the 256x256 accumulation buffer (`81AF8000`) already contain that band, and the final composite (`src = 0x304 DST_ALPHA`, `dst = ONE`) adds it to the main scene. The light/reflection chain is therefore the source, not the scene geometry.
+- Some night/rain shots (e.g. frame 1112) are legitimate wet-road reflections of the bright sky and street lights; those were previously being read as the same artifact. The defect is the hard-edged daytime variant.
+- Checked against the D3D12 backend and found matching: constant-alpha blend translation and dynamic blend colour, fog constants, target formats, sampler state, and vertex element formats in title/gameplay (no unknown element formats encountered).
+- The software reference renderer crashes (`EXIT 139`) when the title 3D scene starts, so it could not be used as a ground-truth A/B for these shots.
+
+Still open: identify whether the band is introduced in the 320x240 downsample, the 256x256 accumulation, or the final composite on the failing hardware. The next capture should come from the Deck with `TCNYC_TRACE=1 TCNYC_DUMP_TARGETS=1`, pressing F3 on the artifact, and include the guest TGA, the present TGA, the draw list and the `target_<frame>_*.tga` files.
+
+Parked (2026-11-06, at the user's request): the band framing was not resolving the actual complaint, and no concrete cause was proven for the road texture itself. The Linux-only changes kept from this pass are the D3D12-parity fixes that are defensible on their own: a compressed/cube/volume texture that shares a render target's address now samples the guest texture (D3D12 already does this), the missing visibility/occlusion-query path is implemented, and an oversized upload ring grows instead of ending an open render pass mid-draw. Shared renderer files and the Windows executable were deliberately left unchanged.
+
+Parity plan Phases 1-4 are implemented in the Vulkan backend (render scale and
+stretch; MSAA with colour and depth resolves; SMAA 1x using the reference shader
+and its area/search lookups; bloom, depth of field and the widescreen UI squeeze
+in the present pass). Targets carry guest and host extents, are created at the
+Graphics menu's percentage/aspect, scale viewport/scissor, mark sampled targets
+`kTexWide` with the shared `spreadtap` values, rebuild live when a setting
+changes, and scale target uploads/readbacks to and from guest memory. MSAA uses
+render-pass resolves (depth `MAX`, or `SAMPLE_ZERO` where the driver only offers
+that), pipelines key on the sample count and the resolved image is what gets
+sampled, read back and presented. SMAA and the post chain sample the resolved
+scene. Validated at 25/50/100% render scale, 4x/8x MSAA requests and 16:9/21:9
+aspects with 0 Vulkan validation errors.
+
+Texture packs and dumps are also implemented, in
+`platform/linux/texturedumper_linux.{h,cpp}`: the same key, folders and file
+names as the Windows backend, PNG via the vendored stb headers, DDS
+(DXT1/3/5/DX10) natively, an in-process DXT decoder for PNG dumps, asynchronous
+loading and a polled directory signature for pack changes. Dumping a full run
+produced 541 PNGs whose level 0 matches the DDS dump of the same key exactly,
+and a replacement pack (every dumped texture made solid magenta) changed the
+whole scene, confirming the swap path. The stb headers are noted in
+`sdk/THIRD_PARTY.txt`.
+
+Console point/line expansion and point sprites are now geometry stages as well:
+point/line pipelines get `PointHlsl`/`LineHlsl` compiled with shaderc (a
+geometry-stage copy of `VOut` without `SV_ClipDistance0`, because glslang's HLSL
+parser crashes on the struct copy), and a program's point list with point sprites
+enabled rewrites stage 3 to stage 0 and expands each point by `tc3.x` (oPts) with
+`SpriteHlsl`. Devices without geometry shaders keep the previous native
+points/lines. The shader-stage flags on the b0/b1 descriptor bindings gained
+`VK_SHADER_STAGE_GEOMETRY_BIT` for this.
+
+One root cause worth remembering: the Vulkan instance used to request 1.1, and
+the loader hides 1.2+ entry points from `vkGetDeviceProcAddr` in that case, so
+`vkCreateRenderPass2` resolved to a null trampoline. The instance now negotiates
+up to 1.3 and MSAA only enables when the render pass 2 path is available.
+
+The current package after this pass is `dist/TrueCrimeNYC-linux-x86_64.tar.gz`
+(11,098,881 bytes, SHA-256
+`e3749a0c936e1c22a90e6c23424b3952f19922286fa29074b6e1ef5f63e26bcd`). The
+Windows executable is still unchanged.
+
+### Remaining parity gaps versus Windows
+
+- HDR/range targets are not modelled; the title's scenes keep range 1.
+- Without `textureCompressionBC`, BC1/2/3 guest and replacement textures are decoded
+  to BGRA8 rather than falling back to the white 1x1 texture.
+- The software reference renderer has no Graphics overlay.
+
+## 2026-11-06 - Review fixes
+
+The full code review found and the current tree fixes these correctness issues:
+
+- Windows right Ctrl/Right Alt use real `VK_RCONTROL`/`VK_RMENU`; the mouse regression
+  harness now includes `ApplyMouseDelta` and the platform constants.
+- Linux SDL events have one owner (the window thread); guest threads no longer pump or
+  drain the queue, joystick hints are set before `SDL_Init`, and the XAPI port poller
+  uses `input::Connected` instead of running the pad filters/recorder.
+- The Vulkan texture view aspect uses the format's depth flag, not volume depth, so 2D
+  colour textures get colour views. CPU-uploaded targets are rebuilt single-sample
+  instead of being written to the resolve image, `AllocUpload` keeps its buffer with each
+  offset, pass reuse checks the full target shape, and `Sync`/`Copy` respect the dirty
+  epoch. `Clear` scales guest rects to the host target, stencil masks/reference are
+  applied, and `Present` resets its per-frame rings on every exit path.
+- D3D12 sampler descriptors are partitioned per frame; scratch RTVs are not borrowed
+  twice in a frame; target views and targets are retired after the fence; depth
+  signatures use the format's bytes per texel. The threaded backend joins its worker,
+  `FencePending` submits the inserted fence, and `GetReport` completes the list it
+  reports instead of relying on a later present.
+- Kernel fixes: directory queries keep the entry on `BufferTooSmall`, file query/set
+  paths take the file I/O lock, thread stacks/KPCRs are released on exit, allocator size
+  rounding rejects overflow, the ISO overlapped event is reset per read, ADPCM channels
+  are clamped, and the XBE section/boot bounds are checked.
+- Packaging and docs were refreshed: the Linux licence glob is optional, shaderc's
+  dependencies are checked, the WSL deck helper passes the assets path and refuses
+  unsafe directories, and README/LINUX_PORT_PLAN/OPTIMISATIONS no longer describe the
+  old renderer limits.
+- Deck/RADV validation found two driver-level bugs: D24S8 is not an optimal-tiling
+  sampled depth format on RADV (now D32S8 is selected from the supported depth formats),
+  and one render-done semaphore was reused across swapchain images (now one per image).
+  With the KHRONOS validation layer loaded, the 100% 4x MSAA + SMAA + bloom + DOF run
+  reports 0 VUIDs. The Deck package is `dist/TrueCrimeNYC-linux-x86_64.tar.gz`, 11,121,095
+  bytes, SHA-256 `216001c00e9cac31f8f08bc0c41a45014279919a9b8e2c2e5561dcb81a02e15b`.

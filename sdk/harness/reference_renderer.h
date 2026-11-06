@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <vector>
 
 #include "gpu/state.h"
 
@@ -13,5 +14,7 @@ void Copy(const gpu::Surface& src, const gpu::Surface& dst, uint32_t count, uint
 void Draw(const gpu::State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices);
 // 24 bit TGA of a surface's colour
 bool WriteTga(const gpu::Surface& s, const char* path);
+// the surface's colour as tightly packed RGBA8, top row first (the native window's frame)
+bool ReadRgba(const gpu::Surface& s, std::vector<uint8_t>& out, uint32_t& width, uint32_t& height);
 
 }  // namespace reference

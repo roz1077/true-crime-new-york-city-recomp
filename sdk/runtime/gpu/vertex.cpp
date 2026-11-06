@@ -378,11 +378,12 @@ constexpr uint64_t kRangedSpanPerVertex = 2;
 constexpr uint64_t kRangedSpanSlack = 64;
 
 // converted on the CPU: each element to a float4, vertices in range order when the indices are dense
-bool AssembleConverted(const State& s, const Inputs& inputs, const DrawRange& d, Assembled& out) {
+bool AssembleConverted(const State& s, const Inputs& inputs, const DrawRange& d, Assembled& out,
+                       bool force_converted) {
     using namespace kernel;
     int nregs = inputs.nregs;
     bool ranged = uint64_t(d.span) <= uint64_t(d.count) * kRangedSpanPerVertex + kRangedSpanSlack;
-    const bool native_strip = d.prim == 6 && s.simple[kMShadeMode >> 2] != 0x1D00;
+    const bool native_strip = !force_converted && d.prim == 6 && s.simple[kMShadeMode >> 2] != 0x1D00;
     std::vector<uint32_t> seq;
     if (!ranged || (!native_strip && d.ip)) {
         seq.resize(d.count);
@@ -469,7 +470,8 @@ void RetainVertexAttributes(State& s, uint32_t start, uint32_t count, const uint
     }
 }
 
-bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* ip, Assembled& out) {
+bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* ip, Assembled& out,
+              bool force_converted) {
     ResetAssembled(out);
     if (!count || prim < 1 || prim > 10) return false;
 
@@ -496,9 +498,9 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
     Inputs inputs = {*layout, regs, nregs};
 
     // the guest's own vertices when the input assembler can read every element of them
-    bool raw = kRawVertices && RawReadable(s, inputs);
+    bool raw = kRawVertices && !force_converted && RawReadable(s, inputs);
     if (raw) return AssembleRaw(s, inputs, d, out);
-    return AssembleConverted(s, inputs, d, out);
+    return AssembleConverted(s, inputs, d, out, force_converted);
 }
 
 }  // namespace gpu

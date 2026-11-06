@@ -131,8 +131,12 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_include_directories(${target} SYSTEM PRIVATE ${imgui_SOURCE_DIR})
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
+    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid d3dcompiler ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
     target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
+    if(MINGW)
+        # MinGW's driver needs the wide CRT startup for wWinMain; MSVC targets wire it from the entry name.
+        target_link_options(${target} PRIVATE -municode)
+    endif()
     target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
 
     # without a C runtime: the executable passes on what the code calls
@@ -143,7 +147,7 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_include_directories(${target}_code PRIVATE ${XBE_SDK_DIR}/runtime ${GEN})
     target_include_directories(${target}_code SYSTEM PRIVATE ${XBE_SDK_DIR}/runtime/cpu/freestanding)
     target_compile_definitions(${target}_code PRIVATE X86_GAME_CODE)
-    target_compile_options(${target}_code PRIVATE -fms-compatibility-version=19.40 -O2 -fno-strict-aliasing -nostdinc
+    target_compile_options(${target}_code PRIVATE -fms-extensions -fms-compatibility-version=19.40 -O2 -fno-strict-aliasing -nostdinc
         -nostdinc++ -w)
     target_link_libraries(${target}_code PRIVATE ${target})
     target_link_options(${target}_code PRIVATE -fuse-ld=lld -Wl,/noentry,/nodefaultlib,/opt:noicf

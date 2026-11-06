@@ -50,6 +50,9 @@ public:
     virtual void WaitResource(uint32_t /*resource*/) {}
     // until the GPU has drawn present number n, counted from 0; any thread
     virtual void WaitGpuFrame(uint64_t /*n*/) {}
+    // a CPU-written front buffer: wait until the renderer has read it, so the
+    // guest cannot decode the next movie frame into it mid-read
+    virtual void WaitPresent() {}
 
 private:
     uint32_t fence_ = 0;

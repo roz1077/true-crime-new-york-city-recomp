@@ -26,7 +26,7 @@ void UpdatePorts() {
     std::lock_guard<std::mutex> lock(g_ports_lock);
     uint32_t cur = 0;
     for (int p = 0; p < 4; p++)
-        if (input::Poll(p).connected) cur |= 1u << p;
+        if (input::Connected(p)) cur |= 1u << p;
     uint32_t old = R32(kGamepadType + XDK_XPP_Current);
     if (cur != old) {
         W32(kGamepadType + XDK_XPP_Changed, R32(kGamepadType + XDK_XPP_Changed) | (cur ^ old));
@@ -135,7 +135,7 @@ HLE_STDCALL(XInputGetCapabilities, 2) {
         port = it->second.port;
         generation = it->second.generation;
     }
-    const bool connected = input::Poll(int(port)).connected;
+    const bool connected = input::Connected(int(port));
     std::lock_guard<std::mutex> lock(g_ports_lock);
     auto it = g_handles.find(a[0]);
     if (it == g_handles.end() || it->second.generation != generation) return 6;

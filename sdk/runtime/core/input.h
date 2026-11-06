@@ -39,9 +39,19 @@ void UseDirectMouseAim();
 bool DirectAimRecent();
 // an overlay (the Graphics menu) owns the pointer: no look input, no direct aim
 void SetUiActive(bool active);
+bool UiActive();
 void RegisterMouse(void* window);
 void ReadMouse(void* raw_input);
+// SDL hosts: relative motion and wheel notches from the event loop
+void ReadMouseMotion(float dx, float dy);
+void ReadMouseWheel(float steps);
+// before the host's first SDL_Init: joystick backend hints
+void SetHints();
+// window thread: hot-plug notices from the host's event loop
+void GamepadAdded(int32_t id);
+void GamepadRemoved(int32_t id);
 void Init();  // window thread, before boot; the game code window starts it earlier
+bool Connected(int port);
 uint16_t HeldOnAnyController();  // face buttons as XINPUT_GAMEPAD_A/B/X/Y masks, GameInfo::pad left out
 // the controller on that port, then GameInfo::pad
 Pad Poll(int port);

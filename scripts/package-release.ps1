@@ -22,6 +22,7 @@ try {
         $zip.CreateEntry('assets/') | Out-Null
         Add-ReleaseFile (Join-Path $BuildDir 'TrueCrimeNYC.exe') 'TrueCrimeNYC.exe'
         Add-ReleaseFile (Join-Path $root 'README.md') 'README.md'
+        Add-ReleaseFile (Join-Path $root 'README-LINUX.md') 'README-LINUX.md'
         Add-ReleaseFile (Join-Path $SdkDir 'THIRD_PARTY.txt') 'THIRD_PARTY.txt'
 
         $compiler = (Resolve-Path -LiteralPath (Join-Path $BuildDir 'compiler')).Path

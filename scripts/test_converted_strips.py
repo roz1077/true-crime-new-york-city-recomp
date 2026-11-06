@@ -9,8 +9,9 @@ state = (root / 'sdk/runtime/gpu/state.h').read_text().replace('#pragma once', '
 header = (root / 'sdk/runtime/gpu/vertex.h').read_text().replace('#pragma once', '').replace('#include "gpu/state.h"', '')
 implementation = (root / 'sdk/runtime/gpu/vertex.cpp').read_text()
 implementation = implementation[implementation.index('namespace gpu {'):]
-previous = implementation.replace('const bool native_strip = d.prim == 6 && s.simple[kMShadeMode >> 2] != 0x1D00;',
-                                  'const bool native_strip = false;')
+previous = implementation.replace(
+    'const bool native_strip = !force_converted && d.prim == 6 && s.simple[kMShadeMode >> 2] != 0x1D00;',
+    'const bool native_strip = !force_converted && false;')
 assert previous != implementation
 previous = previous.replace('if (!ranged || (!native_strip && d.ip)) {', 'if (true) {')
 

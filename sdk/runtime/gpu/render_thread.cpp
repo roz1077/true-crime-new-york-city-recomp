@@ -39,7 +39,7 @@ constexpr uint32_t kBatchCommands = 64;
 
 // resource headers the render thread reads: common, data, lock, format, size
 constexpr uint32_t kHeaderBytes = 20, kHeaderSlot = 32;
-constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a copy is renewed after half a ring
+constexpr uint32_t kHeaderRing = 4u << 20;  // guest memory for header copies; a copy is renewed after half a ring
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
@@ -89,7 +89,7 @@ bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
     for (; i + 16 <= n; i += 16)
         diff = _mm_or_si128(diff, _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)),
                                                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i))));
-    if (!_mm_testz_si128(diff, diff)) return false;
+    if (_mm_movemask_epi8(_mm_cmpeq_epi8(diff, _mm_setzero_si128())) != 0xFFFF) return false;
     return i == n || !std::memcmp(a + i, b + i, n - i);
 }
 
@@ -101,7 +101,7 @@ public:
     explicit Threaded(std::unique_ptr<Backend> inner) : inner_(std::move(inner)), ranges_(StateRanges()) {
         ring_ = mem::AllocSystem(kHeaderRing, 64);
         cur_ = NewBatch();
-        std::thread([this] { Run(); }).detach();
+        thread_ = std::thread([this] { Run(); });
     }
     ~Threaded() override {
         {
@@ -109,9 +109,9 @@ public:
             stop_ = true;
         }
         cv_.notify_all();
-        std::unique_lock lock(m_);
-        // at exit the worker may be gone mid-batch: then the inner backend is left, not freed under it
-        if (!done_cv_.wait_for(lock, std::chrono::milliseconds(500), [&] { return exited_; })) (void)inner_.release();
+        // The worker owns the inner backend and touches this object's queue, mutexes and state:
+        // join it instead of destroying those under a detached thread.
+        if (thread_.joinable()) thread_.join();
     }
 
     bool Init(uint32_t width, uint32_t height) override { return inner_->Init(width, height); }
@@ -166,6 +166,10 @@ public:
         const auto t = perf ? Clock::now() : Clock::time_point{};
         Cmd c{Op::Copy};
         c.a = count;
+        if (count && (uint64_t(count) * 16 > kHeaderRing || uint64_t(count) * 8 > kHeaderRing)) {
+            LOG_FIRST(4, "render thread: CopyRects count %u does not fit the header ring", count);
+            return;
+        }
         c.b = count && src_rects ? Scratch(kernel::HostPtr(src_rects), count * 16) : 0;
         c.c = count && dst_points ? Scratch(kernel::HostPtr(dst_points), count * 8) : 0;
         c.s1 = src;
@@ -196,6 +200,8 @@ public:
         presents_++;
         last_present_ = id;
     }
+
+    void WaitPresent() override { Wait(last_present_, WaitFor::Frame, nullptr); }
 
     void Sync(uint32_t data, uint32_t) override { ReadBack(data, false); }
 
@@ -229,7 +235,11 @@ public:
     }
 
     uint32_t Fence() override { return uint32_t(cur_->id); }
-    bool FencePending(uint32_t fence) override { return fence > done_.load(); }
+    bool FencePending(uint32_t fence) override {
+        // an inserted fence names the batch still being recorded: make it runnable before polling
+        if (fence >= uint32_t(cur_->id)) Submit();
+        return fence > done_.load();
+    }
     void WaitFence(uint32_t fence) override { Wait(fence, WaitFor::Fence, "fence"); }
     bool Busy(uint32_t resource) override {
         auto it = last_use_.find(resource);
@@ -277,6 +287,10 @@ private:
 
     // bytes the render thread reads through a guest address, in the header ring
     uint32_t Scratch(const void* p, uint32_t n) {
+        if (!ring_ || n > kHeaderRing) {
+            LOG_FIRST(4, "render thread: a %u byte header copy does not fit the ring", n);
+            return 0;
+        }
         uint32_t size = (n + kHeaderSlot - 1) & ~(kHeaderSlot - 1);
         if (ring_pos_ % kHeaderRing + size > kHeaderRing) ring_pos_ += kHeaderRing - ring_pos_ % kHeaderRing;
         uint32_t at = ring_ + uint32_t(ring_pos_ % kHeaderRing);
@@ -297,7 +311,9 @@ private:
         HeaderCopy& c = r.key == header ? *r.value : headers_[header];
         r = {header, &c};
         if (c.made && !std::memcmp(c.bytes, now, kHeaderBytes) && ring_pos_ - c.made < kHeaderRing / 2) return c.at;
-        c.at = Scratch(now, kHeaderBytes);
+        const uint32_t at = Scratch(now, kHeaderBytes);
+        if (!at) return header;
+        c.at = at;
         c.made = ring_pos_;
         std::memcpy(c.bytes, now, kHeaderBytes);
         return c.at;
@@ -517,6 +533,7 @@ private:
     // the render thread
     State state_;
 
+    std::thread thread_;
     std::mutex m_;
     std::condition_variable cv_, done_cv_;
     std::deque<Batch*> queue_;

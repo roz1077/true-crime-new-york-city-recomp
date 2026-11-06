@@ -1061,7 +1061,7 @@ void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t rects
 void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     uint32_t draw = g_draws++;
     Assembled as;
-    if (!Assemble(s, prim, start, count, indices, as) || as.topology != Topology::Triangles) return;
+    if (!Assemble(s, prim, start, count, indices, as, true) || as.topology != Topology::Triangles) return;
     Plane rt = OpenPlane(s.rt);
     Plane zs = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? OpenPlane(s.zs) : Plane{};
     if (!rt.ok && !zs.ok) return;
@@ -1331,6 +1331,25 @@ bool WriteTga(const Surface& s, const char* path) {
         std::fwrite(row.data(), 1, row.size(), f);
     }
     std::fclose(f);
+    return true;
+}
+
+bool ReadRgba(const Surface& s, std::vector<uint8_t>& out, uint32_t& width, uint32_t& height) {
+    Plane p = OpenPlane(s);
+    if (!p.ok) return false;
+    width = p.w;
+    height = p.h;
+    out.resize(size_t(p.w) * p.h * 4);
+    for (uint32_t y = 0; y < p.h; y++) {
+        for (uint32_t x = 0; x < p.w; x++) {
+            Vec c = p.Load(x, y);
+            uint8_t* d = &out[(size_t(y) * p.w + x) * 4];
+            d[0] = uint8_t(Sat(c[0]) * 255);
+            d[1] = uint8_t(Sat(c[1]) * 255);
+            d[2] = uint8_t(Sat(c[2]) * 255);
+            d[3] = uint8_t(Sat(c[3]) * 255);
+        }
+    }
     return true;
 }
 

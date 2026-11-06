@@ -103,7 +103,7 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     LOGI("boot: title %08X, entry %08X, %zu sections", img.title_id, img.entry, img.sections.size());
     for (auto& l : img.libraries) LOGI("boot: library %-8s %u.%u.%u", l.name.c_str(), l.major, l.minor, l.build);
 
-    if (!img.image_size || img.header_size > img.file.size() ||
+    if (!img.image_size || img.header_size > img.file.size() || img.header_size > img.image_size ||
         uint64_t(img.base) + img.image_size > 0x100000000ull) {
         LOGE("boot: %s: image spans are invalid", xbe_name.c_str());
         return false;

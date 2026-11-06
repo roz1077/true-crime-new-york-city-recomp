@@ -92,3 +92,7 @@ FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+stb_image / stb_image_write v2.30 (https://github.com/nothings/stb), in platform/linux/third_party/stb
+
+Public domain (dual licensed MIT or Unlicense); see the end of each header for the full text. Used by the native Linux build for texture pack PNG loading and texture dump PNG writing.

@@ -1,5 +1,6 @@
 // The game in assets: its files, or a disc image (.iso) with this executable's xbe on it. The xbe must be the one
 // this executable was recompiled from; another release's would run its own data under this code.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -7,10 +8,13 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
-#include <cwctype>
+#include <cctype>
+#include <cstdlib>
 #include <fstream>
+#include <memory>
 
 #include "app/app.h"
 #include "core/log.h"
@@ -38,6 +42,24 @@ fs::path FindAssets() {
     return {};
 }
 
+std::string Narrow(const wchar_t* text) {
+    std::string out;
+    for (; *text; ++text) out += *text < 128 ? char(*text) : '?';
+    return out;
+}
+
+// telling the player what to fix; a host without dialog boxes logs it instead
+bool Alert(const wchar_t* text, bool question = false) {
+#ifdef _WIN32
+    const UINT flags = question ? MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2 : MB_ICONERROR;
+    return MessageBoxW(nullptr, text, kGame.short_title, flags) == IDYES;
+#else
+    LOGE("game: %s", Narrow(text).c_str());
+    // no dialog on this host: an explicit opt-in is the only way to accept another release
+    return question && std::getenv("TCNYC_ALLOW_OTHER_RELEASE") != nullptr;
+#endif
+}
+
 bool ReadHostFile(const fs::path& path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
@@ -61,16 +83,26 @@ std::string Sha1(const std::vector<uint8_t>& data) {
     return hex;
 }
 
-bool FindGame(GameFiles& game) {
-    fs::path assets = FindAssets();
-    std::vector<fs::path> isos;
+bool FindGame(GameFiles& game, std::string* error, const fs::path& location) {
+    const fs::path source = location.empty() ? FindAssets() : location;
     std::error_code ec;
-    if (!assets.empty())
-        for (auto& e : fs::directory_iterator(assets, ec)) {
-            std::wstring ext = e.path().extension().wstring();
-            std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
-            if (ext == L".iso" && e.is_regular_file(ec)) isos.push_back(e.path());
+    const bool source_iso = fs::is_regular_file(source, ec) && [&] {
+        std::string ext = source.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        return ext == ".iso";
+    }();
+    const fs::path dir = source_iso ? source.parent_path() : source;
+
+    std::vector<fs::path> isos;
+    if (source_iso) {
+        isos.push_back(source);
+    } else if (fs::is_directory(source, ec)) {
+        for (auto& e : fs::directory_iterator(source, ec)) {
+            std::string ext = e.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            if (ext == ".iso" && e.is_regular_file(ec)) isos.push_back(e.path());
         }
+    }
     std::sort(isos.begin(), isos.end());
 
     // the first copy with this xbe wins, the extracted files before any image; another release is kept to offer
@@ -82,12 +114,12 @@ bool FindGame(GameFiles& game) {
         bool match = sha == kImageSha1;
         LOGR("Game: %s in %s, sha1 %s%s", IMAGE_XBE, name.string().c_str(), sha.c_str(), match ? "" : ", another release");
         if (match) {
-            game = {assets, std::move(xbe)};
+            game = {dir, std::move(xbe)};
             kernel::MountDisc(std::move(disc));
             return true;
         }
         if (other_name.empty()) {
-            other = {assets, std::move(xbe)};
+            other = {dir, std::move(xbe)};
             other_disc = std::move(disc);
             other_name = name;
         }
@@ -95,12 +127,14 @@ bool FindGame(GameFiles& game) {
     };
 
     std::vector<uint8_t> xbe;
-    if (!assets.empty() && ReadHostFile(assets / IMAGE_XBE, xbe) && consider(assets, std::move(xbe), nullptr)) return true;
+    if (!source_iso && !source.empty() && fs::is_directory(source, ec) &&
+        ReadHostFile(source / IMAGE_XBE, xbe) && consider(source, std::move(xbe), nullptr))
+        return true;
     for (const fs::path& iso : isos) {
         auto disc = std::make_unique<kernel::Disc>();
-        std::string error;
-        if (!disc->Open(iso, error)) {
-            LOGW("game: %s: %s", iso.string().c_str(), error.c_str());
+        std::string why;
+        if (!disc->Open(iso, why)) {
+            LOGW("game: %s: %s", iso.string().c_str(), why.c_str());
             continue;
         }
         if (!disc->Load(IMAGE_XBE, xbe)) {
@@ -110,14 +144,20 @@ bool FindGame(GameFiles& game) {
         if (consider(iso, std::move(xbe), std::move(disc))) return true;
     }
 
+    const std::string searched = source.empty() ? std::string() : " (" + source.string() + ")";
     if (other_name.empty()) {
-        MessageBoxW(nullptr, kGame.missing, kGame.short_title, MB_ICONERROR);
+        Alert(kGame.missing);
+        if (error) *error = Narrow(kGame.missing) + searched;
         return false;
     }
     std::wstring text = other_name.filename().wstring() +
                         L" is a different release of the game than this build was made from, and will most likely "
                         L"crash.\n\nStart it anyway?";
-    if (MessageBoxW(nullptr, text.c_str(), kGame.short_title, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) return false;
+    if (!Alert(text.c_str(), true)) {
+        if (error) *error = other_name.filename().string() +
+                            " is a different release of the game than this build was made from.";
+        return false;
+    }
     game = std::move(other);
     kernel::MountDisc(std::move(other_disc));
     return true;

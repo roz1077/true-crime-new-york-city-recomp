@@ -85,7 +85,7 @@ uint32_t ParseInt(At at, uint32_t n, uint32_t base, uint32_t out) {
 }
 
 std::string Digits(uint32_t v, uint32_t base) {
-    if (!base) base = 10;
+    if (base != 2 && base != 8 && base != 10 && base != 16) base = 10;
     std::string s;
     do s.insert(s.begin(), "0123456789ABCDEF"[v % base]);
     while (v /= base);
@@ -169,7 +169,9 @@ KERNEL_EXPORT(317, RtlUpperString, 2) {
 
 static uint32_t CaseWide(uint32_t d, uint32_t s, bool alloc, uint16_t (*map)(uint16_t)) {
     if (alloc) {
-        W32(d + 4, mem::AllocSystem(Len(s) + 2u));
+        const uint32_t buf = mem::AllocSystem(Len(s) + 2u);
+        if (!buf) return kNoMemory;
+        W32(d + 4, buf);
         W16(d + 2, uint16_t(Len(s) + 2));
     } else if (Max(d) < Len(s)) {
         return kBufferTooSmall;
@@ -182,8 +184,10 @@ KERNEL_EXPORT(276, RtlDowncaseUnicodeString, 3) { return CaseWide(a[0], a[1], a[
 
 KERNEL_EXPORT(274, RtlCreateUnicodeString, 2) {
     uint32_t n = 0;
-    while (R16(a[1] + n)) n += 2;
+    while (n < 0xFFF0 && R16(a[1] + n)) n += 2;
+    if (n >= 0xFFF0) return 0;
     uint32_t buf = mem::AllocSystem(n + 2);
+    if (!buf) return 0;
     std::memcpy(HostPtr(buf), HostPtr(a[1]), n + 2);
     W16(a[0], uint16_t(n));
     W16(a[0] + 2, uint16_t(n + 2));

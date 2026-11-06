@@ -667,7 +667,7 @@ void Start() {
 void ReadFormat(Voice& v, uint32_t wfx) {
     if (!wfx) return;
     v.tag = R16(wfx);
-    v.channels = std::max<uint16_t>(R16(wfx + 2), 1);
+    v.channels = std::min<uint16_t>(std::max<uint16_t>(R16(wfx + 2), 1), 8);
     v.rate = R32(wfx + 4);
     v.align = std::max<uint16_t>(R16(wfx + 12), 1);
     v.bits = R16(wfx + 14);

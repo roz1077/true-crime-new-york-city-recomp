@@ -298,11 +298,15 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
         g_backend = gpu::CreateBackend();
         if (!g_backend->Init(w, h)) {
             LOGE("d3d: renderer init failed");
+#ifdef _WIN32
             // no owner window: this runs on the title's thread and the window may already be fullscreen over the box
             MessageBoxW(nullptr,
                         L"Direct3D 12 could not be started. Make sure your graphics card supports it and its driver "
                         L"is up to date.",
                         app::kGame.short_title, MB_ICONERROR | MB_TOPMOST);
+#else
+            LOGE("d3d: the renderer could not be started; see the log");
+#endif
             kernel::Shutdown(1);
         }
         if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
@@ -651,6 +655,7 @@ HLE_STDCALL(D3DDevice_GetDepthStencilSurface2, 0) {
 
 namespace {
 std::atomic<uint32_t> g_presents{0};
+uint32_t g_frame_draws = 0;  // draws since the last Swap: a frame with none presents a CPU-written buffer
 }  // namespace
 
 uint32_t d3d::PresentCount() { return g_presents.load(); }
@@ -713,7 +718,13 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     uint32_t shown = g_buffers[1];
     if (XDK_CDevice_Flags != xdk::kUnknown && (Dev(XDK_CDevice_Flags) & 0x4000) && Dev(kDevBackBuffer))
         shown = Dev(kDevBackBuffer);
-    if (g_backend) g_backend->Present(SurfaceOf(shown));
+    if (g_backend) {
+        g_backend->Present(SurfaceOf(shown));
+        // a frame with no draws presents a CPU-written buffer (movies, legal screen):
+        // wait for the renderer to finish reading it before the title writes the next one
+        if (!g_frame_draws) g_backend->WaitPresent();
+    }
+    g_frame_draws = 0;
     uint32_t interval = R32(kRenderState + gpu::kRsPresentationInterval * 4);
     if (app::kGame.swap_interval) interval = app::kGame.swap_interval(interval);
     app::Pace(interval >= 1 && interval <= 4 ? 60 / interval : interval == 0 ? 60 : 0);
@@ -777,6 +788,7 @@ HLE_STDCALL(D3DDevice_SetScissors, 3) {
 }
 
 HLE_STDCALL(D3DDevice_SetScreenSpaceOffset, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_state.ss_offset_x = ArgF(a, 0);
     g_state.ss_offset_y = ArgF(a, 1);
     UpdateViewportConstants();
@@ -786,12 +798,14 @@ HLE_STDCALL(D3DDevice_SetScreenSpaceOffset, 2) {
 // render states
 
 HLE_FASTCALL(D3DDevice_SetRenderState_Simple, 0) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t method = a[0] & 0x1FFC, value = a[1];
     SetSimple(method, value);
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_SetRenderStateNotInline, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t rs = a[0], v = a[1];
     if (rs < gpu::kRsDeferredFirst) {
         uint32_t method = R32(kSimpleEncode + rs * 4) & 0x1FFC;
@@ -805,6 +819,7 @@ HLE_STDCALL(D3DDevice_SetRenderStateNotInline, 2) {
 
 #define COMPLEX_STATE(name, rs)                       \
     HLE_STDCALL(D3DDevice_SetRenderState_##name, 1) { \
+        std::lock_guard<std::recursive_mutex> lock(g_lock); \
         SetComplex(rs, a[0]);                         \
         return 0;                                     \
     }
@@ -839,23 +854,28 @@ COMPLEX_STATE(RopZRead, gpu::kRsRopZRead)
 COMPLEX_STATE(DoNotCullUncompressed, gpu::kRsDoNotCullUncompressed)
 
 HLE_STDCALL(D3DDevice_SetTextureState_TexCoordIndex, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_state.tss[a[0] & 3][gpu::kTssTexCoordIndex] = a[1];
     W32(kTextureState + ((a[0] & 3) * kStageStates + gpu::kTssTexCoordIndex) * 4, a[1]);
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureState_BumpEnv, 3) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (a[1] >= gpu::kTssBumpEnvMat00 && a[1] <= gpu::kTssBumpEnvLOffset) g_state.tss[a[0] & 3][a[1]] = a[2];
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureState_BorderColor, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_state.tss[a[0] & 3][gpu::kTssBorderColor] = a[1];
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureState_ColorKeyColor, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_state.tss[a[0] & 3][gpu::kTssColorKeyColor] = a[1];
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureStageStateNotInline, 3) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t stage = a[0] & 3, type = a[1], v = a[2];
     if (type < gpu::kTssCount) {
         g_state.tss[stage][type] = v;
@@ -867,6 +887,7 @@ HLE_STDCALL(D3DDevice_SetTextureStageStateNotInline, 3) {
 // the XDK's transform types: view 0, projection 1, texture 2-5, world 6-9; the renderer keeps Direct3D 8's numbers
 // (view 2, projection 3, texture 16, world 256). The device copy is what GetTransform reads.
 HLE_STDCALL(D3DDevice_SetTransform, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t t = a[0];
     if (t >= 10) return 0;
     std::memcpy(HostPtr(kDevice + kDevTransforms + t * 64), HostPtr(a[1]), 64);
@@ -876,6 +897,7 @@ HLE_STDCALL(D3DDevice_SetTransform, 2) {
 }
 
 HLE_STDCALL(D3DDevice_SetMaterial, 1) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     std::memcpy(g_state.material.data(), HostPtr(a[0]), 17 * 4);
     return 0;
 }
@@ -1295,6 +1317,7 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     Walk(Dev(kDevPush));  // a visibility test begun since the last draw counts this one
     SyncDeferred();
     if (g_backend) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
+    g_frame_draws++;
     gpu::RetainVertexAttributes(g_state, a[1], a[2], nullptr);
     return 0;
 }
@@ -1305,6 +1328,7 @@ HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     SyncDeferred();
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
     if (g_backend) g_backend->Draw(g_state, a[0], 0, a[1], indices);
+    g_frame_draws++;
     gpu::RetainVertexAttributes(g_state, 0, a[1], indices);
     return 0;
 }
@@ -1339,10 +1363,15 @@ uint32_t UpVertices(const void* src, uint32_t bytes) {
 
 void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride) {
     if (!g_backend || !count || !stride) return;
+    if (uint64_t(count) * stride > kUpHalf) {
+        count = kUpHalf / stride;
+        if (!count) return;
+    }
     SyncDeferred();
     auto stream = g_state.streams[0];
     g_state.streams[0] = {UpVertices(vertices, count * stride), stride};
     g_backend->Draw(g_state, prim, 0, count, nullptr);
+    g_frame_draws++;
     gpu::RetainVertexAttributes(g_state, 0, count, nullptr);
     g_state.streams[0] = stream;
 }
@@ -1617,7 +1646,9 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
 // Common, Data, Lock, Size; the library runs Size less its last dword.
 HLE_STDCALL(D3DDevice_RunPushBuffer, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    uint32_t data = R32(a[0] + 4), size = R32(a[0] + 12);
+    uint32_t data = mem::VirtualFromPhysical(R32(a[0] + 4)), size = R32(a[0] + 12);
+    const uint32_t alloc = mem::AllocationSize(data);
+    if (size > alloc) size = alloc;
     LOG_FIRST(8, "d3d: RunPushBuffer %08X, %u bytes, first command %08X", data, size, size ? R32(data) : 0);
     if (a[1]) LOG_FIRST(1, "d3d: RunPushBuffer fixups are not applied");
     Walk(Dev(kDevPush));

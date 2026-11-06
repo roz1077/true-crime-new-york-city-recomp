@@ -49,7 +49,7 @@ struct Image {
 
 // as CMakePresets.json and CMakeLists.txt compile it for build.bat
 constexpr wchar_t kClangFlags[] =
-    L"-target x86_64-pc-windows-msvc -fms-compatibility-version=19.40 -std=c++20 -O2 -march=x86-64-v2 "
+    L"-target x86_64-pc-windows-msvc -fms-extensions -fms-compatibility-version=19.40 -std=c++20 -O2 -march=x86-64-v2 "
     L"-fno-strict-aliasing -DNDEBUG -DX86_GAME_CODE -nostdinc -nostdinc++ -w";
 constexpr wchar_t kLinkFlags[] = L"/dll /noentry /nodefaultlib /machine:x64 /opt:noicf";
 constexpr uint64_t kJobMemory = 512ull << 20;  // a compiler's peak on the biggest file is about half of this
@@ -188,7 +188,11 @@ std::vector<Target> StaleTargets(const GameFiles& game, const std::vector<Image>
             LOGR("Game code: no %s in the game files, %ls is not built", image.xbe.c_str(), image.exe.c_str());
             continue;
         }
-        if (!StampFor(image, target.xbe, target.stamp) || Current(target)) continue;
+        if (!StampFor(image, target.xbe, target.stamp)) {
+            RecordFailure(L"Could not read " + std::wstring(image.exe.begin(), image.exe.end()) + L".exe");
+            continue;
+        }
+        if (Current(target)) continue;
         stale.push_back(std::move(target));
     }
     return stale;
@@ -881,6 +885,12 @@ bool PrepareGameCode(const GameFiles& game) {
     }
     std::vector<Image> images = Images();
     std::vector<Target> stale = StaleTargets(game, images);
+    if (!g_failure.empty()) {
+        ShowFailure();
+        ReleaseMutex(lock);
+        CloseHandle(lock);
+        return false;
+    }
     for (const Target& target : stale) LOGR("Game code: building %ls.dll", target.image->exe.c_str());
     bool built = stale.empty() || BuildWithWindow(stale);
     bool loaded = false;

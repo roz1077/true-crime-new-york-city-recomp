@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <unordered_map>
 
 #include "kernel/disc.h"
 #include "kernel/kernel.h"
@@ -19,6 +20,7 @@ namespace {
 std::mutex g_links_lock;
 std::map<std::string, std::string> g_links;    // upper case "\??\D:" -> "\Device\CdRom0"
 std::map<std::string, fs::path> g_devices;     // upper case device -> host directory
+std::unordered_map<std::string, fs::path> g_resolved;  // Repeated streaming opens skip the directory scan.
 constexpr char kCdRom[] = "\\DEVICE\\CDROM0";
 
 std::string Upper(std::string s) {
@@ -48,6 +50,9 @@ bool Within(const fs::path& root, const fs::path& p) {
 // climbs above the mapped device, and the resolved host path must stay inside it even through a
 // symlink or junction.
 fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts) {
+    std::string cache_key = dir.string();
+    for (const std::string& part : parts) cache_key += "\\" + part;
+    if (auto hit = g_resolved.find(cache_key); hit != g_resolved.end()) return hit->second;
     fs::path cur = dir;
     size_t depth = 0;
     for (auto& part : parts) {
@@ -84,8 +89,10 @@ fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts) {
     const fs::path resolved = fs::weakly_canonical(cur, ec);
     if (ec || !Within(root, resolved)) {
         LOGW("files: refusing path outside %s: %s", dir.string().c_str(), cur.string().c_str());
+        g_resolved.erase(cache_key);
         return {};
     }
+    g_resolved.emplace(std::move(cache_key), resolved);
     return resolved;
 }
 
@@ -221,6 +228,7 @@ std::string ReadCString(uint32_t va, size_t max) {
 
 void MountDefaults(const std::string& game_dir, const std::string& data_dir) {
     std::lock_guard<std::mutex> lock(g_links_lock);
+    g_resolved.clear();
     fs::path d = data_dir;
     g_devices[kCdRom] = game_dir;
     g_devices["\\DEVICE\\HARDDISK0\\PARTITION1"] = d / "E";
@@ -239,6 +247,7 @@ void MountDefaults(const std::string& game_dir, const std::string& data_dir) {
 
 bool CreateSymbolicLink(const std::string& link, const std::string& target) {
     std::lock_guard<std::mutex> lock(g_links_lock);
+    g_resolved.clear();
     g_links[Upper(Normalize(link))] = Normalize(target);
     LOGI("files: link %s -> %s", link.c_str(), target.c_str());
     return true;
@@ -246,6 +255,7 @@ bool CreateSymbolicLink(const std::string& link, const std::string& target) {
 
 bool DeleteSymbolicLink(const std::string& link) {
     std::lock_guard<std::mutex> lock(g_links_lock);
+    g_resolved.clear();
     return g_links.erase(Upper(Normalize(link))) != 0;
 }
 
@@ -532,11 +542,17 @@ KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
     uint32_t h = a[0], iosb = a[1], out = a[2], len = a[3], cls = a[4];
     auto f = FileFromHandle(h);
     if (!f) return kInvalidHandle;
+    std::lock_guard<std::mutex> io(f->io);
     std::error_code ec;
     uint64_t size = f->dir ? 0 : f->entry ? f->entry->size : fs::file_size(f->host, ec);
     if (f->fp) {
         std::fflush(f->fp);
         size = fs::file_size(f->host, ec);
+    }
+    uint32_t need = cls == 4 ? 0x28 : cls == 5 ? 0x18 : cls == 14 ? 8 : cls == 34 ? 0x38 : 0;
+    if (need && len < need) {
+        IoStatus(iosb, kBufferTooSmall, need);
+        return kBufferTooSmall;
     }
     std::memset(HostPtr(out), 0, len);
     switch (cls) {
@@ -577,6 +593,7 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
     uint32_t h = a[0], iosb = a[1], in = a[2], cls = a[4];
     auto f = FileFromHandle(h);
     if (!f) return kInvalidHandle;
+    std::lock_guard<std::mutex> io(f->io);
     if (f->entry && cls != 14 && cls != 4) return kAccessDenied;
     std::error_code ec;
     switch (cls) {
@@ -674,6 +691,7 @@ KERNEL_EXPORT(207, NtQueryDirectoryFile, 10) {
              mask = a[8], restart = a[9];
     auto f = FileFromHandle(h);
     if (!f || !f->dir) return kInvalidHandle;
+    std::lock_guard<std::mutex> io(f->io);
     if (cls != 1) {
         LOG_FIRST(8, "NtQueryDirectoryFile: class %u", cls);
         return kInvalidParameter;
@@ -698,10 +716,14 @@ KERNEL_EXPORT(207, NtQueryDirectoryFile, 10) {
         IoStatus(iosb, kNoMoreFiles, 0);
         return f->next == 0 ? kNoSuchFile : kNoMoreFiles;
     }
-    size_t i = f->next++;
+    size_t i = f->next;
     std::string fname = f->entry ? f->disc_entries[i]->name : f->entries[i].path().filename().string();
     uint32_t need = 0x40 + uint32_t(fname.size());
-    if (len < need) return kBufferTooSmall;
+    if (len < need) {
+        IoStatus(iosb, kBufferTooSmall, 0);
+        return kBufferTooSmall;  // keep the entry for the retry with a larger buffer
+    }
+    f->next++;
     std::memset(HostPtr(out), 0, need);
     // times, sizes and attributes sit at the same place
     if (f->entry) FillNetworkInfo(out + 8, *f->disc_entries[i]);

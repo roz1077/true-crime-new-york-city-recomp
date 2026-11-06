@@ -29,14 +29,30 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         wf.wBitsPerSample = 32;
         wf.nBlockAlign = 8;
         wf.nAvgBytesPerSec = kRate * 8;
-        HRESULT hr = XAudio2Create(&xa, 0, XAUDIO2_DEFAULT_PROCESSOR);
+        // The mingw toolchains carry no XAudio2 import library; the DLL is part of
+        // Windows 8 and later, so bind it at run time.
+        using CreateFn = HRESULT(WINAPI*)(IXAudio2**, UINT32, XAUDIO2_PROCESSOR);
+        using CreateVersionFn = HRESULT(WINAPI*)(IXAudio2**, UINT32, XAUDIO2_PROCESSOR, DWORD);
+        HMODULE dll = LoadLibraryW(L"XAudio2_8.dll");
+        CreateFn create = dll ? reinterpret_cast<CreateFn>(reinterpret_cast<void*>(
+                                   GetProcAddress(dll, "XAudio2Create"))) : nullptr;
+        CreateVersionFn create_version = nullptr;
+        if (!create && dll)
+            create_version = reinterpret_cast<CreateVersionFn>(
+                reinterpret_cast<void*>(GetProcAddress(dll, "XAudio2CreateWithVersionInfo")));
+        HRESULT hr = create ? create(&xa, 0, XAUDIO2_DEFAULT_PROCESSOR)
+                            : create_version ? create_version(&xa, 0, XAUDIO2_DEFAULT_PROCESSOR, 0x0A000000)
+                                             : E_FAIL;
         if (SUCCEEDED(hr)) hr = xa->CreateMasteringVoice(&master);
         if (SUCCEEDED(hr)) hr = xa->CreateSourceVoice(&voice, &wf);
         if (FAILED(hr)) {
             LOGE("audio: XAudio2 unavailable (%08X), no sound", unsigned(hr));
             return;
         }
-        voice->Start();
+        if (FAILED(voice->Start())) {
+            LOGE("audio: XAudio2 source voice could not start");
+            return;
+        }
         constexpr uint32_t kFrames = kRate / 100;
         constexpr uint32_t kMinQueued = 3;
         constexpr uint32_t kMaxQueued = 10;
@@ -61,7 +77,10 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
             XAUDIO2_BUFFER xb{};
             xb.AudioBytes = kFrames * 8;
             xb.pAudioData = reinterpret_cast<const BYTE*>(b);
-            voice->SubmitSourceBuffer(&xb);
+            if (FAILED(voice->SubmitSourceBuffer(&xb))) {
+                LOGE("audio: XAudio2 could not queue a buffer, stopping output");
+                return;
+            }
             n++;  // only a submitted buffer takes a slot, XAudio2 still reads the queued ones
         }
     }).detach();

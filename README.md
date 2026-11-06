@@ -15,6 +15,18 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 
 If an ISO or extracted game files are already in `assets`, click **Launch** without browsing. To switch dumps, move the previous ISO or extracted files out of `assets` first. Recomp settings are stored in `settings.toml` beside the executable.
 
+## Linux / SteamOS (native)
+
+A native SDL3 + Vulkan build lives in `platform/linux`; see `README-LINUX.md` for
+install/Steam steps and `LINUX_PORT_PLAN.md` for the build and run steps. It takes
+`--assets <folder>`, `--iso <image>` or a positional path, and otherwise uses `assets/`
+beside the executable. Settings are stored under `$XDG_CONFIG_HOME/TrueCrimeNYC`, shader
+caches under `$XDG_CACHE_HOME/TrueCrimeNYC`, and logs in `logs/` beside the executable.
+
+The native renderer applies the Graphics menu's render scale, aspect/stretch, MSAA,
+SMAA, bloom, depth of field and console point/line expansion. See `README-LINUX.md` for
+the remaining driver limit (HDR/range targets; compressed textures are decoded on drivers without BC support).
+
 ## Features
 
 ### Graphics menu

@@ -10,7 +10,9 @@
 #include <utility>
 
 #define NOMINMAX
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <SDL3/SDL.h>
 
 #include "app/app.h"
@@ -94,10 +96,65 @@ void DeferMouseAim() {
     g_aim_x = g_aim_y = 0;
 }
 
-bool ReadKeyboardMouse(Pad& pad) {
+// the clock the camera and the mouse sample use
+uint64_t NowMs() {
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    return SDL_GetTicks();
+#endif
+}
+
+// keyboard and mouse state: XInput-style virtual keys on Windows, SDL scancodes
+// elsewhere; both feed the same PC mapping below
+#ifdef _WIN32
+bool HeldCode(int code) { return (GetAsyncKeyState(code) & 0x8000) != 0; }
+constexpr int kKeyUp = VK_UP, kKeyDown = VK_DOWN, kKeyLeft = VK_LEFT, kKeyRight = VK_RIGHT;
+constexpr int kKeyEscape = VK_ESCAPE, kKeyTab = VK_TAB, kKeyReturn = VK_RETURN, kKeyBack = VK_BACK;
+constexpr int kKeySpace = VK_SPACE, kKeyShift = VK_SHIFT, kKeyRShift = VK_RSHIFT, kKeyLCtrl = VK_LCONTROL,
+              kKeyRCtrl = VK_RCONTROL, kKeyLAlt = VK_LMENU, kKeyRAlt = VK_RMENU;
+bool HeldChar(char c) { return HeldCode(int(uint8_t(c))); }
+#else
+bool HeldCode(int code) {
+    int count = 0;
+    const bool* keys = SDL_GetKeyboardState(&count);
+    return keys && code >= 0 && code < count && keys[code];
+}
+constexpr int kKeyUp = SDL_SCANCODE_UP, kKeyDown = SDL_SCANCODE_DOWN, kKeyLeft = SDL_SCANCODE_LEFT,
+              kKeyRight = SDL_SCANCODE_RIGHT;
+constexpr int kKeyEscape = SDL_SCANCODE_ESCAPE, kKeyTab = SDL_SCANCODE_TAB, kKeyReturn = SDL_SCANCODE_RETURN,
+              kKeyBack = SDL_SCANCODE_BACKSPACE, kKeySpace = SDL_SCANCODE_SPACE, kKeyShift = SDL_SCANCODE_LSHIFT,
+              kKeyRShift = SDL_SCANCODE_RSHIFT, kKeyLCtrl = SDL_SCANCODE_LCTRL, kKeyRCtrl = SDL_SCANCODE_RCTRL,
+              kKeyLAlt = SDL_SCANCODE_LALT, kKeyRAlt = SDL_SCANCODE_RALT;
+bool HeldChar(char c) { return HeldCode(SDL_GetScancodeFromKey(SDL_Keycode(uint8_t(c) | 0x20), nullptr)); }
+#endif
+
+// 0 left, 1 middle, 2 right, 3 the first side button, 4 the second
+bool MouseHeld(int button) {
+#ifdef _WIN32
+    constexpr int keys[] = {VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+    return HeldCode(keys[button]);
+#else
+    const SDL_MouseButtonFlags state = SDL_GetMouseState(nullptr, nullptr);
+    constexpr SDL_MouseButtonFlags masks[] = {SDL_BUTTON_LMASK, SDL_BUTTON_MMASK, SDL_BUTTON_RMASK,
+                                              SDL_BUTTON_X1MASK, SDL_BUTTON_X2MASK};
+    return (state & masks[button]) != 0;
+#endif
+}
+
+bool WindowFocused() {
+#ifdef _WIN32
     const auto window = static_cast<HWND>(app::Window());
+    return window && GetForegroundWindow() == window;
+#else
+    const auto window = static_cast<SDL_Window*>(app::Window());
+    return window && (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+#endif
+}
+
+bool ReadKeyboardMouse(Pad& pad) {
     static std::atomic<bool> had_focus{true};
-    const bool focused = window && GetForegroundWindow() == window;
+    const bool focused = WindowFocused();
     if (had_focus.exchange(focused, std::memory_order_relaxed) != focused)
         LOGR("input: game window %s focus", focused ? "regained" : "lost");
     if (!focused) {
@@ -110,49 +167,51 @@ bool ReadKeyboardMouse(Pad& pad) {
         g_direct_used_at.store(0, std::memory_order_relaxed);
         return false;
     }
-    auto held = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
+    auto held = [](int key) { return HeldCode(key); };
     // Keyboard movement is digital, and a diagonal is normalized to the same
     // length as a straight push (full / sqrt(2)), like the PC's keyboard input.
     // A real controller keeps its own analog values in Poll().
-    const int move_x = int(held('D')) - int(held('A'));
-    const int move_y = int(held('W')) - int(held('S'));
+    const int move_x = int(HeldChar('D')) - int(HeldChar('A'));
+    const int move_y = int(HeldChar('W')) - int(HeldChar('S'));
     const int move_scale = move_x && move_y ? 23170 : 32767;
     pad.lx = int16_t(move_x * move_scale);
     pad.ly = int16_t(move_y * move_scale);
-    constexpr int digital[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_TAB, kLeftStickClickKey, 0};
-    for (int i = 0; i < 8; ++i)
-        if (digital[i] && held(digital[i])) pad.buttons |= uint16_t(1 << i);
+    const int digital[] = {kKeyUp, kKeyDown, kKeyLeft, kKeyRight, kKeyEscape, kKeyTab, 0, 0};
+    const bool stick_click = HeldChar(kLeftStickClickKey);
+    for (int i = 0; i < 8; ++i) {
+        if (i == 6 ? stick_click : (digital[i] && held(digital[i]))) pad.buttons |= uint16_t(1 << i);
+    }
     // Preserve the user's preferred aim/lock layout.
-    if (held(VK_SHIFT)) pad.buttons |= uint16_t(1 << 7);
-    if (held('Q')) pad.buttons |= uint16_t(1 << 5); // Back: badge / horn / siren
+    if (held(kKeyShift) || held(kKeyRShift)) pad.buttons |= uint16_t(1 << 7);
+    if (HeldChar('Q')) pad.buttons |= uint16_t(1 << 5); // Back: badge / horn / siren
 
     auto press = [&](int button, bool on) {
         if (on) pad.analog[button] = 255;
     };
     const bool driving = app::kGame.keyboard_driving && app::kGame.keyboard_driving();
-    press(0, held(VK_RETURN)); // A: menu confirmation
-    press(1, held(VK_BACK));   // B: menu cancel
+    press(0, held(kKeyReturn)); // A: menu confirmation
+    press(1, held(kKeyBack));   // B: menu cancel
     if (driving) {
-        press(0, held('W')); // A: accelerate
-        press(2, held('S')); // X: brake / reverse
-        press(1, held(VK_SPACE)); // B: handbrake
+        press(0, HeldChar('W')); // A: accelerate
+        press(2, HeldChar('S')); // X: brake / reverse
+        press(1, held(kKeySpace)); // B: handbrake
         pad.ly = 0; // steering uses the horizontal stick axis
     } else {
-        press(0, held(VK_LCONTROL) || held(VK_XBUTTON1)); // A: light attack
-        press(2, held(VK_LMENU) || held(VK_XBUTTON2)); // X: heavy attack
-        if (char key = LetterKey(g_heavy_attack_key, 0)) press(2, held(key));
-        press(1, held('V')); // B: grapple / human shield
-        press(3, held(VK_SPACE)); // Y: jump
-        if (char key = LetterKey(g_climb_key, 'G')) press(3, held(key)); // Y: jump / climb
+        press(0, held(kKeyLCtrl) || held(kKeyRCtrl) || MouseHeld(3)); // A: light attack
+        press(2, held(kKeyLAlt) || held(kKeyRAlt) || MouseHeld(4)); // X: heavy attack
+        if (char key = LetterKey(g_heavy_attack_key, 0)) press(2, HeldChar(key));
+        press(1, HeldChar('V')); // B: grapple / human shield
+        press(3, held(kKeySpace)); // Y: jump
+        if (char key = LetterKey(g_climb_key, 'G')) press(3, HeldChar(key)); // Y: jump / climb
     }
-    if (char key = LetterKey(g_reload_key, 'R')) press(4, held(key)); // Black: reload / block
-    if (char key = LetterKey(g_use_key, 'E')) press(5, held(key)); // White: use / enter vehicle
-    press(6, held(VK_MBUTTON) || held(VK_RBUTTON));
-    press(7, held(VK_LBUTTON));
+    if (char key = LetterKey(g_reload_key, 'R')) press(4, HeldChar(key)); // Black: reload / block
+    if (char key = LetterKey(g_use_key, 'E')) press(5, HeldChar(key)); // White: use / enter vehicle
+    press(6, MouseHeld(1) || MouseHeld(2));
+    press(7, MouseHeld(0));
     bool mouse_active;
     {
         std::lock_guard lock(g_mouse_lock);
-        const uint64_t now = GetTickCount64();
+        const uint64_t now = NowMs();
         const bool ui = g_ui_active.load(std::memory_order_relaxed);
         const bool direct = DirectAimLive(now);
         static bool was_direct = false;
@@ -212,8 +271,9 @@ bool ReadKeyboardMouse(Pad& pad) {
             g_wheel_steps++;
         }
     }
-    return pad.lx || pad.ly || mouse_active || pad.buttons ||
-           std::any_of(std::begin(pad.analog), std::end(pad.analog), [](uint8_t value) { return value != 0; });
+    const bool active = pad.lx || pad.ly || mouse_active || pad.buttons ||
+                        std::any_of(std::begin(pad.analog), std::end(pad.analog), [](uint8_t value) { return value != 0; });
+    return active;
 }
 
 void AddPad(SDL_JoystickID id) {
@@ -237,51 +297,73 @@ void RemovePad(SDL_JoystickID id) {
     }
 }
 
-// once a millisecond at most, however many ports and threads read
+// once a millisecond at most, however many ports and threads read.
+// Linux owns the SDL event queue on the window thread (GamepadAdded/Removed), so only the
+// Windows host pumps it here; SDL_PumpEvents must not run on guest threads.
 void UpdatePads() {
+#ifdef _WIN32
     static uint64_t last = 0;
     uint64_t now = SDL_GetTicks();
     if (!g_sdl || now == last) return;
     last = now;
     SDL_PumpEvents();
     SDL_Event e;
-    while (SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) == 1) {
+    while (SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_REMOVED) == 1) {
         if (e.type == SDL_EVENT_GAMEPAD_ADDED) AddPad(e.gdevice.which);
         else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) RemovePad(e.gdevice.which);
     }
+#else
+    (void)0;
+#endif
 }
 
 }  // namespace
+
+// Window thread, before the first SDL_Init: these hints shape the joystick subsystem.
+void SetHints() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
+        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+        SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "1");
+        SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
+        SDL_SetHint(SDL_HINT_XINPUT_ENABLED, "0");
+        SDL_SetHint(SDL_HINT_JOYSTICK_DIRECTINPUT, "0");
+    });
+}
+
+void GamepadAdded(int32_t id) {
+    std::lock_guard lock(g_lock);
+    AddPad(SDL_JoystickID(id));
+}
+
+void GamepadRemoved(int32_t id) {
+    std::lock_guard lock(g_lock);
+    RemovePad(SDL_JoystickID(id));
+}
+
+bool Connected(int port) {
+    std::lock_guard lock(g_lock);
+    UpdatePads();
+    return port >= 0 && port < 4 && g_pads[port];
+}
 
 PromptStyle ControllerPromptStyle() {
     if (g_keyboard_mouse_active.load(std::memory_order_relaxed)) return PromptStyle::KeyboardMouse;
     return g_prompt_style.load(std::memory_order_relaxed);
 }
 
-void RegisterMouse(void* window) {
-    const RAWINPUTDEVICE mouse{0x01, 0x02, 0, static_cast<HWND>(window)};
-    if (!RegisterRawInputDevices(&mouse, 1, sizeof(mouse))) LOGE("input: could not register raw mouse");
-}
-
-void ReadMouse(void* raw_input) {
-    RAWINPUT input{};
-    UINT size = sizeof(input);
-    if (GetRawInputData(static_cast<HRAWINPUT>(raw_input), RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) !=
-            sizeof(input) ||
-        input.header.dwType != RIM_TYPEMOUSE || (input.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE))
-        return;
+// relative motion and wheel notches from the window thread; the Windows path
+// takes them from WM_INPUT, the SDL path from MOUSE_MOTION / MOUSE_WHEEL events
+void ApplyMouseDelta(int dx, int dy, int wheel) {
     // the menu moves the pointer, not the camera: do not queue that motion
     if (g_ui_active.load(std::memory_order_relaxed)) return;
     std::lock_guard lock(g_mouse_lock);
-    if (input.data.mouse.usButtonFlags & RI_MOUSE_WHEEL) {
-        const int step = int16_t(input.data.mouse.usButtonData);
-        g_wheel_steps = std::clamp(g_wheel_steps + (step > 0 ? 1 : -1), -8, 8);
-    }
-    const LONG dx = input.data.mouse.lLastX, dy = input.data.mouse.lLastY;
+    if (wheel) g_wheel_steps = std::clamp(g_wheel_steps + wheel, -8, 8);
     // the stick path keeps its small clamp
-    g_mouse_x = std::clamp(g_mouse_x + dx, -100L, 100L);
-    g_mouse_y = std::clamp(g_mouse_y + dy, -100L, 100L);
-    const uint64_t now = GetTickCount64();
+    g_mouse_x = std::clamp(g_mouse_x + dx, -100, 100);
+    g_mouse_y = std::clamp(g_mouse_y + dy, -100, 100);
+    const uint64_t now = NowMs();
     g_aim_at = now;
     if (DirectAimLive(now)) {
         // direct aim takes the full raw delta, like the PC fix's raw input path
@@ -296,8 +378,40 @@ void ReadMouse(void* raw_input) {
     }
 }
 
+#ifdef _WIN32
+void RegisterMouse(void* window) {
+    const RAWINPUTDEVICE mouse{0x01, 0x02, 0, static_cast<HWND>(window)};
+    if (!RegisterRawInputDevices(&mouse, 1, sizeof(mouse))) LOGE("input: could not register raw mouse");
+}
+
+void ReadMouse(void* raw_input) {
+    RAWINPUT input{};
+    UINT size = sizeof(input);
+    if (GetRawInputData(static_cast<HRAWINPUT>(raw_input), RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) !=
+            sizeof(input) ||
+        input.header.dwType != RIM_TYPEMOUSE || (input.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE))
+        return;
+    int wheel = 0;
+    if (input.data.mouse.usButtonFlags & RI_MOUSE_WHEEL)
+        wheel = int16_t(input.data.mouse.usButtonData) > 0 ? 1 : -1;
+    ApplyMouseDelta(int(input.data.mouse.lLastX), int(input.data.mouse.lLastY), wheel);
+}
+#else
+void RegisterMouse(void*) {}
+void ReadMouse(void*) {}
+
+void ReadMouseMotion(float dx, float dy) {
+    ApplyMouseDelta(int(std::lround(dx)), int(std::lround(dy)), 0);
+}
+
+void ReadMouseWheel(float steps) {
+    const int n = int(std::lround(steps));
+    if (n) ApplyMouseDelta(0, 0, n > 0 ? 1 : -1);
+}
+#endif
+
 void UseDirectMouseAim() {
-    g_direct_at.store(GetTickCount64(), std::memory_order_relaxed);
+    g_direct_at.store(NowMs(), std::memory_order_relaxed);
     g_direct_confirmed.store(true, std::memory_order_relaxed);
 }
 
@@ -307,21 +421,24 @@ void SetUiActive(bool active) {
     std::lock_guard lock(g_mouse_lock);
     g_mouse_x = g_mouse_y = g_mouse_rx = g_mouse_ry = 0;
     g_hold_rx = g_hold_ry = 0;
+
     g_aim_x = g_aim_y = 0; // the menu moved the pointer, not the camera
     g_pending_aim_x = g_pending_aim_y = 0;
     g_aim_at = 0;
     g_direct_used_at.store(0, std::memory_order_relaxed);
 }
 
+bool UiActive() { return g_ui_active.load(std::memory_order_relaxed); }
+
 bool ConsumeMouseAim(float& dx, float& dy) {
     std::lock_guard lock(g_mouse_lock);
-    if (g_ui_active.load(std::memory_order_relaxed) || !DirectAimLive(GetTickCount64())) {
+    if (g_ui_active.load(std::memory_order_relaxed) || !DirectAimLive(NowMs())) {
         g_aim_x = g_aim_y = 0;
         return false;
     }
     // If no pad poll ran during the stall, preserve the grace-period counts
     // here as well. Release them through the same bounded transition buffer.
-    if (GetTickCount64() - g_aim_at > 200) DeferMouseAim();
+    if (NowMs() - g_aim_at > 200) DeferMouseAim();
 
     float px = 0, py = 0;
     if (g_pending_aim_x != 0 || g_pending_aim_y != 0) {
@@ -334,13 +451,13 @@ bool ConsumeMouseAim(float& dx, float& dy) {
     dx = g_aim_x + px;
     dy = g_aim_y + py;
     g_aim_x = g_aim_y = 0;
-    g_direct_used_at.store(GetTickCount64(), std::memory_order_relaxed);
+    g_direct_used_at.store(NowMs(), std::memory_order_relaxed);
     return true;
 }
 
 bool DirectAimRecent() {
     const uint64_t used = g_direct_used_at.load(std::memory_order_relaxed);
-    return used && GetTickCount64() - used < 5000;
+    return used && NowMs() - used < 5000;
 }
 
 void Init() {
@@ -348,13 +465,8 @@ void Init() {
     // the old right-stick path stays available as a fallback
     if (std::getenv("TCNYC_MOUSE_STICK")) g_direct_mouse_aim = false;
     // WGI reads the triggers apart and HIDAPI takes PlayStation and Switch pads. Reads come from the guest's threads,
-    // so SDL's own thread takes the device notices.
-    SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "1");
-    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
-    SDL_SetHint(SDL_HINT_XINPUT_ENABLED, "0");
-    SDL_SetHint(SDL_HINT_JOYSTICK_DIRECTINPUT, "0");
+    // so SDL's own thread takes the device notices. Hosts call SetHints before their first SDL_Init.
+    SetHints();
     if (!SDL_Init(SDL_INIT_GAMEPAD)) {
         LOGE("input: SDL failed to start, no controllers: %s", SDL_GetError());
         return;

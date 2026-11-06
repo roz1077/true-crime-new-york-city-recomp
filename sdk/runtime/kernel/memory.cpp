@@ -256,7 +256,7 @@ static Reservation* FindReservation(uint32_t addr, uint32_t* start) {
 uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t protect) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     EnsureRanges();
-    if (!size) return 0xC000000D;  // STATUS_INVALID_PARAMETER
+    if (!size || size > 0xFFFFFFFFu - 0xFFFFu) return 0xC000000D;  // STATUS_INVALID_PARAMETER
     bool reserve = type & kMemReserve;
     bool commit = type & kMemCommit;
     if (!base && commit) reserve = true;
@@ -264,6 +264,7 @@ uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t
         uint32_t sz = (size + 0xFFFF) & ~0xFFFFu;
         uint32_t a;
         if (base) {
+            if (uint64_t(base) + size + 0xFFFF > 0xFFFFFFFFull) return 0xC000000D;
             a = base & ~0xFFFFu;
             sz = ((base + size + 0xFFFF) & ~0xFFFFu) - a;
             if (!g_user.IsFree(a, sz)) return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
@@ -307,7 +308,9 @@ uint32_t FreeVirtual(uint32_t& base, uint32_t& size, uint32_t type) {
         return 0;
     }
     uint32_t first = base & ~(kPage - 1);
-    uint32_t end = size ? (base + size + kPage - 1) & ~(kPage - 1) : start + r->size;
+    uint64_t end64 = size ? (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1) : uint64_t(start) + r->size;
+    if (end64 > uint64_t(start) + r->size) return 0xC000000D;
+    uint32_t end = uint32_t(end64);
     Decommit(first, end - first);
     for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 0;
     base = first;
@@ -346,6 +349,7 @@ bool QueryVirtual(uint32_t addr, RegionInfo& out) {
 uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint32_t align) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     EnsureRanges();
+    if (size > 0xFFFFFFFFu - (kPage - 1)) return 0;
     size = (size + kPage - 1) & ~(kPage - 1);
     if (!size) size = kPage;
     align = std::max<uint32_t>(align, kPage);
@@ -372,6 +376,7 @@ void FreeContiguous(uint32_t va) {
 uint32_t AllocSystem(uint32_t size, uint32_t align) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     EnsureRanges();
+    if (size > 0xFFFFFFFFu - 15u) return 0;
     size = (size + 15) & ~15u;
     if (!size) size = 16;
     uint32_t a = g_system.Alloc(size, std::max<uint32_t>(align, 16), kSystemBase, kSystemBase + kSystemSize - 1, false);
@@ -389,6 +394,7 @@ void FreeSystem(uint32_t va) {
 uint32_t AllocStack(uint32_t size) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     EnsureRanges();
+    if (size > 0xFFFFFFFFu - 0xFFFFu) return 0;
     size = (size + 0xFFFF) & ~0xFFFFu;
     // one uncommitted guard page below the stack
     uint32_t a = g_stacks.Alloc(size + 0x10000, 0x10000, kStackBase, kStackBase + kStackSize - 1, false);

@@ -61,6 +61,8 @@ struct Mode {
 };
 Mode Desktop();
 Mode Output();
+// the full-screen sizes the primary display lists, for the Graphics menu
+std::vector<Mode> DisplayModes();
 // host pixels per console pixel vertically: render_percent of the displayed frame's height
 float RenderScale(uint32_t guest_height);
 // the frame's display aspect: the aspect setting, or the output's shape
@@ -73,12 +75,14 @@ bool Widescreen();
 
 std::filesystem::path ExeDir();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
-// image (.iso), which it mounts as D:; false after telling the player what is missing
+// image (.iso), which it mounts as D:; false after telling the player what is missing, with error set for hosts
+// that show it themselves
 struct GameFiles {
     std::filesystem::path dir;
     std::vector<uint8_t> xbe;
 };
-bool FindGame(GameFiles& game);
+// location names the game's folder or its disc image; empty searches for assets beside the executable
+bool FindGame(GameFiles& game, std::string* error = nullptr, const std::filesystem::path& location = {});
 std::string Sha1(const std::vector<uint8_t>& data);  // lower case hex
 // the recompiled code, <exe>.dll, built from the game in assets when missing or out of date (game_code.cpp) and
 // loaded; false after telling the player why the game cannot start, or when they chose not to start it yet

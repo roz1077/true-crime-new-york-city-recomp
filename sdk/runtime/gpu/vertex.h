@@ -57,7 +57,10 @@ void FvfInputs(uint32_t fvf, VertexShader& out);
 
 // false when there is nothing to draw
 // indices: the title's 16 bit indices, null for an unindexed draw
-bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, Assembled& out);
+// force_converted: the reference renderer needs CPU vertices even when the GPU path can read
+// guest memory directly
+bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, Assembled& out,
+              bool force_converted = false);
 
 // Retain the last submitted vertex's streamed attributes for subsequent unfed inputs.
 void RetainVertexAttributes(State& s, uint32_t start, uint32_t count, const uint8_t* indices);

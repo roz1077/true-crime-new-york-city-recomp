@@ -485,10 +485,12 @@ HLE_STDCALL(closesocket, 1) {
     auto it = g_sockets.find(a[0]);
     if (it == g_sockets.end()) return Fail(WSAENOTSOCK);
     for (size_t i = 0; i < g_pending.size();) {
-        if (g_pending[i].sock == a[0])
+        if (g_pending[i].sock == a[0]) {
+            Complete(g_pending[i].ovl, WSA_OPERATION_ABORTED, 0);
             g_pending.erase(g_pending.begin() + ptrdiff_t(i));
-        else
+        } else {
             i++;
+        }
     }
     ::closesocket(it->second.s);
     g_sockets.erase(it);

@@ -26,13 +26,15 @@ std::atomic<uint32_t> g_next_id{0x10};
 constexpr uint32_t kKpcrSize = 0x400;
 constexpr uint32_t kEthreadSize = 0x200;
 
-void SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
+bool SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
     stack_size = std::max<uint32_t>(stack_size, 0x10000);
+    if (tls_size > 0xFFFFFFFFu - 3u - stack_size - 0x1000u) return false;
     tls_size = (tls_size + 3) & ~3u;
     t.stack_top = mem::AllocStack(stack_size + tls_size + 0x1000);
     t.stack_size = stack_size;
     t.kpcr = mem::AllocSystem(kKpcrSize, 64);
     t.ethread = mem::AllocSystem(kEthreadSize, 64);
+    if (!t.stack_top || !t.kpcr || !t.ethread) return false;
     // TLS sits at the top of the stack: StackBase + tls_index * 4 must equal TlsData
     t.tls = t.stack_top - tls_size;
     uint32_t k = t.kpcr;
@@ -51,6 +53,22 @@ void SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
     W32(e + 0x20, t.stack_top - stack_size);    // KTHREAD.StackLimit
     W32(e + 0x28, t.tls);                       // KTHREAD.TlsData
     W32(e + 0x12C, t.id);                       // ETHREAD.UniqueThread
+    return true;
+}
+
+// After a thread exits its stack and KPCR are dead. Keep the ETHREAD: guest handles may still
+// reference the thread object (the same lifetime Windows gives it).
+void ReleaseGuestStack(Thread& t) {
+    if (t.stack_top) {
+        mem::FreeStack(t.stack_top);
+        t.stack_top = 0;
+        t.stack_size = 0;
+        t.tls = 0;
+    }
+    if (t.kpcr) {
+        mem::FreeSystem(t.kpcr);
+        t.kpcr = 0;
+    }
 }
 
 void InitContext(Thread& t, X86Context& ctx) {
@@ -105,18 +123,26 @@ void Spawn(std::function<void()> fn) {
         return 0;
     };
     HANDLE h = ::CreateThread(nullptr, 64u << 20, entry, f, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
-    if (h) ::CloseHandle(h);
+    if (!h) {
+        delete f;
+        return;
+    }
+    ::CloseHandle(h);
 #else
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 64u << 20);
     pthread_t th;
-    pthread_create(&th, &attr, [](void* p) -> void* {
+    const int rc = pthread_create(&th, &attr, [](void* p) -> void* {
         std::unique_ptr<std::function<void()>> g(static_cast<std::function<void()>*>(p));
         (*g)();
         return nullptr;
     }, f);
-    pthread_detach(th);
+    if (rc != 0) {
+        delete f;
+    } else {
+        pthread_detach(th);
+    }
     pthread_attr_destroy(&attr);
 #endif
 }
@@ -278,7 +304,12 @@ ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_r
                        uint32_t start_context, bool suspended) {
     auto t = std::make_shared<Thread>();
     t->id = g_next_id.fetch_add(4);
-    SetupGuestBlocks(*t, stack_size, tls_size);
+    if (!SetupGuestBlocks(*t, stack_size, tls_size)) {
+        mem::FreeStack(t->stack_top);
+        mem::FreeSystem(t->kpcr);
+        mem::FreeSystem(t->ethread);
+        return nullptr;
+    }
     Bind(t, t->ethread);
     if (suspended) t->suspend = 1;
     std::lock_guard<std::mutex> lock(g_start_lock);
@@ -319,6 +350,7 @@ void StartThread(ThreadRef t) {
             code = CallGuest(ctx, si.start_routine, {si.start_context});
         LOGI("thread %X returned %08X", t->id, code);
         MarkExited(*t, code);
+        ReleaseGuestStack(*t);
         Unregister(t.get());
         t->host_tid.store(0);
         t_current.reset();
@@ -328,7 +360,12 @@ void StartThread(ThreadRef t) {
 void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
     auto t = std::make_shared<Thread>();
     t->id = g_next_id.fetch_add(4);
-    SetupGuestBlocks(*t, 0x20000, 0x100);
+    if (!SetupGuestBlocks(*t, 0x20000, 0x100)) {
+        mem::FreeStack(t->stack_top);
+        mem::FreeSystem(t->kpcr);
+        mem::FreeSystem(t->ethread);
+        return;
+    }
     Bind(t, t->ethread);
     std::string n = name;
     Spawn([t, fn, n] {
@@ -342,6 +379,7 @@ void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
         X86Context ctx;
         InitContext(*t, ctx);
         fn(ctx);
+        ReleaseGuestStack(*t);
         t->host_tid.store(0);
         t_current.reset();
     });
@@ -352,6 +390,7 @@ void ExitThread(uint32_t code) {
     if (t) {
         LOGI("thread %X exits with %08X", t->id, code);
         MarkExited(*t, code);
+        ReleaseGuestStack(*t);
         t->host_tid.store(0);
         Unregister(t);
     }

@@ -15,12 +15,15 @@
 
 #include <imgui.h>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -40,10 +43,20 @@ namespace {
 
 using namespace menu_input;
 
+uint64_t NowMs() {
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+#endif
+}
+
 // shared between the pad thread and the UI thread
 std::atomic<bool> g_open{false};
 std::atomic<bool> g_toggle{false};
-std::atomic<uint64_t> g_pad_nav{0};   // nav bits << 32 | GetTickCount64 of the poll
+std::atomic<uint64_t> g_pad_nav{0};   // nav bits << 32 | NowMs of the poll
 constexpr uint32_t kPadStaleMs = 250; // a game that stopped polling leaves no held direction behind
 
 enum class Row {
@@ -113,6 +126,7 @@ bool SameMode(app::Mode a, app::Mode b) { return a.width == b.width && a.height 
 
 std::vector<app::Mode> DisplayModes() {
     std::vector<app::Mode> modes{{0, 0}};
+#ifdef _WIN32
     MONITORINFOEXW monitor{};
     monitor.cbSize = sizeof(monitor);
     if (!GetMonitorInfoW(MonitorFromWindow(static_cast<HWND>(app::Window()), MONITOR_DEFAULTTOPRIMARY), &monitor))
@@ -124,6 +138,12 @@ std::vector<app::Mode> DisplayModes() {
         if (m.width < 640 || m.height < 480) continue;
         if (std::ranges::none_of(modes, [&](app::Mode e) { return SameMode(e, m); })) modes.push_back(m);
     }
+#else
+    for (app::Mode m : app::DisplayModes()) {
+        if (m.width < 640 || m.height < 480) continue;
+        if (std::ranges::none_of(modes, [&](app::Mode e) { return SameMode(e, m); })) modes.push_back(m);
+    }
+#endif
     std::sort(modes.begin() + 1, modes.end(),
               [](app::Mode a, app::Mode b) { return std::pair{a.width, a.height} < std::pair{b.width, b.height}; });
     return modes;
@@ -338,10 +358,10 @@ const char *Help(Row row) {
     case Row::ShowFps:
         return "Shows the frame rate in the top-left corner.";
     case Row::TextureReplacement:
-        return "Uses images in textures\\replacement beside the exe in place of the game's textures.";
+        return "Uses images in the textures/replacement folder beside the executable in place of the game's textures.";
     case Row::TextureDumping:
-        return "Saves each texture the game uses into textures\\dumps beside the exe, once. Slows loading "
-               "while on.";
+        return "Saves each texture the game uses into the textures/dumps folder beside the executable, once. Slows "
+               "loading while on.";
     case Row::DumpFormat:
         return "File format for dumped textures.";
     case Row::Defaults:
@@ -430,6 +450,7 @@ std::string Value(Row row) {
 
 // Left or right on a choice; true when the value changed.
 bool Change(Row row, int direction) {
+    app::SettingsLock lock;
     app::Settings &s = app::Get();
     auto set = [](uint32_t &field, uint32_t value) {
         if (field == value) return false;
@@ -564,7 +585,7 @@ void MoveSelection(int direction) {
 uint32_t NavPresses() {
     uint32_t held = 0;
     const uint64_t pad = g_pad_nav.load();
-    if (uint32_t(GetTickCount64()) - uint32_t(pad) <= kPadStaleMs) held = uint32_t(pad >> 32);
+    if (uint32_t(NowMs()) - uint32_t(pad) <= kPadStaleMs) held = uint32_t(pad >> 32);
     uint32_t pressed = g_menu.repeater.Update(held, ImGui::GetTime());
     if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) pressed |= kUp;
     if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) pressed |= kDown;
@@ -736,11 +757,12 @@ void FilterMenuPad(int port, input::Pad &pad) {
     static PadGate gate;
     if (port != 0) return;
     std::lock_guard guard(lock);
-    g_pad_nav.store(uint64_t(NavBits(pad)) << 32 | uint32_t(GetTickCount64()));
+    g_pad_nav.store(uint64_t(NavBits(pad)) << 32 | uint32_t(NowMs()));
     if (gate.Filter(pad, g_open.load())) g_toggle.store(true);
 }
 
 bool GraphicsMenuMessage(void *, uint32_t msg, uintptr_t wp, intptr_t, intptr_t *result) {
+#ifdef _WIN32
     // Left Alt is heavy attack. Prevent its release from entering window-menu mode.
     if (msg == WM_SYSCOMMAND && (wp & 0xFFF0u) == SC_KEYMENU) {
         *result = 0;
@@ -752,6 +774,11 @@ bool GraphicsMenuMessage(void *, uint32_t msg, uintptr_t wp, intptr_t, intptr_t 
         *result = 0;
         return true;
     }
+#else
+    (void)msg;
+    (void)wp;
+    (void)result;
+#endif
     return false;
 }
 

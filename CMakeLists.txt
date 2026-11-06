@@ -38,6 +38,10 @@ endif()
 # target name = GAME_EXE in build.bat, xbe = GAME_XBE
 add_xbe_image(TrueCrimeNYC default.xbe game.toml ${GAME_PARTITIONS} game)
 
+# The app uses the per-monitor DPI and dark-mode era APIs; current llvm-mingw still
+# defaults WINVER below Windows 10, which hides their declarations.
+target_compile_definitions(TrueCrimeNYC PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000000)
+
 # Keep the SDK startup intact and invoke it after the launcher closes.
 set_property(SOURCE "${SDK}/runtime/app/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS wWinMain=RecompMain)
 target_sources(TrueCrimeNYC PRIVATE launcher/launcher.cpp)

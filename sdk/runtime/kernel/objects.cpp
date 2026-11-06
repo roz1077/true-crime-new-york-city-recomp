@@ -347,17 +347,19 @@ int32_t PulseEvent(Object& o) {
     int32_t old = o.signal;
     SetSignal(o, 1);
     Wake(o);
+    SetSignal(o, 0);  // notification events must not stay signaled for a later wait
     return old;
 }
 
 int32_t ReleaseSemaphore(Object& o, int32_t count, uint32_t& status) {
     std::lock_guard<std::mutex> lock(g_dispatch);
     int32_t old = o.signal;
-    if (o.limit && old + count > o.limit) {
+    const int64_t next = int64_t(old) + int64_t(count);
+    if (count < 0 || next > INT32_MAX || (o.limit && next > o.limit)) {
         status = kSemaphoreLimitExceeded;
         return old;
     }
-    SetSignal(o, old + count);
+    SetSignal(o, int32_t(next));
     status = kSuccess;
     Wake(o);
     return old;
@@ -419,10 +421,18 @@ void RunDpcs(X86Context& ctx) {
             g_dpcs.pop_front();
         }
         uint32_t dpc = d[0];
+        if (!G<uint8_t>(dpc + 2)) continue;  // removed before the worker ran it
         G<uint8_t>(dpc + 2) = 0;  // Inserted
         uint32_t routine = R32(dpc + 0x0C), context = R32(dpc + 0x10);  // KDPC.DeferredRoutine and DeferredContext
         if (routine) CallGuest(ctx, routine, {dpc, context, d[1], d[2]});
     }
+}
+
+bool CancelDpc(uint32_t dpc) {
+    std::lock_guard<std::mutex> lock(g_dpc_lock);
+    const size_t before = g_dpcs.size();
+    std::erase_if(g_dpcs, [dpc](const auto& e) { return e[0] == dpc; });
+    return g_dpcs.size() != before;
 }
 
 void QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2) {
