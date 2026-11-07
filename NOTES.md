@@ -1699,7 +1699,8 @@ The full code review found and the current tree fixes these correctness issues:
   same non-recursive mutex again in the file-allocation/end-of-file case. Pressing Start
   made the title truncate the save metadata, so the guest stopped on the second lock.
   Removing the inner lock fixes the freeze. This is a shared runtime fix; the Windows
-  executable was not rebuilt.
+  executable has been rebuilt from the current tree and includes it. The Linux-only
+  input, reflection and legal-screen corrections remain guarded off the Windows path.
 - **Garage puddles:** the guest reuses one data address for a 128x128 reflection target
   and a 320x240 light/bloom target. The Vulkan backend's borrowed-target-view cache was
   keyed by the guest address and format only, so whichever shape sampled first created
