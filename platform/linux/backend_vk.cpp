@@ -790,6 +790,7 @@ private:
     bool smaa_lookups_pending_ = false;
     bool smaa_failed_ = false;
     bool dof_active_ = false;
+    bool bloom_active_ = false;
 
     // the open pass
     Target* pass_rt_ = nullptr;
@@ -5430,6 +5431,10 @@ void VulkanBackend::Present(const Surface& front) {
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, present_pipeline_layout_, 0, 1, &present_set_, 0,
                             nullptr);
     const bool bloom_on = snapshot.bloom && direct;
+    if (bloom_on != bloom_active_) {
+        bloom_active_ = bloom_on;
+        LOGR("vulkan: bloom %s", bloom_active_ ? "on" : "off");
+    }
     const uint32_t bloom_w = ft ? ft->w : sw, bloom_h = ft ? ft->h : sh;
     const bool dof_on = dof != nullptr;
     float present_pc[8] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? 1.0f : 0.0f,

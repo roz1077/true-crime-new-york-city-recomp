@@ -1760,7 +1760,9 @@ The full code review found and the current tree fixes these correctness issues:
 - The Vulkan backend now uploads the same scale and its vertex shaders apply it to the
   guest clip z (`o.pos.z *= zparams.w`). Vulkan keeps the guest 0..1 depth convention, so
   the same factor preserves the Windows depth ordering without the reversed-depth
-  transform. A one-time `vulkan: depth scale` log marks the affected pass.
+  transform. A one-time `vulkan: depth scale` log marks the affected pass. Bloom and
+  distance-blur transitions log `vulkan: bloom on/off` and `vulkan: distance blur on/off`
+  for verification.
 - The compile-time default is now Off (`app.h`), and README.md says so. The F10 Graphics
   menu row was exercised on the Deck: toggling it wrote and saved `building_seam_fix` true,
   and toggling back wrote false. The live hook reads the same setting under the settings
