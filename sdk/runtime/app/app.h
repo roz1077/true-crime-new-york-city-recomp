@@ -24,11 +24,11 @@ struct Settings {
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
-    uint32_t msaa = 0;               // 0, 2, 4 or 8 samples
-    bool smaa = false;               // SMAA 1x on the finished frame
-    bool bloom = false;               // bright-pass bloom on the finished frame
-    bool dof = false;                 // distance blur on the finished frame
-    bool building_seam_fix = false;  // experimental priority for detailed city geometry
+    uint32_t msaa = 2;               // 0, 2, 4 or 8 samples
+    bool smaa = true;                // SMAA 1x on the finished frame
+    bool bloom = true;                // bright-pass bloom on the finished frame
+    bool dof = true;                  // distance blur on the finished frame
+    bool building_seam_fix = true;   // experimental priority for detailed city geometry
     bool pc_contrast = true;         // PC contrast curve on the finished frame
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe

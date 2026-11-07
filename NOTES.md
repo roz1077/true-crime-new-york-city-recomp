@@ -1773,9 +1773,11 @@ The full code review found and the current tree fixes these correctness issues:
   and depth views. This also restores main-scene MSAA, not just the offscreen effects.
   Verified in free roam at 4x: `vulkan: distance blur on`. D3D12 already had the
   equivalent `want_samples` rebuild.
-- The compile-time default is now Off (`app.h`), and README.md says so. The F10 Graphics
-  menu row was exercised on the Deck: toggling it wrote and saved `building_seam_fix` true,
-  and toggling back wrote false. The live hook reads the same setting under the settings
-  lock on each distant-city pass, so the change applies without a restart.
+- Graphics defaults: SMAA, bloom, distance blur, PC contrast and the building seam fix
+  are on, with MSAA 2x, in both the shared settings and the refreshed Windows/Linux
+  configs. The F10 Graphics menu row was exercised on the Deck: toggling it wrote and
+  saved `building_seam_fix` true, and toggling back wrote false. The live hook reads the
+  same setting under the settings lock on each distant-city pass, so changes apply
+  without a restart.
 
 

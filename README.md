@@ -41,12 +41,12 @@ closes.
 - **Render scale** - 25% to 200% of the output height.
 - **Field of view** - 80% to 150% of the game's view, gameplay camera only; aiming still zooms.
 - **Anisotropic filtering** - Game default, 2x, 4x, 8x or 16x.
-- **MSAA** - Off, 2x, 4x or 8x multisample anti-aliasing.
-- **SMAA** - SMAA 1x anti-aliasing on the finished frame.
-- **Bloom** - optional bright-pass bloom over the game’s own lighting. Off by default.
-- **Building seam fix (Experimental)** - gives detailed buildings priority over overlapping simplified city meshes. Off by default and can be toggled live.
+- **MSAA** - Off, 2x, 4x or 8x multisample anti-aliasing. 2x by default.
+- **SMAA** - SMAA 1x anti-aliasing on the finished frame. On by default.
+- **Bloom** - optional bright-pass bloom over the game's own lighting. On by default.
+- **Building seam fix (Experimental)** - gives detailed buildings priority over overlapping simplified city meshes. On by default and can be toggled live.
 - **PC contrast** - PC-inspired tone curve with a softer shadow roll-off. On by default.
-- **Depth of field** - optional distance blur for 3D scenes with MSAA enabled. Off by default.
+- **Depth of field** - optional distance blur for 3D scenes with MSAA enabled. On by default.
 - **V-Sync** and **Frame rate limit** (30 or 60 FPS; the game's timing is built for at most 60).
 - **FPS counter**.
 - **Texture replacement**, **texture dumping** and **dump format** (PNG or DDS).
