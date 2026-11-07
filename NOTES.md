@@ -1763,6 +1763,10 @@ The full code review found and the current tree fixes these correctness issues:
   transform. A one-time `vulkan: depth scale` log marks the affected pass. Bloom and
   distance-blur transitions log `vulkan: bloom on/off` and `vulkan: distance blur on/off`
   for verification.
+- Depth-of-field parity: the Vulkan backend now carries the 3D scene's depth
+  association across a full-frame scene-to-front copy, matching D3D12. Without it the
+  present pass could not find the multisampled scene depth and DOF stayed off in free
+  roam. Bloom was unaffected (it does not read scene depth).
 - The compile-time default is now Off (`app.h`), and README.md says so. The F10 Graphics
   menu row was exercised on the Deck: toggling it wrote and saved `building_seam_fix` true,
   and toggling back wrote false. The live hook reads the same setting under the settings
