@@ -1,0 +1,43 @@
+name: Windows regression checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Show compiler
+        shell: pwsh
+        run: |
+          $clang = Join-Path $env:ProgramFiles 'LLVM\bin\clang++.exe'
+          if (!(Test-Path -LiteralPath $clang)) { throw "LLVM clang++ not found at $clang" }
+          & $clang --version
+          & (Join-Path $env:ProgramFiles 'LLVM\bin\lld-link.exe') --version
+
+      - name: Run regression checks
+        env:
+          TCNYC_CHECK_TIMEOUT: '300'
+        run: python scripts/run_checks.py
+
+      # The release build needs the player's own assets/default.xbe, which is
+      # never committed. Forks and self-hosted runners that provide it still get
+      # a full CI build with the same switch as a local build.
+      - name: Build release when game assets are present
+        if: ${{ hashFiles('assets/default.xbe') != '' }}
+        shell: cmd
+        env:
+          CI: '1'
+        run: build.bat

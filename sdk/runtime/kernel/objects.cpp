@@ -7,6 +7,7 @@
 
 #include "core/log.h"
 #include "kernel/kernel.h"
+#include "kernel/memory.h"
 
 namespace kernel {
 
@@ -53,7 +54,12 @@ static void Wake(Object& o) {
 struct Queued {
     const std::vector<ObjectRef>& objs;
     Waiter w;
+    std::vector<uint64_t> pulse_seen;
     bool on = false;
+    explicit Queued(const std::vector<ObjectRef>& o) : objs(o), pulse_seen(o.size()) {
+        for (size_t i = 0; i < o.size(); i++)
+            if (o[i]) pulse_seen[i] = o[i]->pulse;
+    }
     void Add() {
         for (auto& o : objs) {
             if (o) o->waiters.push_back(&w);
@@ -88,8 +94,16 @@ ObjectRef FromHandle(uint32_t handle) {
 }
 
 bool CloseHandle(uint32_t handle) {
-    std::lock_guard<std::mutex> lock(g_handles_lock);
-    return g_handles.erase(handle) != 0;
+    ObjectRef removed;
+    {
+        std::lock_guard<std::mutex> lock(g_handles_lock);
+        auto it = g_handles.find(handle);
+        if (it == g_handles.end()) return false;
+        removed = std::move(it->second);
+        g_handles.erase(it);
+    }
+    // fclose/fs::remove and other destructors must not run under g_handles_lock.
+    return true;
 }
 
 uint32_t DuplicateHandle(uint32_t handle) {
@@ -116,6 +130,19 @@ void Bind(ObjectRef obj, uint32_t guest) {
 ObjectRef FromPointer(uint32_t guest) {
     if (!guest) return nullptr;
     std::lock_guard<std::mutex> lock(g_ptr_lock);
+    // Dispose address entries whose guest body is gone or has been reinitialised.
+    // Without this, every address ever used as a dispatcher object stays in the
+    // strong map for the life of the process.
+    static uint32_t sweep_tick = 0;
+    if (g_by_ptr.size() > 2048 && (++sweep_tick & 0xFF) == 0) {
+        for (auto it = g_by_ptr.begin(); it != g_by_ptr.end();) {
+            const uint32_t address = it->first;
+            const bool stale = !it->second.references &&
+                               (!mem::IsCommitted(address) || R32(address + 12) != kStamp ||
+                                R32(address + 8) != it->second.serial);
+            it = stale ? g_by_ptr.erase(it) : std::next(it);
+        }
+    }
     auto it = g_by_ptr.find(guest);
     if (it != g_by_ptr.end() && R32(guest + 12) == kStamp && R32(guest + 8) == it->second.serial)
         if (auto o = it->second.weak.lock()) return o;
@@ -259,6 +286,17 @@ int64_t ToDeadline(int64_t due) {
     return now + std::max<int64_t>(rel, 0) * 100;
 }
 
+// A pulse that happened after this waiter registered counts as a release. For an
+// auto-reset event only one waiter may take each pulse; notification events wake
+// every waiter that was already waiting.
+static bool Pulsed(Object& o, size_t i, const Queued& q) {
+    if (i >= q.pulse_seen.size() || o.pulse == q.pulse_seen[i]) return false;
+    if (o.notification) return true;
+    if (o.pulse_taken >= o.pulse) return false;
+    ++o.pulse_taken;
+    return true;
+}
+
 static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64_t timeout, bool alertable) {
     using namespace std::chrono;
     Thread* self = Current();
@@ -281,17 +319,23 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
             if (self && self->ctx) LogGuestStack(*self->ctx, 96);
         }
         if (wait_all) {
-            bool all = std::all_of(objs.begin(), objs.end(), [&](const ObjectRef& o) { return o && Satisfied(*o, me); });
+            bool all = true;
+            for (size_t i = 0; i < objs.size() && all; i++)
+                all = objs[i] && (Satisfied(*objs[i], me) || Pulsed(*objs[i], i, queued));
             if (all) {
-                for (auto& o : objs) Consume(*o, me);
+                for (auto& o : objs)
+                    if (o && Satisfied(*o, me)) Consume(*o, me);
                 return kWait0;
             }
         } else {
-            for (size_t i = 0; i < objs.size(); i++)
-                if (objs[i] && Satisfied(*objs[i], me)) {
-                    Consume(*objs[i], me);
+            for (size_t i = 0; i < objs.size(); i++) {
+                if (!objs[i]) continue;
+                const bool signaled = Satisfied(*objs[i], me);
+                if (signaled || Pulsed(*objs[i], i, queued)) {
+                    if (signaled) Consume(*objs[i], me);
                     return kWait0 + uint32_t(i);
                 }
+            }
         }
         if (alertable && self) {
             bool pending;
@@ -342,12 +386,12 @@ int32_t ResetEvent(Object& o) {
 }
 
 int32_t PulseEvent(Object& o) {
-    // waiters already blocked cannot be told apart here, so a pulse behaves like set for one pass
+    // A pulse must be visible to waiters that were already blocked. Wake() alone
+    // is not enough: the signal would be cleared again before they could run.
     std::lock_guard<std::mutex> lock(g_dispatch);
     int32_t old = o.signal;
-    SetSignal(o, 1);
+    ++o.pulse;
     Wake(o);
-    SetSignal(o, 0);  // notification events must not stay signaled for a later wait
     return old;
 }
 

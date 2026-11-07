@@ -2,10 +2,17 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <unordered_map>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "kernel/disc.h"
 #include "kernel/kernel.h"
@@ -15,12 +22,25 @@ namespace fs = std::filesystem;
 
 namespace kernel {
 
+// Opens a host path without narrowing it through the active ANSI code page.
+FILE* OpenHostFile(const fs::path& path, const char* mode) {
+#ifdef _WIN32
+    wchar_t wide[8];
+    size_t i = 0;
+    for (; mode[i] && i + 1 < sizeof(wide) / sizeof(wide[0]); i++) wide[i] = wchar_t(uint8_t(mode[i]));
+    wide[i] = 0;
+    return _wfopen(path.c_str(), wide);
+#else
+    return std::fopen(path.string().c_str(), mode);
+#endif
+}
+
 namespace {
 
 std::mutex g_links_lock;
 std::map<std::string, std::string> g_links;    // upper case "\??\D:" -> "\Device\CdRom0"
 std::map<std::string, fs::path> g_devices;     // upper case device -> host directory
-std::unordered_map<std::string, fs::path> g_resolved;  // Repeated streaming opens skip the directory scan.
+std::map<fs::path, fs::path> g_resolved;       // Repeated streaming opens skip the directory scan.
 constexpr char kCdRom[] = "\\DEVICE\\CDROM0";
 
 std::string Upper(std::string s) {
@@ -50,8 +70,8 @@ bool Within(const fs::path& root, const fs::path& p) {
 // climbs above the mapped device, and the resolved host path must stay inside it even through a
 // symlink or junction.
 fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts) {
-    std::string cache_key = dir.string();
-    for (const std::string& part : parts) cache_key += "\\" + part;
+    fs::path cache_key = dir;
+    for (const std::string& part : parts) cache_key /= part;
     if (auto hit = g_resolved.find(cache_key); hit != g_resolved.end()) return hit->second;
     fs::path cur = dir;
     size_t depth = 0;
@@ -102,6 +122,8 @@ struct File : Object {
     FILE* fp = nullptr;
     const Disc::Entry* entry = nullptr;  // on the disc image instead of a host path
     bool dir = false;
+    bool writable = false;  // opened for writing, so flush/truncate has data to commit
+    bool read_only = false; // CDROM0 content (disc or extracted assets)
     uint64_t pos = 0;
     std::vector<fs::directory_entry> entries;
     std::vector<const Disc::Entry*> disc_entries;
@@ -111,7 +133,7 @@ struct File : Object {
     std::mutex io;  // threads sharing a handle: seek and transfer stay together
     File() : Object(ObjType::File) {}
     ~File() override {
-        if (fp) std::fclose(fp);
+        if (fp && std::fclose(fp) != 0) LOGW("files: close failed for %s", host.string().c_str());
         // File bodies are allocated by ObReferenceObjectByHandle. Their address
         // lookup must not keep a closed file (and its CRT stream) alive forever.
         if (guest) {
@@ -130,6 +152,32 @@ struct Link : Object {
     Link() : Object(ObjType::SymLink) {}
 };
 
+// Flushes a CRT stream through the host filesystem. fflush alone only reaches the
+// CRT buffer; the commit is what tells us a full or failing disk actually failed.
+bool SyncStream(FILE* fp) {
+    if (!fp) return true;
+    if (std::fflush(fp) != 0) return false;
+#ifdef _WIN32
+    const int fd = _fileno(fp);
+    return fd >= 0 && _commit(fd) == 0;
+#else
+    const int fd = fileno(fp);
+    return fd >= 0 && fsync(fd) == 0;
+#endif
+}
+
+// Shutdown can end the process with _Exit before File destructors run. Weak
+// entries let FlushOpenFiles commit every writable stream without keeping a
+// closed file (or its CRT stream) alive.
+std::mutex g_open_lock;
+std::vector<std::weak_ptr<File>> g_open_files;
+
+void RegisterFile(const std::shared_ptr<File>& f) {
+    std::lock_guard<std::mutex> lock(g_open_lock);
+    if (g_open_files.size() > 64) std::erase_if(g_open_files, [](const auto& w) { return w.expired(); });
+    g_open_files.push_back(f);
+}
+
 uint64_t ToFileTime(fs::file_time_type t) {
     using namespace std::chrono;
     auto sys = time_point_cast<nanoseconds>(t - fs::file_time_type::clock::now() + system_clock::now());
@@ -146,7 +194,10 @@ void FillNetworkInfo(uint32_t out, uint64_t t, uint64_t size, bool dir) {
 void FillNetworkInfo(uint32_t out, const fs::path& p) {
     std::error_code ec;
     bool dir = fs::is_directory(p, ec);
-    FillNetworkInfo(out, ToFileTime(fs::last_write_time(p, ec)), dir ? 0 : fs::file_size(p, ec), dir);
+    const auto written = fs::last_write_time(p, ec);
+    const uint64_t time = ec ? 0 : ToFileTime(written);
+    const uint64_t size = dir || ec ? 0 : fs::file_size(p, ec);
+    FillNetworkInfo(out, time, size, dir);
 }
 
 void FillNetworkInfo(uint32_t out, const Disc::Entry& e) {
@@ -184,6 +235,7 @@ void Seek(FILE* fp, uint64_t pos) {
 
 void IoStatus(uint32_t iosb, uint32_t status, uint32_t info) {
     if (!iosb) return;
+    if (!mem::IsCommitted(iosb) || !mem::IsCommitted(iosb + 4)) return;
     W32(iosb, status);
     W32(iosb + 4, info);
 }
@@ -207,18 +259,48 @@ void Complete(uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
 
 }  // namespace
 
+// Best-effort save durability at process exit: commit every writable stream that
+// is still open before _Exit bypasses the File destructors.
+void FlushOpenFiles() {
+    std::vector<std::shared_ptr<File>> files;
+    {
+        std::lock_guard<std::mutex> lock(g_open_lock);
+        std::erase_if(g_open_files, [](const auto& w) { return w.expired(); });
+        for (auto& w : g_open_files)
+            if (auto f = w.lock()) files.push_back(std::move(f));
+    }
+    for (auto& f : files) {
+        std::lock_guard<std::mutex> io(f->io);
+        if (f->fp && f->writable && !SyncStream(f->fp))
+            LOGW("files: shutdown flush failed for %s", f->host.string().c_str());
+    }
+}
+
 std::string ReadAnsiString(uint32_t str) {
-    if (!str) return {};
+    if (!str || !mem::IsCommitted(str) || !mem::IsCommitted(str + 3)) return {};
     uint16_t len = R16(str);
     uint32_t buf = R32(str + 4);
-    if (!buf) return {};
+    if (!buf || !len || uint64_t(buf) + len > 0x100000000ull) return {};
+    if (!mem::IsCommitted(buf) || !mem::IsCommitted(buf + len - 1)) return {};
+    for (uint32_t off = 0; off < len; off += 0x1000)
+        if (!mem::IsCommitted(buf + off)) return {};
     return std::string(reinterpret_cast<const char*>(HostPtr(buf)), len);
+}
+
+bool GuestWritable(uint32_t va, uint32_t len) {
+    if (!len) return true;
+    if (!va || uint64_t(va) + len > 0x100000000ull) return false;
+    const uint64_t end = uint64_t(va) + len;
+    for (uint64_t p = uint64_t(va) & ~uint64_t(mem::kPage - 1); p < end; p += mem::kPage)
+        if (!mem::IsCommitted(uint32_t(p))) return false;
+    return true;
 }
 
 std::string ReadCString(uint32_t va, size_t max) {
     std::string s;
     if (!va) return s;
     for (size_t i = 0; i < max; i++) {
+        if (!mem::IsCommitted(va + uint32_t(i))) break;
         char c = char(G<uint8_t>(va + uint32_t(i)));
         if (!c) break;
         s += c;
@@ -226,7 +308,7 @@ std::string ReadCString(uint32_t va, size_t max) {
     return s;
 }
 
-void MountDefaults(const std::string& game_dir, const std::string& data_dir) {
+void MountDefaults(const fs::path& game_dir, const fs::path& data_dir) {
     std::lock_guard<std::mutex> lock(g_links_lock);
     g_resolved.clear();
     fs::path d = data_dir;
@@ -242,7 +324,8 @@ void MountDefaults(const std::string& game_dir, const std::string& data_dir) {
     }
     g_links["\\??\\D:"] = "\\Device\\CdRom0";
     const Disc* disc = MountedDisc();
-    LOGI("files: D: is %s, hard disk under %s", disc ? disc->Path().string().c_str() : game_dir.c_str(), data_dir.c_str());
+    LOGI("files: D: is %s, hard disk under %s", disc ? disc->Path().string().c_str() : game_dir.string().c_str(),
+         data_dir.string().c_str());
 }
 
 bool CreateSymbolicLink(const std::string& link, const std::string& target) {
@@ -268,9 +351,10 @@ std::string QuerySymbolicLink(const std::string& link) {
 namespace {
 
 struct Target {
-    std::string host;                    // empty on the disc image or unmapped
+    fs::path host;                       // empty on the disc image or unmapped
     bool disc = false;                   // on the mounted disc image
     const Disc::Entry* entry = nullptr;  // there: the file or folder, null when missing
+    bool read_only = false;              // CDROM0 with extracted files: game data must not be written
 };
 
 Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
@@ -310,9 +394,11 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
     // no Xbox name holds ':', and fs::path would take "D:" as a host drive
     for (auto& part : parts)
         if (part.find(':') != std::string::npos) return {};
-    if (best->first == kCdRom)
-        if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts)};
-    return {MatchCase(best->second, parts).string()};
+    if (best->first == kCdRom) {
+        if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts), true};
+        return {MatchCase(best->second, parts), false, nullptr, true};
+    }
+    return {MatchCase(best->second, parts)};
 }
 
 // the disc image is read only: nothing on it is created, replaced or written
@@ -335,6 +421,8 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
     f->xbox = Normalize(name);
     f->entry = e;
     f->dir = e->dir;
+    f->read_only = true;
+    RegisterFile(f);
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, 1);
     LOG_FIRST(400, "open %s", name.c_str());
@@ -343,19 +431,23 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
 
 }  // namespace
 
-std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle) { return Resolve(xbox_path, root_handle).host; }
+fs::path ResolvePath(const std::string& xbox_path, uint32_t root_handle) { return Resolve(xbox_path, root_handle).host; }
 
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
+    constexpr uint64_t kMaxGameFileBytes = 64ull << 20;  // DSP images are small; keep a malformed image from OOMing
     Target t = Resolve(xbox_path, 0);
     if (t.disc) {
-        if (!t.entry || t.entry->dir) return false;
+        if (!t.entry || t.entry->dir || t.entry->size > kMaxGameFileBytes) return false;
         out.resize(t.entry->size);
         return MountedDisc()->Read(*t.entry, 0, out.data(), t.entry->size) == t.entry->size;
     }
+    std::error_code ec;
+    const uintmax_t size = fs::file_size(t.host, ec);
+    if (ec || size > kMaxGameFileBytes) return false;
     std::ifstream f(t.host, std::ios::binary);
     if (!f) return false;
-    out.assign(std::istreambuf_iterator<char>(f), {});
-    return true;
+    out.resize(size_t(size));
+    return f.read(reinterpret_cast<char*>(out.data()), std::streamsize(out.size())).good();
 }
 
 // exports
@@ -367,7 +459,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     std::string name = ObjectName(attrs, &root);
     Target t = Resolve(name, root);
     if (t.disc) return OpenOnDisc(t.entry, name, handle_out, iosb, disposition, options);
-    const std::string& host = t.host;
+    const fs::path& host = t.host;
     if (host.empty()) {
         LOGW("NtCreateFile: no mapping for %s", name.c_str());
         IoStatus(iosb, kObjectPathNotFound, 0);
@@ -376,6 +468,11 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     std::error_code ec;
     bool exists = fs::exists(host, ec);
     bool is_dir = exists && fs::is_directory(host, ec);
+    // CDROM0 is read-only media, including when its files are extracted.
+    if (t.read_only && (!exists || (disposition != 1 && disposition != 3) || (options & 0x1000))) {
+        IoStatus(iosb, kAccessDenied, 0);
+        return kAccessDenied;
+    }
     bool want_dir = options & 1;
     uint32_t info = 1;  // FILE_OPENED
     if (want_dir || is_dir) {
@@ -398,6 +495,8 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
         f->host = host;
         f->xbox = Normalize(name);
         f->dir = true;
+        f->read_only = t.read_only;
+        RegisterFile(f);
         W32(handle_out, NewHandle(f));
         IoStatus(iosb, kSuccess, info);
         return kSuccess;
@@ -441,14 +540,14 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
             return kInvalidParameter;
     }
     // a file in a missing folder fails as on the console: XAPI probes saves with OPEN_ALWAYS
-    if (!exists && !fs::is_directory(fs::path(host).parent_path(), ec)) {
+    if (!exists && !fs::is_directory(host.parent_path(), ec)) {
         IoStatus(iosb, kObjectPathNotFound, 0);
         return kObjectPathNotFound;
     }
-    FILE* fp = std::fopen(host.c_str(), mode);
-    if (!fp && std::string(mode) == "r+b") fp = std::fopen(host.c_str(), "rb");  // read only media
+    FILE* fp = OpenHostFile(host, mode);
+    if (!fp && std::string(mode) == "r+b") fp = OpenHostFile(host, "rb");  // read only media
     if (!fp) {
-        LOGW("NtCreateFile: cannot open %s", host.c_str());
+        LOGW("NtCreateFile: cannot open %s", host.string().c_str());
         IoStatus(iosb, kAccessDenied, 0);
         return kAccessDenied;
     }
@@ -456,7 +555,10 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     f->host = host;
     f->xbox = Normalize(name);
     f->fp = fp;
+    f->writable = std::strchr(mode, '+') != nullptr;
+    f->read_only = t.read_only;
     f->delete_on_close = options & 0x1000;  // FILE_DELETE_ON_CLOSE
+    RegisterFile(f);
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, info);
     LOG_FIRST(400, "open %s", name.c_str());
@@ -470,7 +572,7 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     std::string name = ObjectName(attrs, &root);
     Target t = Resolve(name, root);
     if (t.disc) return OpenOnDisc(t.entry, name, handle_out, iosb, 1, options);
-    const std::string& host = t.host;
+    const fs::path& host = t.host;
     std::error_code ec;
     if (host.empty() || !fs::exists(host, ec)) {
         LOG_FIRST(200, "missing %s", name.c_str());
@@ -481,11 +583,14 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     f->host = host;
     f->xbox = Normalize(name);
     f->dir = fs::is_directory(host, ec);
+    f->read_only = t.read_only;
     if (!f->dir) {
-        f->fp = std::fopen(host.c_str(), "r+b");
-        if (!f->fp) f->fp = std::fopen(host.c_str(), "rb");
+        f->fp = OpenHostFile(host, t.read_only ? "rb" : "r+b");
+        f->writable = !t.read_only && f->fp != nullptr;
+        if (!f->fp && !t.read_only) f->fp = OpenHostFile(host, "rb");
         if (!f->fp) return kAccessDenied;
     }
+    RegisterFile(f);
     (void)options;
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, 1);
@@ -511,7 +616,7 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], buf = a[5], len = a[6], off = a[7];
     auto f = FileFromHandle(h);
     if (!f || (!f->fp && !f->entry)) return kInvalidHandle;
-    if (write && f->entry) return kAccessDenied;
+    if (write && (f->entry || f->read_only)) return kAccessDenied;
     ResetEvent(*f);
     std::lock_guard<std::mutex> lock(f->io);
     uint64_t pos = Offset(*f, off);
@@ -544,20 +649,31 @@ KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
     if (!f) return kInvalidHandle;
     std::lock_guard<std::mutex> io(f->io);
     std::error_code ec;
-    uint64_t size = f->dir ? 0 : f->entry ? f->entry->size : fs::file_size(f->host, ec);
-    if (f->fp) {
-        std::fflush(f->fp);
-        size = fs::file_size(f->host, ec);
+    uint64_t size = f->dir ? 0 : f->entry ? f->entry->size : 0;
+    if (!f->dir && !f->entry) {
+        if (f->fp && std::fflush(f->fp) != 0) return kDiskFull;
+        const uintmax_t host_size = fs::file_size(f->host, ec);
+        size = ec ? 0 : uint64_t(host_size);  // a vanished/locked file must not report UINT64_MAX
     }
     uint32_t need = cls == 4 ? 0x28 : cls == 5 ? 0x18 : cls == 14 ? 8 : cls == 34 ? 0x38 : 0;
     if (need && len < need) {
         IoStatus(iosb, kBufferTooSmall, need);
         return kBufferTooSmall;
     }
+    if (len && !GuestWritable(out, len)) {
+        IoStatus(iosb, kAccessViolation, 0);
+        return kAccessViolation;
+    }
     std::memset(HostPtr(out), 0, len);
     switch (cls) {
         case 4: {  // FileBasicInformation
-            uint64_t t = f->entry ? MountedDisc()->Time() : ToFileTime(fs::last_write_time(f->host, ec));
+            uint64_t t = 0;
+            if (f->entry) {
+                t = MountedDisc()->Time();
+            } else {
+                const auto written = fs::last_write_time(f->host, ec);
+                if (!ec) t = ToFileTime(written);
+            }
             for (int i = 0; i < 4; i++) W64(out + i * 8, t);
             W32(out + 0x20, f->dir ? 0x10 : 0x80);
             IoStatus(iosb, kSuccess, 0x28);
@@ -594,7 +710,7 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
     auto f = FileFromHandle(h);
     if (!f) return kInvalidHandle;
     std::lock_guard<std::mutex> io(f->io);
-    if (f->entry && cls != 14 && cls != 4) return kAccessDenied;
+    if ((f->entry || f->read_only) && cls != 14 && cls != 4) return kAccessDenied;
     std::error_code ec;
     switch (cls) {
         case 14:  // position
@@ -605,9 +721,15 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
             if (f->fp) {
                 // The function already holds f->io; taking it again here deadlocks
                 // the first time a save truncates a file.
-                std::fflush(f->fp);
-                uint64_t size = fs::file_size(f->host, ec);
-                if (cls == 20 || R64(in) < size) fs::resize_file(f->host, R64(in), ec);
+                if (std::fflush(f->fp) != 0) return kDiskFull;
+                const uintmax_t host_size = fs::file_size(f->host, ec);
+                const uint64_t size = ec ? 0 : uint64_t(host_size);
+                if (cls == 20 || R64(in) < size) {
+                    fs::resize_file(f->host, R64(in), ec);
+                    if (ec) return kDiskFull;
+                }
+                // Truncation is metadata; commit it before reporting success.
+                if (!SyncStream(f->fp)) return kDiskFull;
             }
             break;
         case 13:  // disposition
@@ -616,9 +738,11 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
         case 10: {  // rename: ReplaceIfExists, RootDirectory, FileName (ANSI_STRING inline)
             uint32_t root = R32(in + 4);
             std::string target = ReadAnsiString(in + 8);
-            std::string host = ResolvePath(target, root);
+            Target resolved = Resolve(target, root);
+            if (resolved.read_only) return kAccessDenied;
+            fs::path host = resolved.host;
             if (host.empty()) return kObjectPathNotFound;
-            if (f->fp) std::fflush(f->fp);
+            if (f->fp && std::fflush(f->fp) != 0) return kDiskFull;
             fs::rename(f->host, host, ec);
             if (ec) return kAccessDenied;
             f->host = host;
@@ -636,8 +760,9 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
 
 // fills a volume information class into out; returns the status and the byte count written
 static uint32_t QueryVolume(uint32_t out, uint32_t len, uint32_t cls, uint32_t& bytes, const char* who) {
-    std::memset(HostPtr(out), 0, len);
     bytes = 0;
+    if (len && !GuestWritable(out, len)) return kAccessViolation;
+    std::memset(HostPtr(out), 0, len);
     switch (cls) {
         case 3:  // FileFsSizeInformation: 16 GiB total, 8 GiB free in 16 KiB units
             W64(out, 0x100000);
@@ -724,6 +849,10 @@ KERNEL_EXPORT(207, NtQueryDirectoryFile, 10) {
         IoStatus(iosb, kBufferTooSmall, 0);
         return kBufferTooSmall;  // keep the entry for the retry with a larger buffer
     }
+    if (!GuestWritable(out, need)) {
+        IoStatus(iosb, kAccessViolation, 0);
+        return kAccessViolation;
+    }
     f->next++;
     std::memset(HostPtr(out), 0, need);
     // times, sizes and attributes sit at the same place
@@ -749,23 +878,30 @@ KERNEL_EXPORT(210, NtQueryFullAttributesFile, 2) {
         LOG_FIRST(200, "missing %s", name.c_str());
         return kObjectNameNotFound;
     }
+    if (!GuestWritable(a[1], 0x38)) return kAccessViolation;
     if (t.disc) FillNetworkInfo(a[1], *t.entry);
     else FillNetworkInfo(a[1], t.host);
     return kSuccess;
 }
 
 KERNEL_EXPORT(195, NtDeleteFile, 1) {
-    std::string host = ResolvePath(ReadAnsiString(R32(a[0] + 4)), R32(a[0]));
+    Target target = Resolve(ReadAnsiString(R32(a[0] + 4)), R32(a[0]));
+    if (target.read_only) return kAccessDenied;
     std::error_code ec;
-    if (host.empty() || !fs::remove(host, ec)) return kObjectNameNotFound;
+    if (target.host.empty() || !fs::remove(target.host, ec)) return kObjectNameNotFound;
     return kSuccess;
 }
 
 KERNEL_EXPORT(198, NtFlushBuffersFile, 2) {
-    if (auto f = FileFromHandle(a[0]))
-        if (f->fp) std::fflush(f->fp);
-    IoStatus(a[1], kSuccess, 0);
-    return kSuccess;
+    uint32_t status = kSuccess;
+    if (auto f = FileFromHandle(a[0])) {
+        std::lock_guard<std::mutex> io(f->io);
+        // A full or failing disk is visible only when the CRT buffer reaches the
+        // host file system, so report it instead of acknowledging lost data.
+        if (f->fp && f->writable && !SyncStream(f->fp)) status = kDiskFull;
+    }
+    IoStatus(a[1], status, 0);
+    return status;
 }
 
 KERNEL_EXPORT(200, NtFsControlFile, 10) {

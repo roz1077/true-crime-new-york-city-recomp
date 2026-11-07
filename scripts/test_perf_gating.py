@@ -53,6 +53,7 @@ struct WaitCv {
  }
 };
 constexpr uint32_t kBatchCommands=64;
+uint64_t IndexRoom(const uint8_t*) { return ~uint64_t(0); }
 struct Threaded:Backend {
  Batch batch; Batch* cur_=&batch; unsigned states=0,uses=0,writes=0,submits=0,puts=0;
  std::mutex m_; std::atomic<uint64_t> done_{0}; WaitCv done_cv_{&done_};

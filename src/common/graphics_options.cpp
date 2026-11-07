@@ -10,6 +10,7 @@
 #include "graphics_menu.h"
 
 #include "app/app.h"
+#include "core/log.h"
 #include "graphics_choices.h"
 #include "menu_input.h"
 
@@ -28,6 +29,26 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+namespace app {
+// main.cpp: the window thread applies the current settings and reports success
+// through these, so the frame thread does not hold UiLock across a SendMessage.
+uint64_t RequestDisplayApply();
+bool DisplayApplyResult(uint64_t request, bool &ok);
+#ifndef _WIN32
+// The SDL hosts already apply display changes through their own window loop
+// and do not report a result; keep the previous optimistic apply there.
+uint64_t RequestDisplayApply() {
+    ApplyDisplay();
+    return 1;
+}
+bool DisplayApplyResult(uint64_t request, bool &ok) {
+    if (request != 1) return false;
+    ok = true;
+    return true;
+}
+#endif
+} // namespace app
 
 namespace game {
 
@@ -112,6 +133,11 @@ struct Menu {
     bool open = false;
     int selected = 0;
     bool dirty = false; // settings changed since the menu opened or last saved
+    bool apply_pending = false; // the window thread has not reported the display apply yet
+    bool apply_failed = false;  // the last display apply was refused
+    uint64_t apply_seq = 0;
+    app::DisplayMode old_mode{};
+    app::Mode old_resolution{};
     app::DisplayMode mode{};
     app::Mode resolution{};
     std::vector<app::Mode> resolutions; // index 0 is Desktop (0 x 0)
@@ -152,6 +178,10 @@ std::vector<app::Mode> DisplayModes() {
 namespace {
 
 bool DisplayPending() {
+    // While an apply is in flight the live settings already hold the candidate
+    // values; compare with the last applied mode so the pending marker stays.
+    if (g_menu.apply_pending)
+        return g_menu.mode != g_menu.old_mode || !SameMode(g_menu.resolution, g_menu.old_resolution);
     app::SettingsLock lock;
     const app::Settings &s = app::Get();
     return g_menu.mode != s.display_mode || !SameMode(g_menu.resolution, {s.width, s.height});
@@ -162,6 +192,7 @@ void OpenMenu() {
     const app::Settings &s = app::Get();
     g_menu.open = true;
     g_menu.dirty = false;
+    if (!g_menu.apply_pending) g_menu.apply_failed = false;
     g_menu.mode = s.display_mode;
     g_menu.resolution = {s.width, s.height};
     g_menu.resolutions = DisplayModes();
@@ -170,12 +201,14 @@ void OpenMenu() {
     g_menu.desktop = app::Desktop();
     g_menu.output_height = app::Output().height;
     g_menu.repeater = {};
+    g_pad_nav.store(0); // drop any keyboard-derived bits from before the overlay owned the keys
     g_open.store(true);
     input::SetUiActive(true);
     app::CaptureMouse(false); // the menu needs the pointer
 }
 
 void CloseMenu() {
+    if (g_menu.apply_pending) return; // keep the menu up until the mode apply is answered
     if (g_menu.dirty) app::Save();
     g_menu.open = false;
     g_open.store(false);
@@ -183,16 +216,92 @@ void CloseMenu() {
     app::CaptureMouse(true);
 }
 
-void ApplyDisplayChanges() {
-    app::SettingsLock lock;
-    app::Settings &s = app::Get();
-    s.display_mode = g_menu.mode;
-    s.width = g_menu.resolution.width;
-    s.height = g_menu.resolution.height;
+// WM_CLOSE/WM_DESTROY bypass CloseMenu. Save live changes, but never persist a
+// display mode that was not applied (or whose apply is still in flight).
+#ifdef _WIN32
+void SaveOnExit() {
+    // The window handler runs outside UiLock; the menu state is shared with
+    // the frame that draws it.
+    std::lock_guard lock(app::UiLock());
+    if (!g_menu.dirty && !g_menu.apply_pending) return;
+    static bool saved = false;
+    if (saved) return;
+    saved = true;
+    if (g_menu.apply_pending) {
+        bool ok = false;
+        // A result already published for a successful apply is safe to keep;
+        // anything still in flight reverts to the last applied mode.
+        if (app::DisplayApplyResult(g_menu.apply_seq, ok) && ok) {
+            g_menu.apply_pending = false;
+        } else {
+            app::SettingsLock lock;
+            app::Settings &s = app::Get();
+            s.display_mode = g_menu.old_mode;
+            s.width = g_menu.old_resolution.width;
+            s.height = g_menu.old_resolution.height;
+            g_menu.apply_pending = false;
+        }
+    }
     app::Save();
-    app::ApplyDisplay();
     g_menu.dirty = false;
+}
+#endif
+
+void ApplyDisplayChanges() {
+    if (g_menu.apply_pending) return;
+    {
+        app::SettingsLock lock;
+        app::Settings &s = app::Get();
+        g_menu.old_mode = s.display_mode;
+        g_menu.old_resolution = {s.width, s.height};
+        // ApplyNow reads the settings; the file is written only after the
+        // window thread confirms the mode change (see PollDisplayApply).
+        s.display_mode = g_menu.mode;
+        s.width = g_menu.resolution.width;
+        s.height = g_menu.resolution.height;
+    }
+    const uint64_t request = app::RequestDisplayApply();
+    if (!request) {
+        app::SettingsLock lock;
+        app::Settings &s = app::Get();
+        s.display_mode = g_menu.old_mode;
+        s.width = g_menu.old_resolution.width;
+        s.height = g_menu.old_resolution.height;
+        g_menu.apply_failed = true;
+        LOGE("Graphics: could not request a display apply for mode %u, %ux%u", uint32_t(g_menu.mode),
+             g_menu.resolution.width, g_menu.resolution.height);
+        return;
+    }
+    g_menu.apply_pending = true;
+    g_menu.apply_seq = request;
+    g_menu.apply_failed = false;
+}
+
+// Runs on the frame that owns the menu, after the window thread has answered.
+void PollDisplayApply() {
+    if (!g_menu.apply_pending) return;
+    bool ok = false;
+    if (!app::DisplayApplyResult(g_menu.apply_seq, ok)) return;
+    g_menu.apply_pending = false;
+    if (ok) {
+        app::Save();
+        g_menu.dirty = false;
+        g_menu.output_height = app::Output().height;
+        g_menu.apply_failed = false;
+        return;
+    }
+    {
+        app::SettingsLock lock;
+        app::Settings &s = app::Get();
+        s.display_mode = g_menu.old_mode;
+        s.width = g_menu.old_resolution.width;
+        s.height = g_menu.old_resolution.height;
+    }
+    app::ApplyDisplay(); // put the previously applied mode/window back
     g_menu.output_height = app::Output().height;
+    g_menu.apply_failed = true;
+    LOGE("Graphics: display mode %u at %ux%u was refused; kept the previous settings", uint32_t(g_menu.mode),
+         g_menu.resolution.width, g_menu.resolution.height);
 }
 
 void RestoreDefaults() {
@@ -248,7 +357,7 @@ Kind KindOf(Row row) {
 }
 
 bool Enabled(Row row) {
-    if (row == Row::ApplyDisplay) return DisplayPending();
+    if (row == Row::ApplyDisplay) return !g_menu.apply_pending && DisplayPending();
     if (row == Row::DumpFormat) return app::Get().dump_textures;
     return true;
 }
@@ -727,6 +836,8 @@ void DrawMenu(double fps) {
         ImGui::TextDisabled("%s", Help(kRows[g_menu.selected]));
         ImGui::PopTextWrapPos();
         ImGui::EndChild();
+        if (g_menu.apply_failed)
+            ImGui::TextColored({1.0f, 0.45f, 0.35f, 1.0f}, "Display change failed; the previous mode is still in use.");
         ImGui::Separator();
         ImGui::TextDisabled("Arrows / D-pad: change   Enter / A: select   Esc / B: close");
     }
@@ -737,6 +848,7 @@ void DrawMenu(double fps) {
 } // namespace
 
 void DrawGraphicsMenu(double fps) {
+    PollDisplayApply();
     const bool toggle = g_toggle.exchange(false) || ImGui::IsKeyPressed(ImGuiKey_F10, false);
     if (toggle) {
         if (g_menu.open)
@@ -763,6 +875,9 @@ void FilterMenuPad(int port, input::Pad &pad) {
 
 bool GraphicsMenuMessage(void *, uint32_t msg, uintptr_t wp, intptr_t, intptr_t *result) {
 #ifdef _WIN32
+    // Alt+F4 and the window close button skip CloseMenu; save the live
+    // overlay settings here so an applied change is not lost on exit.
+    if (msg == WM_CLOSE || msg == WM_DESTROY) SaveOnExit();
     // Left Alt is heavy attack. Prevent its release from entering window-menu mode.
     if (msg == WM_SYSCOMMAND && (wp & 0xFFF0u) == SC_KEYMENU) {
         *result = 0;

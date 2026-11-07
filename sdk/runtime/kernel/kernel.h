@@ -2,9 +2,11 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -38,6 +40,7 @@ enum : uint32_t {
     kEndOfFile = 0xC0000011,
     kNoMemory = 0xC0000017,
     kAccessDenied = 0xC0000022,
+    kAccessViolation = 0xC0000005,
     kBufferTooSmall = 0xC0000023,
     kObjectTypeMismatch = 0xC0000024,
     kObjectNameInvalid = 0xC0000033,
@@ -49,6 +52,7 @@ enum : uint32_t {
     kNotADirectory = 0xC0000103,
     kFileIsADirectory = 0xC00000BA,
     kNotSupported = 0xC00000BB,
+    kDiskFull = 0xC000007F,
     kDeviceNotConnected = 0xC000009D,
     kCannotDelete = 0xC0000121,
 };
@@ -113,6 +117,8 @@ struct Object {
     bool notification = false;  // manual reset event or notification timer
     uint32_t owner = 0;         // mutant owner thread
     uint32_t recursion = 0;
+    uint64_t pulse = 0;         // successful PulseEvent calls, for waiters that were already registered
+    uint64_t pulse_taken = 0;   // auto-reset pulses handed to a waiter
     std::vector<Waiter*> waiters;  // Waits blocked on it
     std::string name;
     explicit Object(ObjType t) : type(t) {}
@@ -205,7 +211,7 @@ struct HleRunScope {
 X86Context& CurrentContext();
 ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_routine, uint32_t start_routine,
                        uint32_t start_context, bool suspended);
-void StartThread(ThreadRef t);
+bool StartThread(ThreadRef t);
 [[noreturn]] void ExitThread(uint32_t code);
 void Resume(Thread& t);
 uint32_t Suspend(Thread& t);  // previous count; another thread stops at its next kernel wait, delay or yield
@@ -215,20 +221,24 @@ void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3
 std::vector<ThreadRef> Threads();
 
 // files
-void MountDefaults(const std::string& game_dir, const std::string& data_dir);
+void MountDefaults(const std::filesystem::path& game_dir, const std::filesystem::path& data_dir);
+void FlushOpenFiles();  // commit writable saves before Shutdown's _Exit
 bool CreateSymbolicLink(const std::string& link, const std::string& target);
 bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);
-std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle);  // host path or empty
+std::filesystem::path ResolvePath(const std::string& xbox_path, uint32_t root_handle);  // host path or empty
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
+// wide-safe fopen for host paths; mode is the usual CRT mode string
+FILE* OpenHostFile(const std::filesystem::path& path, const char* mode);
 
 // boot
-bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::string& game_dir, const std::string& data_dir);
+bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::filesystem::path& game_dir,
+          const std::filesystem::path& data_dir);
 [[noreturn]] void Shutdown(int code);
 // the executable recompiled from an Xbox image path (D:\\default.xbe), null when there is none
 const char* ImageExe(std::string xbe_path);
 [[noreturn]] void Relaunch(const char* exe);
-extern std::string g_launch_file;
+extern std::filesystem::path g_launch_file;
 // The display a title keeps up through a quick reboot (D3DDevice_PersistDisplay): its front buffer goes to a file
 // beside launch.bin, and the next instance finds it as a surface at AvGetSavedDataAddress.
 void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, const void* pixels, uint32_t bytes);

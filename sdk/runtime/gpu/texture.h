@@ -32,10 +32,11 @@ struct TextureDesc {
 
 bool Describe(uint32_t header, TextureDesc& out);
 bool DescribeSurface(const Surface& s, TextureDesc& out);
-uint32_t LevelSize(const TextureDesc& d, uint32_t level);
-uint32_t LevelOffset(const TextureDesc& d, uint32_t level);
-uint32_t FaceSize(const TextureDesc& d);  // cube face stride
-uint32_t TotalSize(const TextureDesc& d);
+// guest byte sizes, 64 bit so a corrupt descriptor cannot wrap them
+uint64_t LevelSize(const TextureDesc& d, uint32_t level);
+uint64_t LevelOffset(const TextureDesc& d, uint32_t level);
+uint64_t FaceSize(const TextureDesc& d);  // cube face stride
+uint64_t TotalSize(const TextureDesc& d);
 
 // converts one level (one face) from guest memory into what Host describes, rows tightly packed
 void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint8_t* guest, const uint32_t* palette,

@@ -11,19 +11,23 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iterator>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -41,8 +45,9 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr size_t kKeyDigits = 16;
-constexpr uint32_t kMaxSide = 16384;  // D3D12's 2D texture limit
-constexpr uint32_t kDumpDds = 1;      // texture_dump_format
+constexpr uint32_t kMaxSide = 16384;              // D3D12's 2D texture limit
+constexpr uint64_t kMaxPixels = 64ull << 20;      // a dumped image's top level, 256 MB as BGRA
+constexpr uint32_t kDumpDds = 1;                  // texture_dump_format
 constexpr size_t kPaletteBytes = 256 * 4;
 constexpr auto kSettle = std::chrono::milliseconds(500);  // files still being copied in
 constexpr uint32_t kWatchRetry = 120;  // presents between tries while the pack folder is missing
@@ -69,6 +74,8 @@ struct Pack {
     uint32_t watch_tries = 0;
     std::optional<Clock::time_point> changed;      // the last change seen, not listed yet
     std::once_flag worker;
+    std::thread worker_thread;
+    std::atomic<bool> stop{false};
     std::mutex lock;                               // everything below
     uint32_t revision = 0;                         // a load started before the pack was listed again is dropped
     std::condition_variable wake;
@@ -80,7 +87,15 @@ struct Pack {
 
 Pack g;
 
-// Worker
+// Worker: joined at exit (this destructor runs before g), jobs never escape their exceptions
+struct WorkerOwner {
+    ~WorkerOwner() {
+        g.stop.store(true);
+        g.wake.notify_all();
+        if (g.worker_thread.joinable()) g.worker_thread.join();
+    }
+};
+WorkerOwner g_worker_owner;
 
 void Work() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -88,19 +103,39 @@ void Work() {
         std::function<void()> job;
         {
             std::unique_lock l(g.lock);
-            g.wake.wait(l, [] { return !g.jobs.empty(); });
+            g.wake.wait(l, [] { return g.stop.load() || !g.jobs.empty(); });
+            if (g.stop.load()) return;
             job = std::move(g.jobs.front());
             g.jobs.pop_front();
         }
-        job();
+        try {
+            job();
+        } catch (const std::bad_alloc&) {
+            LOGE("texture dump: a worker job ran out of memory");
+        } catch (const std::exception& e) {
+            LOGE("texture dump: a worker job failed: %s", e.what());
+        } catch (...) {
+            LOGE("texture dump: a worker job failed");
+        }
     }
 }
 
 void Post(std::function<void()> job) {
-    std::call_once(g.worker, [] { std::thread(Work).detach(); });
-    {
+    try {
+        std::call_once(g.worker, [] {
+            g.stop.store(false);
+            g.worker_thread = std::thread(Work);
+        });
+    } catch (const std::exception& e) {
+        LOGE("texture dump: the worker thread could not start: %s", e.what());
+        return;
+    }
+    try {
         std::lock_guard l(g.lock);
         g.jobs.push_back(std::move(job));
+    } catch (const std::bad_alloc&) {
+        LOGE("texture dump: a worker job could not be queued");
+        return;
     }
     g.wake.notify_one();
 }
@@ -277,7 +312,7 @@ bool ReadDds(const fs::path& path, Image& img) {
     img.width = Read32(f, kDdsWidth);
     img.height = Read32(f, kDdsHeight);
     if (img.format == DXGI_FORMAT_UNKNOWN || !img.width || !img.height) return false;
-    if (img.width > kMaxSide || img.height > kMaxSide) return false;
+    if (img.width > kMaxSide || img.height > kMaxSide || uint64_t(img.width) * img.height > kMaxPixels) return false;
     uint32_t mips = Read32(f, kDdsFlags) & kDdsdMipCount ? Read32(f, kDdsMipCount) : 1;
     uint32_t levels = std::clamp(mips, 1u, FullChain(img.width, img.height));
     for (uint32_t l = 0; l < levels; l++) {
@@ -324,15 +359,31 @@ std::vector<uint8_t> DdsHeader(const Image& img) {
 }
 
 void WriteDds(const fs::path& path, const Image& img) {
+    if (img.levels.empty() || !img.width || !img.height || uint64_t(img.width) * img.height > kMaxPixels) return;
     std::error_code ec;
     if (fs::exists(path, ec)) return;
-    std::ofstream out(path, std::ios::binary);
-    std::vector<uint8_t> header = DdsHeader(img);
-    out.write(reinterpret_cast<const char*>(header.data()), std::streamsize(header.size()));
-    for (const Level& l : img.levels) {
-        out.write(reinterpret_cast<const char*>(l.px.data()), std::streamsize(l.px.size()));
+    fs::path temp = path;
+    temp += ".tmp";
+    fs::remove(temp, ec);
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        std::vector<uint8_t> header = DdsHeader(img);
+        out.write(reinterpret_cast<const char*>(header.data()), std::streamsize(header.size()));
+        for (const Level& l : img.levels) {
+            out.write(reinterpret_cast<const char*>(l.px.data()), std::streamsize(l.px.size()));
+        }
+        if (!out) {
+            LOGE("texture dump: %s not written", Utf8(path).c_str());
+            out.close();
+            fs::remove(temp, ec);
+            return;
+        }
     }
-    if (!out) LOGE("texture dump: %s not written", Utf8(path).c_str());
+    fs::rename(temp, path, ec);
+    if (ec) {
+        LOGE("texture dump: %s could not be renamed into place", Utf8(path).c_str());
+        fs::remove(temp, ec);
+    }
 }
 
 // PNG and other WIC files
@@ -371,8 +422,12 @@ HRESULT LevelZeroBitmap(IWICImagingFactory* wic, const Image& img, std::vector<u
 }
 
 void WritePng(const fs::path& path, const Image& img) {
+    if (img.levels.empty() || !img.width || !img.height || uint64_t(img.width) * img.height > kMaxPixels) return;
     std::error_code ec;
     if (fs::exists(path, ec)) return;
+    fs::path temp = path;
+    temp += ".tmp";
+    fs::remove(temp, ec);
     IWICImagingFactory* wic = Wic();
     std::vector<uint8_t> dds;  // the source reads it until the frame is written
     ComPtr<IWICBitmapSource> bgra;
@@ -382,7 +437,7 @@ void WritePng(const fs::path& path, const Image& img) {
     WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
     HRESULT hr = wic ? LevelZeroBitmap(wic, img, dds, bgra) : E_FAIL;
     if (SUCCEEDED(hr)) hr = wic->CreateStream(&file);
-    if (SUCCEEDED(hr)) hr = file->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+    if (SUCCEEDED(hr)) hr = file->InitializeFromFilename(temp.c_str(), GENERIC_WRITE);
     if (SUCCEEDED(hr)) hr = wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
     if (SUCCEEDED(hr)) hr = encoder->Initialize(file.Get(), WICBitmapEncoderNoCache);
     if (SUCCEEDED(hr)) hr = encoder->CreateNewFrame(&frame, nullptr);
@@ -392,7 +447,19 @@ void WritePng(const fs::path& path, const Image& img) {
     if (SUCCEEDED(hr)) hr = frame->WriteSource(bgra.Get(), nullptr);
     if (SUCCEEDED(hr)) hr = frame->Commit();
     if (SUCCEEDED(hr)) hr = encoder->Commit();
-    if (FAILED(hr)) LOGE("texture dump: %s not written (0x%08lx)", Utf8(path).c_str(), static_cast<unsigned long>(hr));
+    frame.Reset();
+    encoder.Reset();
+    file.Reset();
+    if (FAILED(hr)) {
+        LOGE("texture dump: %s not written (0x%08lx)", Utf8(path).c_str(), static_cast<unsigned long>(hr));
+        fs::remove(temp, ec);
+        return;
+    }
+    fs::rename(temp, path, ec);
+    if (ec) {
+        LOGE("texture dump: %s could not be renamed into place", Utf8(path).c_str());
+        fs::remove(temp, ec);
+    }
 }
 
 bool ReadPng(const fs::path& path, Image& img) {
@@ -410,7 +477,7 @@ bool ReadPng(const fs::path& path, Image& img) {
     UINT w = 0;
     UINT h = 0;
     if (SUCCEEDED(hr)) hr = bgra->GetSize(&w, &h);
-    if (FAILED(hr) || !w || !h || w > kMaxSide || h > kMaxSide) return false;
+    if (FAILED(hr) || !w || !h || w > kMaxSide || h > kMaxSide || uint64_t(w) * h > kMaxPixels) return false;
     Level top{std::vector<uint8_t>(size_t(w) * h * 4), w * 4};
     if (FAILED(bgra->CopyPixels(nullptr, top.pitch, UINT(top.px.size()), top.px.data()))) return false;
     img.format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -477,6 +544,11 @@ void Load(uint64_t key, const fs::path& path, uint32_t revision) {
 
 Image Decode(const TextureDesc& d, const uint8_t* guest, const uint32_t* palette) {
     Image img;
+    if (!d.width || !d.height || d.width > kMaxSide || d.height > kMaxSide || uint64_t(d.width) * d.height > kMaxPixels ||
+        !d.levels || d.levels > 15) {
+        LOGE("texture dump: %ux%u texture not decoded, its size is not sane", d.width, d.height);
+        return img;
+    }
     img.format = UploadFormat(Format(d.format).host);
     img.width = d.width;
     img.height = d.height;
@@ -557,8 +629,12 @@ uint64_t Key(const TextureDesc& d, const FormatInfo& fi, const uint8_t* guest, c
     if (!Replacing() && !g.set.dumping) return 0;
     // cube maps, volumes and depth stay the console's; linear ones are movie frames and the game's own copies
     if (d.cube || d.depth > 1 || d.linear || UploadFormat(fi.host) == DXGI_FORMAT_UNKNOWN) return 0;
+    if (!d.width || !d.height || d.width > kMaxSide || d.height > kMaxSide ||
+        uint64_t(d.width) * d.height > kMaxPixels || LevelSize(d, 0) > kMaxPixels * 4) {
+        return 0;
+    }
     uint32_t shape[] = {d.format, d.width, d.height};
-    uint64_t key = Hash(guest, LevelSize(d, 0), Hash(shape, sizeof(shape)));
+    uint64_t key = Hash(guest, size_t(LevelSize(d, 0)), Hash(shape, sizeof(shape)));
     if (palette) key = Hash(palette, kPaletteBytes, key);
     return key ? key : 1;
 }
@@ -571,13 +647,23 @@ void Dump(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32
     }
     bool dds = g.set.format == kDumpDds;
     fs::path path = g.dump_dir / DumpName(key, d, dds ? "dds" : "png");
-    Post([path, dds, img = Decode(d, guest, palette)] {
-        if (dds) {
-            WriteDds(path, img);
-        } else {
-            WritePng(path, img);
-        }
-    });
+    try {
+        Image img = Decode(d, guest, palette);
+        if (img.levels.empty()) return;
+        Post([path, dds, img = std::move(img)] {
+            try {
+                if (dds) {
+                    WriteDds(path, img);
+                } else {
+                    WritePng(path, img);
+                }
+            } catch (const std::bad_alloc&) {
+                LOGE("texture dump: %s ran out of memory", Utf8(path).c_str());
+            }
+        });
+    } catch (const std::bad_alloc&) {
+        LOGE("texture dump: %s ran out of memory before its job was queued", Utf8(path).c_str());
+    }
 }
 
 Lookup Take(uint64_t key, Image& out) {

@@ -13,6 +13,8 @@
 // g_first + slot.
 // The rules are in display_rows.h; GRAPHICS_NOTES.md has the research.
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -54,6 +56,38 @@ uint64_t g_pending_size = 0;
 bool g_pending = false;
 std::vector<uint64_t> g_sizes;
 
+// Apply changes the live settings at once, but writing and flushing the file
+// on every arrow step stalled the tab. Save after the row changes settle, when
+// navigation/exit arrives, or when the tab is entered again.
+constexpr uint64_t kSaveIdleMs = 250;
+std::atomic<bool> g_save_dirty{false};
+std::atomic<uint64_t> g_save_due{0};
+
+uint64_t NowMs() {
+    return uint64_t(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+void MarkSave() {
+    g_save_due.store(NowMs() + kSaveIdleMs, std::memory_order_relaxed);
+    g_save_dirty.store(true, std::memory_order_release);
+}
+
+void FlushSettings() {
+    if (!g_save_dirty.exchange(false, std::memory_order_acq_rel)) return;
+    app::Save();
+}
+
+void MaybeSave() {
+    if (g_save_dirty.load(std::memory_order_acquire) && NowMs() >= g_save_due.load(std::memory_order_relaxed))
+        FlushSettings();
+}
+
+bool OnDisplayRows(uint8_t* base, uint32_t self) {
+    return X86_MEM32(self + kPage) == kDisplayPage && X86_MEM32(self + kFocus) == kRowListFocus;
+}
+
 Values Current() {
     app::SettingsLock lock;
     const app::Settings &s = app::Get();
@@ -80,7 +114,7 @@ void Apply(const Values &v) {
     app::SetMsaaSamples(v.msaa);
     s.smaa = v.smaa;
     game::SetShowFps(v.show_fps);
-    app::Save();
+    MarkSave();
 }
 
 // sets the output resolution and has the window thread apply it, as the overlay's Apply does
@@ -116,6 +150,7 @@ uint32_t g_first = 0;
 X86_EXTERN_FUNC(__imp__sub_000B13C0);
 X86_FUNC(sub_000B13C0) {
     __imp__sub_000B13C0(ctx, base);
+    FlushSettings(); // a previous visit left before its idle save
     g_pending = false;
     g_on_entry = Current();
     g_entered = true;
@@ -134,11 +169,13 @@ X86_FUNC(sub_000B14F0) {
         Apply(g_on_entry);
         ApplySize(g_on_entry.applied);
     }
+    FlushSettings(); // Back restores and saves before the tab (or menu) closes
     g_first = 0;
 }
 
 X86_EXTERN_FUNC(__imp__sub_000C7B80);
 X86_FUNC(sub_000C7B80) {
+    MaybeSave(); // the row getter runs every frame while the tab is open
     const uint32_t self = ctx.ecx, out = X86_MEM32(ctx.esp + 4), port = X86_MEM32(ctx.esp + 8);
     const bool text = port >= kDisplayText && port < kDisplayText + kShownRows;
     const bool colour = port >= kDisplayColour && port < kDisplayColour + kShownRows;
@@ -181,6 +218,7 @@ X86_FUNC(sub_000C7B80) {
 // MenuPauseInterface event dispatcher (thiscall: event, two arguments).
 X86_EXTERN_FUNC(__imp__sub_000CB400);
 X86_FUNC(sub_000CB400) {
+    MaybeSave();
     const uint32_t self = ctx.ecx, event = X86_MEM32(ctx.esp + 4), input = X86_MEM32(ctx.esp + 8);
     const uint32_t page = self ? X86_MEM32(self + kPage) : 0;
     if (Tracing() && event == kInputEvent && page >= 0x0F && page <= 0x12) {
@@ -211,9 +249,14 @@ X86_FUNC(sub_000CB400) {
                 }
             }
             if (step.apply) ApplySize(g_pending_size);
+            // Navigation (no value change) means the arrow steps have settled;
+            // leaving the row list/tab also has to save before the hooks stop.
+            // A resolution apply already wrote the file in ApplySize.
+            if ((!step.change && !step.apply) || !OnDisplayRows(base, self)) FlushSettings();
             ::kernel::Return(ctx, 0, 3);
             return;
         }
     }
     __imp__sub_000CB400(ctx, base);
+    if (event == kInputEvent && page == kDisplayPage && !OnDisplayRows(base, self)) FlushSettings();
 }

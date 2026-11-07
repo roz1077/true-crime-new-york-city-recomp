@@ -229,11 +229,12 @@ inline uint64_t mmx_map2(uint64_t a, uint64_t b, F f) {
 inline void x86_rep_movs(X86Context& ctx, uint8_t* base, uint32_t w) {
     uint32_t n = ctx.ecx;
     if (!n) return;
-    uint32_t bytes = n * w;
-    if (!ctx.df && (ctx.edi - ctx.esi >= bytes || ctx.edi <= ctx.esi)) {
-        std::memmove(base + ctx.edi, base + ctx.esi, bytes);
-        ctx.esi += bytes;
-        ctx.edi += bytes;
+    const uint64_t bytes = uint64_t(n) * w;
+    const uint64_t src = ctx.esi, dst = ctx.edi;
+    if (!ctx.df && bytes <= 0xFFFFFFFFull && (dst >= src + bytes || dst <= src)) {
+        std::memmove(base + ctx.edi, base + ctx.esi, size_t(bytes));
+        ctx.esi = uint32_t(src + bytes);
+        ctx.edi = uint32_t(dst + bytes);
         ctx.ecx = 0;
         return;
     }

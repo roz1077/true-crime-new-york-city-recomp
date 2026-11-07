@@ -27,8 +27,10 @@ def main():
         output.mkdir()
 
         def extract():
+            # Python startup and antivirus scans can take tens of seconds on a
+            # loaded Windows/CI machine; the extractor itself is milliseconds.
             return subprocess.run([sys.executable, str(extractor), str(iso), str(output)],
-                                  capture_output=True, text=True, timeout=10)
+                                  capture_output=True, text=True, timeout=120)
 
         make_image(iso, b'../escaped.txt', b'proof', 5)
         result = extract()

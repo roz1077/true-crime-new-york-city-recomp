@@ -137,7 +137,7 @@ function(add_xbe_image target xbe config partitions game_dir)
         # MinGW's driver needs the wide CRT startup for wWinMain; MSVC targets wire it from the entry name.
         target_link_options(${target} PRIVATE -municode)
     endif()
-    target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
+    target_link_options(${target} PRIVATE -fuse-ld=lld $<$<CONFIG:Debug>:-g> -Wl,/delayload:${target}.dll)
 
     # without a C runtime: the executable passes on what the code calls
     add_library(${target}_code SHARED ${GEN_SOURCES})

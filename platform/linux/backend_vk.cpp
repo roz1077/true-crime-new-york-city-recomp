@@ -543,6 +543,19 @@ VkFormat ElementFormat(uint32_t dxgi) {
     }
 }
 
+// bytes one vertex element fetches, matching ElementFormat's fallback
+uint32_t ElementBytes(uint32_t dxgi) {
+    switch (dxgi) {
+        case 2: return 16;
+        case 6: return 12;
+        case 13: case 14: case 16: return 8;
+        case 28: case 37: case 38: case 41: case 42: case 87: return 4;
+        case 49: case 58: case 59: return 2;
+        case 61: return 1;
+        default: return 16;
+    }
+}
+
 } // namespace
 
 class VulkanBackend final : public Backend {
@@ -588,6 +601,7 @@ private:
     // recording
     void BeginRecord();
     void EndRecord(bool wait);
+    void Fail(const char* what, VkResult r);
     void Transition(VkImage image, VkImageLayout& layout, VkImageLayout want, VkFormat format, uint32_t levels = 1,
                     uint32_t layers = 1);
     VkRenderPass RenderPassFor(VkFormat color, VkFormat depth);
@@ -670,6 +684,7 @@ private:
 
     uint32_t width_ = 0, height_ = 0;
     float scale_ = 1.0f, stretch_ = 1.0f;
+    uint32_t max_image_side_ = 16384;
     uint32_t msaa_ = 1;
     uint32_t color_samples_ = 1, depth_samples_ = 1;
     uint32_t instance_version_ = VK_API_VERSION_1_0;
@@ -707,6 +722,7 @@ private:
     VkFormat depth_format_ = VK_FORMAT_D24_UNORM_S8_UINT;
     bool depth_has_stencil_ = true;
     VkFence fence_ = VK_NULL_HANDLE;
+    bool failed_ = false;  // a submit or acquire failure stops presenting instead of waiting on a dead fence
     bool recording_ = false;
     // dynamic state caching: these persist across render passes in one command buffer
     VkPipeline bound_pipe_ = VK_NULL_HANDLE;
@@ -720,6 +736,8 @@ private:
     uint64_t upload_size_ = 0, upload_used_ = 0;
     // an oversized frame grows the ring; the previous buffer stays alive until the frame's GPU work is done
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> upload_retired_;
+    // staging buffers for uploads recorded into the current command buffer; freed after its fence
+    std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging_pending_;
 
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
@@ -971,6 +989,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(physical_, &props);
+        max_image_side_ = props.limits.maxImageDimension2D;
         api12_ = instance_version_ >= VK_API_VERSION_1_2 && props.apiVersion >= VK_API_VERSION_1_2;
         VkPhysicalDeviceDepthStencilResolveProperties dsr{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
@@ -989,10 +1008,11 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
             create_render_pass2_ =
                 reinterpret_cast<PFN_vkCreateRenderPass2>(vkGetInstanceProcAddr(instance_, "vkCreateRenderPass2KHR"));
         depth_resolve_ = api12_ && create_render_pass2_ && (dsr.supportedDepthResolveModes != 0);
-        if (dsr.supportedDepthResolveModes & VK_RESOLVE_MODE_MAX_BIT)
-            depth_resolve_mode_ = VK_RESOLVE_MODE_MAX_BIT;
-        else if (dsr.supportedDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT)
+        // D3D12 resolves depth by reading sample 0; MAX would resolve the farthest sample instead.
+        if (dsr.supportedDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT)
             depth_resolve_mode_ = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        else if (dsr.supportedDepthResolveModes & VK_RESOLVE_MODE_MAX_BIT)
+            depth_resolve_mode_ = VK_RESOLVE_MODE_MAX_BIT;
         else
             depth_resolve_ = false;
         color_samples_ = props.limits.framebufferColorSampleCounts;
@@ -1246,6 +1266,7 @@ bool VulkanBackend::CreateDevice() {
     }
     LOGR("vulkan: custom sampler border colours %s", border_custom_ ? "on" : "off (fixed colours)");
     VkPhysicalDeviceFeatures features{};
+    features.robustBufferAccess = supported.robustBufferAccess;
     features.textureCompressionBC = supported.textureCompressionBC;
     features.samplerAnisotropy = supported.samplerAnisotropy;
     sampler_anisotropy_ = supported.samplerAnisotropy == VK_TRUE;
@@ -1324,6 +1345,12 @@ bool VulkanBackend::CreateSwapchain() {
                                   caps.maxImageExtent.width);
         extent.height = std::clamp(pixels.height ? pixels.height : height_, caps.minImageExtent.height,
                                    caps.maxImageExtent.height);
+    }
+    // A minimised surface can report 0x0. Keep the old chain (if any) and retry next frame rather
+    // than creating an invalid swapchain.
+    if (!extent.width || !extent.height) {
+        LOG_FIRST(8, "vulkan: surface extent %ux%u, keeping the current swapchain", extent.width, extent.height);
+        return false;
     }
     // F3 can read the finished swapchain image back when the surface allows it
     swap_capture_supported_ = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
@@ -1791,24 +1818,53 @@ void VulkanBackend::BeginRecord() {
     recording_ = true;
 }
 
+void VulkanBackend::Fail(const char* what, VkResult r) {
+    if (failed_) return;
+    failed_ = true;
+    LOGE("vulkan: %s failed: %s; stopping presentation", what, VkError(r));
+    if (r == VK_ERROR_DEVICE_LOST || r == VK_ERROR_SURFACE_LOST_KHR) {
+        LOGE("vulkan: %s is unrecoverable", what);
+        kernel::Shutdown(1);
+    }
+}
+
 void VulkanBackend::EndRecord(bool wait) {
     if (!recording_) return;
+    if (failed_) {
+        // A prior failure left the fence unsignalled: finish the buffer but never wait on it.
+        FlushPass();
+        vkEndCommandBuffer(cmd_);
+        recording_ = false;
+        return;
+    }
     FlushPass();
     vkEndCommandBuffer(cmd_);
     recording_ = false;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd_;
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-    vkResetFences(device_, 1, &fence_);
-    const uint64_t serial = ++submit_serial_;
-    VkResult r = vkQueueSubmit(queue_, 1, &submit, fence_);
+    VkResult r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
     if (r != VK_SUCCESS) {
-        LOGE("vulkan: submit failed: %s", VkError(r));
+        Fail("wait for fence", r);
+        return;
+    }
+    r = vkResetFences(device_, 1, &fence_);
+    if (r != VK_SUCCESS) {
+        Fail("reset fence", r);
+        return;
+    }
+    const uint64_t serial = ++submit_serial_;
+    r = vkQueueSubmit(queue_, 1, &submit, fence_);
+    if (r != VK_SUCCESS) {
+        Fail("submit", r);
         return;
     }
     if (wait) {
-        vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        if (r != VK_SUCCESS) {
+            Fail("wait for submitted frame", r);
+            return;
+        }
         completed_serial_.store(serial);
     }
 }
@@ -1828,6 +1884,11 @@ void VulkanBackend::ResetFrame() {
     }
     pack_textures_retired_.clear();
     ReleaseOldTextures();
+    // framebuffers reference the views below: destroy them first, then the views and images
+    for (VkFramebuffer fb : retired_framebuffers_) vkDestroyFramebuffer(device_, fb, nullptr);
+    retired_framebuffers_.clear();
+    for (Tex* tx : retired_borrowed_) delete tx;
+    retired_borrowed_.clear();
     for (RetiredGpu& r : retired_gpu_) {
         if (r.sample_view && r.sample_view != r.resolved_view) vkDestroyImageView(device_, r.sample_view, nullptr);
         if (r.resolved_view) vkDestroyImageView(device_, r.resolved_view, nullptr);
@@ -1842,10 +1903,6 @@ void VulkanBackend::ResetFrame() {
         if (r.memory) vkFreeMemory(device_, r.memory, nullptr);
     }
     retired_gpu_.clear();
-    for (VkFramebuffer fb : retired_framebuffers_) vkDestroyFramebuffer(device_, fb, nullptr);
-    retired_framebuffers_.clear();
-    for (Tex* tx : retired_borrowed_) delete tx;
-    retired_borrowed_.clear();
     for (auto& [buffer, memory] : late_retired_) {
         if (buffer) vkDestroyBuffer(device_, buffer, nullptr);
         if (memory) vkFreeMemory(device_, memory, nullptr);
@@ -1861,17 +1918,26 @@ void VulkanBackend::ResetFrame() {
         vkFreeMemory(device_, memory, nullptr);
     }
     upload_retired_.clear();
+    for (auto& [buffer, memory] : staging_pending_) {
+        vkDestroyBuffer(device_, buffer, nullptr);
+        vkFreeMemory(device_, memory, nullptr);
+    }
+    staging_pending_.clear();
 }
 
 void VulkanBackend::GetReport(uint32_t report) {
     if (!report) return;
     LOGR("linux: GetReport %08X recording %d pass %d queries %zu", report, int(recording_), int(pass_ != VK_NULL_HANDLE),
          counted_.size());
+    if (failed_) return;  // no submission will complete the queries
     // the console's GPU fills the report after the counted draws; finish them first
     if (recording_)
         EndRecord(true);
-    else
-        vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    else {
+        const VkResult r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        if (r != VK_SUCCESS) Fail("wait for report fence", r);
+    }
+    if (failed_) return;
     double pixels = 0.0;
     const double samples_per_pixel =
         double(msaa_) * double(scale_) * double(scale_) * std::max(1.0, double(stretch_));
@@ -2536,17 +2602,26 @@ bool VulkanBackend::CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderM
         const uint32_t e = k.elements[r];
         const uint32_t buffer = (e >> 8) & 0xFF;
         if (buffer >= 16) continue;
+        const uint32_t format = e & 0xFF;
+        const uint32_t offset = (e >> 16) & 0xFFFF;
+        const uint32_t stride = k.strides[buffer];
+        const uint32_t bytes = ElementBytes(format);
+        if (!stride || offset > stride || bytes > stride - offset) {
+            LOG_FIRST(16, "vulkan: vertex element %d fmt %u offset %u outside stride %u; rejecting pipeline", r,
+                      format, offset, stride);
+            return false;
+        }
         if (bind_of[buffer] < 0) {
             bind_of[buffer] = int(nb);
             bindings[nb].binding = buffer;
-            bindings[nb].stride = k.strides[buffer];
+            bindings[nb].stride = stride;
             bindings[nb].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
             nb++;
         }
         attrs[na].location = na;
         attrs[na].binding = buffer;
-        attrs[na].format = ElementFormat(e & 0xFF);
-        attrs[na].offset = (e >> 16);
+        attrs[na].format = ElementFormat(format);
+        attrs[na].offset = offset;
         na++;
     }
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -2768,8 +2843,12 @@ void VulkanBackend::RetireTargetResources(Target* t) {
     t->fb_memory = VK_NULL_HANDLE;
     t->fb_view = VK_NULL_HANDLE;
     t->fb_tex = nullptr;
+    t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    t->resolved_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    t->fb_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (pass_rt_ == t) pass_rt_ = nullptr;
     if (pass_ds_ == t) pass_ds_ = nullptr;
+    if (sampled_target_ == t) sampled_target_ = nullptr;
 
     for (auto it = framebuffer_targets_.begin(); it != framebuffer_targets_.end();) {
         if (it->second.first == t || it->second.second == t) {
@@ -2794,7 +2873,7 @@ void VulkanBackend::RetireTargetResources(Target* t) {
         }
     }
     for (auto it = scene_depth_.begin(); it != scene_depth_.end();) {
-        if (it->second.depth == t)
+        if (it->first == t || it->second.depth == t)
             it = scene_depth_.erase(it);
         else
             ++it;
@@ -2802,6 +2881,17 @@ void VulkanBackend::RetireTargetResources(Target* t) {
 }
 
 void VulkanBackend::DestroyTargets() {
+    pass_ = VK_NULL_HANDLE;
+    pass_fb_ = VK_NULL_HANDLE;
+    pass_rt_ = pass_ds_ = nullptr;
+    // Framebuffers reference target views: destroy them before the views and images they point at.
+    for (auto& [key, fb] : framebuffers_) vkDestroyFramebuffer(device_, fb, nullptr);
+    framebuffers_.clear();
+    framebuffer_targets_.clear();
+    for (auto& [key, t] : borrowed_) delete t;
+    borrowed_.clear();
+    sampled_target_ = nullptr;
+    scene_depth_.clear();
     for (auto& [key, t] : targets_) {
         if (!t) continue;
         if (t->sample_view && t->sample_view != t->resolved_view)
@@ -2819,7 +2909,6 @@ void VulkanBackend::DestroyTargets() {
         delete t;
     }
     targets_.clear();
-    scene_depth_.clear();
     {
         std::lock_guard lock(late_lock_);
         for (auto& [address, l] : late_)
@@ -2827,14 +2916,6 @@ void VulkanBackend::DestroyTargets() {
                 if (s.buffer) late_retired_.push_back({s.buffer, s.memory});
         late_.clear();
     }
-    for (auto& [key, t] : borrowed_) delete t;
-    borrowed_.clear();
-    for (auto& [key, fb] : framebuffers_) vkDestroyFramebuffer(device_, fb, nullptr);
-    framebuffers_.clear();
-    framebuffer_targets_.clear();
-    pass_ = VK_NULL_HANDLE;
-    pass_fb_ = VK_NULL_HANDLE;
-    pass_rt_ = pass_ds_ = nullptr;
 }
 
 Target* VulkanBackend::TargetAt(uint32_t data, bool depth, bool newest) {
@@ -2931,11 +3012,25 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
         Target* t = it->second;
         // A CPU-written movie/front buffer is rebuilt single-sample so the guest bytes can be
         // uploaded. When it is bound as a render target again, restore the configured sample
-        // count; its old contents are gone anyway and the title draws/clears it next.
-        if (t->samples != msaa_) {
+        // count; its old contents are gone anyway and the title draws/clears it next. A target
+        // whose guest bytes are newer this frame skips that restore: UploadTarget needs the
+        // single-sample image anyway, so rebuilding to MSAA first is a wasted allocate/free pair.
+        const bool needs_upload = !depth && (DirtyEpoch(t->data) != t->epoch || t->upload_pending);
+        const bool restores_samples = t->samples != msaa_;
+        const bool resized = t->scale != scale_ || t->stretch != stretch_;
+        if (resized || (restores_samples && !needs_upload)) {
             EndRecord(true);
-            if (pass_rt_ == t || pass_ds_ == t) FlushPass();
             RetireTargetResources(t);
+            if (resized) {
+                t->scale = scale_;
+                t->stretch = stretch_;
+                t->w = std::max(1u, uint32_t(std::lround(double(d.width) * t->scale * t->stretch)));
+                t->h = std::max(1u, uint32_t(std::lround(double(d.height) * t->scale)));
+                if (max_image_side_ && (t->w > max_image_side_ || t->h > max_image_side_)) {
+                    t->w = std::min(t->w, max_image_side_);
+                    t->h = std::min(t->h, max_image_side_);
+                }
+            }
             t->samples = msaa_;
             t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
             t->resolved_layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2954,10 +3049,14 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
         t->header = s.header;
         t->size = s.size;
         t->last_use = frames_ + 1;
-        if ((DirtyEpoch(t->data) != t->epoch || t->upload_pending) && !depth) {
+        if (needs_upload) {
             EndRecord(true);
             UploadTarget(t);
             t->upload_pending = false;
+            if (restores_samples) {
+                t->drawn = false;
+                t->scene_frame = ~0ull;
+            }
             if (perf_) perf_target_upload_++;
         }
         return t;
@@ -2975,6 +3074,11 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     t->stretch = stretch_;
     t->w = std::max(1u, uint32_t(std::lround(double(d.width) * t->scale * t->stretch)));
     t->h = std::max(1u, uint32_t(std::lround(double(d.height) * t->scale)));
+    if (max_image_side_ && (t->w > max_image_side_ || t->h > max_image_side_)) {
+        LOGR("vulkan: host target %ux%u exceeds the device limit %u, clamping", t->w, t->h, max_image_side_);
+        t->w = std::min(t->w, max_image_side_);
+        t->h = std::min(t->h, max_image_side_);
+    }
     t->pitch = d.pitch;
     t->linear = d.linear;
     t->swizzled = !d.linear;
@@ -3020,31 +3124,9 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
 bool VulkanBackend::RebuildTargetSingleSample(Target* t) {
     if (!t || t->samples <= 1) return true;
     EndRecord(true);
-    if (pass_rt_ == t || pass_ds_ == t) FlushPass();
-    VkImage old_image = t->image;
-    VkDeviceMemory old_memory = t->memory;
-    VkImageView old_view = t->view;
-    VkImage old_resolved = t->resolved_image;
-    VkDeviceMemory old_resolved_memory = t->resolved_memory;
-    VkImageView old_resolved_view = t->resolved_view;
-    VkImageView old_sample_view = t->sample_view;
-    VkImage old_fb = t->fb_image;
-    VkDeviceMemory old_fb_memory = t->fb_memory;
-    VkImageView old_fb_view = t->fb_view;
-    t->image = VK_NULL_HANDLE;
-    t->memory = VK_NULL_HANDLE;
-    t->view = VK_NULL_HANDLE;
-    t->resolved_image = VK_NULL_HANDLE;
-    t->resolved_memory = VK_NULL_HANDLE;
-    t->resolved_view = VK_NULL_HANDLE;
-    t->resolved_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    t->sample_view = VK_NULL_HANDLE;
-    t->fb_image = VK_NULL_HANDLE;
-    t->fb_memory = VK_NULL_HANDLE;
-    t->fb_view = VK_NULL_HANDLE;
-    t->fb_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    delete t->fb_tex;
-    t->fb_tex = nullptr;
+    // Retire, do not destroy: framebuffers, borrowed Tex wrappers and the scene-depth map may
+    // still name these views until the frame's fence wait.
+    RetireTargetResources(t);
     t->samples = 1;
 
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -3099,16 +3181,6 @@ bool VulkanBackend::RebuildTargetSingleSample(Target* t) {
         t->view = VK_NULL_HANDLE;
         t->sample_view = VK_NULL_HANDLE;
     }
-    if (old_fb_view) vkDestroyImageView(device_, old_fb_view, nullptr);
-    if (old_fb) vkDestroyImage(device_, old_fb, nullptr);
-    if (old_fb_memory) vkFreeMemory(device_, old_fb_memory, nullptr);
-    if (old_sample_view) vkDestroyImageView(device_, old_sample_view, nullptr);
-    if (old_resolved_view) vkDestroyImageView(device_, old_resolved_view, nullptr);
-    if (old_resolved) vkDestroyImage(device_, old_resolved, nullptr);
-    if (old_resolved_memory) vkFreeMemory(device_, old_resolved_memory, nullptr);
-    if (old_view) vkDestroyImageView(device_, old_view, nullptr);
-    if (old_image) vkDestroyImage(device_, old_image, nullptr);
-    if (old_memory) vkFreeMemory(device_, old_memory, nullptr);
     return ok;
 }
 
@@ -3154,8 +3226,7 @@ bool VulkanBackend::UploadTarget(Target* t) {
     StagingBuffer(device_, mem_props_, row * t->h, buffer, memory, &map);
     if (!map) return false;
     std::memcpy(map, px.data(), px.size());
-    EndRecord(true);
-    BeginRecord();
+    if (!recording_) BeginRecord();
     VkImage upload_image = t->image;
     VkImageLayout& upload_layout = t->layout;
     Transition(upload_image, upload_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, t->format);
@@ -3163,10 +3234,10 @@ bool VulkanBackend::UploadTarget(Target* t) {
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {t->w, t->h, 1};
     vkCmdCopyBufferToImage(cmd_, buffer, upload_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    EndRecord(true);
+    // The copy is ordered with the draws already recorded. Keep the staging
+    // buffer until the next fence wait; do not submit and stall per upload.
     vkUnmapMemory(device_, memory);
-    vkDestroyBuffer(device_, buffer, nullptr);
-    vkFreeMemory(device_, memory, nullptr);
+    staging_pending_.emplace_back(buffer, memory);
     t->epoch = DirtyEpoch(t->data);
     t->cpu = true;
     return true;
@@ -3369,6 +3440,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
                        depth_tex ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
                                  : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        target->format);
+            it->second->layout = target_layout;  // the descriptor must name the image's real layout
             if (is_target) *is_target = true;
             sampled_target_ = target;
             return it->second;
@@ -3622,6 +3694,7 @@ Tex* VulkanBackend::FeedbackTexture(const State& s, Target* t, const TextureDesc
         FlushPass();
         BeginRecord();
         Transition(t->resolved_image, t->resolved_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, t->format);
+        t->fb_tex->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         return t->fb_tex;
     }
     if (!t->fb_image) {
@@ -3678,6 +3751,7 @@ Tex* VulkanBackend::FeedbackTexture(const State& s, Target* t, const TextureDesc
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     Transition(t->fb_image, t->fb_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, t->format);
     Transition(t->image, t->layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, t->format);
+    t->fb_tex->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     // the pass was flushed for the copy: reopen the draw's targets before it continues
     Target* rt = nullptr;
     Target* ds = nullptr;
@@ -4416,7 +4490,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     k.ccw = cull == kCullCw;
     k.fill = s.rs[kRsFillMode];
     if (a.topology == Topology::Triangles && SimpleState(s, kMSolidOffsetEnable))
-        k.zslope = -Bits(SimpleState(s, kMSlopeScale));
+        k.zslope = SimpleState(s, kMSlopeScale) ? -Bits(SimpleState(s, kMSlopeScale)) : 0.0f;
 
     VkPipeline pipe = VK_NULL_HANDLE;
     if (auto it = pipelines_.find(k); it != pipelines_.end()) {
@@ -4470,7 +4544,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     std::memcpy(dc, &c, sizeof(c));
 
     if (draw_set_next_ >= draw_sets_.size()) {
-        LOGE("vulkan: more than %zu draws in a frame", draw_sets_.size());
+        LOG_FIRST(4, "vulkan: more than %zu draws in a frame, dropping the rest", draw_sets_.size());
         return;
     }
     VkDescriptorSet set = draw_sets_[draw_set_next_++];
@@ -4491,7 +4565,8 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     for (int i = 0; i < 4; i++) {
         const Tex* drawn = tex[i] && tex[i]->swap ? tex[i]->swap : tex[i];
         ii[i].imageView = drawn ? drawn->view : white_view_;
-        ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        const VkImageLayout layout = drawn ? drawn->layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ii[i].imageLayout = layout != VK_IMAGE_LAYOUT_UNDEFINED ? layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         si[i].sampler = drawn ? EnsureSampler(s, i, info[size_t(i)], clamp_samplers, drawn->levels)
                               : white_sampler_;
         writes[2 + i] = {};
@@ -5091,13 +5166,13 @@ void VulkanBackend::Present(const Surface& front) {
             if (!finished) self->ResetFrame();
         }
     } frame_end{this};
-    // a previous resize may have failed: retry before acquiring from a null swapchain
-    if (!swapchain_ && !CreateSwapchain()) return;
+    if (failed_) return;  // a dead fence is never waited on again
+    // a previous resize may have failed: retry before acquiring from a null or partial swapchain
+    if ((!swapchain_ || swap_framebuffers_.empty() || render_done_.empty()) && !CreateSwapchain()) return;
     const float want_scale = app::RenderScale(height_);
     const float want_stretch = app::RenderStretch(width_, height_);
     if (std::fabs(want_scale - scale_) > 1e-4f || std::fabs(want_stretch - stretch_) > 1e-4f) {
         vkDeviceWaitIdle(device_);
-        DestroyTargets();
         scale_ = want_scale;
         stretch_ = want_stretch;
         bound_pipe_ = VK_NULL_HANDLE;
@@ -5110,7 +5185,6 @@ void VulkanBackend::Present(const Surface& front) {
             : 1;
     if (want_msaa != msaa_) {
         vkDeviceWaitIdle(device_);
-        DestroyTargets();
         msaa_ = want_msaa;
         bound_pipe_ = VK_NULL_HANDLE;
         viewport_valid_ = false;
@@ -5313,24 +5387,47 @@ void VulkanBackend::Present(const Surface& front) {
 
     RenderUi();
 
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    if (!swapchain_) return;
+    VkResult r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS) {
+        Fail("wait for present fence", r);
+        return;
+    }
     uint32_t image = 0;
-    VkResult r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, image_available_, VK_NULL_HANDLE, &image);
+    r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, image_available_, VK_NULL_HANDLE, &image);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         vkDeviceWaitIdle(device_);
         if (!CreateSwapchain()) LOGE("vulkan: could not rebuild the swapchain");
         return;  // the next frame retries and rebuilds the present pipeline
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
-        LOGE("vulkan: acquire failed: %s", VkError(r));
+        Fail("acquire", r);
+        return;
+    }
+    if (image >= render_done_.size() || image >= swap_framebuffers_.size()) {
+        LOGE("vulkan: acquired image %u outside %zu render-done and %zu swapchain framebuffers", image,
+             render_done_.size(), swap_framebuffers_.size());
+        failed_ = true;
         return;
     }
 
-    vkResetFences(device_, 1, &fence_);
-    vkResetCommandBuffer(cmd_, 0);
+    r = vkResetFences(device_, 1, &fence_);
+    if (r != VK_SUCCESS) {
+        Fail("reset present fence", r);
+        return;
+    }
+    r = vkResetCommandBuffer(cmd_, 0);
+    if (r != VK_SUCCESS) {
+        Fail("reset command buffer", r);
+        return;
+    }
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd_, &begin);
+    r = vkBeginCommandBuffer(cmd_, &begin);
+    if (r != VK_SUCCESS) {
+        Fail("begin command buffer", r);
+        return;
+    }
     bound_pipe_ = VK_NULL_HANDLE;
     viewport_valid_ = false;
 
@@ -5515,7 +5612,6 @@ void VulkanBackend::Present(const Surface& front) {
     vkEndCommandBuffer(cmd_);
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    if (image >= render_done_.size()) return;
     VkSemaphore render_done = render_done_[image];
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.waitSemaphoreCount = 1;
@@ -5527,7 +5623,7 @@ void VulkanBackend::Present(const Surface& front) {
     submit.pSignalSemaphores = &render_done;
     r = vkQueueSubmit(queue_, 1, &submit, fence_);
     if (r != VK_SUCCESS) {
-        LOGE("vulkan: present submit failed: %s", VkError(r));
+        Fail("present submit", r);
         return;
     }
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -5540,20 +5636,27 @@ void VulkanBackend::Present(const Surface& front) {
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
         vkDeviceWaitIdle(device_);
         if (!CreateSwapchain()) LOGE("vulkan: could not rebuild the swapchain");
+    } else if (r == VK_ERROR_DEVICE_LOST || r == VK_ERROR_SURFACE_LOST_KHR) {
+        Fail("present", r);
     } else if (r != VK_SUCCESS) {
         LOGE("vulkan: present failed: %s", VkError(r));
     }
 
     // the next frame may reuse the upload ring and descriptor pool only now
     present_lap.Stop();
+    bool waited = false;
     {
         const auto wait_at = perf_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        const VkResult wait_result = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        if (wait_result != VK_SUCCESS)
+            Fail("wait for present fence", wait_result);
+        else
+            waited = true;
         if (perf_)
             perf_wait_ms_ +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_at).count();
     }
-    if (record_swap_trace) {
+    if (record_swap_trace && waited) {
         const std::string path = trace_base + "_present.tga";
         if (WriteSwapTga(path.c_str(), trace_ptr_, extent_.width, extent_.height, swapchain_format_))
             LOGR("linux: trace present %s saved (%ux%u)", path.c_str(), extent_.width, extent_.height);

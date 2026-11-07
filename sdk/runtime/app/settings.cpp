@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -102,9 +103,15 @@ void Load() {
     SetFrameCap(t["fps_cap"].value_or(FrameCap()));
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
-    // a sample count; older settings files stored msaa = true for 4x
-    const auto samples = t["msaa"].value_or(t["msaa"].value_or(false) ? 4u : 0u);
-    SetMsaaSamples(samples == 2 || samples == 4 || samples == 8 ? samples : 0);
+    // a sample count; older settings files stored msaa = true for 4x. A file
+    // without the key keeps the built-in default (2x), not "off".
+    const auto msaa = t["msaa"];
+    if (!msaa) {
+        SetMsaaSamples(2);
+    } else {
+        const auto samples = msaa.value_or(msaa.value_or(false) ? 4u : 0u);
+        SetMsaaSamples(samples == 2 || samples == 4 || samples == 8 ? samples : 0);
+    }
     s.smaa = t["smaa"].value_or(s.smaa);
     s.bloom = t["bloom"].value_or(s.bloom);
     s.dof = t["dof"].value_or(s.dof);
@@ -118,8 +125,12 @@ void Load() {
         if (o.flag) {
             auto flag = std::atomic_ref(*o.flag);
             flag.store(t[o.key].value_or(flag.load(std::memory_order_relaxed)), std::memory_order_relaxed);
+        } else {
+            *o.value = t[o.key].value_or(*o.value);
+            // The field of view is a percentage with a fixed range; a
+            // hand-edited file must not push the camera outside it.
+            if (std::strcmp(o.key, "fov_percent") == 0) *o.value = std::clamp(*o.value, 50u, 200u);
         }
-        else *o.value = t[o.key].value_or(*o.value);
     }
     if (kGame.load) kGame.load(&t);
 }
@@ -160,11 +171,17 @@ void Save() {
     // Two menus can save at once, and a failed write must not leave the live file truncated.
     // Separate game instances share this file: every save uses its own exclusively created temporary
     // file and publications are serialized by a named mutex. The last writer wins.
-    SettingsLock guard;
-    std::ostringstream out;
-    out << Table() << "\n";
-    const std::string text = out.str();
-    const std::filesystem::path path = File();
+    // Build the snapshot under the settings lock, then write without holding it:
+    // a slow or cross-process-locked save must not stall render-thread snapshots.
+    std::string text;
+    std::filesystem::path path;
+    {
+        SettingsLock guard;
+        std::ostringstream out;
+        out << Table() << "\n";
+        text = out.str();
+        path = File();
+    }
     const std::wstring path_text = path.wstring();
 
     // Serialize publication between processes in this session.

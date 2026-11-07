@@ -474,6 +474,7 @@ KERNEL_EXPORT(189, NtCreateEvent, 4) {
     o->notification = a[2] == 0;
     o->signal = (a[3] & 0xFF) ? 1 : 0;
     uint32_t body = mem::AllocSystem(16);
+    if (!body) return kNoMemory;
     G<uint8_t>(body) = uint8_t(a[2]);  // NotificationEvent or SynchronizationEvent
     G<uint8_t>(body + 2) = 4;
     W32(body + 4, uint32_t(o->signal));
@@ -506,6 +507,7 @@ KERNEL_EXPORT(192, NtCreateMutant, 3) {
     }
     auto o = std::make_shared<Object>(ObjType::Mutant);
     uint32_t body = mem::AllocSystem(32);
+    if (!body) return kNoMemory;
     G<uint8_t>(body) = 2;  // MutantObject
     G<uint8_t>(body + 2) = 8;
     if (a[2] & 0xFF) {
@@ -543,6 +545,7 @@ KERNEL_EXPORT(193, NtCreateSemaphore, 4) {
     o->signal = count;
     o->limit = limit;
     uint32_t body = mem::AllocSystem(20);
+    if (!body) return kNoMemory;
     G<uint8_t>(body) = 5;  // SemaphoreObject
     G<uint8_t>(body + 2) = 5;
     W32(body + 4, uint32_t(count));
@@ -650,6 +653,7 @@ KERNEL_EXPORT(234, NtWaitForSingleObjectEx, 4) {
 }
 
 KERNEL_EXPORT(235, NtWaitForMultipleObjectsEx, 6) {
+    if (!a[0] || a[0] > 64) return kInvalidParameter;
     std::vector<ObjectRef> objs;
     for (uint32_t i = 0; i < a[0]; i++) {
         ObjectRef o = FromHandle(R32(a[1] + i * 4));
@@ -665,6 +669,7 @@ KERNEL_EXPORT(159, KeWaitForSingleObject, 5) {
 }
 
 KERNEL_EXPORT(158, KeWaitForMultipleObjects, 8) {
+    if (!a[0] || a[0] > 64) return kInvalidParameter;
     std::vector<ObjectRef> objs;
     for (uint32_t i = 0; i < a[0]; i++) objs.push_back(FromPointer(R32(a[1] + i * 4)));
     return Wait(objs, a[2] == 0, TimeoutArg(a[6]), a[5] & 0xFF);
@@ -678,6 +683,7 @@ KERNEL_EXPORT(246, ObReferenceObjectByHandle, 3) {
     if (!o) return kInvalidHandle;
     if (!o->guest) {
         uint32_t body = mem::AllocSystem(32);
+        if (!body) return kNoMemory;
         Bind(o, body);
     }
     ReferenceObject(o->guest);
@@ -700,6 +706,11 @@ KERNEL_FASTCALL(250, ObfDereferenceObject) {
 
 KERNEL_EXPORT(113, KeInitializeTimerEx, 2) {
     uint32_t t = a[0];
+    // Re-initialising an armed timer must stop the old host entry first: the
+    // memset below destroys the stamp that FromPointer uses to find it again.
+    if (t) {
+        if (ObjectRef old = FromPointer(t)) CancelTimer(*old);
+    }
     std::memset(HostPtr(t), 0, 0x28);
     G<uint8_t>(t) = uint8_t(8 + a[1]);  // TimerNotificationObject or TimerSynchronizationObject
     G<uint8_t>(t + 2) = 10;
@@ -710,6 +721,7 @@ KERNEL_EXPORT(113, KeInitializeTimerEx, 2) {
 
 KERNEL_EXPORT(150, KeSetTimerEx, 5) {
     ObjectRef t = FromPointer(a[0]);
+    if (!t) return 0;
     bool was = CancelTimer(*t);
     int64_t due = int64_t(uint64_t(a[1]) | uint64_t(a[2]) << 32);
     W32(a[0] + 0x20, a[4]);  // KTIMER.Dpc
@@ -720,13 +732,17 @@ KERNEL_EXPORT(150, KeSetTimerEx, 5) {
 
 KERNEL_EXPORT(149, KeSetTimer, 4) {
     ObjectRef t = FromPointer(a[0]);
+    if (!t) return 0;
     bool was = CancelTimer(*t);
     int64_t due = int64_t(uint64_t(a[1]) | uint64_t(a[2]) << 32);
     SetTimer(t, due, 0, a[3]);
     return was;
 }
 
-KERNEL_EXPORT(97, KeCancelTimer, 1) { return CancelTimer(*FromPointer(a[0])); }
+KERNEL_EXPORT(97, KeCancelTimer, 1) {
+    ObjectRef t = FromPointer(a[0]);
+    return t ? CancelTimer(*t) : 0;
+}
 
 KERNEL_EXPORT(194, NtCreateTimer, 3) {
     std::string name;
@@ -737,6 +753,7 @@ KERNEL_EXPORT(194, NtCreateTimer, 3) {
     auto o = std::make_shared<Object>(ObjType::Timer);
     o->notification = a[2] == 0;
     uint32_t body = mem::AllocSystem(0x28);
+    if (!body) return kNoMemory;
     InitHeader(body, uint8_t(8 + (a[2] & 1)), 10, 0);  // TimerNotificationObject or TimerSynchronizationObject
     Bind(o, body);
     if (!name.empty()) AddNamed(name, o);
@@ -804,9 +821,9 @@ KERNEL_EXPORT(255, PsCreateSystemThreadEx, 10) {
     uint32_t system = a[9];
     ThreadRef t = CreateThread(stack ? stack : 0x10000, tls, system, start, context, suspended);
     if (!t) return kNoMemory;
+    if (!StartThread(t)) return kNoMemory;
     if (handle_out) W32(handle_out, NewHandle(t));
     if (id_out) W32(id_out, t->id);
-    StartThread(t);
     return kSuccess;
 }
 
@@ -859,9 +876,9 @@ KERNEL_EXPORT(104, KeGetCurrentThread, 0) { return Current()->ethread; }
 KERNEL_EXPORT(254, PsCreateSystemThread, 5) {
     ThreadRef t = CreateThread(0x10000, 0, 0, a[2], a[3], false);
     if (!t) return kNoMemory;
+    if (!StartThread(t)) return kNoMemory;
     if (a[0]) W32(a[0], NewHandle(t));
     if (a[1]) W32(a[1], t->id);
-    StartThread(t);
     return kSuccess;
 }
 
@@ -902,7 +919,10 @@ KERNEL_EXPORT(142, KeSaveFloatingPointState, 1) { return kSuccess; }
 
 KERNEL_EXPORT(289, RtlInitAnsiString, 2) {
     uint32_t d = a[0], s = a[1];
-    size_t n = s ? std::strlen(reinterpret_cast<const char*>(HostPtr(s))) : 0;
+    size_t n = 0;
+    if (s)
+        for (; n < 0xFFFF && mem::IsCommitted(s + uint32_t(n)) && G<uint8_t>(s + uint32_t(n)); n++) {
+        }
     W16(d, uint16_t(n));
     W16(d + 2, uint16_t(s ? n + 1 : 0));
     W32(d + 4, s);
@@ -913,7 +933,8 @@ KERNEL_EXPORT(290, RtlInitUnicodeString, 2) {
     uint32_t d = a[0], s = a[1];
     size_t n = 0;
     if (s)
-        while (R16(s + uint32_t(n) * 2)) n++;
+        for (; n < 0x7FFF && mem::IsCommitted(s + uint32_t(n) * 2) && R16(s + uint32_t(n) * 2); n++) {
+        }
     W16(d, uint16_t(n * 2));
     W16(d + 2, uint16_t(s ? n * 2 + 2 : 0));
     W32(d + 4, s);
@@ -924,14 +945,17 @@ KERNEL_EXPORT(260, RtlAnsiStringToUnicodeString, 3) {
     uint32_t d = a[0], s = a[1];
     uint16_t n = R16(s);
     uint32_t src = R32(s + 4);
+    if (n && (!src || !mem::IsCommitted(src) || !mem::IsCommitted(src + n - 1))) return kAccessViolation;
     if (a[2] & 0xFF) {
         uint32_t buf = mem::AllocSystem(n * 2u + 2);
+        if (!buf) return kNoMemory;
         W32(d + 4, buf);
         W16(d + 2, uint16_t(n * 2 + 2));
     } else if (R16(d + 2) < n * 2) {
         return kBufferTooSmall;
     }
     uint32_t buf = R32(d + 4);
+    if (n && (!buf || !mem::IsCommitted(buf) || !mem::IsCommitted(buf + n * 2u - 1))) return kAccessViolation;
     for (uint16_t i = 0; i < n; i++) W16(buf + i * 2u, G<uint8_t>(src + i));
     if (R16(d + 2) >= n * 2 + 2) W16(buf + n * 2u, 0);
     W16(d, uint16_t(n * 2));
@@ -942,14 +966,18 @@ KERNEL_EXPORT(308, RtlUnicodeStringToAnsiString, 3) {
     uint32_t d = a[0], s = a[1];
     uint16_t n = R16(s) / 2;
     uint32_t src = R32(s + 4);
+    if (n && (!src || !mem::IsCommitted(src) || !mem::IsCommitted(src + uint32_t(n) * 2u - 1)))
+        return kAccessViolation;
     if (a[2] & 0xFF) {
         uint32_t buf = mem::AllocSystem(n + 1u);
+        if (!buf) return kNoMemory;
         W32(d + 4, buf);
         W16(d + 2, uint16_t(n + 1));
     } else if (R16(d + 2) < n) {
         return kBufferTooSmall;
     }
     uint32_t buf = R32(d + 4);
+    if (n && (!buf || !mem::IsCommitted(buf) || !mem::IsCommitted(buf + n))) return kAccessViolation;
     for (uint16_t i = 0; i < n; i++) {
         uint16_t c = R16(src + i * 2u);
         G<uint8_t>(buf + i) = c < 0x100 ? uint8_t(c) : '?';
@@ -1065,11 +1093,17 @@ KERNEL_EXPORT(302, RtlRaiseException, 1) {
     ctx.esp = (ctx.esp - kContextBytes) & ~15u;
     uint32_t scratch = ctx.esp;
     std::memset(HostPtr(scratch), 0, kContextBytes);
-    for (uint32_t frame = R32(ctx.fs_base); frame && frame != 0xFFFFFFFF; frame = R32(frame)) {
+    uint32_t frame = R32(ctx.fs_base);
+    for (uint32_t steps = 0; frame && frame != 0xFFFFFFFF && steps < 256; steps++) {
+        if (!mem::IsCommitted(frame) || !mem::IsCommitted(frame + 4)) {
+            LOGE("RtlRaiseException: exception frame %08X is not readable", frame);
+            break;
+        }
         if (CallHandler(ctx, rec, frame, scratch) == kContinueExecution) {
             ctx.esp = esp;
             return 0;
         }
+        frame = R32(frame);
     }
     ctx.esp = esp;
     LOGE("RtlRaiseException code %08X flags %X address %08X params %u, not handled", R32(rec), R32(rec + 4), R32(rec + 12),
@@ -1092,7 +1126,13 @@ KERNEL_EXPORT(312, RtlUnwind, 4) {
         W32(rec, 0xC0000027);  // STATUS_UNWIND
     }
     W32(rec + 4, R32(rec + 4) | kUnwinding | (target ? 0 : kExitUnwind));
-    for (uint32_t frame = R32(ctx.fs_base); frame && frame != 0xFFFFFFFF && frame != target; frame = R32(ctx.fs_base)) {
+    for (uint32_t steps = 0; steps < 256; steps++) {
+        uint32_t frame = R32(ctx.fs_base);
+        if (!frame || frame == 0xFFFFFFFF || frame == target) break;
+        if (!mem::IsCommitted(frame) || !mem::IsCommitted(frame + 4)) {
+            LOGE("RtlUnwind: exception frame %08X is not readable", frame);
+            break;
+        }
         CallHandler(ctx, rec, frame, scratch);
         W32(ctx.fs_base, R32(frame));
     }
@@ -1136,6 +1176,12 @@ static std::string FormatGuest(X86Context& ctx, uint32_t fmt_va, uint32_t args_v
         std::string clean;
         for (char ch : spec)
             if (ch != 'l' && ch != 'h' && ch != 'I') clean += ch;
+        // Only conversions that consume the guest's 32-bit argument. %n and
+        // arbitrary snprintf conversions would write through guest pointers.
+        if (!std::strchr("diouxXc", c) && c != 'p') {
+            out += '%';
+            continue;
+        }
         std::snprintf(buf, sizeof(buf), (clean + (c == 'p' ? 'x' : c)).c_str(), R32(ap));
         ap += 4;
         out += buf;
@@ -1205,7 +1251,7 @@ KERNEL_EXPORT(49, HalReturnToFirmware, 1) {
     if (a[0] == 2 && page) {
         std::string path = ReadCString(page + 8, 520);
         if (const char* exe = ImageExe(path)) {
-            if (FILE* f = std::fopen(g_launch_file.c_str(), "wb")) {
+            if (FILE* f = OpenHostFile(g_launch_file, "wb")) {
                 std::fwrite(HostPtr(page), 1, 0x1000, f);
                 std::fclose(f);
             }

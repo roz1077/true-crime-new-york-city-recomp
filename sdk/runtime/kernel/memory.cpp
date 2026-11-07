@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -71,8 +72,12 @@ bool Init() {
     return true;
 }
 
-// page commit map, one byte per 4 KB page
+// page commit map, one byte per 4 KB page; read off the lock by crash/watch paths
 static std::vector<uint8_t> g_committed(0x100000, 0);
+
+static uint8_t CommittedAt(size_t page) {
+    return std::atomic_ref<uint8_t>(g_committed[page]).load(std::memory_order_relaxed);
+}
 
 bool Commit(uint32_t va, uint32_t size) {
     if (!size || InPhysical(va)) return true;
@@ -90,7 +95,8 @@ bool Commit(uint32_t va, uint32_t size) {
         return false;
     }
 #endif
-    for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 1;
+    for (uint64_t p = first; p < end; p += kPage)
+        std::atomic_ref<uint8_t>(g_committed[size_t(p >> 12)]).store(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -105,10 +111,11 @@ void Decommit(uint32_t va, uint32_t size) {
     madvise(g_base + first, size_t(end - first), MADV_DONTNEED);
     mprotect(g_base + first, size_t(end - first), PROT_NONE);
 #endif
-    for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 0;
+    for (uint64_t p = first; p < end; p += kPage)
+        std::atomic_ref<uint8_t>(g_committed[size_t(p >> 12)]).store(0, std::memory_order_relaxed);
 }
 
-bool IsCommitted(uint32_t va) { return InPhysical(va) || g_committed[va >> 12] != 0; }
+bool IsCommitted(uint32_t va) { return InPhysical(va) || CommittedAt(va >> 12) != 0; }
 
 // first fit allocator over a guest range
 class Ranges {
@@ -282,13 +289,13 @@ uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t
         uint32_t start;
         Reservation* r = FindReservation(base, &start);
         if (!r) return 0xC0000045;  // STATUS_INVALID_PAGE_PROTECTION stands in for not reserved
-        uint32_t first = base & ~(kPage - 1);
-        uint32_t end = (base + size + kPage - 1) & ~(kPage - 1);
-        if (end > start + r->size) return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
-        Commit(first, end - first);
-        for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 1;
-        base = first;
-        size = end - first;
+        const uint64_t first = uint64_t(base) & ~uint64_t(kPage - 1);
+        const uint64_t end = (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1);
+        if (end > uint64_t(start) + r->size || end > 0x100000000ull) return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
+        if (!Commit(uint32_t(first), uint32_t(end - first))) return 0xC0000017;  // STATUS_NO_MEMORY
+        for (uint32_t p = uint32_t(first); p < uint32_t(end); p += kPage) r->commit[(p - start) / kPage] = 1;
+        base = uint32_t(first);
+        size = uint32_t(end - first);
     }
     return 0;
 }
@@ -362,7 +369,11 @@ uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint3
              (unsigned long long)(g_contig.Used() >> 10));
         return 0;
     }
-    Commit(a, size);
+    if (!Commit(a, size)) {
+        uint32_t freed = 0;
+        g_contig.Free(a, &freed);
+        return 0;
+    }
     std::memset(g_base + a, 0, size);
     return a;
 }
@@ -381,7 +392,11 @@ uint32_t AllocSystem(uint32_t size, uint32_t align) {
     if (!size) size = 16;
     uint32_t a = g_system.Alloc(size, std::max<uint32_t>(align, 16), kSystemBase, kSystemBase + kSystemSize - 1, false);
     if (!a) return 0;
-    Commit(a, size);
+    if (!Commit(a, size)) {
+        uint32_t freed = 0;
+        g_system.Free(a, &freed);
+        return 0;
+    }
     std::memset(g_base + a, 0, size);
     return a;
 }
@@ -399,7 +414,11 @@ uint32_t AllocStack(uint32_t size) {
     // one uncommitted guard page below the stack
     uint32_t a = g_stacks.Alloc(size + 0x10000, 0x10000, kStackBase, kStackBase + kStackSize - 1, false);
     if (!a) return 0;
-    Commit(a + 0x10000, size);
+    if (!Commit(a + 0x10000, size)) {
+        uint32_t freed = 0;
+        g_stacks.Free(a, &freed);
+        return 0;
+    }
     g_stack_tops[a + 0x10000 + size] = a;
     return a + 0x10000 + size;
 }

@@ -25,13 +25,16 @@ evidence, not source files to distribute. Generated game code and assets should 
 
 ## Build and checks
 
-Close the running port before linking: Windows locks the executable and guest DLL. From PowerShell:
+Close the running port before linking: Windows locks the executable and guest DLL. Create the local Python environment once (Python 3.11+), then build and run the checks from PowerShell:
 
 ```powershell
+if (!(Test-Path tools/venv)) { python -m venv tools/venv }
 $env:CI = '1'
 cmd /c .\build.bat
 tools/venv/Scripts/python.exe scripts/run_checks.py
 ```
+
+On Linux the interpreter is `tools/venv/bin/python`.
 
 `cmd` is given the path explicitly because some shells do not search the current directory for batch files.
 

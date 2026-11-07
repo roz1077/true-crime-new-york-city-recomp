@@ -2,7 +2,10 @@
 
 **First pass implemented:** profiler gating, allocation-free audio lane scratch, and persistent DXBC shader
 bytecode caching. See [PERFORMANCE.md](PERFORMANCE.md) for measured cache reuse, regression results and the
-limits of the replay comparison. Adapter-specific pipeline caching and the other candidates remain open.
+limits of the replay comparison. The 2026-11-07 beta pass added batched Vulkan target uploads, lazy render
+target rebuilds, per-frame D3D12 command lists/readback reuse and an SDL3 audio jitter buffer; those changes
+were validated for correctness and stability, not measured as a present-rate speedup. Adapter-specific
+pipeline caching and the other candidates remain open.
 
 Reviewed 2026-11-02 after the file-lifetime, timing and locker fixes. These are candidates found in the
 source at review time, not measured speedup claims. The cleanup did not alter rendering quality, simulation
@@ -27,6 +30,21 @@ preserving the game's simulation timing. Removing the cap would invalidate that 
 | 8 | **Measure upload-ring pressure before changing allocation policy.** `Upload` uses a64 MiB per-frame ring, creates committed overflow buffers and can force submission when little space remains. Counters already expose uploaded bytes and overflow. | Reduce allocation/submission hitches if large scenes actually exhaust the ring. | Do not simply increase memory budgets. First establish overflow frequency and allocation lifetime; then consider pooled overflow buffers or appropriately sized rings with fence-safe reuse. Track peak GPU/host memory as well as frame times. |
 | 9 | **Latch draw-rate settings once a frame.** `UiSqueeze` and the Linux sampler path no longer take the settings lock per draw; keep it that way and apply the same rule to any new favourite/quality lookup. | Removes thousands of mutex locks and `Settings` copies per frame and avoids contention with menu saves. | Read a cached value in `Present`/`ApplySettings`; never change behaviour by delaying a user change more than one frame. |
 | 10 | **Cache resolved Xbox file paths.** `kernel/files.cpp` `MatchCase` walks directories and calls `weakly_canonical` for every open when the host name differs in case; streaming opens many files. | Fewer directory scans during level streaming on Linux. | Invalidate the cache when the assets folder or disc changes; keep the traversal and symlink checks for misses. |
+
+## Status after the beta pass (2026-11-07)
+
+| Candidate | Status |
+| --- | --- |
+| 1. Profiler gating | Implemented and regression-tested. |
+| 2. Shader/pipeline persistence | DXBC blobs are persisted with a compiler fingerprint; adapter-specific pipeline state remains open. |
+| 3. Texture-change checks | Open; signature cost was only ~0.1 ms/frame in the sampled scene, so it was not changed speculatively. |
+| 4. Audio scratch reuse | Implemented; Linux SDL3 also pre-renders through a jitter buffer with zero underruns in the Deck run. |
+| 5. Dirty state tracking | `DeltaRange` now skips equal 256-byte groups; finer per-register generations remain open. |
+| 6. Readback synchronisation | D3D12 readback buffers are reused per frame and waits are bounded; broader CPU/GPU overlap remains open. |
+| 7. Vertex metadata cache | Open; the previous native-strip work is in, but metadata caching still needs versioning. |
+| 8. Upload-ring policy | Vulkan target uploads are batched into the frame command buffer; ring sizing/pooling still needs overflow measurements. |
+| 9. Latch draw-rate settings | Implemented for the sampler paths; keep new lookups on the same rule. |
+| 10. File-path cache | Open; invalidation must cover asset/disc changes and symlink checks. |
 
 ## Baseline and acceptance
 

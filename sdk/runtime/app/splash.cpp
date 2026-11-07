@@ -48,6 +48,8 @@ bool Read(const std::filesystem::path& path, std::vector<uint32_t>& pixels, UINT
         hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
                                    WICBitmapPaletteTypeCustom);
     if (SUCCEEDED(hr)) hr = converter->GetSize(&w, &h);
+    // A splash is bounded like any other local image; WIC can report huge sizes.
+    if (SUCCEEDED(hr) && (w > 16384 || h > 16384 || uint64_t(w) * h > (64ull << 20))) hr = E_FAIL;
     if (SUCCEEDED(hr) && w && h) {
         pixels.resize(size_t(w) * h);
         hr = converter->CopyPixels(nullptr, w * 4, UINT(pixels.size() * 4), reinterpret_cast<BYTE*>(pixels.data()));

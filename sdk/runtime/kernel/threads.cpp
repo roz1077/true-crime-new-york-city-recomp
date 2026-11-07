@@ -28,7 +28,9 @@ constexpr uint32_t kEthreadSize = 0x200;
 
 bool SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
     stack_size = std::max<uint32_t>(stack_size, 0x10000);
-    if (tls_size > 0xFFFFFFFFu - 3u - stack_size - 0x1000u) return false;
+    // Reject implausible requests before any addition can wrap.
+    if (stack_size > (64u << 20) || tls_size > (4u << 20)) return false;
+    if (uint64_t(stack_size) + tls_size + 0x1000u > 0xFFFFFFFFull) return false;
     tls_size = (tls_size + 3) & ~3u;
     t.stack_top = mem::AllocStack(stack_size + tls_size + 0x1000);
     t.stack_size = stack_size;
@@ -114,7 +116,7 @@ void NameHostThread(const char* name) {
 }
 
 // recompiled code nests host frames as deep as the guest's calls, give it room
-void Spawn(std::function<void()> fn) {
+bool Spawn(std::function<void()> fn) {
     auto* f = new std::function<void()>(std::move(fn));
 #ifdef _WIN32
     auto entry = [](void* p) -> DWORD {
@@ -125,7 +127,7 @@ void Spawn(std::function<void()> fn) {
     HANDLE h = ::CreateThread(nullptr, 64u << 20, entry, f, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (!h) {
         delete f;
-        return;
+        return false;
     }
     ::CloseHandle(h);
 #else
@@ -144,7 +146,9 @@ void Spawn(std::function<void()> fn) {
         pthread_detach(th);
     }
     pthread_attr_destroy(&attr);
+    if (rc != 0) return false;
 #endif
+    return true;
 }
 
 }  // namespace
@@ -305,9 +309,9 @@ ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_r
     auto t = std::make_shared<Thread>();
     t->id = g_next_id.fetch_add(4);
     if (!SetupGuestBlocks(*t, stack_size, tls_size)) {
-        mem::FreeStack(t->stack_top);
-        mem::FreeSystem(t->kpcr);
-        mem::FreeSystem(t->ethread);
+        if (t->stack_top) mem::FreeStack(t->stack_top);
+        if (t->kpcr) mem::FreeSystem(t->kpcr);
+        if (t->ethread) mem::FreeSystem(t->ethread);
         return nullptr;
     }
     Bind(t, t->ethread);
@@ -317,9 +321,9 @@ ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_r
     return t;
 }
 
-void StartThread(ThreadRef t) {
+bool StartThread(ThreadRef t) {
     Register(t);
-    Spawn([t] {
+    const bool started = Spawn([t] {
         t_current = t;
         t->host_tid = HostThreadId();
         if (GuestWatchActive()) {
@@ -355,20 +359,32 @@ void StartThread(ThreadRef t) {
         t->host_tid.store(0);
         t_current.reset();
     });
+    if (!started) {
+        LOGE("thread %X could not start", t->id);
+        Unregister(t.get());
+        if (t->ethread) Unbind(t->ethread);
+        ReleaseGuestStack(*t);
+        if (t->ethread) {
+            mem::FreeSystem(t->ethread);
+            t->ethread = 0;
+        }
+        return false;
+    }
+    return true;
 }
 
 void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
     auto t = std::make_shared<Thread>();
     t->id = g_next_id.fetch_add(4);
     if (!SetupGuestBlocks(*t, 0x20000, 0x100)) {
-        mem::FreeStack(t->stack_top);
-        mem::FreeSystem(t->kpcr);
-        mem::FreeSystem(t->ethread);
+        if (t->stack_top) mem::FreeStack(t->stack_top);
+        if (t->kpcr) mem::FreeSystem(t->kpcr);
+        if (t->ethread) mem::FreeSystem(t->ethread);
         return;
     }
     Bind(t, t->ethread);
     std::string n = name;
-    Spawn([t, fn, n] {
+    if (!Spawn([t, fn, n] {
         t_current = t;
         t->host_tid = HostThreadId();
         if (GuestWatchActive()) {
@@ -382,7 +398,15 @@ void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
         ReleaseGuestStack(*t);
         t->host_tid.store(0);
         t_current.reset();
-    });
+    })) {
+        LOGE("host thread %s could not start", name);
+        Unbind(t->ethread);
+        ReleaseGuestStack(*t);
+        if (t->ethread) {
+            mem::FreeSystem(t->ethread);
+            t->ethread = 0;
+        }
+    }
 }
 
 void ExitThread(uint32_t code) {

@@ -148,9 +148,12 @@ void ApplyAim(uint8_t *base, uint32_t controller, float pitch_min, float pitch_m
     const float pitch_scale = kRadiansPerPixel * percent * vertical;
     const uint32_t game = Rd(base, kGame);
     const float yaw_sign = Rd8(base, game + kInvertX) ? -1.0f : 1.0f;
-    // on foot the accumulator is positive looking up; raw Y is positive when
-    // the mouse moves down, so the default sign is -1 and invert-Y flips it
-    const float pitch_sign = Rd8(base, game + kInvertY) ? -1.0f : 1.0f;
+    // The on-foot controllers build the view from this accumulator with
+    // positive up, while SDL/WM_INPUT report raw Y positive when the mouse
+    // moves down. The default therefore has to negate dy; invert-Y flips it.
+    // This matches the right-stick fallback in input.cpp, which feeds
+    // -g_mouse_y to the pad. Needs live confirmation for both settings.
+    const float pitch_sign = Rd8(base, game + kInvertY) ? 1.0f : -1.0f;
 
     const float yaw = RdF(base, kYaw) + dx * yaw_scale * yaw_sign;
     const float pitch = std::clamp(RdF(base, kPitch) + dy * pitch_scale * pitch_sign, pitch_min, pitch_max);
@@ -259,9 +262,11 @@ X86_FUNC(sub_0001FD40) {
                     float(std::clamp(input::g_mouse_vertical_sensitivity_percent, 10u, 400u)) * 0.01f;
                 const uint32_t game = Rd(base, kGame);
                 const float yaw_sign = Rd8(base, game + kInvertX) ? -1.0f : 1.0f;
-                // here the accumulator is positive looking down, the opposite
-                // of the on-foot controllers
-                const float pitch_sign = Rd8(base, game + kInvertY) ? 1.0f : -1.0f;
+                // Here the accumulator is positive looking down, the opposite
+                // of the on-foot controllers, so the default does not negate
+                // dy; invert-Y flips that. Matches the stick fallback's
+                // -g_mouse_y sign. Needs live confirmation for both settings.
+                const float pitch_sign = Rd8(base, game + kInvertY) ? -1.0f : 1.0f;
                 yaw += dx * kRadiansPerPixel * percent * yaw_sign;
                 pitch = std::clamp(pitch + dy * kRadiansPerPixel * percent * vertical * pitch_sign, kVehiclePitchMin,
                                    kVehiclePitchMax);

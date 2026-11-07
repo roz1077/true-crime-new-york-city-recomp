@@ -32,6 +32,7 @@ struct Config {
     std::vector<std::string> code_prefixes;
     uint32_t partitions = 128;
     std::map<uint32_t, std::string> functions;  // extra entry points
+    std::set<uint32_t> explicit_functions;      // the [functions] table's own addresses
     // names the host binds to: functions it replaces and data it reads; 0 = not in this image
     std::map<std::string, uint32_t> symbols, data;
     std::map<std::string, uint32_t> layout;     // XDK data layout, emitted as XDK_<name>
@@ -80,6 +81,8 @@ public:
     const xbe::Image& img;
     const Config& cfg;
     uint32_t lo_ = 0, hi_ = 0;
+    size_t code_section_count = 0;            // sections selected by code_sections/code_prefixes
+    std::string error;                        // why the image or configuration cannot be analysed
     std::set<uint32_t> functions;
     std::unordered_map<uint32_t, JumpTable> jump_tables;  // keyed by jmp address
     std::unordered_map<uint32_t, Insn> insns_;

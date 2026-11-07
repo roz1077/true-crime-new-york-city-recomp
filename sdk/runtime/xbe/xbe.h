@@ -149,8 +149,13 @@ struct Image {
             s.vsize = U32(o + 8);
             s.raw = U32(o + 12);
             s.rsize = U32(o + 16);
+            if (s.rsize > s.vsize) {
+                error = "section raw data is larger than its virtual size";
+                return false;
+            }
             if (!InFile(s.raw, s.rsize) ||
-                (s.rsize && (uint64_t(s.va) + s.rsize > image_end || s.va < base))) {
+                (s.rsize && (uint64_t(s.va) + s.rsize > image_end || uint64_t(s.va) + s.rsize >= 0x100000000ull ||
+                             s.va < base))) {
                 error = "section data is outside the image";
                 return false;
             }

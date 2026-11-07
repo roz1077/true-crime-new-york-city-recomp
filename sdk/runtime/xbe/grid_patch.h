@@ -148,6 +148,7 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
             if (comment == std::string::npos) continue;
             uint32_t address = 0;
             if (!ParseHex(line, comment + 3, 8, address)) continue;
+            if (comment + 12 > line.size()) continue;
             if (line.compare(comment + 12, 4, "idiv") != 0) continue;
             const GridSite* site = GridSiteAt(address);
             if (!site) continue;

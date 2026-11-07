@@ -127,3 +127,52 @@ The routes had different draw and vertex medians, so this comparison leaves the 
 Texture binding now keeps the decoded descriptor in the draw's stage data. Shader constant setup
 and frame capture read that descriptor. Mip-chain sizing runs only when the texture enters its existing
 change-check path. Both the signature inputs and the upload decision use the same data as before.
+
+## Beta hardening pass — 2026-11-07
+
+This pass prioritised correctness and release readiness over speculative speedups. The only
+renderer-path change with a performance intent is the Vulkan target-upload batch.
+
+### Vulkan target uploads
+
+CPU-written targets used to submit and wait twice per upload: once after the copy and once
+after the following draw state. `UploadTarget` now records the copy into the current command
+buffer in order with the draws already queued, unmaps the staging buffer, and keeps it in
+`staging_pending_` until the frame fence retires it. This removes two full GPU waits per
+CPU-written surface and avoids creating and destroying a staging buffer inside the critical
+path.
+
+Validation: 60-second scripted Deck gameplay at 4x MSAA + SMAA + bloom + DOF reported
+2,940 frames (~49 fps), ~676 draws/frame, 0 VUIDs, 0 audio underruns/starvation and no device
+loss; the in-world capture was correct. The frame rate stayed in the same ~47–50 fps band as
+the unbatched build, so the benefit here is fewer synchronisation points and less allocation
+churn, not a measured present-rate increase.
+
+### Target lifetime and HUD correctness
+
+MSAA and render-scale changes no longer call `DestroyTargets()`. `EnsureTarget` rebuilds a
+target lazily only when it is next bound as a render target with a different size or sample
+count, so a HUD slot that is only being sampled keeps its contents across the change. This
+mirrors the Windows fix for the static red "FS" placeholder and was verified with a live
+4x-to-8x MSAA change on the Deck (0 VUIDs, intact HUD).
+
+### D3D12 and audio
+
+The D3D12 backend now uses one command list per frame slot, waits on its own fence with a
+bounded timeout and device-removal detection, reuses readback buffers per frame, and caps the
+CPU shader-blob cache. These changes target TDRs, unbounded memory growth and frame-to-frame
+allocation rather than raw throughput. On Linux SDL3, audio is produced through a small
+jitter buffer; a 60-second Deck run logged zero underruns and zero starvation events. The
+48 kHz clock, 60 Hz simulation and original presented-frame cap are unchanged.
+
+### Acceptance
+
+`scripts/run_checks.py` passes all 18 checks, including the save-flush and PulseEvent
+regressions. A clean Windows Release build reached the title and gameplay on an RX 7900 XTX at
+8x MSAA (~2,000 draws, ~50 fps) with no device loss, and a clean Linux Release build ran the
+Deck checks above. The shipped Windows zip was extracted fresh and reached gameplay on the
+same machine (~60 fps, 1,500–1,800 draws at the default 2x MSAA); its internal SHA256SUMS
+verify. Several manual checks (mouse pitch in both modes, DSound callback
+re-entrancy, fullscreen rollback, Alt+F4, focus/controller handoff, full-disk saves, Deck
+suspend/resume and multi-hour soak) remain for the maintainer; see `DECK_TEST.md` and the
+open-items list in `NOTES.md`.

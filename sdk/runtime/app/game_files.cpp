@@ -61,10 +61,14 @@ bool Alert(const wchar_t* text, bool question = false) {
 }
 
 bool ReadHostFile(const fs::path& path, std::vector<uint8_t>& out) {
+    constexpr uint64_t kMaxXbeBytes = 64ull << 20;
+    std::error_code ec;
+    const uintmax_t size = fs::file_size(path, ec);
+    if (ec || size > kMaxXbeBytes) return false;
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
-    out.assign(std::istreambuf_iterator<char>(f), {});
-    return true;
+    out.resize(size_t(size));
+    return f.read(reinterpret_cast<char*>(out.data()), std::streamsize(out.size())).good();
 }
 
 }  // namespace

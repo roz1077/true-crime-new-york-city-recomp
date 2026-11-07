@@ -33,7 +33,7 @@ struct D3D12Backend {
  uint32_t bb_w_=640,bb_h_=480;
  bool tearing_=false, views=true; unsigned view_calls=0;
  void Flush() {}
- void WaitFence(uint64_t) {}
+ bool WaitFence(uint64_t) { return true; }
  bool CreateBackBufferViews() {
   ++view_calls;
   for(auto& b:bb_)b.valid=views;

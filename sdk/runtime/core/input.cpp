@@ -168,6 +168,10 @@ bool ReadKeyboardMouse(Pad& pad) {
         return false;
     }
     auto held = [](int key) { return HeldCode(key); };
+    // When an ImGui overlay owns the keyboard, the arrows and Enter/Escape
+    // already reach it as keys. Do not also mirror them into the pad: the menu
+    // reads both paths and would step twice. Controller input is unaffected.
+    const bool ui = g_ui_active.load(std::memory_order_relaxed);
     // Keyboard movement is digital, and a diagonal is normalized to the same
     // length as a straight push (full / sqrt(2)), like the PC's keyboard input.
     // A real controller keeps its own analog values in Poll().
@@ -176,10 +180,12 @@ bool ReadKeyboardMouse(Pad& pad) {
     const int move_scale = move_x && move_y ? 23170 : 32767;
     pad.lx = int16_t(move_x * move_scale);
     pad.ly = int16_t(move_y * move_scale);
-    const int digital[] = {kKeyUp, kKeyDown, kKeyLeft, kKeyRight, kKeyEscape, kKeyTab, 0, 0};
-    const bool stick_click = HeldChar(kLeftStickClickKey);
-    for (int i = 0; i < 8; ++i) {
-        if (i == 6 ? stick_click : (digital[i] && held(digital[i]))) pad.buttons |= uint16_t(1 << i);
+    if (!ui) {
+        const int digital[] = {kKeyUp, kKeyDown, kKeyLeft, kKeyRight, kKeyEscape, kKeyTab, 0, 0};
+        const bool stick_click = HeldChar(kLeftStickClickKey);
+        for (int i = 0; i < 8; ++i) {
+            if (i == 6 ? stick_click : (digital[i] && held(digital[i]))) pad.buttons |= uint16_t(1 << i);
+        }
     }
     // Preserve the user's preferred aim/lock layout.
     if (held(kKeyShift) || held(kKeyRShift)) pad.buttons |= uint16_t(1 << 7);
@@ -189,8 +195,10 @@ bool ReadKeyboardMouse(Pad& pad) {
         if (on) pad.analog[button] = 255;
     };
     const bool driving = app::kGame.keyboard_driving && app::kGame.keyboard_driving();
-    press(0, held(kKeyReturn)); // A: menu confirmation
-    press(1, held(kKeyBack));   // B: menu cancel
+    if (!ui) {
+        press(0, held(kKeyReturn)); // A: menu confirmation
+        press(1, held(kKeyBack));   // B: menu cancel
+    }
     if (driving) {
         press(0, HeldChar('W')); // A: accelerate
         press(2, HeldChar('S')); // X: brake / reverse
@@ -521,6 +529,7 @@ Pad Poll(int port) {
     if (port == 0) {
         Pad keyboard_mouse;
         const bool active = ReadKeyboardMouse(keyboard_mouse);
+        const bool ui = g_ui_active.load(std::memory_order_relaxed);
         const bool controller_active = p.buttons || std::abs(p.lx) > 8000 || std::abs(p.ly) > 8000 ||
                                        std::abs(p.rx) > 8000 || std::abs(p.ry) > 8000 ||
                                        std::any_of(std::begin(p.analog), std::end(p.analog),
@@ -532,12 +541,29 @@ Pad Poll(int port) {
             // sample starts from the controller's current heading.
             std::lock_guard lock(g_mouse_lock);
             g_direct_used_at.store(0, std::memory_order_relaxed);
+            g_aim_x = g_aim_y = 0; // a flick before the handoff must not turn once
             g_pending_aim_x = g_pending_aim_y = 0;
         }
-        if (active || !p.connected) {
+        // While an ImGui overlay owns the keyboard, do not merge the keyboard
+        // pad into port 0: its movement and button mappings would reach
+        // NavBits as extra menu presses. ImGui gets the keys directly, and the
+        // real controller (if any) stays the pad source.
+        if (!ui && (active || !p.connected)) {
             keyboard_mouse.connected = true;
             p = keyboard_mouse;
+        } else if (ui) {
+            // Keep port 0 present as before. With no controller the pad is
+            // already neutral; keyboard overlay controls never enter it.
+            p.connected = true;
         }
+    }
+    // A background window keeps receiving controller state through SDL, but it
+    // must not steer, attack or open the menu. Scripted and replayed input is
+    // applied by GameInfo::pad just below, after this gate.
+    if (!WindowFocused()) {
+        const bool connected = p.connected;
+        p = Pad{};
+        p.connected = connected;
     }
     if (app::kGame.pad) app::kGame.pad(port, p);
     return p;

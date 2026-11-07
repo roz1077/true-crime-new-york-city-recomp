@@ -4,6 +4,13 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <system_error>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #include "codegen.h"
 
@@ -20,14 +27,72 @@ static std::string F(const char* f, ...) {
 }
 
 // rewriting identical files would force a full rebuild of the generated code
-static void WriteIfChanged(const fs::path& p, const std::string& text) {
-    std::ifstream in(p, std::ios::binary);
-    if (in) {
-        std::string old((std::istreambuf_iterator<char>(in)), {});
-        if (old == text) return;
+static bool WriteIfChanged(const fs::path& p, const std::string& text) {
+    {
+        // The comparison stream must be closed before the replace: a Windows
+        // ifstream can keep the destination open and make MoveFileEx fail.
+        std::ifstream in(p, std::ios::binary);
+        if (in) {
+            std::string old((std::istreambuf_iterator<char>(in)), {});
+            if (in.bad()) {
+                std::fprintf(stderr, "%s: read failed\n", p.string().c_str());
+                return false;
+            }
+            if (old == text) return true;
+        } else {
+            std::error_code ec;
+            if (fs::exists(p, ec)) {
+                std::fprintf(stderr, "%s: cannot be read\n", p.string().c_str());
+                return false;
+            }
+        }
     }
-    std::ofstream out(p, std::ios::binary);
-    out << text;
+    fs::path temp = p;
+    temp += ".tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            std::fprintf(stderr, "%s: cannot be written\n", temp.string().c_str());
+            return false;
+        }
+        out.write(text.data(), std::streamsize(text.size()));
+        out.flush();
+        if (!out) {
+            out.close();
+            std::error_code ec;
+            fs::remove(temp, ec);
+            std::fprintf(stderr, "%s: write failed\n", temp.string().c_str());
+            return false;
+        }
+        out.close();
+        if (out.fail()) {
+            std::error_code ec;
+            fs::remove(temp, ec);
+            std::fprintf(stderr, "%s: close failed\n", temp.string().c_str());
+            return false;
+        }
+    }
+    std::error_code ec;
+#ifdef _WIN32
+    // MinGW's std::filesystem::rename maps to MoveFileW, which refuses to
+    // replace an existing file. Generated partitions are rewritten in place.
+    if (!::MoveFileExW(temp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD error = GetLastError();
+        std::error_code ignored;
+        fs::remove(temp, ignored);
+        std::fprintf(stderr, "%s: replacing it failed: %lu\n", p.string().c_str(), error);
+        return false;
+    }
+#else
+    fs::rename(temp, p, ec);
+    if (ec) {
+        std::error_code ignored;
+        fs::remove(temp, ignored);
+        std::fprintf(stderr, "%s: replacing it failed: %s\n", p.string().c_str(), ec.message().c_str());
+        return false;
+    }
+#endif
+    return true;
 }
 
 std::string CodeGen::EmitFunction(uint32_t entry) {
@@ -224,7 +289,7 @@ bool CodeGen::Run() {
         }
         syms += "\n";
     }
-    WriteIfChanged(out_ / "image_symbols.h", syms);
+    if (!WriteIfChanged(out_ / "image_symbols.h", syms)) return false;
 
     // shared declarations
     std::string shared = "#pragma once\n#include \"cpu/x86_ops.h\"\n\n";
@@ -234,7 +299,7 @@ bool CodeGen::Run() {
     for (auto& [va, h] : an_.cfg.hooks) hooks.emplace(h.call, h.Returns());
     for (auto& [name, returns] : hooks)
         shared += F("X86_HOST_API %s %s(X86Context& ctx, uint8_t* base);\n", returns ? "bool" : "void", name.c_str());
-    WriteIfChanged(out_ / "x86_recomp_shared.h", shared);
+    if (!WriteIfChanged(out_ / "x86_recomp_shared.h", shared)) return false;
 
     // the executable exports the hooks under their C++ names (app/game_code.cpp includes this)
     std::string hook_exports = "#pragma once\n";
@@ -242,7 +307,7 @@ bool CodeGen::Run() {
         const char* result = returns ? "_N" : "X";
         hook_exports += F("#pragma comment(linker, \"/EXPORT:?%s@@YA%sAEAUX86Context@@PEAE@Z\")\n", name.c_str(), result);
     }
-    WriteIfChanged(out_ / "hook_exports.h", hook_exports);
+    if (!WriteIfChanged(out_ / "hook_exports.h", hook_exports)) return false;
 
     // partition by instruction count so the files compile in similar time
     size_t total = 0;
@@ -262,7 +327,7 @@ bool CodeGen::Run() {
             acc += weight[fi];
             fi++;
         }
-        WriteIfChanged(out_ / F("x86_recomp.%u.cpp", p), text);
+        if (!WriteIfChanged(out_ / F("x86_recomp.%u.cpp", p), text)) return false;
     }
 
     std::string map = "#include \"x86_recomp_shared.h\"\n\n";
@@ -290,7 +355,7 @@ bool CodeGen::Run() {
         map += F("\nX86_FUNC(__imp__%s) { x86_trap(ctx, 0x%Xu, \"not in this image\"); }\n", FuncName(f).c_str(), f);
         map += F("X86_WEAK_FUNC(%s, __imp__%s)\n", FuncName(f).c_str(), FuncName(f).c_str());
     }
-    WriteIfChanged(out_ / "x86_func_mapping.cpp", map);
+    if (!WriteIfChanged(out_ / "x86_func_mapping.cpp", map)) return false;
 
     // the game code DLL exports its tables and each recompiled body (one name a function: PE allows 65535); the
     // executable's import library also takes a function's own name, for the calls it makes where it has no override
@@ -306,12 +371,12 @@ bool CodeGen::Run() {
             aliases += F("    %s == __imp__%s\n", name.c_str(), name.c_str());
         }
     }
-    WriteIfChanged(out_ / "exports.def", library + exports);
-    WriteIfChanged(out_ / "imports.def", library + exports + aliases);
+    if (!WriteIfChanged(out_ / "exports.def", library + exports)) return false;
+    if (!WriteIfChanged(out_ / "imports.def", library + exports + aliases)) return false;
 
     std::string stats = F("functions %zu\ninstructions %zu\n", funcs.size(), insn_count_);
     for (auto& [k, v] : unimpl_) stats += F("unimplemented %s %zu\n", k.c_str(), v);
-    WriteIfChanged(out_ / "x86_recomp_stats.txt", stats);
+    if (!WriteIfChanged(out_ / "x86_recomp_stats.txt", stats)) return false;
     std::fprintf(stderr, "%s", stats.c_str());
     return true;
 }

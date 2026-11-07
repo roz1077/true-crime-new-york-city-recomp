@@ -26,6 +26,9 @@ inline constexpr int16_t kStickNav = 16000;     // left stick counts as a direct
 inline constexpr int16_t kStickNeutral = 8000;  // and as released inside this
 inline constexpr uint8_t kAnalogNeutral = 0x20; // analog buttons and triggers, released below this
 
+// Navigation comes from the controller only while an ImGui overlay owns the
+// keyboard: input.cpp stops mirroring keyboard arrows/Enter/Escape into the
+// pad then, because ImGui already delivers those keys to the menu.
 inline uint32_t NavBits(const input::Pad &p) {
     uint32_t bits = 0;
     if ((p.buttons & kDpadUp) || p.ly > kStickNav) bits |= kUp;

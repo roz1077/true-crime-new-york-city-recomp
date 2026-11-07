@@ -1780,4 +1780,76 @@ The full code review found and the current tree fixes these correctness issues:
   same setting under the settings lock on each distant-city pass, so changes apply
   without a restart.
 
+## 2026-11-07 - Beta hardening pass
 
+The pre-beta review's P0 and most P1 items were implemented in one pass.
+
+- **Save durability:** `NtFlushBuffersFile` now checks the CRT flush and commits the
+  host file; truncation and rename check every error; writable streams are flushed and
+  synced in `Shutdown`/`Relaunch` before `_Exit`; close failures are logged.
+- **D3D12:** one command list per frame slot, reset only after its own fence completes;
+  bounded fence waits with device-removal detection; HRESULT checks on list close and
+  queue signal; descriptor-ring overflow submits instead of borrowing another frame's
+  slots; late-lock readback buffers are swept; readback buffers are reused per frame
+  instead of allocated for every lock; failed upload allocations no longer dereference
+  null; SMAA views are repointed only after a full drain; the CPU shader blob cache is
+  bounded.
+- **Vulkan:** target rebuilds retire framebuffers/borrowed views instead of destroying
+  them under an in-flight command buffer; framebuffers are destroyed before their views;
+  sampled depth descriptors use the target's actual layout; depth resolve prefers
+  sample zero; zero-extent swapchains are refused; submit/acquire failures stop cleanly;
+  robust buffer access is enabled and vertex attributes are validated against the
+  stream stride; suspend/resume pauses audio and pacing. MSAA/render-scale changes
+  rebuild targets lazily, so a sampled HUD target keeps its contents until it is next
+  used as a render target (the Windows FS placeholder fix). CPU-written target uploads
+  are recorded into the current command buffer and their staging buffers retired at the
+  frame fence, avoiding two full GPU waits per target upload.
+- **Guest-data bounds:** texture descriptors and mip/cube sizes are validated against
+  the guest allocation with 64-bit math; vertex/index counts, spans, strides, base
+  vertices and stream elements are bounded; D3D8 buffer-count, surface, shader and
+  push-buffer reads are validated; the texture dumper worker is joinable and writes
+  atomically with allocation caps.
+- **Kernel/update path:** `PulseEvent` uses a waiter-visible pulse generation; memory
+  commits check failure and use 64-bit range math; file-size errors no longer report
+  `UINT64_MAX`; thread/stack creation failures propagate; timer re-initialisation
+  cancels the old entry; address dispatcher entries are swept; exception frame walks
+  are bounded and committed, RTL string conversions validate guest ranges, and the
+  first-launch object cache is keyed by host/tool/header/flag content.
+- **Files:** CDROM0 is read-only even when its files come from extracted assets, so
+  write/truncate/rename/delete requests are refused; file-information, directory and
+  volume output buffers are checked before the host writes them.
+- **Title:** direct mouse pitch defaults follow the documented on-foot/vehicle
+  conventions (live confirmation still required); stream release runs flushed callbacks
+  before freeing the stream; F10 settings save when the window closes; display changes
+  apply before they are saved and roll back on failure; duplicate keyboard menu
+  navigation and unfocused controller input are removed; XInput capability layout,
+  settings defaults/validation, and the native Options save debounce were corrected.
+- **Release engineering:** both packages include `sdk/LICENSE`; the Windows package is
+  deterministic and has `SHA256SUMS`; release links no longer carry `-g`; the Linux tar
+  is deterministic and dependency-checked; CI workflows, a pinned SDK fallback and a
+  missing-game configure guard were added.
+- **Paths and identity:** host game data, save paths, logs and relaunch files are carried
+  as `std::filesystem::path` and opened with `_wfopen` on Windows, so a Unicode install
+  folder no longer narrows through the ANSI code page; the launcher and runtime locate
+  their module folder with a growing buffer. The executable embeds a `longPathAware`
+  manifest, an original application icon and 0.9.0.0 version/product metadata. The
+  port's own source is MIT-licensed; the original game and assets remain excluded.
+
+Verification for this pass: clean Windows Release build with MSVC-target LLVM, all 18
+`scripts/run_checks.py` checks passing (including save-flush and PulseEvent regressions),
+clean Linux Release build in WSL, loader smoke test, and package inspections (GLIBC
+2.38, bundled shaderc, no game assets, licence files present). A 35-second Windows boot
+smoke test on an RX 7900 XTX at 8x MSAA initialised the renderer, streamed level/audio
+data and settled at roughly 2,000 draws and 50 fps with no device loss; the first launch
+after the tool/flag change rebuilt the DLL as intended. On the Steam Deck (RADV, 1920x1080,
+4x MSAA + SMAA + bloom + DOF) the game ran scripted gameplay for 60 seconds with 0 VUIDs,
+0 audio underruns, no device loss and ~47 fps; a live 4x-to-8x MSAA change also reported
+0 VUIDs and preserved the HUD. Live gameplay/audio checks remain for the maintainer.
+The SDK patch was regenerated against upstream `f7b13fd`: 65 real file diffs after excluding
+line-ending and permission churn, applies cleanly to a pristine checkout and reproduces
+`sdk/` content exactly.
+
+The review items from this pass are now implemented: a project-level MIT licence and
+third-party notices, an original icon resource, batched Vulkan target uploads, the SDL3
+audio jitter buffer, and lazy target rebuilds. The remaining work is live/manual QA and
+the measured optimisation candidates in OPTIMISATIONS.md.

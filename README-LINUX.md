@@ -30,6 +30,16 @@ You can also point at a folder or image directly:
 The XBE is checked against the release this binary was built from. A different
 release is refused, because it would run its own data under this recompiled code.
 
+The package also contains:
+
+- `TrueCrimeNYC`: the executable.
+- `lib/libshaderc.so.1`: the bundled shader compiler, loaded from beside the
+  executable.
+- `README.md`, `README-LINUX.md`, `BUILD.txt` and `THIRD_PARTY.txt`.
+- `LICENSES/XboxXBE-Recomp-LICENSE.txt` for the SDK, plus `LICENSES/imgui-LICENSE.txt`
+  and the shaderc/glslang copyright files when the build host provides them.
+- `assets/PUT-THE-GAME-HERE.txt`; no game files are included.
+
 ## Steam and Steam Deck
 
 1. Steam -> Games -> **Add a Non-Steam Game** -> **Browse** -> select `TrueCrimeNYC`.
@@ -123,5 +133,7 @@ cache is safe and only costs one slower start.
 
 ## Licenses
 
-The executable statically links SDL3 and Dear ImGui, and loads shaderc at run
-time. See `THIRD_PARTY.txt` and `LICENSES/`.
+The executable links SDL3 (statically when the SDL3 package provides the static
+target, otherwise the shared SDL3 library) and statically links Dear ImGui.
+shaderc is loaded at run time from the bundled `lib/libshaderc.so.1`. See
+`THIRD_PARTY.txt` and `LICENSES/`.

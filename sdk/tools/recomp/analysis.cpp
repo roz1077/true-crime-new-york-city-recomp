@@ -6,6 +6,13 @@
 
 Analysis::Analysis(const xbe::Image& image, const Config& config) : img(image), cfg(config) {
     ZydisDecoderInit(&dec_, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
+    std::set<std::string> names;
+    for (auto& s : img.sections) names.insert(s.name);
+    for (auto& n : cfg.code_sections)
+        if (!names.count(n)) {
+            error = "code section \"" + n + "\" is not in the image";
+            return;
+        }
     auto is_code = [&](const xbe::Section& s) {
         for (auto& n : cfg.code_sections)
             if (s.name == n) return true;
@@ -14,19 +21,47 @@ Analysis::Analysis(const xbe::Image& image, const Config& config) : img(image), 
         return false;
     };
     lo_ = 0xFFFFFFFF;
+    hi_ = 0;
     for (auto& s : img.sections)
         if (is_code(s)) {
+            code_section_count++;
+            if (!s.rsize) continue;
             lo_ = std::min(lo_, s.va);
             hi_ = std::max(hi_, s.va + s.rsize);
         }
-    code_.assign(hi_ - lo_, 0);
-    cover_.assign(hi_ - lo_, 0);
+    if (!code_section_count) {
+        error = cfg.code_sections.empty() && cfg.code_prefixes.empty()
+                    ? "no code sections are configured"
+                    : "the configured code sections match no section of the image";
+        lo_ = 0;
+        return;
+    }
+    if (lo_ == 0xFFFFFFFF) {
+        error = "the configured code sections have no file data";
+        lo_ = 0;
+        return;
+    }
+    // A handful of code sections can be placed far apart in the 32 bit address space. Reject a span no real image
+    // has instead of allocating a code map over the whole gap.
+    const uint64_t span = uint64_t(hi_) - lo_;
+    const uint64_t limit =
+        std::min<uint64_t>(256ull << 20, std::max<uint64_t>(64ull << 20, uint64_t(img.file.size()) * 8));
+    if (span > limit) {
+        error = "the configured code sections span " + std::to_string(span) + " bytes, over the " +
+                std::to_string(limit) + " byte limit for a " + std::to_string(img.file.size()) + " byte image";
+        lo_ = hi_ = 0;
+        return;
+    }
+    code_.assign(size_t(span), 0);
+    cover_.assign(size_t(span), 0);
     for (auto& s : img.sections)
         if (is_code(s))
             for (uint32_t i = 0; i < s.rsize; i++) code_[s.va - lo_ + i] = 1;
-    for (auto& r : cfg.data_ranges)
-        for (uint32_t a = r.first; a < r.second; a++)
-            if (a >= lo_ && a < hi_) cover_[a - lo_] = 3;
+    for (auto& r : cfg.data_ranges) {
+        const uint32_t begin = std::max(r.first, lo_);
+        const uint32_t end = std::min(r.second, hi_);
+        for (uint32_t a = begin; a < end; a++) cover_[a - lo_] = 3;
+    }
 }
 
 const uint8_t* Analysis::Bytes(uint32_t va, uint32_t& avail) const {
@@ -547,6 +582,8 @@ void Analysis::Run() {
         std::vector<uint32_t> targets;
         for (auto& [va, insn] : insns_)
             if (insn.flow == Flow::Call && IsCode(insn.target) && !functions.count(insn.target)) targets.push_back(insn.target);
+        std::sort(targets.begin(), targets.end());
+        targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
         for (uint32_t t : targets) {
             if (functions.count(t)) continue;
             uint8_t cov = cover_[t - lo_];

@@ -120,10 +120,10 @@ uint8_t Expand6(uint32_t v) { return uint8_t((v << 2) | (v >> 4)); }
 uint8_t Expand4(uint32_t v) { return uint8_t(v * 17); }
 uint8_t Clamp255(int v) { return uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); }
 
-// one texel to B, G, R, A
-void Texel(uint32_t fmt, const uint8_t* p, uint8_t* o) {
-    uint16_t s16;
-    std::memcpy(&s16, p, 2);
+// one texel to B, G, R, A; bpp keeps the 16 bit staging read inside an 8 bit level's last texel
+void Texel(uint32_t fmt, const uint8_t* p, uint8_t* o, uint32_t bpp) {
+    uint16_t s16 = 0;
+    if (bpp >= 2) std::memcpy(&s16, p, 2);
     switch (fmt) {
         case 0x00: case 0x13:
             o[0] = o[1] = o[2] = p[0];
@@ -237,14 +237,18 @@ void Texel(uint32_t fmt, const uint8_t* p, uint8_t* o) {
 }
 
 float DepthTexel(uint32_t fmt, const uint8_t* p) {
-    uint32_t v;
     uint16_t s;
-    std::memcpy(&v, p, 4);
     std::memcpy(&s, p, 2);
     switch (fmt) {
-        case 0x2A: case 0x2E: return float(v >> 8) / 16777215.0f;
+        case 0x2A: case 0x2E: {  // 24 bit depth in the high bytes
+            uint32_t v;
+            std::memcpy(&v, p, 4);
+            return float(v >> 8) / 16777215.0f;
+        }
         case 0x2C: case 0x30: return float(s) / 65535.0f;
         case 0x2B: case 0x2F: {  // unsigned, 8 bit exponent, 16 bit mantissa: a float32 missing its low bits
+            uint32_t v;
+            std::memcpy(&v, p, 4);
             uint32_t exponent = v >> 24, mantissa = (v >> 8) & 0xFFFF;
             return std::bit_cast<float>(exponent << 23 | mantissa << 7);
         }
@@ -258,6 +262,71 @@ float DepthTexel(uint32_t fmt, const uint8_t* p) {
 std::mutex g_dirty_lock;
 std::unordered_map<uint32_t, uint64_t> g_dirty;
 uint64_t g_epoch = 1;
+
+// sane limits: D3D12's largest 2D side, the Xbox format's four level bits, and a level a host upload can hold
+constexpr uint32_t kMaxTextureSide = 16384;
+constexpr uint32_t kMaxTextureLevels = 15;
+constexpr uint64_t kMaxDecodedLevelBytes = 512ull << 20;
+constexpr uint64_t kMaxTextureBytes = 512ull << 20;  // far above anything the 64 MB console could hold
+
+// whether a guest range is backed by host memory, without trusting a corrupt header's sizes
+bool GuestRangeReadable(uint32_t va, uint64_t bytes) {
+    if (!va || !bytes) return false;
+    if (va >= mem::kContiguousBase && va < mem::kContiguousBase + mem::kPhysicalSize) {
+        return bytes <= uint64_t(mem::kContiguousBase + mem::kPhysicalSize) - va;
+    }
+    if (va >= mem::kWriteCombineBase && va < mem::kWriteCombineBase + mem::kPhysicalSize) {
+        return bytes <= uint64_t(mem::kWriteCombineBase + mem::kPhysicalSize) - va;
+    }
+    if (uint32_t alloc = mem::AllocationSize(va)) return bytes <= alloc;
+    // not tracked by an allocator: every page the range touches must at least be committed
+    const uint64_t end = uint64_t(va) + bytes;
+    if (end > 0x100000000ull) return false;
+    for (uint64_t p = uint64_t(va) & ~uint64_t(mem::kPage - 1); p < end; p += mem::kPage) {
+        if (!mem::IsCommitted(uint32_t(p))) return false;
+    }
+    return true;
+}
+
+// a swizzled level of non-power-of-two dimensions still uses the next power of two's Morton footprint
+uint64_t SwizzledLevelBytes(const TextureDesc& d, uint32_t level) {
+    const FormatInfo& f = Format(d.format);
+    if (!f.swizzled || f.compressed) return 0;
+    uint64_t w = std::max<uint64_t>(uint64_t(d.width) >> level, 1);
+    uint64_t h = std::max<uint64_t>(uint64_t(d.height) >> level, 1);
+    uint64_t z = std::max<uint64_t>(uint64_t(d.depth) >> level, 1);
+    auto ceil_pow2 = [](uint64_t v) {
+        uint64_t p = 1;
+        while (p < v) p <<= 1;
+        return p;
+    };
+    return ceil_pow2(w) * ceil_pow2(h) * ceil_pow2(z) * f.bits / 8;
+}
+
+// the memory a descriptor's decoder can touch, including swizzle padding
+uint64_t RequiredGuestBytes(const TextureDesc& d) {
+    uint64_t face = 0;
+    for (uint32_t l = 0; l < d.levels; l++) {
+        face += std::max<uint64_t>(LevelSize(d, l), SwizzledLevelBytes(d, l));
+    }
+    if (!d.cube) return face;
+    face = (face + 127) & ~uint64_t(127);
+    return face * 6;
+}
+
+bool ValidGeometry(const TextureDesc& d) {
+    if (!d.width || !d.height || !d.depth) return false;
+    if (d.width > kMaxTextureSide || d.height > kMaxTextureSide || d.depth > kMaxTextureSide) return false;
+    if (d.levels < 1 || d.levels > kMaxTextureLevels) return false;
+    if (d.cube && d.depth != 1) return false;
+    const FormatInfo& f = Format(d.format);
+    if (f.host == Host::None || f.bits < 8) return false;
+    if (d.linear) {
+        if (f.compressed || d.levels != 1) return false;
+        if (uint64_t(d.pitch) < uint64_t(d.width) * (f.bits / 8)) return false;
+    }
+    return true;
+}
 
 }  // namespace
 
@@ -274,98 +343,142 @@ const FormatInfo& Format(uint32_t f) {
 
 bool Describe(uint32_t header, TextureDesc& d) {
     using namespace kernel;
+    d = {};
     if (!header) return false;
     uint32_t common = R32(header);
     uint32_t type = common & 0x70000;  // 0x40000 texture, 0x50000 surface
     if (type != 0x40000 && type != 0x50000) return false;
     // D3DPixelContainer: Common, Data, Lock, Format, Size
-    uint32_t fmt = R32(header + 12), size = R32(header + 16);
-    d.data = mem::VirtualFromPhysical(R32(header + 4));
+    uint32_t fmt = R32(header + 12), size = R32(header + 16), data = R32(header + 4);
+    if (!data) return false;
+    TextureDesc t;
+    t.data = mem::VirtualFromPhysical(data);
     // Format: cube bit 2, dimensions bits 4 to 7, format 8 to 15, levels 16 to 19, log2 sizes from bit 20
-    d.format = (fmt >> 8) & 0xFF;
-    d.cube = fmt & 4;
+    t.format = (fmt >> 8) & 0xFF;
+    t.cube = fmt & 4;
     uint32_t dims = (fmt >> 4) & 0xF;
-    d.levels = std::max<uint32_t>((fmt >> 16) & 0xF, 1);
+    t.levels = std::max<uint32_t>((fmt >> 16) & 0xF, 1);
     if (size) {
-        d.width = (size & 0xFFF) + 1;
-        d.height = ((size >> 12) & 0xFFF) + 1;
-        d.pitch = ((size >> 24) + 1) * 64;
-        d.depth = 1;
-        d.levels = 1;
-        d.linear = true;
+        t.width = (size & 0xFFF) + 1;
+        t.height = ((size >> 12) & 0xFFF) + 1;
+        t.pitch = ((size >> 24) + 1) * 64;
+        t.depth = 1;
+        t.levels = 1;
+        t.linear = true;
     } else {
-        d.width = 1u << ((fmt >> 20) & 0xF);
-        d.height = 1u << ((fmt >> 24) & 0xF);
-        d.depth = dims == 3 ? 1u << ((fmt >> 28) & 0xF) : 1;
-        d.linear = !Format(d.format).swizzled && !Format(d.format).compressed;
-        d.pitch = d.width * Format(d.format).bits / 8;
+        t.width = 1u << ((fmt >> 20) & 0xF);
+        t.height = 1u << ((fmt >> 24) & 0xF);
+        t.depth = dims == 3 ? 1u << ((fmt >> 28) & 0xF) : 1;
+        t.linear = !Format(t.format).swizzled && !Format(t.format).compressed;
+        t.pitch = uint32_t(uint64_t(t.width) * Format(t.format).bits / 8);
     }
+    if (!ValidGeometry(t)) {
+        LOG_FIRST(32, "texture: descriptor %08X rejected: %ux%ux%u fmt %02X levels %u", header, t.width, t.height,
+                  t.depth, t.format, t.levels);
+        return false;
+    }
+    const uint64_t need = RequiredGuestBytes(t);
+    if (need > kMaxTextureBytes) {
+        LOG_FIRST(32, "texture: %08X needs %llu bytes, over the host texture limit", header,
+                  static_cast<unsigned long long>(need));
+        return false;
+    }
+    if (!GuestRangeReadable(t.data, need)) {
+        LOG_FIRST(32, "texture: %08X at %08X needs %llu bytes outside its allocation", header, t.data,
+                  static_cast<unsigned long long>(need));
+        return false;
+    }
+    d = t;
     return true;
 }
 
 bool DescribeSurface(const Surface& s, TextureDesc& d) {
+    d = {};
     if (!s.header) return false;
     return Describe(s.header, d);
 }
 
-uint32_t LevelSize(const TextureDesc& d, uint32_t level) {
+uint64_t LevelSize(const TextureDesc& d, uint32_t level) {
     const FormatInfo& f = Format(d.format);
-    if (d.linear) return d.pitch * d.height;
-    uint32_t w = std::max(d.width >> level, 1u), h = std::max(d.height >> level, 1u), z = std::max(d.depth >> level, 1u);
-    if (f.compressed) return std::max(1u, (w + 3) / 4) * std::max(1u, (h + 3) / 4) * f.bits * z;
+    if (d.linear) return uint64_t(d.pitch) * d.height;
+    uint64_t w = std::max<uint64_t>(uint64_t(d.width) >> level, 1);
+    uint64_t h = std::max<uint64_t>(uint64_t(d.height) >> level, 1);
+    uint64_t z = std::max<uint64_t>(uint64_t(d.depth) >> level, 1);
+    if (f.compressed) return std::max<uint64_t>(1, (w + 3) / 4) * std::max<uint64_t>(1, (h + 3) / 4) * f.bits * z;
     return w * h * z * f.bits / 8;
 }
 
-uint32_t LevelOffset(const TextureDesc& d, uint32_t level) {
-    uint32_t off = 0;
+uint64_t LevelOffset(const TextureDesc& d, uint32_t level) {
+    uint64_t off = 0;
+    level = std::min(level, kMaxTextureLevels);
     for (uint32_t l = 0; l < level; l++) off += LevelSize(d, l);
     return off;
 }
 
-uint32_t FaceSize(const TextureDesc& d) { return (LevelOffset(d, d.levels) + 127) & ~127u; }
+uint64_t FaceSize(const TextureDesc& d) { return (LevelOffset(d, d.levels) + 127) & ~uint64_t(127); }
 
-uint32_t TotalSize(const TextureDesc& d) { return d.cube ? FaceSize(d) * 6 : LevelOffset(d, d.levels); }
+uint64_t TotalSize(const TextureDesc& d) { return d.cube ? FaceSize(d) * 6 : LevelOffset(d, d.levels); }
 
 void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint8_t* guest, const uint32_t* palette,
                  std::vector<uint8_t>& out, uint32_t& row_pitch) {
+    out.clear();
+    row_pitch = 0;
+    if (!ValidGeometry(d) || level >= d.levels || face >= (d.cube ? 6u : 1u)) return;
     const FormatInfo& f = Format(d.format);
     uint32_t w = d.linear ? d.width : std::max(d.width >> level, 1u);
     uint32_t h = d.linear ? d.height : std::max(d.height >> level, 1u);
     uint32_t z = d.linear ? 1 : std::max(d.depth >> level, 1u);
-    const uint8_t* src = guest + (d.cube ? face * FaceSize(d) : 0) + LevelOffset(d, level);
+    uint64_t offset = LevelOffset(d, level);
+    if (d.cube) offset += uint64_t(face) * FaceSize(d);
+    const uint64_t span = std::max<uint64_t>(LevelSize(d, level), SwizzledLevelBytes(d, level));
+    if (offset > UINT64_MAX - span || !GuestRangeReadable(d.data, offset + span)) return;
+    const uint8_t* src = guest + size_t(offset);
     if (f.compressed) {
-        uint32_t bw = std::max(1u, (w + 3) / 4), bh = std::max(1u, (h + 3) / 4);
-        row_pitch = bw * f.bits;
-        out.assign(src, src + size_t(row_pitch) * bh * z);
+        uint64_t bw = std::max<uint64_t>(1, (uint64_t(w) + 3) / 4), bh = std::max<uint64_t>(1, (uint64_t(h) + 3) / 4);
+        uint64_t bytes = bw * f.bits * bh * z;
+        if (!bytes || bytes > kMaxDecodedLevelBytes) return;
+        row_pitch = uint32_t(bw * f.bits);
+        out.resize(size_t(bytes));
+        std::memcpy(out.data(), src, size_t(bytes));
         return;
     }
+    const uint64_t bpp = f.bits / 8;
     if (f.host == Host::R32F) {
+        const uint64_t bytes = uint64_t(w) * h * z * 4;
+        if (!bytes || bytes > kMaxDecodedLevelBytes) return;
         row_pitch = w * 4;
-        out.resize(size_t(row_pitch) * h * z);
+        out.resize(size_t(bytes));
         float* o = reinterpret_cast<float*>(out.data());
-        uint32_t bpp = f.bits / 8;
         uint32_t mx, my, mz;
         SwizzleMasks(w, h, z, mx, my, mz);
-        for (uint32_t y = 0; y < h; y++)
-            for (uint32_t x = 0; x < w; x++) {
-                uint32_t off = d.linear ? y * d.pitch + x * bpp : (Deposit(x, mx) | Deposit(y, my)) * bpp;
-                o[y * w + x] = DepthTexel(d.format, src + off);
-            }
+        for (uint32_t k = 0; k < z; k++)
+            for (uint32_t y = 0; y < h; y++)
+                for (uint32_t x = 0; x < w; x++) {
+                    uint32_t off = d.linear ? uint32_t(uint64_t(y) * d.pitch + x * bpp)
+                                            : uint32_t((Deposit(x, mx) | Deposit(y, my) | Deposit(k, mz)) * bpp);
+                    o[(size_t(k) * h + y) * w + x] = DepthTexel(d.format, src + off);
+                }
         return;
     }
+    const uint64_t bytes = uint64_t(w) * h * z * 4;
+    if (!bytes || bytes > kMaxDecodedLevelBytes) return;
     row_pitch = w * 4;
-    out.resize(size_t(row_pitch) * h * z);
-    uint32_t bpp = f.bits / 8;
+    out.resize(size_t(bytes));
     if (d.format == 0x24 || d.format == 0x25) {
-        // packed 4:2:2, two pixels share chroma
+        // packed 4:2:2, two pixels share chroma; an odd last pixel has only one 16 bit pair
         bool yuy2 = d.format == 0x24;
         for (uint32_t y = 0; y < h; y++)
-            for (uint32_t x = 0; x + 1 < w + 1; x += 2) {
-                const uint8_t* p = src + y * d.pitch + x * 2;
-                int y0 = yuy2 ? p[0] : p[1], u = yuy2 ? p[1] : p[0], y1 = yuy2 ? p[2] : p[3], v = yuy2 ? p[3] : p[2];
+            for (uint32_t x = 0; x < w; x += 2) {
+                const uint8_t* p = src + uint64_t(y) * d.pitch + uint64_t(x) * 2;
+                int y0 = yuy2 ? p[0] : p[1], u = yuy2 ? p[1] : p[0];
+                int y1 = y0, v = u;
+                if (x + 1 < w) {
+                    y1 = yuy2 ? p[2] : p[3];
+                    v = yuy2 ? p[3] : p[2];
+                }
                 for (int k = 0; k < 2 && x + uint32_t(k) < w; k++) {
                     int c = (k ? y1 : y0) - 16, dd = u - 128, e = v - 128;  // BT.601 studio range
-                    uint8_t* o = &out[(y * w + x + uint32_t(k)) * 4];
+                    uint8_t* o = &out[(size_t(y) * w + x + uint32_t(k)) * 4];
                     o[2] = Clamp255((298 * c + 409 * e + 128) >> 8);
                     o[1] = Clamp255((298 * c - 100 * dd - 208 * e + 128) >> 8);
                     o[0] = Clamp255((298 * c + 516 * dd + 128) >> 8);
@@ -376,7 +489,9 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
     }
     if (d.linear) {
         for (uint32_t y = 0; y < h; y++)
-            for (uint32_t x = 0; x < w; x++) Texel(d.format, src + y * d.pitch + x * bpp, &out[(y * w + x) * 4]);
+            for (uint32_t x = 0; x < w; x++)
+                Texel(d.format, src + uint64_t(y) * d.pitch + x * bpp, &out[(size_t(y) * w + x) * 4],
+                      uint32_t(bpp));
         return;
     }
     uint32_t mx, my, mz;
@@ -394,7 +509,7 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
                     uint32_t c = palette[p[0]];
                     std::memcpy(o, &c, 4);
                 } else {
-                    Texel(d.format, p, o);
+                    Texel(d.format, p, o, uint32_t(bpp));
                 }
             }
 }

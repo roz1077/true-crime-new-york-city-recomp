@@ -10,12 +10,14 @@
 #include <timeapi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cwchar>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <imgui.h>
 #include <backends/imgui_impl_win32.h>
@@ -37,6 +39,11 @@ HWND g_hwnd = nullptr;
 constexpr UINT kApplyDisplay = WM_APP + 1, kOpenWindow = WM_APP + 2, kCaptureMouse = WM_APP + 3;
 bool g_mode_changed = false;
 bool g_apply_posted = false;  // a display apply is waiting in the queue or running
+// the last synchronous display apply the menu asked for: the window thread
+// publishes its result here for RequestDisplayApply/DisplayApplyResult
+std::atomic<uint64_t> g_apply_request{0};
+std::atomic<uint64_t> g_apply_finished{0};
+std::atomic<bool> g_apply_ok{false};
 bool g_capture_wanted = true; // gameplay wants the pointer hidden and confined
 bool g_captured = false;
 bool g_cursor_hidden = false;
@@ -171,9 +178,11 @@ void DumpThreads() {
         }
 }
 
-// window thread only
-void ApplyNow() {
+// window thread only. false when a requested full-screen mode was refused, so
+// the caller can restore the previous settings instead of saving the new ones.
+bool ApplyNow() {
     const Settings s = Snapshot();
+    bool ok = true;
     HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
@@ -195,7 +204,10 @@ void ApplyNow() {
         dm.dmPelsWidth = s.width;
         dm.dmPelsHeight = s.height;
         dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
-        g_mode_changed = ChangeDisplaySettingsExW(mi.szDevice, &dm, nullptr, CDS_FULLSCREEN, nullptr) == DISP_CHANGE_SUCCESSFUL;
+        const LONG change = ChangeDisplaySettingsExW(mi.szDevice, &dm, nullptr, CDS_FULLSCREEN, nullptr);
+        g_mode_changed = change == DISP_CHANGE_SUCCESSFUL;
+        ok = g_mode_changed;
+        if (!ok) LOGE("app: fullscreen mode %ux%u refused (%ld)", s.width, s.height, change);
         GetMonitorInfoW(mon, &mi);
     }
     if (s.display_mode == DisplayMode::Windowed) {
@@ -211,6 +223,7 @@ void ApplyNow() {
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | visible);
         SetWindowPos(g_hwnd, HWND_NOTOPMOST, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED);
     }
+    return ok;
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -265,7 +278,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case kApplyDisplay:
             if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-            ApplyNow();
+            if (wp) {
+                const bool ok = ApplyNow();
+                g_apply_ok.store(ok, std::memory_order_relaxed);
+                g_apply_finished.store(uint64_t(wp), std::memory_order_release);
+            } else {
+                ApplyNow();
+            }
             g_apply_posted = false;
             return 0;
         case kOpenWindow:
@@ -293,9 +312,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }  // namespace
 
 std::filesystem::path ExeDir() {
-    wchar_t p[MAX_PATH];
-    GetModuleFileNameW(nullptr, p, MAX_PATH);
-    return std::filesystem::path(p).parent_path();
+    std::vector<wchar_t> p(MAX_PATH);
+    for (;;) {
+        const DWORD n = GetModuleFileNameW(nullptr, p.data(), DWORD(p.size()));
+        if (!n) return {};
+        if (n < p.size()) return std::filesystem::path(std::wstring(p.data(), n)).parent_path();
+        p.resize(p.size() * 2);
+    }
 }
 
 // Hardware write watchpoint diagnostic (XBE_EFFECT_WATCH). The exception carries the host instruction that
@@ -358,6 +381,21 @@ std::recursive_mutex& UiLock() {
 }
 
 void ApplyDisplay() { PostMessageW(g_hwnd, kApplyDisplay, 0, 0); }
+
+// Posts a display apply and returns a request number, or 0 when the window
+// would not accept the message. The window thread publishes the result; the
+// caller polls DisplayApplyResult from the frame that owns the Graphics menu.
+uint64_t RequestDisplayApply() {
+    const uint64_t request = g_apply_request.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!PostMessageW(g_hwnd, kApplyDisplay, WPARAM(request), 0)) return 0;
+    return request;
+}
+
+bool DisplayApplyResult(uint64_t request, bool &ok) {
+    if (!request || g_apply_finished.load(std::memory_order_acquire) != request) return false;
+    ok = g_apply_ok.load(std::memory_order_relaxed);
+    return true;
+}
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
 void CaptureMouse(bool capture) {
     if (g_hwnd) PostMessageW(g_hwnd, kCaptureMouse, capture ? 1 : 0, 0);
@@ -467,7 +505,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     std::wstring hdd = app::Instance() > 1 ? L"hdd" + std::to_wstring(app::Instance()) : L"hdd";
     if (app::Instance())
         SetWindowTextW(app::g_hwnd, (std::wstring(app::kGame.title) + L" [" + std::to_wstring(app::Instance()) + L"]").c_str());
-    if (!kernel::Boot(std::move(game.xbe), IMAGE_XBE, game.dir.string(), (app::ExeDir() / hdd).string())) {
+    if (!kernel::Boot(std::move(game.xbe), IMAGE_XBE, game.dir, app::ExeDir() / hdd)) {
         MessageBoxW(app::g_hwnd, L"The game failed to start, see the log in the logs folder.", app::kGame.short_title,
                     MB_ICONERROR);
         return 1;

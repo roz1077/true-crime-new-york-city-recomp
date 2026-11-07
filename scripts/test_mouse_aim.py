@@ -264,6 +264,7 @@ handler = window_source[start:window_source.index('\n}\n', start) + 3]
 window_check = r"""
 #include <windows.h>
 #include <cstdint>
+void SaveOnExit() {}
 """ + handler + r"""
 extern "C" __declspec(dllexport) int run() {
  intptr_t result=123;

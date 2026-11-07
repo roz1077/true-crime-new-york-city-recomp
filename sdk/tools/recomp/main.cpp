@@ -6,13 +6,25 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <set>
+#include <stdexcept>
 
 #include "analysis.h"
 #include "codegen.h"
 
 namespace fs = std::filesystem;
 
-static uint32_t ParseAddr(std::string_view s) { return uint32_t(std::stoul(std::string(s), nullptr, 0)); }
+static bool ParseAddr(std::string_view s, uint32_t& out) {
+    try {
+        size_t used = 0;
+        const unsigned long v = std::stoul(std::string(s), &used, 0);
+        if (used != s.size() || v > 0xFFFFFFFFul) return false;
+        out = uint32_t(v);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
 
 static std::optional<int64_t> Num(const toml::table* t, const char* key) {
     return t ? (*t)[key].value<int64_t>() : std::nullopt;
@@ -32,12 +44,7 @@ static bool ParseExit(const toml::node* n, Hook::Exit& e) {
         e.ret = true;
         return true;
     }
-    try {
-        e.to = ParseAddr(*s);
-    } catch (...) {
-        return false;
-    }
-    return true;
+    return ParseAddr(*s, e.to);
 }
 
 // Keys beyond [xbe], [functions], [symbols], [data] and [layout]:
@@ -50,7 +57,24 @@ static bool ParseExit(const toml::node* n, Hook::Exit& e) {
 //   [xbe] xdk = build  includes <--xdk folder>/<build>/layout.toml
 //   [abi] name = ["esi", "stack", ...]  where a [symbols] function takes each API argument when the image does not
 //     use the convention the host declares: a register, or "stack" for the next stack slot, which the callee pops
-static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_dir) {
+static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_dir, std::set<fs::path>& open) {
+    std::error_code ec;
+    fs::path canonical = fs::weakly_canonical(path, ec);
+    if (ec) {
+        ec.clear();
+        canonical = fs::absolute(path, ec);
+        if (ec) canonical = path;
+    }
+    if (!open.insert(canonical).second) {
+        std::fprintf(stderr, "%s: include cycle: %s is already being loaded\n", path.string().c_str(),
+                     canonical.string().c_str());
+        return false;
+    }
+    struct EraseOnReturn {
+        std::set<fs::path>& set;
+        fs::path key;
+        ~EraseOnReturn() { set.erase(key); }
+    } erase_on_return{open, canonical};
     toml::table t;
     try {
         t = toml::parse_file(path.string());
@@ -70,13 +94,13 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
                          layout.string().c_str());
             return false;
         }
-        if (!LoadConfig(layout, cfg, xdk_dir)) return false;
+        if (!LoadConfig(layout, cfg, xdk_dir, open)) return false;
     }
     auto includes = t["includes"].as_array();
     if (includes)
         for (auto& i : *includes)
             if (auto s = i.value<std::string>())
-                if (!LoadConfig(dir / *s, cfg, xdk_dir)) return false;
+                if (!LoadConfig(dir / *s, cfg, xdk_dir, open)) return false;
     if (auto v = t["xbe"]["path"].value<std::string>()) cfg.xbe_path = *v;
     if (auto v = t["xbe"]["title"].value<int64_t>()) cfg.title = uint32_t(*v);
     if (auto v = t["xbe"]["entry"].value<int64_t>()) cfg.entry = uint32_t(*v);
@@ -99,7 +123,16 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
                 cfg.data_ranges.push_back({uint32_t(r->get(0)->value<int64_t>().value_or(0)),
                                            uint32_t(r->get(1)->value<int64_t>().value_or(0))});
     if (auto f = t["functions"].as_table())
-        for (auto& [k, v] : *f) cfg.functions[ParseAddr(k.str())] = v.value<std::string>().value_or("");
+        for (auto& [k, v] : *f) {
+            uint32_t at = 0;
+            if (!ParseAddr(k.str(), at)) {
+                std::fprintf(stderr, "%s: [functions] %s: not a 32 bit address\n", path.string().c_str(),
+                             std::string(k.str()).c_str());
+                return false;
+            }
+            cfg.functions[at] = v.value<std::string>().value_or("");
+            cfg.explicit_functions.insert(at);
+        }
     for (auto [key, out] : {std::pair{"symbols", &cfg.symbols}, std::pair{"data", &cfg.data}})
         if (auto f = t[key].as_table())
             for (auto& [k, v] : *f) (*out)[std::string(k.str())] = uint32_t(v.value<int64_t>().value_or(0));
@@ -172,6 +205,20 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
 // overrides that analysis could not apply are config mistakes
 static bool CheckOverrides(const Analysis& an) {
     bool ok = true;
+    auto configured = [&](uint32_t va, const char* table, const std::string& name) {
+        const std::string what = table + (name.empty() ? "" : " " + name) + " = " + std::to_string(va);
+        if (!an.IsCode(va)) {
+            std::fprintf(stderr, "%s: not inside the configured code sections\n", what.c_str());
+            ok = false;
+        } else if (!an.InsnAt(va) && !an.cfg.function_ends.count(va)) {
+            std::fprintf(stderr, "%s: not a decoded instruction start\n", what.c_str());
+            ok = false;
+        }
+    };
+    for (auto& [name, va] : an.cfg.symbols)
+        if (va) configured(va, "[symbols]", name);
+    for (uint32_t va : an.cfg.explicit_functions)
+        if (va) configured(va, "[functions]", "");
     for (auto& [at, end] : an.cfg.function_ends)
         if (!an.functions.count(at) || (end && end <= at)) {
             std::fprintf(stderr, "[[function]] %08X: not decodable code or end not above it\n", at);
@@ -207,7 +254,8 @@ int main(int argc, char** argv) {
     }
     Config cfg;
     fs::path cfg_path = args[0];
-    if (!LoadConfig(cfg_path, cfg, xdk_dir)) return 1;
+    std::set<fs::path> open;
+    if (!LoadConfig(cfg_path, cfg, xdk_dir, open)) return 1;
     if (cfg.library.empty()) {
         std::fprintf(stderr, "%s: [xbe] needs library = \"<exe>.dll\", the game code DLL the executable loads\n", args[0].c_str());
         return 1;
@@ -242,9 +290,26 @@ int main(int argc, char** argv) {
     }
 
     Analysis an(img, cfg);
+    if (!an.error.empty()) {
+        std::fprintf(stderr, "%s: %s\n", xbe_path.string().c_str(), an.error.c_str());
+        return 1;
+    }
     an.Run();
+    if (!an.IsCode(img.entry) || !an.InsnAt(img.entry)) {
+        std::fprintf(stderr, "%s: entry point %08X is not a decoded instruction in the configured code sections\n",
+                     xbe_path.string().c_str(), img.entry);
+        return 1;
+    }
+    if (an.functions.empty()) {
+        std::fprintf(stderr, "%s: no functions decoded from the configured code sections\n", xbe_path.string().c_str());
+        return 1;
+    }
     if (!CheckOverrides(an)) return 1;
     fs::create_directories(out_dir);
     CodeGen gen(an, out_dir);
-    return gen.Run() ? 0 : 1;
+    if (!gen.Run()) return 1;
+    std::fprintf(stderr, "%s: %zu of %zu sections are code, %zu functions, %zu instructions\n",
+                 xbe_path.filename().string().c_str(), an.code_section_count, img.sections.size(), an.functions.size(),
+                 an.insns_.size());
+    return 0;
 }

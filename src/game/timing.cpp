@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "app/app.h"
+#include "common/graphics_choices.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
 #include "xdk/hle.h"
@@ -50,6 +51,11 @@ constexpr uint32_t kMainLoopSimulate = 0xA7910;
 constexpr uint32_t kMainLoopRender = 0xA794B;
 constexpr uint32_t kMainLoopPresent = 0xA7952;
 constexpr uint32_t kSimulateVblank = 0xA5221; // the simulation's own vblank read
+
+// The main loop's fast path only matches the game's own 60 Hz cadence. The
+// stored cap can be 0 (unlimited), 1 (monitor refresh) or above 60; the
+// effective limit in all of those cases is still the game's 60.
+bool AtGameFrameRate() { return game::choices::EffectiveFrameCap(app::FrameCap()) == 60; }
 } // namespace
 
 namespace timing {
@@ -245,7 +251,7 @@ X86_FUNC(sub_00243000) {
         return;
     }
     if (ret == kMainLoopVblank) {
-        fast_gameplay = !X86_MEM8(kAudioClockMode) && app::FrameCap() == 60 && !timing::Enabled();
+        fast_gameplay = !X86_MEM8(kAudioClockMode) && AtGameFrameRate() && !timing::Enabled();
         if (fast_gameplay) {
             const uint32_t last = X86_MEM32(kLastVblank);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
@@ -291,7 +297,7 @@ X86_FUNC(sub_002914D2) {
     std::memcpy(&ret, base + ctx.esp, 4);
     if (ret == kMainLoopSampleTime) {
         fast_gameplay = false;
-        fast_cutscene = X86_MEM8(kAudioClockMode) && app::FrameCap() == 60 && !timing::Enabled();
+        fast_cutscene = X86_MEM8(kAudioClockMode) && AtGameFrameRate() && !timing::Enabled();
         cutscene_tick_not_due = false;
         // Only the steady audio-clock branch forces a tick when the scene is
         // already caught up. Leave the entry and clock rebase paths alone.

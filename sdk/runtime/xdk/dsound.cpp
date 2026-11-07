@@ -141,6 +141,7 @@ struct Voice {
     bool playing = false, looping = false, paused = false;
     bool sync = false;  // held until IDirectSound_SynchPlayback
     bool active = false, ending = false;  // stream: took a packet since it went quiet, quiet again once they run out
+    bool released = false;  // stream Release is running callbacks; hidden from lookups until it frees
     double pos = 0;  // frames
     uint32_t freq = 0;
     // stream
@@ -622,7 +623,7 @@ void Render(float* out, uint32_t frames) {
     bins.assign(size_t(frames) * kBins, 0.0f);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     for (auto& [obj, v] : g_voices) {
-        if (v.paused || v.sync || (!v.stream && !v.playing)) continue;
+        if (v.released || v.paused || v.sync || (!v.stream && !v.playing)) continue;
         MixVoice(v, bins.data(), frames);
     }
     if (dsp::Loaded()) dsp::Run(bins.data(), frames);
@@ -696,7 +697,7 @@ float DefaultHeadroom(uint32_t flags) { return flags & 0x382010 ? 1.0f : Db(-600
 
 Voice* Find(uint32_t obj) {
     auto it = g_voices.find(obj);
-    return it == g_voices.end() ? nullptr : &it->second;
+    return it == g_voices.end() || it->second.released ? nullptr : &it->second;
 }
 
 uint32_t NewBuffer(uint32_t desc, uint32_t out) {
@@ -1163,19 +1164,39 @@ static void FlushStream(Voice& v) {
 }
 
 STREAM(AddRef, 1) { return uint32_t(++v.refs); }
+
+// Release holds the stream's object memory until after its flushed callbacks
+// have run, so a callback that still touches the guest-side stream cannot hit
+// freed memory. Find hides the voice while the callbacks run (a re-entrant
+// call on the same handle behaves as it does once Release returns); the voice
+// is erased and freed only after Run.
+HLE_STDCALL(CDirectSoundStream_Release, 1) {
+    uint32_t obj = 0;
+    std::vector<Done> flushed;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_lock);
+        Voice* v = Find(a[0]);
+        if (!v) return 0x80004005u;
+        if (--v->refs > 0) return uint32_t(v->refs);
+        FlushStream(*v);
+        v->released = true;
+        obj = v->obj;
+        flushed.swap(t_flushed);
+    }
+    Run(ctx, flushed);
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_lock);
+        g_voices.erase(obj);
+        mem::FreeSystem(obj);
+    }
+    return 0;
+}
+
 STREAM(SetFormat, 2) {
     FlushStream(v);
     ReadFormat(v, a[1]);
     v.freq = 0;  // the XDK sets the pitch back to the new format's own rate
     ForgetBlocks(v);
-    return 0;
-}
-STREAM(Release, 1) {
-    if (--v.refs > 0) return uint32_t(v.refs);
-    FlushStream(v);
-    uint32_t obj = v.obj;
-    g_voices.erase(obj);
-    mem::FreeSystem(obj);
     return 0;
 }
 STREAM(GetInfo, 2) {

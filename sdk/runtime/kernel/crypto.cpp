@@ -111,13 +111,14 @@ void Hmac(const uint8_t* key, size_t key_len, const uint8_t* a, size_t a_len, co
 void Rc4Key(void* ks, const uint8_t* key, size_t len) {
     auto* s = static_cast<uint8_t*>(ks);
     for (int i = 0; i < 256; i++) s[i] = uint8_t(i);
+    s[256] = 0;  // the i and j indices live after the table
+    s[257] = 0;
+    if (!len) return;  // XcRC4Key with an empty key has no defined key stream
     uint8_t j = 0;
     for (int i = 0; i < 256; i++) {
         j = uint8_t(j + s[i] + key[i % len]);
         std::swap(s[i], s[j]);
     }
-    s[256] = 0;  // the i and j indices live after the table
-    s[257] = 0;
 }
 
 void Rc4Crypt(void* ks, uint8_t* data, size_t len) {

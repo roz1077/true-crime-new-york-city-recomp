@@ -1,7 +1,9 @@
 #include "gpu/vertex.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
+#include <new>
 
 #include <dxgiformat.h>
 
@@ -173,6 +175,119 @@ uint32_t TypeBytes(uint32_t t) {
 
 constexpr uint32_t kResData = 4;
 
+// the console's whole memory is 64 MB: no vertex or index span can honestly be larger
+constexpr uint64_t kMaxBufferBytes = mem::kPhysicalSize;
+// expanded vertices and rebuilt index lists a host draw may allocate
+constexpr uint64_t kMaxAssemblyBytes = 256ull << 20;
+
+bool GuestReadable(uint32_t va, uint64_t bytes) {
+    if (!va || !bytes) return false;
+    if (uint32_t alloc = mem::AllocationSize(va)) return bytes <= alloc;
+    const uint64_t end = uint64_t(va) + bytes;
+    if (end > 0x100000000ull) return false;
+    for (uint64_t p = uint64_t(va) & ~uint64_t(mem::kPage - 1); p < end; p += mem::kPage) {
+        if (!mem::IsCommitted(uint32_t(p))) return false;
+    }
+    return true;
+}
+
+struct GuestBuffer {
+    uint32_t va = 0;
+    uint64_t size = 0;  // 0: not tracked by one of the emulator's allocators
+};
+
+GuestBuffer BufferOf(uint32_t header) {
+    GuestBuffer b;
+    if (!header || !GuestReadable(header, 8)) return b;
+    const uint32_t raw = kernel::R32(header + kResData);
+    if (!raw) return b;
+    b.va = mem::VirtualFromPhysical(raw);
+    if (!b.va) return b;
+    b.size = std::min<uint64_t>(mem::AllocationSize(b.va), kMaxBufferBytes);
+    return b;
+}
+
+uint64_t BufferCapacity(const GuestBuffer& b) {
+    if (!b.va) return 0;
+    return b.size ? b.size : kMaxBufferBytes;
+}
+
+// untracked memory (a heap carves its own blocks): require the touched range to be committed
+bool CommittedRange(uint64_t va, uint64_t bytes) {
+    if (va >= mem::kContiguousBase && va < mem::kContiguousBase + mem::kPhysicalSize) {
+        return bytes <= uint64_t(mem::kContiguousBase + mem::kPhysicalSize) - va;
+    }
+    if (va >= mem::kWriteCombineBase && va < mem::kWriteCombineBase + mem::kPhysicalSize) {
+        return bytes <= uint64_t(mem::kWriteCombineBase + mem::kPhysicalSize) - va;
+    }
+    const uint64_t end = va + bytes;
+    if (end > 0x100000000ull) return false;
+    for (uint64_t p = va & ~uint64_t(mem::kPage - 1); p < end; p += mem::kPage) {
+        if (!mem::IsCommitted(uint32_t(p))) return false;
+    }
+    return true;
+}
+
+bool BufferReadable(const GuestBuffer& b, uint64_t offset, uint64_t bytes) {
+    if (!b.va || !bytes || offset > kMaxBufferBytes || bytes > kMaxBufferBytes - offset) return false;
+    if (b.size) return offset <= b.size && bytes <= b.size - offset;
+    return CommittedRange(uint64_t(b.va) + offset, bytes);
+}
+
+// committed bytes from va forward, at most max; physical windows end at their own boundary
+uint64_t CommittedBytes(uint32_t va, uint64_t max) {
+    max = std::min<uint64_t>(max, 0x100000000ull - uint64_t(va));
+    if (va >= mem::kContiguousBase && va < mem::kContiguousBase + mem::kPhysicalSize) {
+        max = std::min(max, uint64_t(mem::kContiguousBase + mem::kPhysicalSize) - va);
+    } else if (va >= mem::kWriteCombineBase && va < mem::kWriteCombineBase + mem::kPhysicalSize) {
+        max = std::min(max, uint64_t(mem::kWriteCombineBase + mem::kPhysicalSize) - va);
+    } else if (uint32_t alloc = mem::AllocationSize(va)) {
+        max = std::min<uint64_t>(max, alloc);
+    }
+    uint64_t n = 0;
+    while (n < max) {
+        const uint64_t p = uint64_t(va) + n;
+        if (!mem::IsCommitted(uint32_t(p))) break;
+        n += std::min<uint64_t>(mem::kPage - (p & (mem::kPage - 1)), max - n);
+    }
+    return n;
+}
+
+struct IndexSpan {
+    uint64_t room = 0;    // index elements that may be read from ip
+    bool copied = false;  // the render thread's own copy, not the guest's index buffer
+};
+
+bool IndexSpanOf(const uint8_t* ip, IndexSpan& out) {
+    if (!ip) return false;
+    const uint64_t p = uint64_t(reinterpret_cast<uintptr_t>(ip));
+    const uint64_t guest_base = uint64_t(reinterpret_cast<uintptr_t>(mem::Base()));
+    // the render thread hands over its own copy of the indices, outside the guest's 4 GB space. It already
+    // clamped the count when it copied them; the guest binding may have been freed since.
+    if (p < guest_base || p >= guest_base + (1ull << 32)) {
+        out.copied = true;
+        out.room = UINT32_MAX;
+        return true;
+    }
+    const uint64_t va = p - guest_base;
+    if (va > UINT32_MAX) return false;
+    out.room = CommittedBytes(uint32_t(va), kMaxBufferBytes) / 2;
+    return true;
+}
+
+// 16 bit indices past the readable memory are dropped, never read
+bool ClampIndexCount(const uint8_t* ip, uint32_t& count) {
+    if (!ip) return true;
+    IndexSpan span;
+    if (!IndexSpanOf(ip, span)) return false;
+    if (uint64_t(count) > span.room) {
+        LOG_FIRST(16, "vertex: draw of %u indices clamped to %llu by readable memory", count,
+                  static_cast<unsigned long long>(span.room));
+        count = uint32_t(span.room);
+    }
+    return count != 0;
+}
+
 void ResetAssembled(Assembled& out) {
     out.vertices.clear();
     out.indices.clear();
@@ -195,8 +310,8 @@ struct DrawRange {
     uint32_t start = 0;
     uint32_t count = 0;
     const uint8_t* ip = nullptr;
-    uint32_t first = 0;         // lowest index
-    uint32_t first_vertex = 0;  // first vertex read, base vertex applied
+    uint32_t first = 0;          // lowest index
+    int64_t first_vertex = 0;    // first vertex read, base vertex applied
     uint32_t span = 0;
 };
 
@@ -238,12 +353,12 @@ IndexBounds IndexRange(const uint8_t* ip, uint32_t count) {
     return {lo16, hi16};
 }
 
-// logical vertex numbers in draw order
-uint32_t DrawVertex(const State& s, const DrawRange& d, uint32_t i) {
-    if (!d.ip) return d.start + i;
+// logical vertex numbers in draw order; the base vertex is signed and applied in 64 bits
+int64_t DrawVertex(const State& s, const DrawRange& d, uint32_t i) {
+    if (!d.ip) return int64_t(d.start) + i;
     uint16_t v;
-    std::memcpy(&v, d.ip + i * 2, 2);
-    return v + s.base_vertex;
+    std::memcpy(&v, d.ip + size_t(i) * 2, 2);
+    return int64_t(v) + int64_t(std::bit_cast<int32_t>(s.base_vertex));
 }
 
 // the input registers fed by a bound stream, also marked in out.regs
@@ -273,8 +388,9 @@ bool RawReadable(const State& s, const Inputs& inputs) {
         const auto& in = inputs.layout.inputs[size_t(inputs.regs[k])];
         HostElement he = HostFormat(in.type);
         uint32_t stride = StrideOf(s, inputs.layout, in);
-        bool readable = he.format && stride && stride % kStrideAlign == 0 && in.offset < kElementOffsetEnd &&
-                        in.offset % std::min<uint32_t>(he.bytes, 4) == 0;
+        bool readable = he.format && he.bytes && stride && stride % kStrideAlign == 0 && in.offset < kElementOffsetEnd &&
+                        in.offset % std::min<uint32_t>(he.bytes, 4) == 0 &&
+                        uint64_t(in.offset) + he.bytes <= stride;
         if (!readable) {
             LOG_FIRST(32, "vertex: converted on the CPU: v%d type %02X offset %u stride %u", inputs.regs[k], in.type,
                       in.offset, stride);
@@ -285,28 +401,38 @@ bool RawReadable(const State& s, const Inputs& inputs) {
 }
 
 // sparse indices: the vertices they read, copied in draw order
-void GatherVertices(const State& s, const DrawRange& d, const uint8_t* data, uint32_t stride,
+bool GatherVertices(const State& s, const DrawRange& d, const uint8_t* data, uint32_t stride,
                     std::vector<uint8_t>& g) {
+    if (!stride || uint64_t(d.count) * stride > kMaxAssemblyBytes) return false;
     g.resize(size_t(d.count) * stride);
     for (uint32_t i = 0; i < d.count; i++) {
-        std::memcpy(&g[size_t(i) * stride], data + size_t(DrawVertex(s, d, i)) * stride, stride);
+        const int64_t v = DrawVertex(s, d, i);
+        if (v < 0) return false;
+        std::memcpy(&g[size_t(i) * stride], data + size_t(v) * stride, stride);
     }
+    return true;
 }
 
-// returns the buffer slot the stream got
+// returns the buffer slot the stream got, -1 when the range does not fit host limits
 int AddRawBuffer(const State& s, const VertexShader& layout, const VertexShader::Input& in, const DrawRange& d,
                  bool dense, Assembled& out) {
     using namespace kernel;
+    if (out.buffer_count >= out.buffers.size()) return -1;
     const auto& st = s.streams[size_t(in.stream)];
     uint32_t stride = StrideOf(s, layout, in);
+    if (!stride || d.first_vertex < 0) return -1;
     const uint8_t* data = static_cast<const uint8_t*>(HostPtr(mem::VirtualFromPhysical(R32(st.vb + kResData))));
-    int slot = int(out.buffer_count);
+    const int slot = int(out.buffer_count);
     if (dense) {
-        out.buffers[out.buffer_count++] = {data + size_t(d.first_vertex) * stride, d.span * stride, stride};
+        const uint64_t bytes = uint64_t(d.span) * stride;
+        if (bytes > UINT32_MAX) return -1;
+        out.buffers[out.buffer_count++] = {data + size_t(d.first_vertex) * stride, uint32_t(bytes), stride};
     } else {
+        const uint64_t bytes = uint64_t(d.count) * stride;
+        if (bytes > UINT32_MAX) return -1;
         auto& g = out.gathered[out.buffer_count];
-        GatherVertices(s, d, data, stride, g);
-        out.buffers[out.buffer_count++] = {g.data(), d.count * stride, stride};
+        if (!GatherVertices(s, d, data, stride, g)) return -1;
+        out.buffers[out.buffer_count++] = {g.data(), uint32_t(bytes), stride};
     }
     return slot;
 }
@@ -361,6 +487,7 @@ bool AssembleRaw(const State& s, const Inputs& inputs, const DrawRange& d, Assem
         const auto& in = inputs.layout.inputs[size_t(reg)];
         if (slot[in.stream] < 0) {
             slot[in.stream] = AddRawBuffer(s, inputs.layout, in, d, dense, out);
+            if (slot[in.stream] < 0) return false;
         }
         HostElement he = HostFormat(in.type);
         out.elements[size_t(reg)] = {he.format, uint8_t(slot[in.stream]), uint16_t(in.offset)};
@@ -368,7 +495,9 @@ bool AssembleRaw(const State& s, const Inputs& inputs, const DrawRange& d, Assem
     }
     out.vertex_count = dense ? d.span : d.count;
     if (NativePrimitive(d.prim)) return DrawNative(d, dense, out);
-    auto local = [&](uint32_t i) { return dense ? DrawVertex(s, d, i) - d.first_vertex : i; };
+    auto local = [&](uint32_t i) -> uint32_t {
+        return dense ? uint32_t(DrawVertex(s, d, i) - d.first_vertex) : i;
+    };
     ListIndices(d.prim, d.count, local, out.indices, out.topology);
     return UseIndexList(out);
 }
@@ -386,10 +515,16 @@ bool AssembleConverted(const State& s, const Inputs& inputs, const DrawRange& d,
     const bool native_strip = !force_converted && d.prim == 6 && s.simple[kMShadeMode >> 2] != 0x1D00;
     std::vector<uint32_t> seq;
     if (!ranged || (!native_strip && d.ip)) {
+        if (uint64_t(d.count) * 4 > kMaxAssemblyBytes) return false;
         seq.resize(d.count);
-        for (uint32_t i = 0; i < d.count; i++) seq[i] = DrawVertex(s, d, i);
+        for (uint32_t i = 0; i < d.count; i++) {
+            const int64_t v = DrawVertex(s, d, i);
+            if (v < 0) return false;
+            seq[i] = uint32_t(v);
+        }
     }
     uint32_t n = ranged ? d.span : d.count;
+    if (!n || uint64_t(n) * nregs * 16 > kMaxAssemblyBytes) return false;
     out.vertex_count = n;
     out.vertices.resize(size_t(n) * nregs * 4);
     for (int k = 0; k < nregs; k++) {
@@ -397,9 +532,11 @@ bool AssembleConverted(const State& s, const Inputs& inputs, const DrawRange& d,
         const auto& st = s.streams[size_t(in.stream)];
         uint32_t data = mem::VirtualFromPhysical(R32(st.vb + kResData));
         uint32_t stride = StrideOf(s, inputs.layout, in);
+        if (!stride) return false;
         const uint8_t* src = static_cast<const uint8_t*>(HostPtr(data + in.offset));
         for (uint32_t v = 0; v < n; v++) {
-            uint32_t id = ranged ? d.first_vertex + v : seq[v];
+            const int64_t id = ranged ? d.first_vertex + v : int64_t(seq[v]);
+            if (id < 0) return false;
             Convert(in.type, src + size_t(id) * stride, &out.vertices[(size_t(v) * nregs + k) * 4]);
         }
         out.elements[size_t(inputs.regs[k])] = {DXGI_FORMAT_R32G32B32A32_FLOAT, 0, uint16_t(k * 16)};
@@ -410,7 +547,9 @@ bool AssembleConverted(const State& s, const Inputs& inputs, const DrawRange& d,
     // Converted vertices can use the same strip submission as raw vertices.
     // Retain the list path for flat shading, where the provoking vertex matters.
     if (native_strip) return DrawNative(d, ranged, out);
-    auto local = [&](uint32_t i) { return ranged && d.ip ? seq[i] - d.first_vertex : i; };
+    auto local = [&](uint32_t i) -> uint32_t {
+        return ranged && d.ip ? uint32_t(int64_t(seq[i]) - d.first_vertex) : i;
+    };
     ListIndices(d.prim, d.count, local, out.indices, out.topology);
     return UseIndexList(out);
 }
@@ -480,6 +619,13 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
     out.pretransformed = Pretransformed(s);
     if (!layout) return false;
 
+    // never read an index outside the bound index buffer
+    if (!ClampIndexCount(ip, count) || !count) return false;
+    if (uint64_t(count) * 3 * 4 > kMaxAssemblyBytes) {
+        LOG_FIRST(8, "vertex: draw of %u indices is too large to rebuild", count);
+        return false;
+    }
+
     // the vertex range the draw reads
     IndexBounds bounds = {0, count - 1};
     if (ip) bounds = IndexRange(ip, count);
@@ -489,18 +635,56 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
     d.count = count;
     d.ip = ip;
     d.first = bounds.first;
-    d.first_vertex = ip ? bounds.first + s.base_vertex : start;
+    d.first_vertex = ip ? int64_t(bounds.first) + int64_t(std::bit_cast<int32_t>(s.base_vertex))
+                        : int64_t(start);
     d.span = bounds.last - bounds.first + 1;
+    if (d.first_vertex < 0) {
+        LOG_FIRST(16, "vertex: draw maps to negative vertex %lld (base %d)", static_cast<long long>(d.first_vertex),
+                  std::bit_cast<int32_t>(s.base_vertex));
+        return false;
+    }
 
     int regs[16];
     int nregs = CollectRegs(s, *layout, regs, out);
     if (!nregs) return false;
     Inputs inputs = {*layout, regs, nregs};
 
+    // every element read by the converted path, and the whole stride the raw path copies, must be in the buffer
+    bool converted_ok = true, raw_ok = true;
+    for (int k = 0; k < nregs; k++) {
+        const auto& in = layout->inputs[size_t(regs[k])];
+        const auto& st = s.streams[size_t(in.stream)];
+        const uint64_t stride = StrideOf(s, *layout, in);
+        const uint64_t elem = TypeBytes(in.type);
+        const GuestBuffer buffer = BufferOf(st.vb);
+        if (!stride || in.offset > stride || elem > stride - in.offset || !buffer.va || !d.span ||
+            uint64_t(d.first_vertex) > kMaxBufferBytes || uint64_t(d.span) > kMaxBufferBytes) {
+            converted_ok = raw_ok = false;
+            break;
+        }
+        const uint64_t first = uint64_t(d.first_vertex);
+        const uint64_t last = first + d.span - 1;
+        const uint64_t first_byte = first * stride + in.offset;
+        const uint64_t element_span = last * stride + in.offset + elem - first_byte;
+        if (!BufferReadable(buffer, first_byte, element_span)) converted_ok = false;
+        if (!BufferReadable(buffer, first * stride, uint64_t(d.span) * stride)) raw_ok = false;
+    }
+    if (!converted_ok) {
+        LOG_FIRST(16, "vertex: draw %u..%u is outside its vertex buffers", start, start + count - 1);
+        return false;
+    }
+
     // the guest's own vertices when the input assembler can read every element of them
-    bool raw = kRawVertices && !force_converted && RawReadable(s, inputs);
-    if (raw) return AssembleRaw(s, inputs, d, out);
-    return AssembleConverted(s, inputs, d, out, force_converted);
+    bool raw = kRawVertices && !force_converted && raw_ok && RawReadable(s, inputs);
+    try {
+        bool ok = raw ? AssembleRaw(s, inputs, d, out) : AssembleConverted(s, inputs, d, out, force_converted);
+        if (!ok) ResetAssembled(out);
+        return ok;
+    } catch (const std::bad_alloc&) {
+        LOG_FIRST(8, "vertex: draw %u..%u did not fit host memory", start, start + count - 1);
+        ResetAssembled(out);
+        return false;
+    }
 }
 
 }  // namespace gpu

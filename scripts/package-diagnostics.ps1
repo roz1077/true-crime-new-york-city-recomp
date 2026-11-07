@@ -6,7 +6,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $name = "TrueCrimeNYC-diagnostics-$Stamp"
-$stage = Join-Path $OutDir $name
 $zip = Join-Path $OutDir "$name.zip"
 
 if ($Stamp -notmatch '^[A-Za-z0-9._-]+$') { throw 'Stamp must be a filename component.' }
@@ -16,16 +15,18 @@ foreach ($required in 'TrueCrimeNYC.exe', 'TrueCrimeNYC.dll', 'TrueCrimeNYC.pdb'
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 $stage = Join-Path $OutDir ($name + '-' + [guid]::NewGuid().ToString('N'))
 $stagedZip = "$stage.zip"
-New-Item -ItemType Directory -Path $stage | Out-Null
 
-foreach ($file in 'TrueCrimeNYC.exe', 'TrueCrimeNYC.dll', 'TrueCrimeNYC.pdb', 'TrueCrimeNYC.dll.stamp') {
-    Copy-Item -LiteralPath (Join-Path $BuildDir $file) -Destination (Join-Path $stage $file) -Force
-}
-New-Item -ItemType Directory -Path (Join-Path $stage 'compiler') -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $BuildDir 'compiler\TrueCrimeNYC.lib') -Destination (Join-Path $stage 'compiler\TrueCrimeNYC.lib') -Force
+try {
+    New-Item -ItemType Directory -Path $stage | Out-Null
 
-$readme = @'
-True Crime NYC - diagnostic build 7 (2026-11-05)
+    foreach ($file in 'TrueCrimeNYC.exe', 'TrueCrimeNYC.dll', 'TrueCrimeNYC.pdb', 'TrueCrimeNYC.dll.stamp') {
+        Copy-Item -LiteralPath (Join-Path $BuildDir $file) -Destination (Join-Path $stage $file) -Force
+    }
+    New-Item -ItemType Directory -Path (Join-Path $stage 'compiler') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $BuildDir 'compiler\TrueCrimeNYC.lib') -Destination (Join-Path $stage 'compiler\TrueCrimeNYC.lib') -Force
+
+    $readme = @"
+True Crime NYC - diagnostic build $Stamp
 
 This build contains the confirmed grid crash fix, plus the diagnostics.
 
@@ -43,7 +44,7 @@ every non-negative coordinate this produces exactly the same value as before;
 only the previously impossible negative case changes, and it can no longer write
 outside the table. Nothing is skipped and no state is guessed.
 
-CHANGES IN BUILD 7 (review follow-up)
+CHANGES IN THIS BUILD (review follow-up)
 - The frame-chain log validates the guest stack range (around 0xD0000000), so
   normal frames are shown. It also no longer prints "frame chain: none" after a
   one-frame chain.
@@ -77,37 +78,42 @@ It should no longer crash at that spot. Please send back:
 If you run run-watch.cmd instead, the log shows every write into cell slot 8 - a
 "watch: hit" line with a valid value after activation means the slot was written
 normally. The other launcher, run-serial.cmd, is no longer needed for this bug.
-'@
-Set-Content -LiteralPath (Join-Path $stage 'READ-ME-FIRST.txt') -Value $readme -Encoding utf8
+"@
+    Set-Content -LiteralPath (Join-Path $stage 'READ-ME-FIRST.txt') -Value $readme -Encoding utf8
 
-$normal = @'
+    $normal = @'
 @echo off
 start "" "%~dp0TrueCrimeNYC.exe"
 '@
-Set-Content -LiteralPath (Join-Path $stage 'run-normal.cmd') -Value $normal -Encoding ascii
+    Set-Content -LiteralPath (Join-Path $stage 'run-normal.cmd') -Value $normal -Encoding ascii
 
-$serial = @'
+    $serial = @'
 @echo off
 set XBE_SERIAL_GUEST=1
 start "" "%~dp0TrueCrimeNYC.exe"
 '@
-Set-Content -LiteralPath (Join-Path $stage 'run-serial.cmd') -Value $serial -Encoding ascii
+    Set-Content -LiteralPath (Join-Path $stage 'run-serial.cmd') -Value $serial -Encoding ascii
 
-$watch = @'
+    $watch = @'
 @echo off
 set XBE_EFFECT_WATCH=1
 start "" "%~dp0TrueCrimeNYC.exe"
 '@
-Set-Content -LiteralPath (Join-Path $stage 'run-watch.cmd') -Value $watch -Encoding ascii
+    Set-Content -LiteralPath (Join-Path $stage 'run-watch.cmd') -Value $watch -Encoding ascii
 
-Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $stagedZip
-if (Test-Path -LiteralPath $zip) {
-    [IO.File]::Replace([IO.Path]::GetFullPath($stagedZip), [IO.Path]::GetFullPath($zip), [IO.Path]::GetFullPath("$stage.previous.zip"))
-    Remove-Item -LiteralPath "$stage.previous.zip"
-} else {
-    [IO.File]::Move([IO.Path]::GetFullPath($stagedZip), [IO.Path]::GetFullPath($zip))
+    Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $stagedZip
+    if (Test-Path -LiteralPath $zip) {
+        [IO.File]::Replace([IO.Path]::GetFullPath($stagedZip), [IO.Path]::GetFullPath($zip), [IO.Path]::GetFullPath("$stage.previous.zip"))
+        Remove-Item -LiteralPath "$stage.previous.zip" -Force
+    } else {
+        [IO.File]::Move([IO.Path]::GetFullPath($stagedZip), [IO.Path]::GetFullPath($zip))
+    }
+    $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+    Set-Content -LiteralPath (Join-Path $OutDir "$name.sha256.txt") -Value "$hash  $name.zip" -Encoding ascii
+    Write-Output "Created $zip"
+    Write-Output "SHA256 $hash"
+} finally {
+    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    if (Test-Path -LiteralPath $stagedZip) { Remove-Item -LiteralPath $stagedZip -Force }
+    if (Test-Path -LiteralPath "$stage.previous.zip") { Remove-Item -LiteralPath "$stage.previous.zip" -Force }
 }
-$hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
-Set-Content -LiteralPath (Join-Path $OutDir "$name.sha256.txt") -Value "$hash  $name.zip" -Encoding ascii
-Write-Output "Created $zip"
-Write-Output "SHA256 $hash"

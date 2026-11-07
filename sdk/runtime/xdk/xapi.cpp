@@ -121,11 +121,15 @@ HLE_STDCALL(XInputGetState, 2) {
     return 0;
 }
 
-// XINPUT_CAPABILITIES: subtype, reserved, the gamepad's buttons, 8 analog buttons and thumbs, then its 2 motors, each
-// with every bit set: the controller has them all
+// XINPUT_CAPABILITIES is 26 bytes in the original Xbox XDK: Type, SubType,
+// Flags, then XINPUT_GAMEPAD (a WORD of digital buttons, 8 analog button
+// bytes and four SHORT thumb axes), then XINPUT_VIBRATION (two WORD motors).
+// The host implements a wired rumble-capable gamepad.
 HLE_STDCALL(XInputGetCapabilities, 2) {
-    constexpr uint32_t kCapsBytes = 25;
-    constexpr uint8_t kSubtypeGamepad = 1;  // XINPUT_DEVSUBTYPE_GC_GAMEPAD
+    constexpr uint32_t kCapsBytes = 26;
+    constexpr uint8_t kTypeGamepad = 1;       // XINPUT_DEVTYPE_GAMEPAD
+    constexpr uint8_t kSubtypeGamepad = 1;    // XINPUT_DEVSUBTYPE_GC_GAMEPAD
+    constexpr uint16_t kFlags = 0x0001;       // vibration / force feedback supported
     uint32_t port;
     uint64_t generation;
     {
@@ -141,10 +145,18 @@ HLE_STDCALL(XInputGetCapabilities, 2) {
     if (it == g_handles.end() || it->second.generation != generation) return 6;
     if (!connected) return 1167;  // ERROR_DEVICE_NOT_CONNECTED
     uint32_t c = a[1];
-    std::memset(HostPtr(c), 0xFF, kCapsBytes);
-    G<uint8_t>(c) = kSubtypeGamepad;
-    W16(c + 1, 0);
-    W16(c + 3, 0x00FF);  // the 8 digital buttons
+    std::memset(HostPtr(c), 0, kCapsBytes);
+    G<uint8_t>(c + 0) = kTypeGamepad;
+    G<uint8_t>(c + 1) = kSubtypeGamepad;
+    W16(c + 2, kFlags);
+    W16(c + 4, 0x00FF);                   // the 8 digital buttons
+    std::memset(HostPtr(c + 6), 0xFF, 8); // every analog button
+    W16(c + 14, 0x7FFF);                  // thumb X/Y axes, full resolution
+    W16(c + 16, 0x7FFF);
+    W16(c + 18, 0x7FFF);
+    W16(c + 20, 0x7FFF);
+    W16(c + 22, 0xFFFF);                  // left and right motors
+    W16(c + 24, 0xFFFF);
     return 0;
 }
 

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -96,6 +97,36 @@ bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
 using Clock = std::chrono::steady_clock;
 uint64_t Ns(Clock::time_point t) { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
 
+// committed bytes from va forward, at most max; physical windows end at their own boundary
+uint64_t CommittedBytes(uint32_t va, uint64_t max) {
+    max = std::min<uint64_t>(max, 0x100000000ull - uint64_t(va));
+    if (va >= mem::kContiguousBase && va < mem::kContiguousBase + mem::kPhysicalSize) {
+        max = std::min(max, uint64_t(mem::kContiguousBase + mem::kPhysicalSize) - va);
+    } else if (va >= mem::kWriteCombineBase && va < mem::kWriteCombineBase + mem::kPhysicalSize) {
+        max = std::min(max, uint64_t(mem::kWriteCombineBase + mem::kPhysicalSize) - va);
+    } else if (uint32_t alloc = mem::AllocationSize(va)) {
+        max = std::min<uint64_t>(max, alloc);
+    }
+    uint64_t n = 0;
+    while (n < max) {
+        const uint64_t p = uint64_t(va) + n;
+        if (!mem::IsCommitted(uint32_t(p))) break;
+        n += std::min<uint64_t>(mem::kPage - (p & (mem::kPage - 1)), max - n);
+    }
+    return n;
+}
+
+// 16 bit indices that stay inside readable guest memory at the pointer the title passed
+uint64_t IndexRoom(const uint8_t* ip) {
+    if (!ip) return 0;
+    const uint64_t p = uint64_t(reinterpret_cast<uintptr_t>(ip));
+    const uint64_t base = uint64_t(reinterpret_cast<uintptr_t>(mem::Base()));
+    if (p < base || p >= base + (1ull << 32)) return UINT32_MAX;  // an already copied buffer
+    const uint64_t va = p - base;
+    if (va > UINT32_MAX) return 0;
+    return CommittedBytes(uint32_t(va), mem::kPhysicalSize) / 2;
+}
+
 class Threaded final : public Backend {
 public:
     explicit Threaded(std::unique_ptr<Backend> inner) : inner_(std::move(inner)), ranges_(StateRanges()) {
@@ -125,8 +156,21 @@ public:
         c.b = start;
         c.c = count;
         if (indices) {
+            const uint64_t room = IndexRoom(indices);
+            if (uint64_t(count) > room) {
+                LOG_FIRST(16, "render thread: draw of %u indices clamped to %llu by the index buffer", count,
+                          static_cast<unsigned long long>(room));
+                count = uint32_t(room);
+            }
+            if (!count) return;
+            c.c = count;
             c.d = 1;
-            c.data = Put(indices, size_t(count) * 2);
+            try {
+                c.data = Put(indices, size_t(count) * 2);
+            } catch (const std::bad_alloc&) {
+                LOG_FIRST(8, "render thread: draw of %u indices did not fit the command batch", count);
+                return;
+            }
         }
         cur_->cmds.push_back(c);
         for (uint32_t tex : s.textures) Use(tex);
@@ -150,6 +194,10 @@ public:
         c.d = stencil;
         c.f = z;
         if (count && rects) {
+            if (uint64_t(count) * 16 > kHeaderRing) {
+                LOG_FIRST(4, "render thread: Clear with %u rects does not fit the header ring", count);
+                return;
+            }
             c.data = Put(rects, size_t(count) * 16);
             c.size = count * 16;
         }

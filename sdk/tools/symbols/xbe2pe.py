@@ -7,33 +7,70 @@ import tomllib
 from pathlib import Path
 
 
-def load(path, cfg):
-    t = tomllib.loads(path.read_text())
-    for inc in t.get('includes', []):
-        load(path.parent / inc, cfg)
+def load(path, cfg, open_paths=None):
+    open_paths = set() if open_paths is None else open_paths
+    key = path.resolve()
+    if key in open_paths:
+        raise SystemExit(f"{path}: include cycle")
+    open_paths.add(key)
+    try:
+        t = tomllib.loads(path.read_text())
+        for inc in t.get('includes', []):
+            load(path.parent / inc, cfg, open_paths)
+    finally:
+        open_paths.remove(key)
     for k in ('xbe', 'functions', 'symbols'):
         cfg.setdefault(k, {}).update(t.get(k, {}))
     return cfg
+
+
+def u32(data, offset):
+    if offset < 0 or offset + 4 > len(data):
+        raise SystemExit(f"XBE is truncated at 0x{offset:X}")
+    return struct.unpack_from('<I', data, offset)[0]
 
 
 cfg_path, out = Path(sys.argv[1]), Path(sys.argv[2])
 cfg = load(cfg_path, {})
 root = cfg_path.parent.parent
 d = (root / cfg['xbe']['path']).read_bytes()
-u32 = lambda o: struct.unpack_from('<I', d, o)[0]
+if len(d) < 0x180 or d[:4] != b'XBEH':
+    raise SystemExit("not an XBE")
 # XBE header: base, headers size, image size; the entry is xored with the retail key, else the debug key
-base, hsize, isize = u32(0x104), u32(0x108), u32(0x10C)
-entry = u32(0x128) ^ 0xA8FC57AB
+base, hsize, isize = u32(d, 0x104), u32(d, 0x108), u32(d, 0x10C)
+if not base or hsize < 0x178 or hsize > len(d) or isize < hsize or base + isize > 0x100000000:
+    raise SystemExit("XBE header sizes are invalid")
+# a flat image much larger than its file is a truncated or hostile header, not a game
+if isize > min(512 << 20, max(64 << 20, len(d) * 8)):
+    raise SystemExit(f"XBE image size 0x{isize:X} is too large for its 0x{len(d):X} byte file")
+entry_raw = u32(d, 0x128)
+entry = entry_raw ^ 0xA8FC57AB
 if not base <= entry < base + isize:
-    entry = u32(0x128) ^ 0x94859D4B
+    entry = entry_raw ^ 0x94859D4B
+if not base <= entry < base + isize:
+    raise SystemExit("entry point key not recognised")
 
 img = bytearray(isize)
 img[:hsize] = d[:hsize]
 # section headers are 56 bytes, virtual address, virtual size, raw address and raw size from +4
-for i in range(u32(0x11C)):
-    va, vs, raw, rs = struct.unpack_from('<IIII', d, u32(0x120) - base + i * 56 + 4)
-    n = min(vs, rs)
-    img[va - base:va - base + n] = d[raw:raw + n]
+nsec = u32(d, 0x11C)
+sec_addr = u32(d, 0x120)
+if nsec > 1024 or (nsec and sec_addr < base):
+    raise SystemExit("section table is invalid")
+sec_off = sec_addr - base if nsec else 0
+if nsec and (sec_off + nsec * 56 > len(d) or sec_off + nsec * 56 > hsize):
+    raise SystemExit("section table is outside the header")
+for i in range(nsec):
+    off = sec_off + i * 56
+    va, vs, raw, rs = struct.unpack_from('<IIII', d, off + 4)
+    if rs > vs:
+        raise SystemExit(f"section {i} raw data is larger than its virtual size")
+    if rs:
+        if va < base or va + rs > base + isize or raw + rs > len(d):
+            raise SystemExit(f"section {i} data is outside the image")
+        img[va - base:va - base + rs] = d[raw:raw + rs]
+    elif vs and (va < base or va + vs > base + isize):
+        raise SystemExit(f"section {i} range is outside the image")
 
 names = {}
 mapping = root / cfg['xbe']['out'] / 'x86_func_mapping.cpp'

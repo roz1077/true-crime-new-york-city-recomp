@@ -60,13 +60,20 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         constexpr uint32_t kSlots = kMaxQueued + 1;
         std::vector<float> bufs(kSlots * kFrames * 2);
         uint32_t depth = kMinQueued;
+        DWORD stable_since = GetTickCount();
         for (uint32_t n = 0;;) {
             XAUDIO2_VOICE_STATE st;
             voice->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
             // a starved voice crackles: queue one buffer more each time, up to kMaxQueued
             if (n && !st.BuffersQueued && depth < kMaxQueued) {
                 depth++;
+                stable_since = GetTickCount();
                 LOGI("audio: output starved, queueing %u ms", depth * 10);
+            } else if (depth > kMinQueued && GetTickCount() - stable_since > 5000) {
+                // after five stable seconds, give the latency back one buffer at a time
+                depth--;
+                stable_since = GetTickCount();
+                LOGI("audio: output stable, queueing %u ms", depth * 10);
             }
             if (st.BuffersQueued >= depth) {
                 Sleep(2);

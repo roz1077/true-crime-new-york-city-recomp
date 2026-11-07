@@ -45,6 +45,17 @@ bool g_frame_new = false;
 
 } // namespace
 
+std::atomic<bool> g_suspended{false};
+
+// Steam Deck suspend/resume: stop pacing at full speed and release the mouse.
+// The guest keeps running slowly; the renderer recreates its swapchain on resume.
+void SetSuspended(bool suspended) {
+    g_suspended.store(suspended, std::memory_order_relaxed);
+    if (suspended) g_capture_wanted.store(false, std::memory_order_relaxed);
+}
+
+bool Suspended() { return g_suspended.load(std::memory_order_relaxed); }
+
 void SubmitFrame(const uint8_t* rgba, int width, int height) {
     if (!rgba || width <= 0 || height <= 0) return;
     std::lock_guard<std::mutex> lock(g_frame_lock);
@@ -283,6 +294,10 @@ std::recursive_mutex& UiLock() {
 void Pace(uint32_t max_fps) {
     // the presentation interval's rate and the menu's cap both apply; this runs on
     // the guest's swap thread only (the window loop must not pace as well)
+    if (g_suspended.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return;
+    }
     uint32_t cap = FrameCap();
     if (cap == kFpsCapRefresh) {
         const float rate = g_refresh.load(std::memory_order_relaxed);

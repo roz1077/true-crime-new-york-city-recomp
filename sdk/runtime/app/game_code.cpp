@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <toml++/toml.hpp>
@@ -173,8 +174,12 @@ bool ReadXbe(const GameFiles& game, const char* name, std::vector<uint8_t>& out)
     }
     std::ifstream f(game.dir / name, std::ios::binary);
     if (f) {
-        out.assign(std::istreambuf_iterator<char>(f), {});
-        return true;
+        constexpr uint64_t kMaxXbeBytes = 64ull << 20;
+        std::error_code ec;
+        const uintmax_t size = std::filesystem::file_size(game.dir / name, ec);
+        if (ec || size > kMaxXbeBytes) return false;
+        out.resize(size_t(size));
+        return f.read(reinterpret_cast<char*>(out.data()), std::streamsize(out.size())).good();
     }
     const kernel::Disc* disc = kernel::MountedDisc();
     return disc && disc->Load(name, out);
@@ -224,9 +229,108 @@ fs::file_time_type SharedInputsTime(const Image& image) {
     return newest;
 }
 
+std::string Narrow(const wchar_t* text) {
+    std::string out;
+    for (; *text; ++text) out.push_back(char(*text));
+    return out;
+}
+
+void KeyField(std::vector<uint8_t>& key, std::string_view field) {
+    const uint64_t size = field.size();
+    for (int i = 0; i < 8; i++) key.push_back(uint8_t(size >> (i * 8)));
+    key.insert(key.end(), field.begin(), field.end());
+}
+
+void KeyFile(std::vector<uint8_t>& key, std::string_view name, const fs::path& path) {
+    KeyField(key, name);
+    std::string hash;
+    KeyField(key, Sha1File(path, hash) ? hash : std::string("missing"));
+}
+
+// everything outside an object's own source that decides its bytes; false when the include tree cannot be read
+bool CacheKey(const Image& image, std::string& out) {
+    std::vector<uint8_t> key;
+    KeyField(key, "game-code object cache 1");
+    KeyField(key, Narrow(kClangFlags));
+    KeyField(key, Narrow(kLinkFlags));
+    KeyFile(key, "host", ExeDir() / (image.exe + L".exe"));
+    for (const wchar_t* tool : {L"clang.exe", L"lld-link.exe", L"xbe_recomp.exe", L"grid_patch.exe"})
+        KeyFile(key, Narrow(tool), CompilerDir() / tool);
+    KeyFile(key, "shared", WorkDir(image) / "x86_recomp_shared.h");
+    std::vector<std::pair<std::string, fs::path>> headers;
+    std::error_code ec;
+    const fs::path include = CompilerDir() / "include";
+    for (auto it = fs::recursive_directory_iterator(include, ec); !ec && it != fs::recursive_directory_iterator();
+         it.increment(ec)) {
+        std::error_code entry_ec;
+        if (!it->is_regular_file(entry_ec)) continue;
+        headers.emplace_back(it->path().lexically_relative(include).generic_string(), it->path());
+    }
+    if (ec) return false;
+    std::sort(headers.begin(), headers.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    KeyField(key, "headers");
+    for (auto& [name, path] : headers) KeyFile(key, name, path);
+    out = Sha1(key);
+    return true;
+}
+
+// a changed key throws away every object built from the old tools, headers or flags
+bool RefreshCacheKey(const Image& image, const std::string& key) {
+    const fs::path work = WorkDir(image);
+    const fs::path file = work / "cache-key";
+    std::error_code ec;
+    {
+        std::ifstream in(file, std::ios::binary);
+        std::string old;
+        if (in && std::getline(in, old) && old == key) return true;
+    }
+    std::vector<fs::path> stale;
+    for (auto& e : fs::directory_iterator(work, ec)) {
+        std::error_code entry_ec;
+        if (!e.is_regular_file(entry_ec)) continue;
+        const fs::path path = e.path();
+        const std::wstring name = path.filename().wstring();
+        const bool object = path.extension().wstring() == L".obj";
+        const bool temp = name.size() >= 8 && name.compare(name.size() - 8, 8, L".obj.tmp") == 0;
+        if (object || temp) stale.push_back(path);
+    }
+    if (ec) return RecordFailure(L"Could not list " + work.wstring() + L" for stale objects.");
+    for (const fs::path& path : stale) {
+        fs::remove(path, ec);
+        if (ec) return RecordFailure(L"Could not discard the stale object " + path.filename().wstring() + L".");
+    }
+    fs::path temp = file;
+    temp += L".tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!out) return RecordFailure(L"Could not write " + temp.wstring() + L".");
+        out << key << "\n";
+        out.flush();
+        if (!out) {
+            out.close();
+            fs::remove(temp, ec);
+            return RecordFailure(L"Could not write " + temp.wstring() + L".");
+        }
+        out.close();
+        if (out.fail()) {
+            fs::remove(temp, ec);
+            return RecordFailure(L"Could not close " + temp.wstring() + L".");
+        }
+    }
+    fs::rename(temp, file, ec);
+    if (ec) {
+        fs::remove(temp, ec);
+        return RecordFailure(L"Could not save " + file.wstring() + L".");
+    }
+    return true;
+}
+
 // the image's sources whose object is missing or older than what it is built from
-void AddJobs(const Image& image, std::vector<Job>& jobs) {
+bool AddJobs(const Image& image, std::vector<Job>& jobs) {
     fs::path work = WorkDir(image);
+    std::string key;
+    if (!CacheKey(image, key)) return RecordFailure(L"Could not read the compiler's include headers.");
+    if (!RefreshCacheKey(image, key)) return false;
     std::vector<std::string> names{"x86_func_mapping"};
     for (uint32_t i = 0; i < PartitionCount(image); i++) names.push_back("x86_recomp." + std::to_string(i));
     fs::file_time_type shared = SharedInputsTime(image);
@@ -234,10 +338,17 @@ void AddJobs(const Image& image, std::vector<Job>& jobs) {
         Job job{work / (name + ".cpp"), work / (name + ".obj")};
         std::error_code ec;
         job.bytes = fs::file_size(job.source, ec);
+        if (ec) job.bytes = 0;
+        ec.clear();
+        const fs::file_time_type source_time = fs::last_write_time(job.source, ec);
+        std::error_code exists_ec;
+        const bool source_ok = !ec && fs::exists(job.source, exists_ec) && !exists_ec;
+        ec.clear();
         fs::file_time_type built = fs::last_write_time(job.object, ec);
-        if (!ec && built > shared && built > fs::last_write_time(job.source, ec)) continue;
+        if (!ec && source_ok && built > shared && built > source_time) continue;
         jobs.push_back(std::move(job));
     }
+    return true;
 }
 
 // compilers that run at once: one a logical processor, as many as the free memory holds
@@ -544,7 +655,8 @@ bool Build(std::vector<Target>& targets) {
     if (!run.Failure().empty()) return RecordFailure(run.Failure());
     if (!Translate(targets, run)) return false;
     std::vector<Job> jobs;
-    for (const Target& target : targets) AddJobs(*target.image, jobs);
+    for (const Target& target : targets)
+        if (!AddJobs(*target.image, jobs)) return false;
     if (!Compile(jobs, run)) return false;
     g_progress.stage = Stage::Linking;
     for (const Target& target : targets)

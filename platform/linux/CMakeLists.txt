@@ -7,6 +7,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(GEN "${REPO}/generated/game")
 
+# the xbe's SHA-1: the executable checks the game it finds is the release it was made from
+set(XBE_FILE "${REPO}/assets/default.xbe")
+if(NOT EXISTS "${XBE_FILE}")
+    message(FATAL_ERROR
+        "Missing game image: ${XBE_FILE}\n"
+        "The Linux build needs the matching default.xbe to embed its SHA-1. Game assets are "
+        "not part of this repository; copy your own assets/default.xbe (and the extracted game "
+        "folders beside it) into assets/ before configuring. CI runners must provide it too.")
+endif()
+
 find_package(SDL3 CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(VULKAN REQUIRED IMPORTED_TARGET vulkan)
@@ -50,7 +60,6 @@ set(HARNESS
     "${REPO}/sdk/harness/reference_renderer.cpp")
 
 # the xbe's SHA-1: the executable checks the game it finds is the release it was made from
-set(XBE_FILE "${REPO}/assets/default.xbe")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${XBE_FILE}")
 file(SHA1 "${XBE_FILE}" XBE_SHA1)
 set(XBE_HASH "${CMAKE_CURRENT_BINARY_DIR}/TrueCrimeNYC_xbe.cpp")

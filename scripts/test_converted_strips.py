@@ -34,7 +34,14 @@ namespace kernel {
  uint32_t R32(uint32_t address) { uint32_t v;std::memcpy(&v,memory+address,4);return v; }
  void* HostPtr(uint32_t address) { return memory+address; }
 }
-namespace mem { uint32_t VirtualFromPhysical(uint32_t address) { return address; } }
+namespace mem { uint32_t VirtualFromPhysical(uint32_t address) { return address; }
+ uint32_t AllocationSize(uint32_t) { return 0; }
+ bool IsCommitted(uint32_t) { return true; }
+ uint8_t* Base() { return memory; }
+ constexpr uint32_t kPage = 0x1000;
+ constexpr uint32_t kPhysicalSize = 64u << 20;
+ constexpr uint32_t kContiguousBase = 0x80000000;
+ constexpr uint32_t kWriteCombineBase = 0xF0000000; }
 #define LOG_FIRST(...) ((void)0)
 ''' + state + header + implementation
 test += (state + header + previous).replace('namespace gpu {', 'namespace previous {')

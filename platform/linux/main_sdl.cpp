@@ -22,6 +22,11 @@ namespace app {
 void SetWindow(SDL_Window* window);
 void UpdateWindow();
 void RefreshDesktop();
+void SetSuspended(bool suspended);
+}
+namespace audio {
+void SetSuspended(bool suspended);
+void DeviceChanged();
 }
 namespace input {
 void Init();
@@ -118,7 +123,7 @@ int main(int argc, char** argv) {
     input::RegisterMouse(window);
 
     const std::string hdd = app::Instance() > 1 ? "hdd" + std::to_string(app::Instance()) : "hdd";
-    if (!kernel::Boot(std::move(game.xbe), IMAGE_XBE, game.dir.string(), (app::ExeDir() / hdd).string())) {
+    if (!kernel::Boot(std::move(game.xbe), IMAGE_XBE, game.dir, app::ExeDir() / hdd)) {
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
@@ -165,6 +170,22 @@ int main(int argc, char** argv) {
                     break;
                 case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
                     app::RefreshDesktop();
+                    break;
+                case SDL_EVENT_WILL_ENTER_BACKGROUND:
+                case SDL_EVENT_DID_ENTER_BACKGROUND:
+                    app::SetSuspended(true);
+                    audio::SetSuspended(true);
+                    LOGR("linux: entering background, game paused");
+                    break;
+                case SDL_EVENT_WILL_ENTER_FOREGROUND:
+                case SDL_EVENT_DID_ENTER_FOREGROUND:
+                    app::SetSuspended(false);
+                    audio::SetSuspended(false);
+                    app::RefreshDesktop();
+                    LOGR("linux: returning to foreground, game resumed");
+                    break;
+                case SDL_EVENT_AUDIO_DEVICE_REMOVED:
+                    audio::DeviceChanged();
                     break;
                 default:
                     break;

@@ -11,7 +11,9 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -619,6 +621,18 @@ std::optional<toml::table> ParseToml(const fs::path& p) {
     }
 }
 
+bool ParseAddress(const std::string& text, uint32_t& out) {
+    try {
+        size_t used = 0;
+        const unsigned long v = std::stoul(text, &used, 0);
+        if (used != text.size() || v > 0xFFFFFFFFul) return false;
+        out = uint32_t(v);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 bool LoadSigs(const fs::path& p, SigFile& f) {
     std::optional<toml::table> parsed = ParseToml(p);
     if (!parsed) return false;
@@ -658,13 +672,30 @@ struct Config {
     std::map<uint32_t, std::string> functions;
 };
 
-bool LoadConfig(const fs::path& p, Config& cfg) {
+bool LoadConfig(const fs::path& p, Config& cfg, std::set<fs::path>& open) {
+    std::error_code ec;
+    fs::path canonical = fs::weakly_canonical(p, ec);
+    if (ec) {
+        ec.clear();
+        canonical = fs::absolute(p, ec);
+        if (ec) canonical = p;
+    }
+    if (!open.insert(canonical).second) {
+        std::fprintf(stderr, "%s: include cycle: %s is already being loaded\n", p.string().c_str(),
+                     canonical.string().c_str());
+        return false;
+    }
+    struct EraseOnReturn {
+        std::set<fs::path>& set;
+        fs::path key;
+        ~EraseOnReturn() { set.erase(key); }
+    } erase_on_return{open, canonical};
     std::optional<toml::table> parsed = ParseToml(p);
     if (!parsed) return false;
     toml::table& t = *parsed;
     if (auto a = t["includes"].as_array())
         for (auto& i : *a)
-            if (auto s = i.value<std::string>(); s && !LoadConfig(p.parent_path() / *s, cfg)) return false;
+            if (auto s = i.value<std::string>(); s && !LoadConfig(p.parent_path() / *s, cfg, open)) return false;
     if (auto v = t["xbe"]["path"].value<std::string>()) cfg.xbe = *v;
     if (auto a = t["xbe"]["code_sections"].as_array())
         for (auto& i : *a) cfg.code_sections.push_back(i.value_or(std::string()));
@@ -673,8 +704,15 @@ bool LoadConfig(const fs::path& p, Config& cfg) {
         if (auto s = t[key].as_table())
             for (auto& [k, v] : *s) (*out)[std::string(k.str())] = uint32_t(v.value_or(int64_t(0)));
     if (auto s = t["functions"].as_table())
-        for (auto& [k, v] : *s)
-            cfg.functions[uint32_t(std::stoul(std::string(k.str()), nullptr, 0))] = v.value_or(std::string());
+        for (auto& [k, v] : *s) {
+            uint32_t at = 0;
+            if (!ParseAddress(std::string(k.str()), at)) {
+                std::fprintf(stderr, "%s: [functions] %s: not a 32 bit address\n", p.string().c_str(),
+                             std::string(k.str()).c_str());
+                return false;
+            }
+            cfg.functions[at] = v.value_or(std::string());
+        }
     return true;
 }
 
@@ -889,7 +927,8 @@ bool SignTitle(const fs::path& cp, const std::set<std::string>& skip, SigFile& s
     Title t;
     t.cp = cp;
     Config& cfg = t.cfg;
-    if (!LoadConfig(cp, cfg)) return false;
+    std::set<fs::path> open;
+    if (!LoadConfig(cp, cfg, open)) return false;
     cfg.root = cp.parent_path().parent_path();
     Image& img = t.img;
     if (!img.Load(cfg.root / cfg.xbe)) return false;
@@ -942,6 +981,44 @@ std::string SigFileText(SigFile& sf) {
     return s;
 }
 
+// replaces the output only once the whole text is on disk, so a failed run never leaves a truncated file behind
+bool WriteFileChecked(const fs::path& out, const std::string& text) {
+    fs::path temp = out;
+    temp += ".tmp";
+    {
+        std::ofstream f(temp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            std::fprintf(stderr, "%s: cannot be written\n", temp.string().c_str());
+            return false;
+        }
+        f.write(text.data(), std::streamsize(text.size()));
+        f.flush();
+        if (!f) {
+            f.close();
+            std::error_code ec;
+            fs::remove(temp, ec);
+            std::fprintf(stderr, "%s: write failed\n", temp.string().c_str());
+            return false;
+        }
+        f.close();
+        if (f.fail()) {
+            std::error_code ec;
+            fs::remove(temp, ec);
+            std::fprintf(stderr, "%s: close failed\n", temp.string().c_str());
+            return false;
+        }
+    }
+    std::error_code ec;
+    fs::rename(temp, out, ec);
+    if (ec) {
+        std::error_code ignored;
+        fs::remove(temp, ignored);
+        std::fprintf(stderr, "%s: replacing it failed: %s\n", out.string().c_str(), ec.message().c_str());
+        return false;
+    }
+    return true;
+}
+
 void PrintSigned(const fs::path& out, const std::vector<fs::path>& configs, SigFile& sf,
                  const std::map<std::string, std::string>& origin) {
     size_t signed_count = 0;
@@ -959,7 +1036,7 @@ int Sign(const fs::path& out, const std::vector<fs::path>& configs, const std::s
     std::map<std::string, std::string> origin;
     for (auto& cp : configs)
         if (!SignTitle(cp, skip, sf, origin)) return 1;
-    std::ofstream(out, std::ios::binary) << SigFileText(sf);
+    if (!WriteFileChecked(out, SigFileText(sf))) return 1;
     PrintSigned(out, configs, sf, origin);
     return 0;
 }
@@ -1390,8 +1467,14 @@ int Scan(const fs::path& xbe_path, const fs::path& xdk, const fs::path& out, con
     s += "\n# functions the host replaces or calls by name, 0 where the image has none\n[symbols]\n" + Table(symbols);
     s += "\n[data]\n" + Table(data);
     s += AbiTable(abi);
-    if (out.empty()) std::fwrite(s.data(), 1, s.size(), stdout);
-    else std::ofstream(out, std::ios::binary) << s;
+    if (out.empty()) {
+        if (std::fwrite(s.data(), 1, s.size(), stdout) != s.size() || std::fflush(stdout) != 0) {
+            std::fprintf(stderr, "writing the config to stdout failed\n");
+            return 1;
+        }
+    } else if (!WriteFileChecked(out, s)) {
+        return 1;
+    }
     return 0;
 }
 

@@ -134,6 +134,22 @@ uint32_t g_depth = 0;
 uint32_t g_scratch_push = 0, g_scratch_size = 0;
 uint32_t g_walk = 0;  // first scratch command not read yet
 
+// guest shader objects the title owns; the cap keeps a corrupt stream of creates from exhausting host memory
+constexpr size_t kMaxGuestShaders = 4096;
+constexpr uint32_t kInvalidCall = 0x8876086C;  // D3DERR_INVALIDCALL
+
+// whether a guest range may be read before a length from an untrusted header is used
+bool GuestReadable(uint32_t va, uint64_t bytes) {
+    if (!va || !bytes) return false;
+    if (uint32_t alloc = mem::AllocationSize(va)) return bytes <= alloc;
+    const uint64_t end = uint64_t(va) + bytes;
+    if (end > 0x100000000ull) return false;
+    for (uint64_t p = uint64_t(va) & ~uint64_t(mem::kPage - 1); p < end; p += mem::kPage) {
+        if (!mem::IsCommitted(uint32_t(p))) return false;
+    }
+    return true;
+}
+
 uint32_t Dev(uint32_t off) { return R32(kDevice + off); }
 void SetDev(uint32_t off, uint32_t v) { W32(kDevice + off, v); }
 
@@ -174,10 +190,28 @@ void Walk(uint32_t end);
 // Hardware commands a caller still pushes go to a scratch buffer, rewound at every request once Walk has read it
 uint32_t ScratchPush(uint32_t bytes = 0) {
     Walk(Dev(kDevPush));
-    uint32_t need = std::max<uint32_t>(0x10000, (bytes + 0x1FFF) & ~0xFFFu);
+    const uint64_t rounded = (uint64_t(bytes) + 0x1FFF) & ~uint64_t(0xFFF);
+    const uint64_t need64 = std::max<uint64_t>(0x10000, rounded);
+    if (need64 > UINT32_MAX) {
+        LOGE("d3d: push buffer of %u bytes is too large", bytes);
+        if (g_scratch_push) mem::FreeContiguous(g_scratch_push);
+        g_scratch_push = g_scratch_size = g_walk = 0;
+        SetDev(kDevPush, 0);
+        SetDev(kDevThreshold, 0);
+        return 0;
+    }
+    const uint32_t need = uint32_t(need64);
     if (need > g_scratch_size) {
         if (g_scratch_push) mem::FreeContiguous(g_scratch_push);
         g_scratch_push = mem::AllocContiguous(need, 0, 0xFFFFFFFF, 0x1000);
+        if (!g_scratch_push) {
+            LOGE("d3d: push buffer of %u bytes could not be allocated", need);
+            g_scratch_size = 0;
+            SetDev(kDevPush, 0);
+            SetDev(kDevThreshold, 0);
+            g_walk = 0;
+            return 0;
+        }
         g_scratch_size = need;
     }
     SetDev(kDevPush, g_scratch_push);
@@ -197,15 +231,38 @@ gpu::Surface SurfaceOf(uint32_t header) {
     return s;
 }
 
+// a surface this file made: its contiguous data and its system header
+void FreeSurface(uint32_t hdr) {
+    if (!hdr) return;
+    const uint32_t data = mem::VirtualFromPhysical(R32(hdr + 4));
+    if (data) mem::FreeContiguous(data);
+    mem::FreeSystem(hdr);
+}
+
 uint32_t NewSurface(uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
-    uint32_t pitch = (w * bpp + 63) & ~63u;
-    uint32_t data = mem::AllocContiguous(pitch * h, 0, 0xFFFFFFFF, 0x1000);
-    uint32_t hdr = mem::AllocSystem(24);
+    constexpr uint32_t kMaxSurfaceSide = 4096;  // the header stores w - 1 and h - 1 in 12 bits
+    if (!w || !h || w > kMaxSurfaceSide || h > kMaxSurfaceSide || (bpp != 1 && bpp != 2 && bpp != 4)) {
+        LOG_FIRST(8, "d3d: surface %ux%u bpp %u rejected", w, h, bpp);
+        return 0;
+    }
+    const uint64_t pitch = (uint64_t(w) * bpp + 63) & ~uint64_t(63);
+    const uint64_t bytes = pitch * h;
+    if (pitch / 64 > 256 || bytes > UINT32_MAX) {  // pitch/64 - 1 is stored in 8 bits
+        LOG_FIRST(8, "d3d: surface %ux%u bpp %u is too large", w, h, bpp);
+        return 0;
+    }
+    const uint32_t data = mem::AllocContiguous(uint32_t(bytes), 0, 0xFFFFFFFF, 0x1000);
+    if (!data) return 0;
+    const uint32_t hdr = mem::AllocSystem(24);
+    if (!hdr) {
+        mem::FreeContiguous(data);
+        return 0;
+    }
     W32(hdr + 0, 0x000D0001);  // surface, one reference, one internal reference held by the device
     W32(hdr + 4, mem::PhysicalFromVirtual(data));
     W32(hdr + 8, 0);
     W32(hdr + 12, 0x00010021 | (fmt << 8));  // dma A, 2D, one level
-    W32(hdr + 16, (w - 1) | (h - 1) << 12 | (pitch / 64 - 1) << 24);
+    W32(hdr + 16, (w - 1) | (h - 1) << 12 | (uint32_t(pitch / 64) - 1) << 24);
     W32(hdr + 20, 0);
     return hdr;
 }
@@ -263,7 +320,9 @@ void ApplyDefaultStates(X86Context& ctx) {
 // The frame buffers a D3DPRESENT_PARAMETERS asks for become the device's targets, the viewport covers them. The
 // renderer is made at the first ones' size.
 void SetFrameBuffers(const char* caller, uint32_t pp) {
-    uint32_t w = R32(pp), h = R32(pp + 4), fmt = R32(pp + 8), count = std::max<uint32_t>(R32(pp + 12), 1);
+    const uint64_t count64 = std::max<uint64_t>(R32(pp + 12), 1);
+    const uint32_t count = uint32_t(std::min<uint64_t>(count64, UINT32_MAX));
+    uint32_t w = R32(pp), h = R32(pp + 4), fmt = R32(pp + 8);
     uint32_t auto_depth = R32(pp + 0x20), depth_fmt = R32(pp + 0x24), interval = R32(pp + 0x30);
     if (!w) w = 640;
     if (!h) h = 480;
@@ -273,26 +332,62 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
     uint32_t zf = auto_depth ? gpu::LinearDepthFormat(depth_fmt) : 0;
     // surfaces of the same shape are kept: a title wraps their memory in textures of its own across a Reset
     static std::array<uint32_t, 5> made{};
-    std::array<uint32_t, 5> asked{w, h, color_fmt, std::min<uint32_t>(count + 1, 3), zf};
+    static bool depth_ours = false;
+    const uint64_t buffered = std::clamp<uint64_t>(count64 + 1, 2, 3);  // one front plus the back buffers
+    std::array<uint32_t, 5> asked{w, h, color_fmt, uint32_t(buffered), zf};
     // the title's own frame buffers: D3DPRESENT_PARAMETERS BufferSurfaces[3] (+0x34, front first) and
     // DepthStencilSurface (+0x40). True Crime NYC keeps one object per buffer and finds the back buffer by its memory,
     // so the device must draw into and present these surfaces, not ones of its own.
     uint32_t own[3] = {R32(pp + 0x34), R32(pp + 0x38), R32(pp + 0x3C)}, own_depth = R32(pp + 0x40);
+    auto drop_made = [&] {
+        if (made[0])
+            for (uint32_t i = 0; i < made[3]; i++) FreeSurface(g_buffers[i]);
+        if (depth_ours) FreeSurface(g_depth);
+        g_depth = 0;
+        depth_ours = false;
+        made = {};
+    };
     if (own[0]) {
         uint32_t n = own[2] ? 3 : own[1] ? 2 : 1;
         LOGI("d3d: %s uses the title's buffers %08X %08X %08X depth %08X", caller, own[0], own[1], own[2], own_depth);
+        const uint32_t kept_depth = depth_ours ? 0 : g_depth;  // a title-owned depth may outlive a Reset
+        drop_made();
         g_buffer_count = std::max<uint32_t>(n, 2);
         g_buffers[0] = own[0];
         g_buffers[1] = n > 1 ? own[1] : own[0];
         g_buffers[2] = n > 2 ? own[2] : 0;
-        if (own_depth) g_depth = own_depth;
-        else if (zf && !g_depth) g_depth = NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4);
+        depth_ours = false;
+        if (own_depth) {
+            g_depth = own_depth;
+        } else if (kept_depth) {
+            g_depth = kept_depth;
+        } else if (zf) {
+            g_depth = NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4);
+            depth_ours = g_depth != 0;
+        }
         made = {};  // a later Reset without own buffers makes the host's again
     } else if (asked != made) {
-        made = asked;
-        g_buffer_count = asked[3];
-        for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
-        g_depth = zf ? NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4) : 0;  // 0x30 LIN_D16, 0x31 LIN_F16
+        // make the replacement first: a failed allocation keeps the buffers that are already bound
+        std::array<uint32_t, 3> next{};
+        bool ok = true;
+        for (uint32_t i = 0; i < asked[3]; i++) {
+            next[i] = NewSurface(w, h, color_fmt, 4);
+            if (!next[i]) ok = false;
+        }
+        const uint32_t next_depth = zf ? NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4) : 0;
+        if (zf && !next_depth) ok = false;
+        if (ok) {
+            drop_made();
+            g_buffer_count = asked[3];
+            for (uint32_t i = 0; i < 3; i++) g_buffers[i] = next[i];
+            g_depth = next_depth;  // 0x30 LIN_D16, 0x31 LIN_F16
+            depth_ours = zf != 0;
+            made = asked;
+        } else {
+            for (uint32_t surface : next) FreeSurface(surface);
+            FreeSurface(next_depth);
+            LOGE("d3d: %s could not make %ux%u frame buffers, keeping the current ones", caller, w, h);
+        }
     }
     if (!g_backend) {
         g_backend = gpu::CreateBackend();
@@ -542,7 +637,9 @@ HLE_STDCALL(D3DDevice_EnableOverlay, 1) { return 0; }
 // fade from it at its first frames
 HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    uint32_t front = g_buffers[0], size = R32(front + 0x10);
+    const uint32_t front = g_buffers[0];
+    if (!front) return 0;
+    uint32_t size = R32(front + 0x10);
     uint32_t pitch = ((size >> 24 & 0xFF) + 1) * 64, height = (size >> 12 & 0xFFF) + 1, bytes = pitch * height;
     uint32_t data = mem::VirtualFromPhysical(R32(front + 4));
     if (g_backend) g_backend->Sync(data, bytes);
@@ -715,7 +812,7 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     // back buffer scale on (CDevice flag 0x4000, set by SetBackBufferScale with a scale other than 1): the library's
     // Swap draws the device's back buffer (+BackBuffer, a title may point it at its own surface) as a texture onto
     // the front buffer; present that surface instead of the host's own back buffer
-    uint32_t shown = g_buffers[1];
+    uint32_t shown = g_buffers[1] ? g_buffers[1] : g_buffers[0];
     if (XDK_CDevice_Flags != xdk::kUnknown && (Dev(XDK_CDevice_Flags) & 0x4000) && Dev(kDevBackBuffer))
         shown = Dev(kDevBackBuffer);
     if (g_backend) {
@@ -745,13 +842,16 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     if (app::kGame.swap_interval) interval = app::kGame.swap_interval(interval);
     app::Pace(interval >= 1 && interval <= 4 ? 60 / interval : interval == 0 ? 60 : 0);
     // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
-    uint32_t last = g_buffers[g_buffer_count - 1], data = R32(last + 4), lk = R32(last + 8);
-    for (uint32_t i = g_buffer_count - 1; i > 0; i--) {
-        W32(g_buffers[i] + 4, R32(g_buffers[i - 1] + 4));
-        W32(g_buffers[i] + 8, R32(g_buffers[i - 1] + 8));
+    const uint32_t buffers = std::clamp<uint32_t>(g_buffer_count, 2, 3);
+    if (g_buffers[0] && g_buffers[buffers - 1]) {
+        uint32_t last = g_buffers[buffers - 1], data = R32(last + 4), lk = R32(last + 8);
+        for (uint32_t i = buffers - 1; i > 0; i--) {
+            W32(g_buffers[i] + 4, R32(g_buffers[i - 1] + 4));
+            W32(g_buffers[i] + 8, R32(g_buffers[i - 1] + 8));
+        }
+        W32(g_buffers[0] + 4, data);
+        W32(g_buffers[0] + 8, lk);
     }
-    W32(g_buffers[0] + 4, data);
-    W32(g_buffers[0] + 8, lk);
     g_state.rt = SurfaceOf(Dev(kDevRenderTarget));
     uint32_t n = Dev(kDevSwapCount) + 1;
     SetDev(kDevSwapCount, n);
@@ -774,7 +874,8 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
 HLE_STDCALL(D3DDevice_Reset, 1) {
     constexpr uint32_t kClearTargetAndZ = 3;
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    ApplyRenderTarget(ctx, g_buffers[1], g_depth);
+    const uint32_t back = g_buffer_count > 1 ? g_buffers[1] : g_buffers[0];
+    ApplyRenderTarget(ctx, back, g_depth);
     SetFrameBuffers("Reset", a[0]);
     if (a[0]) W32(kRenderState + gpu::kRsPresentationInterval * 4, R32(a[0] + 0x30));
     if (g_backend) g_backend->Clear(g_state, 0, nullptr, kClearTargetAndZ, 0, 1.0f, 0);
@@ -1011,25 +1112,53 @@ HLE_STDCALL(D3DDevice_SetIndices, 2) {
 
 // shaders
 
+// TODO(pre-beta): a shader that fails validation still fails the create. A basic logged fallback program would let the
+// draw through white instead of disappearing; changing program matching is too invasive for this pass.
 HLE_STDCALL(D3DDevice_CreateVertexShader, 4) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t decl = a[0], func = a[1], out = a[2];
+    if (g_vs.size() >= kMaxGuestShaders) {
+        LOGE("d3d: too many vertex shaders, %08X not made", decl);
+        return kInvalidCall;
+    }
     auto vs = std::make_shared<gpu::VertexShader>();
     if (decl) {
-        for (uint32_t i = 0; i < 1024; i++) {
-            uint32_t t = R32(decl + i * 4);
+        bool ended = false;
+        for (uint32_t i = 0; i < 1024; i++) {  // the console's declaration limit
+            const uint64_t at = uint64_t(decl) + uint64_t(i) * 4;
+            if (at + 4 > 0x100000000ull || !GuestReadable(uint32_t(at), 4)) break;
+            uint32_t t = R32(uint32_t(at));
             vs->decl.push_back(t);
-            if (t == 0xFFFFFFFF) break;
+            if (t == 0xFFFFFFFF) {
+                ended = true;
+                break;
+            }
+        }
+        if (!ended) {
+            LOGE("d3d: vertex shader declaration %08X is not readable or has no end token", decl);
+            return kInvalidCall;
         }
     }
     if (func) {
+        if (!GuestReadable(func, 4)) {
+            LOGE("d3d: vertex shader function %08X is not readable", func);
+            return kInvalidCall;
+        }
         uint32_t hdr = R32(func);
         vs->program_type = hdr & 0xFFFF;
         uint32_t n = hdr >> 16;
-        for (uint32_t i = 0; i < n * 4; i++) vs->program.push_back(R32(func + 4 + i * 4));
+        const uint64_t words = uint64_t(n) * 4;
+        if (words > 512 || uint64_t(func) + 4 + words * 4 > 0x100000000ull ||
+            (words && !GuestReadable(func + 4, words * 4))) {  // 128 instructions, the console's limit
+            LOGE("d3d: vertex shader function %08X has %llu dwords, not readable", func,
+                 static_cast<unsigned long long>(words));
+            return kInvalidCall;
+        }
+        for (uint64_t i = 0; i < words; i++) vs->program.push_back(R32(uint32_t(uint64_t(func) + 4 + i * 4)));
     }
     gpu::ParseDeclaration(*vs);
     uint32_t rec = mem::AllocSystem(16, 16);
+    if (!rec) return kInvalidCall;
     vs->handle = rec | 1;
     g_vs[vs->handle] = vs;
     W32(out, vs->handle);
@@ -1135,6 +1264,7 @@ constexpr uint32_t kTypeNone = 0x02;  // D3DVSDT_NONE
 
 std::array<uint32_t, kProgramSlots * kInstructionDwords> g_program_memory{};
 std::map<uint64_t, std::shared_ptr<gpu::VertexShader>> g_selected;  // kept alive, the render thread keys by pointer
+constexpr size_t kMaxSelected = 1024;  // bound the derived-program cache; entries are rebuilt on demand
 
 // bytes of one D3DVSDT element: kind in the low nibble, count in the next
 uint32_t ElementBytes(uint32_t type) {
@@ -1154,10 +1284,21 @@ void StoreProgram(uint32_t slot, const std::vector<uint32_t>& words) {
 
 // a {type | count << 16, instructions} function's instructions
 std::vector<uint32_t> FunctionWords(uint32_t function) {
+    if (!GuestReadable(function, 4)) {
+        LOGE("d3d: vertex shader function %08X is not readable", function);
+        return {};
+    }
     uint32_t count = R32(function) >> 16;
-    std::vector<uint32_t> words(count * kInstructionDwords);
-    for (uint32_t i = 0; i < words.size(); i++) words[i] = R32(function + 4 + i * 4);
-    return words;
+    const uint64_t words = uint64_t(count) * kInstructionDwords;
+    if (words > 512 || uint64_t(function) + 4 + words * 4 > 0x100000000ull ||
+        (words && !GuestReadable(function + 4, words * 4))) {  // 128 instructions, the console's limit
+        LOGE("d3d: vertex shader function %08X has %llu dwords, not readable", function,
+             static_cast<unsigned long long>(words));
+        return {};
+    }
+    std::vector<uint32_t> out(static_cast<size_t>(words));
+    for (uint64_t i = 0; i < words; i++) out[i] = R32(uint32_t(uint64_t(function) + 4 + i * 4));
+    return out;
 }
 
 // the instructions from slot to the last one
@@ -1211,6 +1352,7 @@ std::shared_ptr<gpu::VertexShader> SelectedShader(uint32_t handle, uint32_t slot
     uint64_t key = gpu::Hash(vs.program.data(), vs.program.size() * 4);
     key = gpu::Hash(vs.inputs.data(), sizeof(vs.inputs), key);
     key = gpu::Hash(vs.stream_stride.data(), sizeof(vs.stream_stride), key);
+    if (g_selected.size() >= kMaxSelected && !g_selected.contains(key)) g_selected.clear();
     auto& kept = g_selected[key];
     if (!kept) kept = std::make_shared<gpu::VertexShader>(std::move(vs));
     return kept;
@@ -1258,9 +1400,14 @@ HLE_STDCALL(D3DDevice_SetShaderConstantMode, 1) {
 
 HLE_STDCALL(D3DDevice_CreatePixelShader, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (g_ps.size() >= kMaxGuestShaders || !GuestReadable(a[0], 0xF0 / 4 * 4)) {
+        LOGE("d3d: pixel shader definition %08X is not readable, not made", a[0]);
+        return kInvalidCall;
+    }
     auto ps = std::make_shared<gpu::PixelShader>();
     std::memcpy(ps->def, HostPtr(a[0]), sizeof(ps->def));
     uint32_t rec = mem::AllocSystem(16, 16);
+    if (!rec) return kInvalidCall;
     ps->handle = rec;
     g_ps[rec] = ps;
     W32(a[1], rec);
@@ -1283,7 +1430,19 @@ HLE_STDCALL(D3DDevice_SetPixelShader, 1) {
     } else if (XDK_PixelShader_Definition != xdk::kUnknown) {
         // made by library code the title inlined: the object points at its definition, handles are reused
         static std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> made;
-        const void* def = HostPtr(R32(a[0] + XDK_PixelShader_Definition));
+        constexpr size_t kMaxMade = 256;  // bound the cache a corrupt stream of handles can grow
+        const uint64_t field = uint64_t(a[0]) + XDK_PixelShader_Definition;
+        if (field + 4 > 0x100000000ull || !GuestReadable(a[0] + XDK_PixelShader_Definition, 4)) {
+            LOG_FIRST(8, "d3d: pixel shader %08X has no readable definition pointer", a[0]);
+            return 0;
+        }
+        const uint32_t def_va = R32(a[0] + XDK_PixelShader_Definition);
+        if (!GuestReadable(def_va, 0xF0 / 4 * 4)) {
+            LOG_FIRST(8, "d3d: pixel shader %08X definition %08X is not readable", a[0], def_va);
+            return 0;
+        }
+        const void* def = HostPtr(def_va);
+        if (made.size() >= kMaxMade && !made.contains(a[0])) made.clear();
         auto& ps = made[a[0]];
         if (!ps || std::memcmp(ps->def, def, sizeof(ps->def))) {
             ps = std::make_shared<gpu::PixelShader>();
@@ -1604,7 +1763,13 @@ HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
 // a primitive between two begin/end writes with its vertices inline or as vertex data, other methods as simple states.
 HLE_STDCALL(D3DDevice_BeginPush, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    g_push_begin = ScratchPush(a[0] * 4);
+    const uint64_t bytes = uint64_t(a[0]) * 4;
+    if (bytes > UINT32_MAX) {
+        LOGE("d3d: BeginPush of %u dwords is too large", a[0]);
+        g_push_begin = 0;
+        return 0;
+    }
+    g_push_begin = ScratchPush(uint32_t(bytes));
     return g_push_begin;
 }
 
@@ -1621,13 +1786,15 @@ static void RunCommands(uint32_t begin, uint32_t end) {
     constexpr uint32_t kBeginEnd = 0x17FC, kInlineArray = 0x1818;
     // vertex array offsets and formats, then index elements and draw arrays up to the inline array
     constexpr uint32_t kArrayOffsets = 0x1720, kArrayFormatsEnd = 0x17A0, kArrayDraws = 0x1800;
+    constexpr size_t kMaxInlineVertices = 4u << 20;  // 16 MB of pushed vertex dwords
     static std::vector<uint32_t> vertices;
     uint32_t prim = 0;
-    for (uint32_t p = begin; begin && p + 4 <= end;) {
+    if (!begin || end <= begin) return;
+    for (uint32_t p = begin; uint64_t(p) + 4 <= end;) {
         // count in bits 18 to 28, bit 30 keeps the method for every value
         uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
         p += 4;
-        if ((head & 0xA0030003) || n * 4 > end - p) {  // anything but a method header
+        if ((head & 0xA0030003) || uint64_t(n) * 4 > uint64_t(end) - p) {  // anything but a method header
             LOG_FIRST(8, "d3d: pushed commands stop at %08X, %u bytes before the end", head, end - p);
             break;
         }
@@ -1635,7 +1802,13 @@ static void RunCommands(uint32_t begin, uint32_t end) {
             uint32_t m = head & 0x40000000 ? method : method + i * 4, v = R32(p);
             ApplyVisibilityMethod(m, v);
             if (m == kInlineArray) {
-                if (prim) vertices.push_back(v);
+                if (prim) {
+                    if (vertices.size() < kMaxInlineVertices) {
+                        vertices.push_back(v);
+                    } else if (vertices.size() == kMaxInlineVertices) {
+                        LOG_FIRST(4, "d3d: pushed inline vertices over %zu dwords are dropped", kMaxInlineVertices);
+                    }
+                }
             } else if (m == kBeginEnd) {
                 if (!v && prim) DrawInline(prim, vertices);
                 prim = v;
@@ -1652,7 +1825,13 @@ static void RunCommands(uint32_t begin, uint32_t end) {
 
 HLE_STDCALL(D3DDevice_EndPush, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    RunCommands(g_push_begin, a[0]);
+    if (g_push_begin && g_scratch_push && g_scratch_size) {
+        uint64_t end = a[0];
+        const uint64_t limit = uint64_t(g_scratch_push) + g_scratch_size;
+        if (end < g_push_begin) end = g_push_begin;
+        if (end > limit) end = limit;
+        RunCommands(g_push_begin, uint32_t(end));
+    }
     g_push_begin = 0;
     ScratchPush();
     return a[0];
@@ -1668,7 +1847,8 @@ HLE_STDCALL(D3DDevice_RunPushBuffer, 2) {
     LOG_FIRST(8, "d3d: RunPushBuffer %08X, %u bytes, first command %08X", data, size, size ? R32(data) : 0);
     if (a[1]) LOG_FIRST(1, "d3d: RunPushBuffer fixups are not applied");
     Walk(Dev(kDevPush));
-    if (size >= 4) RunCommands(data, data + size - 4);
+    const uint64_t finish = uint64_t(data) + size;
+    if (size >= 4 && finish <= 0x100000000ull) RunCommands(data, uint32_t(finish - 4));
     return 0;
 }
 

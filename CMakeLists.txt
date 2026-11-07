@@ -2,6 +2,7 @@
 
 cmake_minimum_required(VERSION 3.25)
 project(game LANGUAGES C CXX)
+enable_language(RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,7 +16,11 @@ elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../XboxXBE-Recomp/cmake/XbeRecomp.cmak
     set(SDK ${CMAKE_CURRENT_SOURCE_DIR}/../XboxXBE-Recomp)
 else()
     include(FetchContent)
-    FetchContent_Declare(xbe_sdk GIT_REPOSITORY https://github.com/TGP482/XboxXBE-Recomp.git GIT_TAG main)
+    # Pin the fallback SDK to the upstream commit this port's sdk/ tree is based on
+    # (see patches/xboxxberecomp-local.patch). Override with -DXBE_SDK_TAG=<commit or tag>.
+    set(XBE_SDK_TAG "f7b13fdbf9560a3b3928aea24e37c789b24408f0" CACHE STRING
+        "Upstream XboxXBE-Recomp commit/tag used when sdk/ is not present")
+    FetchContent_Declare(xbe_sdk GIT_REPOSITORY https://github.com/TGP482/XboxXBE-Recomp.git GIT_TAG ${XBE_SDK_TAG})
     FetchContent_MakeAvailable(xbe_sdk)
     set(SDK ${xbe_sdk_SOURCE_DIR})
 endif()
@@ -44,5 +49,11 @@ target_compile_definitions(TrueCrimeNYC PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A0
 
 # Keep the SDK startup intact and invoke it after the launcher closes.
 set_property(SOURCE "${SDK}/runtime/app/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS wWinMain=RecompMain)
-target_sources(TrueCrimeNYC PRIVATE launcher/launcher.cpp)
+target_sources(TrueCrimeNYC PRIVATE launcher/launcher.cpp launcher/version.rc)
+target_include_directories(TrueCrimeNYC PRIVATE launcher)
+set_property(SOURCE launcher/version.rc APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/launcher/TrueCrimeNYC.ico")
+# Merge the long-path manifest into the manifest CMake already embeds.
+target_link_options(TrueCrimeNYC PRIVATE
+    "-Wl,/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/launcher/TrueCrimeNYC.manifest")
 target_link_libraries(TrueCrimeNYC PRIVATE comdlg32 gdi32 user32)

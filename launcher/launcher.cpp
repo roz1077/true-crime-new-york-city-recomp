@@ -227,6 +227,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
     windowClass.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
     windowClass.lpszClassName = L"TrueCrimeNYCLauncher";
     if (!RegisterClassW(&windowClass)) return Error(L"Could not initialize the launcher window.");

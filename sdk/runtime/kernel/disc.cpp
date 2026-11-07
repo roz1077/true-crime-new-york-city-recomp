@@ -201,7 +201,10 @@ uint32_t Disc::Read(const Entry& file, uint64_t pos, void* out, uint32_t len) co
 
 bool Disc::Load(std::string_view path, std::vector<uint8_t>& out) const {
     const Entry* e = Find(path);
-    if (!e || e->dir || (e->size && !Contains(e->offset, e->size))) return false;
+    // XBEs and XBE alternates are bounded; a malformed or adversarial image must
+    // not ask for a multi-GB allocation.
+    constexpr uint64_t kMaxLoadBytes = 64ull << 20;
+    if (!e || e->dir || e->size > kMaxLoadBytes || (e->size && !Contains(e->offset, e->size))) return false;
     out.resize(e->size);
     return Read(*e, 0, out.data(), e->size) == e->size;
 }

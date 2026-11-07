@@ -32,7 +32,7 @@ void CloseSockets();  // xdk/xnet.cpp
 namespace kernel {
 
 uint8_t* g_base = nullptr;
-std::string g_launch_file;
+std::filesystem::path g_launch_file;
 
 namespace {
 uint32_t g_saved_data = 0;
@@ -40,7 +40,7 @@ bool g_mark = false, g_kept_marked = false;
 std::string g_picture, g_kept_picture;  // the last picture the title showed, raw path string with its terminator
 constexpr uint32_t kPersistMagic = 0x50535044;  // "DPSP"
 
-std::string PersistFile() { return g_launch_file.substr(0, g_launch_file.find_last_of("/\\") + 1) + "display.bin"; }
+std::filesystem::path PersistFile() { return g_launch_file.parent_path() / "display.bin"; }
 
 // surface header (Common, Data, Lock, Format, Size) then the pixels at +0x40, as the XDK lays out its persisted copy
 void LoadPersistedDisplay() {
@@ -65,7 +65,7 @@ void LoadPersistedDisplay() {
 }  // namespace
 
 void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, const void* pixels, uint32_t bytes) {
-    if (FILE* f = std::fopen(PersistFile().c_str(), "wb")) {
+    if (FILE* f = OpenHostFile(PersistFile(), "wb")) {
         uint32_t head[7] = {kPersistMagic, common, format, size, bytes, g_mark, uint32_t(g_picture.size())};
         std::fwrite(head, sizeof head, 1, f);
         std::fwrite(pixels, 1, bytes, f);
@@ -84,7 +84,8 @@ void SetSavedDataAddress(uint32_t surface) { g_saved_data = surface; }
 const xbe::Image* g_image = nullptr;
 static xbe::Image g_xbe;
 
-bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::string& game_dir, const std::string& data_dir) {
+bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::filesystem::path& game_dir,
+          const std::filesystem::path& data_dir) {
     if (!mem::Init()) return false;
     g_base = mem::Base();
 
@@ -169,21 +170,26 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     MountDefaults(game_dir, data_dir);
 
     // a quick reboot into this title left its launch data page behind
-    g_launch_file = data_dir + "/launch.bin";
+    g_launch_file = data_dir / "launch.bin";
     std::ifstream lf(g_launch_file, std::ios::binary);
     if (lf) {
         uint32_t page = mem::AllocContiguous(0x1000, 0, 0xFFFFFFFF, 0x1000);
         lf.read(static_cast<char*>(HostPtr(page)), 0x1000);
         lf.close();
-        std::remove(g_launch_file.c_str());
+        std::error_code ec;
+        std::filesystem::remove(g_launch_file, ec);
         W32(g_launch_data_page_va, page);
         LOGI("boot: launch data from the previous run, type %u", R32(page));
         LoadPersistedDisplay();
     }
-    std::remove(PersistFile().c_str());
+    std::error_code ec;
+    std::filesystem::remove(PersistFile(), ec);
 
     ThreadRef t = CreateThread(stack, uint32_t(tls), 0, img.entry, 0, false);
-    StartThread(t);
+    if (!t || !StartThread(t)) {
+        LOGE("boot: could not start the entry thread");
+        return false;
+    }
     return true;
 }
 
@@ -206,6 +212,7 @@ std::wstring HandoverEvent(unsigned long process) {
 }
 
 void Relaunch(const char* exe) {
+    FlushOpenFiles();
     logx::Flush();
 #ifdef _WIN32
     wchar_t self[MAX_PATH];
@@ -241,12 +248,30 @@ void Relaunch(const char* exe) {
     ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
     std::string path = std::string(self, n > 0 ? size_t(n) : 0);
     path = path.substr(0, path.find_last_of('/') + 1) + exe;
-    execl(path.c_str(), path.c_str(), nullptr);
+    // Preserve --assets/--iso/--instance: the recompiled image switch must not
+    // lose the game location, or a relaunch from an explicit path cannot boot.
+    std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+    std::string raw((std::istreambuf_iterator<char>(cmdline)), {});
+    std::vector<std::string> args;
+    for (size_t at = 0; at < raw.size();) {
+        const size_t end = raw.find('\0', at);
+        if (end == std::string::npos) break;
+        if (end > at) args.emplace_back(raw.substr(at, end - at));
+        at = end + 1;
+    }
+    if (args.empty()) args.emplace_back(path);
+    args[0] = path;
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (auto& arg : args) argv.push_back(arg.data());
+    argv.push_back(nullptr);
+    execv(path.c_str(), argv.data());
     std::_Exit(0);
 #endif
 }
 
 void Shutdown(int code) {
+    FlushOpenFiles();
     LOGR("Exit (%d)", code);
     logx::Flush();
     std::_Exit(code);

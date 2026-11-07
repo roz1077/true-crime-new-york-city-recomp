@@ -36,6 +36,7 @@ __pycache__/
 
 # packaged zips
 /dist/
+*.zip.sha256
 
 # Archived local investigation evidence
 /archive/
