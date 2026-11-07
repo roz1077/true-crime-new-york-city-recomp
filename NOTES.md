@@ -1727,3 +1727,27 @@ The full code review found and the current tree fixes these correctness issues:
   from the Bink base and restore the surface data field afterwards. The fixed 640x480
   frame measures L67/R66/T44/B96, matching xemu exactly. 3D frames are untouched, and
   the correction is Linux-only so the Windows path is unchanged.
+
+## Fixed: Windows D3D12 device hang in gameplay (2026-11-07)
+
+- **Symptom:** after the Windows rebuild included the Linux-port runtime changes, the
+  game lost the D3D12 device with `DXGI_ERROR_DEVICE_REMOVED` (0x887A0005) and
+  `GetDeviceRemovedReason()` returned `DXGI_ERROR_DEVICE_HUNG` (0x887A0006). Windows
+  recorded a `LiveKernelEvent 141` watchdog reset; the crash happened within 15-90 s of
+  entering gameplay and did not depend on MSAA, post effects or render scale.
+- **Cause:** the 14f72da runtime added `SweepTargets`, which retires render targets that
+  have not been used for eight frames. A target that is only *sampled* by a draw was not
+  marked used by `BindTexture`; the sweep could therefore release it after `frame_++`,
+  deferring it to the next frame's garbage list. `ResetFrame` freed that list immediately
+  (the next frame's fence was already complete) while the just-submitted command list
+  still read the target, a GPU use-after-free.
+- **Fix:** `BindTexture` now calls `UpdateTargetUsed` when it finds a rendered target, so
+  a target read by any draw is kept live across the sweep. The sweep remains enabled.
+  The Windows `GetReport` also keeps its deferred delivery instead of forcing a mid-frame
+  `Submit(true)`, and device-loss, pipeline and target failures now log the HRESULT and
+  `GetDeviceRemovedReason()`.
+- **Verified:** full settings (8x MSAA, 2370 aspect, 100% render, bloom/DOF/SMAA/PC
+  contrast, custom textures, seam fix) ran over three minutes of gameplay without a
+  device loss. The same scene previously hung within 15-90 s. The installed copy was
+  rebuilt and repackaged from this source.
+

@@ -583,13 +583,10 @@ public:
     void Flush() override;
     void SetGamma(const uint8_t* ramp) override;
     void ClearReport() override { counted_.clear(); }
-    // Finish the list now: a title may spin on the report status without presenting again.
-    void GetReport(uint32_t report) override {
-        if (!report) return;
-        Submit(true);
-        reports_.push_back({report, counted_, fence_value_});
-        DeliverReports();
-    }
+    // Delivered by the next Submit, as before the Linux-port integration: the title presents
+    // every frame, so the report still arrives in time. Flushing here adds a mid-frame GPU wait
+    // that this backend does not need.
+    void GetReport(uint32_t report) override { reports_.push_back({report, counted_, fence_value_ + 1}); }
 
     ID3D12Device* Device() override { return dev_.Get(); }
     ID3D12GraphicsCommandList* List() override { return cl_.Get(); }
@@ -1322,11 +1319,13 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
     }
     if (msaa_) {
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{cv.Format, msaa_};
+        HRESULT msaa_hr = E_FAIL;
         if (SUCCEEDED(dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
                                                sizeof(levels))) && levels.NumQualityLevels) {
             td.SampleDesc.Count = msaa_;
-            if (SUCCEEDED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.state, &cv,
-                                                        IID_PPV_ARGS(&t.res)))) {
+            msaa_hr = dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.state, &cv,
+                                                    IID_PPV_ARGS(&t.res));
+            if (SUCCEEDED(msaa_hr)) {
                 static bool reported[2] = {};  // colour, depth: the first of each
                 if (!std::exchange(reported[t.depth ? 1 : 0], true))
                     LOGR("d3d12: allocated %ux MSAA %s target", msaa_, t.depth ? "depth" : "color");
@@ -1335,10 +1334,16 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
             td.SampleDesc.Count = 1;
         }
         static unsigned reports = 0;
-        if (reports++ < 8) LOGR("d3d12: %ux MSAA unavailable for format %u, using one sample", msaa_, unsigned(cv.Format));
+        if (reports++ < 8)
+            LOGR("d3d12: %ux MSAA unavailable for format %u at %ux%u (0x%08lX, device removed reason 0x%08lX), "
+                 "using one sample",
+                 msaa_, unsigned(cv.Format), t.w, t.h, msaa_hr, dev_->GetDeviceRemovedReason());
     }
-    return SUCCEEDED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.state, &cv,
-                                                   IID_PPV_ARGS(&t.res)));
+    const HRESULT hr = dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.state, &cv,
+                                                     IID_PPV_ARGS(&t.res));
+    if (FAILED(hr)) LOGE("d3d12: target %ux%u format %u could not be created (0x%08lX), device removed reason 0x%08lX",
+                         t.w, t.h, unsigned(td.Format), hr, dev_->GetDeviceRemovedReason());
+    return SUCCEEDED(hr);
 }
 
 // a view from the free pool, cleared; false when the pool is empty
@@ -2135,13 +2140,14 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
     if (k.topo == uint32_t(Topology::Points)) ExpandPoints(d, k.sprite);
     else if (k.topo == uint32_t(Topology::Lines)) ExpandLines(d);
     ComPtr<ID3D12PipelineState> pso;
-    if (FAILED(CreatePipeline(d, pso))) {
+    const HRESULT hr = CreatePipeline(d, pso);
+    if (FAILED(hr)) {
         const auto& b = d.BlendState.RenderTarget[0];
         const auto& r = d.RasterizerState;
         static int failed = 0;
-        if (failed++ < 16) LOGE("d3d12: pipeline creation failed: blend %d logic %d op %d src %d dst %d bop %d srcA %d dstA %d bopA %d "
+        if (failed++ < 16) LOGE("d3d12: pipeline creation failed (0x%08lX, device removed reason 0x%08lX): blend %d logic %d op %d src %d dst %d bop %d srcA %d dstA %d bopA %d "
                       "mask %X | fill %d cull %d bias %d clamp %.3f slope %.3f | rt %d fmt %d ds %d samples %d | depth %d "
-                      "zfunc %d stencil %d sfunc %d",
+                      "zfunc %d stencil %d sfunc %d", hr, dev_->GetDeviceRemovedReason(),
                   b.BlendEnable, b.LogicOpEnable, b.LogicOp, b.SrcBlend, b.DestBlend, b.BlendOp, b.SrcBlendAlpha,
                   b.DestBlendAlpha, b.BlendOpAlpha, b.RenderTargetWriteMask, r.FillMode, r.CullMode, r.DepthBias,
                   r.DepthBiasClamp, r.SlopeScaledDepthBias, d.NumRenderTargets, d.RTVFormats[0], d.DSVFormat,
@@ -2589,6 +2595,9 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     if (ext_) ext_->Sample(d.data, fi.depth, stage, alt, stages.k[stage], box);
     auto tit = targets_.find(SizedTargetKey(d.data, fi.depth, d.width, d.height) | alt);
     if (tit != targets_.end() && !d.cube && d.depth == 1 && !fi.compressed) {
+        // A target sampled here but not drawn into this frame must stay live: the sweep only
+        // retires targets unused for kStaleFrames, and the submitted frame may still read it.
+        UpdateTargetUsed(d.data);
         return BindTargetTexture(s, stage, d, tit->second, box, stages);
     }
     return BindGuestTexture(s, stage, d, fi, stages);
@@ -4369,7 +4378,8 @@ void D3D12Backend::Present(const Surface& front) {
         PerfScope perf_swap{g_perf.swap};
         const HRESULT hr = swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG) {
-            LOGE("d3d12: present lost the device (0x%08lX)", hr);
+            LOGE("d3d12: present lost the device (0x%08lX), device removed reason 0x%08lX", hr,
+                 dev_->GetDeviceRemovedReason());
             kernel::Shutdown(1);
             return;
         }
