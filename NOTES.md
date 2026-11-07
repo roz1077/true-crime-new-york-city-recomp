@@ -1718,3 +1718,11 @@ The full code review found and the current tree fixes these correctness issues:
   this comparison is the guest frame, the same image the Windows capture stores.
 - All temporary reflection dump/log hooks used during the investigation were removed
   before the final build; only the functional fix remains.
+- **Legal screen centering:** the intro legal page is the 640x448 `Legal.EnUS.bik` Bink
+  movie. The console writes the frame at the movie buffer base and presents that base;
+  the Linux front surface data field points 0x54 bytes (its frame header) into that
+  buffer, so the page was presented 21 pixels left. Against an xemu 4:3 snapshot the
+  Xbox frame is L67/R66/T44/B96; Linux was L46/R87. CPU-written movie frames now present
+  from the Bink base and restore the surface data field afterwards. The fixed 640x480
+  frame measures L67/R66/T44/B96, matching xemu exactly. 3D frames are untouched, and
+  the correction is Linux-only so the Windows path is unchanged.

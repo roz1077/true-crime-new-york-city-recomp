@@ -719,7 +719,23 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     if (XDK_CDevice_Flags != xdk::kUnknown && (Dev(XDK_CDevice_Flags) & 0x4000) && Dev(kDevBackBuffer))
         shown = Dev(kDevBackBuffer);
     if (g_backend) {
-        g_backend->Present(SurfaceOf(shown));
+        gpu::Surface picture = SurfaceOf(shown);
+#ifndef _WIN32
+        // A Bink movie frame is written at the movie buffer's base; the console presents
+        // that base. The Linux surface data field starts 0x54 bytes (its frame header)
+        // into that buffer, so a CPU-written frame (movies, the legal screen) is presented
+        // 0x54 bytes late -- a 21 pixel left shift at 640 pixels wide. The Windows path
+        // already presents the base; keep this correction Linux-only.
+        const uint32_t saved_data = picture.header ? R32(picture.header + 4) : 0;
+        if (!g_frame_draws && picture.data >= 0x54) {
+            picture.data -= 0x54;
+            if (picture.header) W32(picture.header + 4, picture.data);
+        }
+#endif
+        g_backend->Present(picture);
+#ifndef _WIN32
+        if (saved_data) W32(picture.header + 4, saved_data);
+#endif
         // a frame with no draws presents a CPU-written buffer (movies, legal screen):
         // wait for the renderer to finish reading it before the title writes the next one
         if (!g_frame_draws) g_backend->WaitPresent();
