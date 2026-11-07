@@ -172,7 +172,27 @@ regressions. A clean Windows Release build reached the title and gameplay on an 
 8x MSAA (~2,000 draws, ~50 fps) with no device loss, and a clean Linux Release build ran the
 Deck checks above. The shipped Windows zip was extracted fresh and reached gameplay on the
 same machine (~60 fps, 1,500–1,800 draws at the default 2x MSAA); its internal SHA256SUMS
-verify. Several manual checks (mouse pitch in both modes, DSound callback
-re-entrancy, fullscreen rollback, Alt+F4, focus/controller handoff, full-disk saves, Deck
-suspend/resume and multi-hour soak) remain for the maintainer; see `DECK_TEST.md` and the
-open-items list in `NOTES.md`.
+verify.
+
+A live Windows run with the Graphics menu open confirmed the Alt+F4/`SaveOnExit` path: the
+toggled Depth of Field value was written to `settings.toml`, the process exited 0, and focus
+loss/regain is logged. Direct mouse aim engaged (`input: mouse aim direct`) and live mouse
+input moved the camera in gameplay; an open-area pitch-direction comparison is still needed
+because the indoor camera collision altered the framing. A forced invalid 1x1 fullscreen mode was refused and logged
+(`app: fullscreen mode 1x1 refused (-2)`), confirming the display-apply failure path is
+detected; the menu's success/failure rollback still needs an interactive pass.
+
+The final Linux tarball also ran on Ubuntu 24.04 under WSLg with llvmpipe: it reached
+gameplay (~2,000 draws) with 0 VUIDs and no device loss. Software rendering makes its frame
+rate non-representative. On the Deck, texture dumping wrote 701 PNGs and a dumped image
+loaded through `textures/replacement`; the sample PNG validates. Windows texture dumping
+also wrote 744 PNGs and its sample validates. Both CI workflow files pass
+`actionlint`, and a clean-checkout configure fails with the expected missing-image guard.
+
+A 30-minute Deck soak ran 107,520 frames (~59.8 fps). RSS rose from 163 MB to 183 MB during
+the first cache fill and stayed flat for the remaining 21 minutes; the run logged 0 VUIDs,
+0 audio underruns/starvation and no device loss. Exit 124 is the intended timeout.
+
+The remaining manual checks are mouse pitch in both on-foot/vehicle modes, DSound callback
+re-entrancy, fullscreen rollback, full-disk saves, Deck suspend/resume (needs root to set the
+RTC alarm) and a multi-hour soak; see `DECK_TEST.md` and the open-items list in `NOTES.md`.

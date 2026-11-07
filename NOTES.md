@@ -1844,7 +1844,21 @@ data and settled at roughly 2,000 draws and 50 fps with no device loss; the firs
 after the tool/flag change rebuilt the DLL as intended. On the Steam Deck (RADV, 1920x1080,
 4x MSAA + SMAA + bloom + DOF) the game ran scripted gameplay for 60 seconds with 0 VUIDs,
 0 audio underruns, no device loss and ~47 fps; a live 4x-to-8x MSAA change also reported
-0 VUIDs and preserved the HUD. Live gameplay/audio checks remain for the maintainer.
+0 VUIDs and preserved the HUD. Follow-up checks: the shipped Windows zip from a fresh
+extraction reached gameplay at ~60 fps; Alt+F4 with the Graphics menu open wrote the toggled
+Depth of Field value and exited 0; focus loss/regain is logged; direct mouse aim engaged and
+live mouse input moved the camera in gameplay. The final Linux tarball ran on Ubuntu 24.04 under WSLg (llvmpipe) to gameplay with 0 VUIDs and no
+device loss; on the Deck it wrote 701 texture dumps and loaded a replacement pack, and
+Windows wrote 744 dumps with a valid sample. Both CI workflows pass `actionlint`, and the
+clean-checkout configure guard reports the expected
+missing-image message. A forced invalid 1x1 fullscreen mode was refused and logged, confirming
+the apply-failure path is detected. A 30-minute Deck soak ran 107,520 frames (~59.8 fps);
+RSS rose from 163 MB to 183 MB during the first cache fill and stayed flat for the remaining
+21 minutes, with 0 VUIDs, 0 underruns/starvation and no device loss. Exit 124 is the intended
+timeout; a 10-minute partial run is preserved under `out/deck-soak-partial/`.
+Remaining manual checks are mouse pitch in both view modes, DSound callback re-entrancy,
+menu-level display rollback, full-disk saves, Deck suspend/resume (root is needed to set the
+RTC alarm) and a multi-hour soak.
 The SDK patch was regenerated against upstream `f7b13fd`: 65 real file diffs after excluding
 line-ending and permission churn, applies cleanly to a pristine checkout and reproduces
 `sdk/` content exactly.
