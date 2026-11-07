@@ -624,6 +624,7 @@ private:
     bool ReadTarget(Target* t);
     void DumpTexture(const Tex* t);
     bool UploadTarget(Target* t);
+    bool CreateTargetImages(Target& t);
     bool RebuildTargetSingleSample(Target* t);
     bool CreateTargetImage(Target* t);
     void DestroyTargets();
@@ -2845,6 +2846,72 @@ Target* VulkanBackend::TargetAt(uint32_t data, bool depth, bool newest) {
     return best;
 }
 
+bool VulkanBackend::CreateTargetImages(Target& t) {
+    auto create_image = [&](uint32_t samples, bool resolved, VkImage& image, VkDeviceMemory& memory,
+                            VkImageView& out_view) {
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = t.format;
+        info.extent = {t.w, t.h, 1};
+        info.mipLevels = 1;
+        info.arrayLayers = 1;
+        info.samples = VkSampleCountFlagBits(samples);
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        const VkImageUsageFlags attachment =
+            t.depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        info.usage = resolved ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | attachment)
+                              : attachment;
+        if (vkCreateImage(device_, &info, nullptr, &image) != VK_SUCCESS) return false;
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(device_, image, &req);
+        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        alloc.allocationSize = req.size;
+        bool found = false;
+        for (uint32_t i = 0; i < mem_props_.memoryTypeCount; i++)
+            if ((req.memoryTypeBits & (1u << i)) &&
+                (mem_props_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                alloc.memoryTypeIndex = i;
+                found = true;
+                break;
+            }
+        if (!found || vkAllocateMemory(device_, &alloc, nullptr, &memory) != VK_SUCCESS) return false;
+        vkBindImageMemory(device_, image, memory, 0);
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image = image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = t.format;
+        view.subresourceRange = {t.depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                                         : VK_IMAGE_ASPECT_COLOR_BIT,
+                                 0, 1, 0, 1};
+        return vkCreateImageView(device_, &view, nullptr, &out_view) == VK_SUCCESS;
+    };
+    if (!create_image(t.samples, t.samples == 1, t.image, t.memory, t.view)) {
+        if (t.samples == 1) return false;
+        LOG_FIRST(8, "vulkan: %s target %ux%u %ux allocation failed, using one sample",
+                  t.depth ? "depth" : "color", t.w, t.h, t.samples);
+        t.samples = 1;
+        t.image = VK_NULL_HANDLE;
+        t.memory = VK_NULL_HANDLE;
+        t.view = VK_NULL_HANDLE;
+        if (!create_image(1, true, t.image, t.memory, t.view)) return false;
+    }
+    if (t.samples > 1) {
+        if (!create_image(1, true, t.resolved_image, t.resolved_memory, t.resolved_view)) return false;
+        t.resolved_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    if (t.depth) {
+        // shaders read the depth aspect only; the resolved image's combined view stays for present
+        VkImageViewCreateInfo sample{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        sample.image = t.samples > 1 ? t.resolved_image : t.image;
+        sample.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        sample.format = t.format;
+        sample.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(device_, &sample, nullptr, &t.sample_view) != VK_SUCCESS) return false;
+    }
+    return true;
+}
+
 Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     TextureDesc d;
     if (!DescribeSurface(s, d) || !d.width || !d.height || d.width > 8192 || d.height > 8192) return nullptr;
@@ -2862,6 +2929,28 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     auto it = targets_.find(key);
     if (it != targets_.end()) {
         Target* t = it->second;
+        // A CPU-written movie/front buffer is rebuilt single-sample so the guest bytes can be
+        // uploaded. When it is bound as a render target again, restore the configured sample
+        // count; its old contents are gone anyway and the title draws/clears it next.
+        if (t->samples != msaa_) {
+            EndRecord(true);
+            if (pass_rt_ == t || pass_ds_ == t) FlushPass();
+            RetireTargetResources(t);
+            t->samples = msaa_;
+            t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            t->resolved_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            t->fb_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            t->drawn = false;
+            t->cpu = false;
+            t->upload_pending = false;
+            t->scene_frame = ~0ull;
+            t->epoch = DirtyEpoch(t->data);
+            if (!CreateTargetImages(*t)) {
+                targets_.erase(it);
+                delete t;
+                return nullptr;
+            }
+        }
         t->header = s.header;
         t->size = s.size;
         t->last_use = frames_ + 1;
@@ -2894,76 +2983,9 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     t->format = depth ? depth_format_ : VK_FORMAT_B8G8R8A8_UNORM;
 
     t->samples = msaa_;
-    auto create_image = [&](uint32_t samples, bool resolved, VkImage& image, VkDeviceMemory& memory,
-                            VkImageView& out_view) {
-        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        info.imageType = VK_IMAGE_TYPE_2D;
-        info.format = t->format;
-        info.extent = {t->w, t->h, 1};
-        info.mipLevels = 1;
-        info.arrayLayers = 1;
-        info.samples = VkSampleCountFlagBits(samples);
-        info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        const VkImageUsageFlags attachment =
-            depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        info.usage = resolved ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | attachment)
-                              : attachment;
-        if (vkCreateImage(device_, &info, nullptr, &image) != VK_SUCCESS) return false;
-        VkMemoryRequirements req{};
-        vkGetImageMemoryRequirements(device_, image, &req);
-        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        alloc.allocationSize = req.size;
-        bool found = false;
-        for (uint32_t i = 0; i < mem_props_.memoryTypeCount; i++)
-            if ((req.memoryTypeBits & (1u << i)) &&
-                (mem_props_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                alloc.memoryTypeIndex = i;
-                found = true;
-                break;
-            }
-        if (!found || vkAllocateMemory(device_, &alloc, nullptr, &memory) != VK_SUCCESS) return false;
-        vkBindImageMemory(device_, image, memory, 0);
-        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        view.image = image;
-        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view.format = t->format;
-        view.subresourceRange = {depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
-                                       : VK_IMAGE_ASPECT_COLOR_BIT,
-                                 0, 1, 0, 1};
-        return vkCreateImageView(device_, &view, nullptr, &out_view) == VK_SUCCESS;
-    };
-    if (!create_image(t->samples, t->samples == 1, t->image, t->memory, t->view)) {
-        if (t->samples == 1) {
-            delete t;
-            return nullptr;
-        }
-        LOG_FIRST(8, "vulkan: %s target %ux%u %ux allocation failed, using one sample",
-                  depth ? "depth" : "color", t->w, t->h, t->samples);
-        t->samples = 1;
-        t->image = VK_NULL_HANDLE;
-        t->memory = VK_NULL_HANDLE;
-        t->view = VK_NULL_HANDLE;
-        if (!create_image(1, true, t->image, t->memory, t->view)) {
-            delete t;
-            return nullptr;
-        }
-    }
-    if (t->samples > 1) {
-        if (!create_image(1, true, t->resolved_image, t->resolved_memory, t->resolved_view)) {
-            delete t;
-            return nullptr;
-        }
-        t->resolved_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    }
-    if (depth) {
-        // shaders read the depth aspect only; the resolved image's combined view stays for present
-        VkImageViewCreateInfo sample{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        sample.image = t->samples > 1 ? t->resolved_image : t->image;
-        sample.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        sample.format = t->format;
-        sample.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-        if (vkCreateImageView(device_, &sample, nullptr, &t->sample_view) != VK_SUCCESS) return nullptr;
+    if (!CreateTargetImages(*t)) {
+        delete t;
+        return nullptr;
     }
     targets_[key] = t;
     // a reused address can collect a few shapes; drop the ones idle for a long time

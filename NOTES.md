@@ -1767,6 +1767,12 @@ The full code review found and the current tree fixes these correctness issues:
   association across a full-frame scene-to-front copy, matching D3D12. Without it the
   present pass could not find the multisampled scene depth and DOF stayed off in free
   roam. Bloom was unaffected (it does not read scene depth).
+- The front buffers are rebuilt single-sample when a movie or CPU frame is uploaded, so
+  the guest bytes can be stored. `EnsureTarget` now restores the configured MSAA count
+  when such a buffer is bound as a render target again, recreating the MSAA, resolved
+  and depth views. This also restores main-scene MSAA, not just the offscreen effects.
+  Verified in free roam at 4x: `vulkan: distance blur on`. D3D12 already had the
+  equivalent `want_samples` rebuild.
 - The compile-time default is now Off (`app.h`), and README.md says so. The F10 Graphics
   menu row was exercised on the Deck: toggling it wrote and saved `building_seam_fix` true,
   and toggling back wrote false. The live hook reads the same setting under the settings
