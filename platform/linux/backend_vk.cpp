@@ -4417,12 +4417,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     c.tscale[2] = UiSqueeze(s, a, info, tex, rt);
 
     if (rt && !a.pretransformed) rt->scene_frame = frames_ + 1;
+    Target* dof_ds = ds ? ds : pass_ds_;
     // Distance blur only uses the main target's full-size, multisampled scene depth (as d3d12.cpp).
-    if (scene_dof_ && ds && ds->samples > 1 && rt && !a.pretransformed &&
+    if (scene_dof_ && dof_ds && dof_ds->samples > 1 && rt && !a.pretransformed &&
         s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable) && rt->gw == width_ && rt->gh == height_ &&
-        ds->w == rt->w && ds->h == rt->h && s.viewport.w == width_ && s.viewport.h == height_) {
+        dof_ds->w == rt->w && dof_ds->h == rt->h && s.viewport.w == width_ && s.viewport.h == height_) {
         const WRange r = DrawWRange(s, prog);
-        if (r.near_w > 0 && r.far_w > r.near_w) scene_depth_[rt] = {ds, r.near_w, r.far_w};
+        if (r.near_w > 0 && r.far_w > r.near_w) scene_depth_[rt] = {dof_ds, r.near_w, r.far_w};
     }
     c.tscale[3] = 1.0f;
     for (int i = 0; i < 4; i++)
