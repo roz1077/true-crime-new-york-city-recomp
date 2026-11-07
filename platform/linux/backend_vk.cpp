@@ -2938,6 +2938,8 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
             delete t;
             return nullptr;
         }
+        LOG_FIRST(8, "vulkan: %s target %ux%u %ux allocation failed, using one sample",
+                  depth ? "depth" : "color", t->w, t->h, t->samples);
         t->samples = 1;
         t->image = VK_NULL_HANDLE;
         t->memory = VK_NULL_HANDLE;
@@ -4581,10 +4583,37 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
         return DescribeSurface(surface, d) ? d.data : surface.data;
     };
     const uint32_t src_data = virtual_data(src), dst_data = virtual_data(dst);
-    for (Target* t : {TargetAt(src_data, false, true), TargetAt(dst_data, false, true)})
+    Target* src_t = TargetAt(src_data, false, true);
+    Target* dst_t = TargetAt(dst_data, false, true);
+    for (Target* t : {src_t, dst_t})
         if (t && DirtyEpoch(t->data) == t->epoch) ReadTarget(t);
     if (!gpu::CopySurfaceMemory(src, dst, count, rects, points))
         reference::Copy(src, dst, count, rects, points);
+    // Carry the 3D scene's depth association across a full-frame scene->front copy, as the D3D12
+    // backend does. Without this the present pass cannot find the scene depth and DOF stays off.
+    if (dst_t) scene_depth_.erase(dst_t);
+    if (src_t && dst_t && src_t != dst_t) {
+        bool full = !count || !rects;
+        if (count == 1 && rects) {
+            const int32_t left = int32_t(kernel::R32(rects));
+            const int32_t top = int32_t(kernel::R32(rects + 4));
+            const int32_t right = int32_t(kernel::R32(rects + 8));
+            const int32_t bottom = int32_t(kernel::R32(rects + 12));
+            int32_t dx = left, dy = top;
+            if (points) {
+                dx = int32_t(kernel::R32(points));
+                dy = int32_t(kernel::R32(points + 4));
+            }
+            full = left == 0 && top == 0 && dx == 0 && dy == 0 && right == int32_t(src_t->gw) &&
+                   bottom == int32_t(src_t->gh);
+        }
+        if (full && src_t->gw == dst_t->gw && src_t->gh == dst_t->gh) {
+            dst_t->scene_frame = src_t->scene_frame;
+            dst_t->cpu = src_t->cpu;
+            if (auto depth = scene_depth_.find(src_t); depth != scene_depth_.end())
+                scene_depth_.insert_or_assign(dst_t, depth->second);
+        }
+    }
     for (auto& [key, t] : targets_)
         if (!t->depth && t->data == dst_data) t->upload_pending = true;
 }
