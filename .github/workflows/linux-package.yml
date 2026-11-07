@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Game assets and generated code are never committed. Keep the hosted CI
       # honest: without assets/default.xbe the configure step must fail with the
@@ -128,7 +128,7 @@ jobs:
 
       - name: Upload package
         if: steps.assets.outputs.available == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TrueCrimeNYC-linux-x86_64
           path: |
