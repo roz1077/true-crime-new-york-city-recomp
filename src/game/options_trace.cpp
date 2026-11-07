@@ -1,6 +1,5 @@
-// Read-only tracing of the native Options tab renderer, for the research in
-// GRAPHICS_NOTES.md. Off unless XBE_TRACE_OPTIONS_PAGE is set; the hook calls
-// the original unchanged.
+// Read-only tracing of the native Options tab renderer. Off unless
+// XBE_TRACE_OPTIONS_PAGE is set; the hook calls the original unchanged.
 
 #include <cstdint>
 #include <cstdlib>

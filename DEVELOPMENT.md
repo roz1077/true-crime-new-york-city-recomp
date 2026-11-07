@@ -19,7 +19,7 @@ The title-specific C++ code is kept small:
 - `launcher/launcher.cpp`: the ISO picker `TrueCrimeNYC.exe` shows before the game starts.
 - `sdk/`: the XboxXBERecomp SDK with this port's runtime changes, tracked in this repository.
 
-`NOTES.md` contains the investigation history; `GRAPHICS_NOTES.md` the graphics options research. Its newer entries supersede earlier hypotheses. Captures,
+Captures,
 crash dumps, replay recordings and one-off analysis scripts under `.local/`, `out/` and `logs/` are local
 evidence, not source files to distribute. Generated game code and assets should remain unmodified.
 

@@ -11,7 +11,7 @@
 // and 0xA7553; menus, loading screens and previews pass constants or use other
 // renderer objects and keep their framing. fov_percent scales tan(fov / 2),
 // that is divides k, at those two sites only, so aiming still zooms relative
-// to it. XBE_TRACE_CAMERA=1 logs each change. See GRAPHICS_NOTES.md.
+// to it. XBE_TRACE_CAMERA=1 logs each change.
 
 #include <algorithm>
 #include <cmath>

@@ -18,7 +18,7 @@ If an ISO or extracted game files are already in `assets`, click **Launch** with
 ## Linux / SteamOS (native)
 
 A native SDL3 + Vulkan build lives in `platform/linux`; see `README-LINUX.md` for
-install/Steam steps and `LINUX_PORT_PLAN.md` for the build and run steps. It takes
+install/Steam and build/run steps. It takes
 `--assets <folder>`, `--iso <image>` or a positional path, and otherwise uses `assets/`
 beside the executable. Settings are stored under `$XDG_CONFIG_HOME/TrueCrimeNYC`, shader
 caches under `$XDG_CACHE_HOME/TrueCrimeNYC`, and logs in `logs/` beside the executable.
@@ -96,7 +96,7 @@ Install Visual Studio 2022 with **Desktop development with C++**, **C++ Clang to
 Run `build.bat`. The first build recompiles the game and takes a while. The exe is written to `out\build\release`.
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the source layout, regression checks, diagnostics and host-only
-relink workflow. [OPTIMISATIONS.md](OPTIMISATIONS.md) lists performance candidates and how to validate them.
+relink workflow.
 
 ## Credits
 

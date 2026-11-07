@@ -11,7 +11,7 @@
 // rows that scrolls with the cursor. The game's row field (+0x34) keeps the
 // slot, 0 to 4, which its highlight frame follows; the logical row is
 // g_first + slot.
-// The rules are in display_rows.h; GRAPHICS_NOTES.md has the research.
+// The rules are in display_rows.h.
 
 #include <atomic>
 #include <chrono>
