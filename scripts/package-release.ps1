@@ -67,6 +67,17 @@ if (!(Test-Path -LiteralPath $sdkLicence -PathType Leaf)) {
     throw "SDK licence not found: $sdkLicence"
 }
 
+# Compute provenance before the temporary archive exists in the repository, so
+# packaging itself cannot make the tree look dirty.
+$version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion
+if (!$version) { $version = 'unknown' }
+try { $git = (git -C $root rev-parse --short HEAD 2>$null) } catch { $git = $null }
+if (!$git) { $git = 'unknown' }
+else {
+    $dirty = git -C $root status --porcelain 2>$null
+    if ($dirty) { $git = "$git-dirty" }
+}
+
 try {
     $zip = [IO.Compression.ZipFile]::Open($temp, 'Create')
     try {
@@ -100,14 +111,6 @@ try {
             Add-ReleaseFile $runtime "compiler/$name"
         }
 
-        $version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion
-        if (!$version) { $version = 'unknown' }
-        try { $git = (git -C $root rev-parse --short HEAD 2>$null) } catch { $git = $null }
-        if (!$git) { $git = 'unknown' }
-        else {
-            $dirty = git -C $root status --porcelain 2>$null
-            if ($dirty) { $git = "$git-dirty" }
-        }
         $buildText = "True Crime: New York City - Windows build`nVersion: $version`nGit: $git`nBuilt: $($entryTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))`n"
         $buildEntry = $zip.CreateEntry('BUILD.txt')
         $buildEntry.LastWriteTime = $entryTime
