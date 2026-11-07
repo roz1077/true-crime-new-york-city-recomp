@@ -345,6 +345,13 @@ void GamepadRemoved(int32_t id) {
 bool Connected(int port) {
     std::lock_guard lock(g_lock);
     UpdatePads();
+#ifndef _WIN32
+    // The title only polls a controller port that it has seen connect, and keyboard
+    // and scripted input are merged into port 0 by Poll. Without a real pad the
+    // port therefore stayed absent and every input path was ignored; report port 0
+    // present so a keyboard-only Linux host (or the Deck's Desktop Mode) works.
+    if (port == 0) return true;
+#endif
     return port >= 0 && port < 4 && g_pads[port];
 }
 

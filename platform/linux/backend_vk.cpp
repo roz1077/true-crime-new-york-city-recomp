@@ -338,6 +338,24 @@ struct TargetKeyHash {
     }
 };
 
+// A borrowed view belongs to one live target. The guest reuses a data address for
+// surfaces of different sizes, so an address+format key aliases a 128x128 reflection
+// target with the 320x240 light buffer that shares its address.
+struct BorrowKey {
+    Target* target = nullptr;
+    uint32_t format = 0;
+    uint8_t depth = 0;
+    bool operator==(const BorrowKey&) const = default;
+};
+struct BorrowKeyHash {
+    size_t operator()(const BorrowKey& k) const {
+        uint64_t h = Hash(&k.target, sizeof(k.target));
+        h = Hash(&k.format, sizeof(k.format), h);
+        h = Hash(&k.depth, sizeof(k.depth), h);
+        return size_t(h);
+    }
+};
+
 // the depth target the main scene was drawn with, for the distance blur at present
 struct SceneDepth {
     Target* depth = nullptr;
@@ -743,7 +761,7 @@ private:
     std::atomic<uint64_t> presents_seen_{0};
     uint64_t submit_serial_ = 0;
     std::unordered_map<TexKey, Tex*, TexKeyHash> textures_;
-    std::unordered_map<uint64_t, Tex*> borrowed_;
+    std::unordered_map<BorrowKey, Tex*, BorrowKeyHash> borrowed_;
     std::unordered_map<uint64_t, Tex*> pack_textures_;  // pack images by key, kept for the run
     std::vector<Tex*> pack_textures_retired_;           // released after the frame's GPU work
     std::unordered_map<SamplerKey, VkSampler, SamplerKeyHash> samplers_;
@@ -3293,7 +3311,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
                 if (is_target) *is_target = true;
                 return FeedbackTexture(s, target, d);
             }
-            const uint64_t bkey = (uint64_t(d.data) << 8) ^ d.format ^ (depth_tex ? 1ull << 63 : 0);
+            const BorrowKey bkey{target, d.format, uint8_t(depth_tex)};
             auto it = borrowed_.find(bkey);
             if (it == borrowed_.end()) {
                 Tex* tx = new Tex();

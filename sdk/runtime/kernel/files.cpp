@@ -603,7 +603,8 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
         case 19:  // allocation: only a size below the end of file cuts it
         case 20:  // end of file
             if (f->fp) {
-                std::lock_guard<std::mutex> lock(f->io);
+                // The function already holds f->io; taking it again here deadlocks
+                // the first time a save truncates a file.
                 std::fflush(f->fp);
                 uint64_t size = fs::file_size(f->host, ec);
                 if (cls == 20 || R64(in) < size) fs::resize_file(f->host, R64(in), ec);

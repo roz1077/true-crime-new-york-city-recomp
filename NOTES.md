@@ -1687,3 +1687,34 @@ The full code review found and the current tree fixes these correctness issues:
   With the KHRONOS validation layer loaded, the 100% 4x MSAA + SMAA + bloom + DOF run
   reports 0 VUIDs. The Deck package is `dist/TrueCrimeNYC-linux-x86_64.tar.gz`, 11,121,095
   bytes, SHA-256 `216001c00e9cac31f8f08bc0c41a45014279919a9b8e2c2e5561dcb81a02e15b`.
+
+## 2026-11-07 - Linux garage puddles, title input and save-load deadlock
+
+- **Linux input at the title:** XInput reported no controller port unless a physical pad
+  was present, so the title never polled the port that `input::Poll` fills from the
+  keyboard or `XBE_PAD_SCRIPT`. Port 0 now reports connected on Linux when no pad exists;
+  the Windows path is unchanged. Escape (Start), Enter (A), Backspace (B) and the arrow
+  keys now reach the title and menus. The deck's scripted pad path also works again.
+- **Save-load deadlock:** `NtSetInformationFile` took `f->io` at entry and then took the
+  same non-recursive mutex again in the file-allocation/end-of-file case. Pressing Start
+  made the title truncate the save metadata, so the guest stopped on the second lock.
+  Removing the inner lock fixes the freeze. This is a shared runtime fix; the Windows
+  executable was not rebuilt.
+- **Garage puddles:** the guest reuses one data address for a 128x128 reflection target
+  and a 320x240 light/bloom target. The Vulkan backend's borrowed-target-view cache was
+  keyed by the guest address and format only, so whichever shape sampled first created
+  the cached view (host 960x540 for 320x240) and the other shape reused it. The 15-tap
+  reflection blur therefore sampled the bright light buffer instead of its own 128x128
+  downsample; the `DESTALPHA, ONE` composite then added those highlights to the floor
+  and saturated the puddles. Dropping the composite only hid the symptom, and scaling
+  its gain only masked it.
+- **Fix:** key `borrowed_` by the selected `Target*` plus the guest format and depth
+  flag, so every live target keeps its own view. No blend factor, render state, shader
+  output or Windows path is scaled. The earlier 0.5 `outscale`/`reflect_gain_`
+  diagnostic was removed and is not part of this change.
+- Corrected guest frame against the Windows capture: mean 31.17 vs 31.23, p99 131 vs
+  140, p99.9 191 vs 197, and no clipped puddle pixels (the old frame had 1.48% at 255).
+  The optional present post chain (bloom/SMAA/DOF/PC contrast) still runs on the window;
+  this comparison is the guest frame, the same image the Windows capture stores.
+- All temporary reflection dump/log hooks used during the investigation were removed
+  before the final build; only the functional fix remains.
