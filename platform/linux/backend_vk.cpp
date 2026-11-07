@@ -2495,6 +2495,14 @@ VkShaderModule VulkanBackend::VertexShaderFor(const State& s, const Assembled& a
         const size_t at = src.find(kTc3);
         if (at != std::string::npos) src.replace(at, sizeof(kTc3) - 1, "    o.tc3 = oPts;\n");
     }
+    // The restricted distant-city pass is pushed behind the detailed geometry by camera.cpp's
+    // building_seam_fix. Windows scales host Z in its reversed-depth shader; Vulkan keeps the
+    // guest's 0..1 depth, so scale the guest clip z by the same factor. Every other draw has 1.
+    constexpr char kDepthScale[] = "    o.pos.z *= zparams.w;\n";
+    for (const char* tail : {"    o.pos = q;\n", "    o.pos = cp;\n"}) {
+        const size_t at = src.find(tail);
+        if (at != std::string::npos) src.insert(at + std::strlen(tail), kDepthScale);
+    }
     VkShaderModule module = CompileShader(src, shaderc_vertex_shader, "main");
     if (module) {
         vs_cache_[key] = module;
@@ -4033,6 +4041,11 @@ void VulkanBackend::FillConstants(const State& s, const PixelKey& pk, const std:
     c.zclips[0] = s.zclip[0];
     c.zclips[1] = s.zclip[1];
     c.zclips[2] = s.zclip_on && prog ? 1.0f : 0.0f;
+    // building_seam_fix: the same host-Z scale the Windows shader applies, but in Vulkan's
+    // non-reversed 0..1 depth convention. Only the restricted distant-city z-buffer pass uses it.
+    c.zparams[0] = c.zparams[1] = c.zparams[2] = 0.0f;
+    c.zparams[3] = prog && s.rs[kRsZEnable] != kZUseW ? s.program_depth_scale : 1.0f;
+    if (c.zparams[3] != 1.0f) LOG_FIRST(4, "vulkan: depth scale %.3f for the distant city pass", c.zparams[3]);
     for (int i = 0; i < 4; i++) {
         c.tscale[i] = 1.0f;
         if (info[size_t(i)].flags & kTexTarget)

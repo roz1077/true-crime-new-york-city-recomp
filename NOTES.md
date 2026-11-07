@@ -1751,3 +1751,19 @@ The full code review found and the current tree fixes these correctness issues:
   device loss. The same scene previously hung within 15-90 s. The installed copy was
   rebuilt and repackaged from this source.
 
+## Fixed: building seam fix on the Linux Vulkan backend (2026-11-07)
+
+- The shared camera hook (`src/game/camera.cpp`) sets `State::program_depth_scale` to
+  1/32 for the restricted distant-city pass when Building seam fix is enabled. Only the
+  Windows D3D12 backend consumed it (`DrawConstants::zparams.w`); the Vulkan backend left
+  `zparams` unset, so the toggle had no effect on Linux.
+- The Vulkan backend now uploads the same scale and its vertex shaders apply it to the
+  guest clip z (`o.pos.z *= zparams.w`). Vulkan keeps the guest 0..1 depth convention, so
+  the same factor preserves the Windows depth ordering without the reversed-depth
+  transform. A one-time `vulkan: depth scale` log marks the affected pass.
+- The compile-time default is now Off (`app.h`), and README.md says so. The F10 Graphics
+  menu row was exercised on the Deck: toggling it wrote and saved `building_seam_fix` true,
+  and toggling back wrote false. The live hook reads the same setting under the settings
+  lock on each distant-city pass, so the change applies without a restart.
+
+

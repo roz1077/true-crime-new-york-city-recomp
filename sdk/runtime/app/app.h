@@ -28,7 +28,7 @@ struct Settings {
     bool smaa = false;               // SMAA 1x on the finished frame
     bool bloom = false;               // bright-pass bloom on the finished frame
     bool dof = false;                 // distance blur on the finished frame
-    bool building_seam_fix = true;   // experimental priority for detailed city geometry
+    bool building_seam_fix = false;  // experimental priority for detailed city geometry
     bool pc_contrast = true;         // PC contrast curve on the finished frame
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
