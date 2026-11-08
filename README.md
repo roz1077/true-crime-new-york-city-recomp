@@ -41,7 +41,6 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 - **Windows launcher:** you can select your `.iso` instead of extracting it. The launcher copies the ISO into `assets/`, so allow space for one copy. If the files are already in `assets/`, click **Launch** without browsing.
 - **Linux:** `--assets <folder>` and `--iso <image>` also work. See the [Linux / SteamOS guide](README-LINUX.md) for SteamOS handheld steps and paths.
 - **First launch compiles the game code** and can take a while. Later launches reuse the cache.
-- Handheld validation was performed on an Xbox Ally X running SteamOS.
 
 ## Highlights
 

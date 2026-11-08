@@ -42,7 +42,7 @@ The package also contains:
 
 ## Steam and SteamOS handhelds
 
-Validation was performed on an Xbox Ally X running SteamOS; the same steps apply to Steam Deck and other SteamOS handhelds.
+The same steps apply to Steam Deck and other SteamOS handhelds.
 
 1. Steam -> Games -> **Add a Non-Steam Game** -> **Browse** -> select `TrueCrimeNYC`.
 2. Properties -> Compatibility: leave Proton **off**. This is a native build.
@@ -107,31 +107,6 @@ cache is safe and only costs one slower start.
   run a mismatched release.
 - On a system without a Vulkan driver, install the distribution's Mesa Vulkan
   package (`mesa-vulkan-drivers`, `vulkan-radeon`, `vulkan-intel`, ...).
-
-## Known limits in this build
-
-- Render scale and render stretch are applied by the Vulkan backend, so the
-  Graphics menu's percentage and aspect change the rendered resolution.
-- MSAA (2x/4x/8x, clamped to what the GPU and formats support), SMAA 1x, bloom
-  and depth of field are applied on the finished frame. As on Windows, depth of
-  field needs MSAA, because it reads the multisampled scene depth.
-- Widescreen UI squeeze is applied: HUD, text and menus are laid out at 16:9 in
-  the middle of a wider frame. Full-width pictures stay 16:9; fades and
-  letterbox passes still cover the frame.
-- Texture replacement and dumping work: the same key/name scheme and folders as
-  Windows, PNG or DDS output, PNG/DDS input at any resolution, loaded off the
-  render thread. A single-level uncompressed replacement gets a generated mip
-  chain; BC replacements keep the levels in the file (add mips when packing).
-- Points, lines and point sprites are expanded to the console's pixel-sized quads
-  with a geometry shader, so they keep their console coverage at any render
-  scale. A device without geometry shaders falls back to native points/lines.
-- A hard-edged bright road band still appears in some daytime shots. It comes
-  from the light/reflection chain, not the road texture, and is being narrowed
-  down with F3 target captures. Send `trace_<frame>.tga`,
-  `trace_<frame>_present.tga`, `trace_<frame>.txt` and the
-  `target_<frame>_*.tga` files from a failing frame when reporting it.
-- The software reference renderer is a bring-up/debug path: it is very slow, has no
-  Graphics overlay and may fail where the Vulkan path succeeds. Use Vulkan for play.
 
 ## Licenses
 

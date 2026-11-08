@@ -41,11 +41,3 @@
   notices, build metadata and deterministic archives.
 - Original application icon and Windows version metadata.
 - CI workflows for Windows checks and Linux packaging; SDK fallback pinned.
-
-### Validation
-- 18 regression checks (APC context, file references/save flush, converted strips,
-  display rows, XISO extraction, graphics choices, grid patch, guest frames/watch,
-  image parsing, immediate attributes, mouse aim, performance gating, PulseEvent,
-  resize recovery, shader cache, viewport/scissor).
-- Windows boot smoke at 8x MSAA: ~1,800 draws/frame, ~48 fps, no device loss.
-- Linux clean Release build and loader smoke test.
