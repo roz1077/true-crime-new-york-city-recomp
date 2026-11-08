@@ -34,6 +34,7 @@
 #include <backends/imgui_impl_win32.h>
 
 #include "app/app.h"
+#include "common/graphics_menu.h"
 // SMAA 1x: the reference shader and its lookup textures (third_party/smaa, MIT)
 #include "../../third_party/smaa/AreaTex.h"
 #include "../../third_party/smaa/SMAAShader.h"
@@ -65,7 +66,12 @@ constexpr uint32_t kSamplerCount = 2048;
 constexpr uint32_t kRtvCount = 1024;
 constexpr uint32_t kDsvCount = 256;
 constexpr uint32_t kSmaaRtvs = 3;  // after the back buffers' views: SMAA edges, weights, output
+constexpr uint32_t kAoRtvs = 1;    // after the SMAA targets: the half-resolution AO target
+constexpr uint32_t kAoRtv = kRtvCount + kFrames + kSmaaRtvs;
 constexpr DXGI_FORMAT kBgra = DXGI_FORMAT_B8G8R8A8_UNORM;
+constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R8_UNORM;  // half-resolution AO target
+constexpr float kAoStrength = 0.6f;
+constexpr float kAoRadius = 1.5f;
 constexpr uint32_t kQueries = 8192;  // occlusion queries in flight, several frames of counted draws
 constexpr uint32_t kNoQuery = ~0u;
 
@@ -126,13 +132,31 @@ bool CaptureOn() {
 }
 
 const char* kBlitHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; };
+cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; float4 ao; float4 ao2; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
+Texture2D aoTex : register(t4);
+#if DEPTH_MS
 Texture2DMS<float> depthTex : register(t3);
+#else
+Texture2D<float> depthTex : register(t3);
+#endif
 SamplerState ls : register(s0);
 SamplerState ps : register(s1);
 struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+
+#if DEPTH_MS
+float RawDepth(float2 uv) {
+    uint w, h, samples;
+    depthTex.GetDimensions(w, h, samples);
+    uint2 p = uint2(saturate(uv) * float2(max(w, 1) - 1, max(h, 1) - 1));
+    return depthTex.Load(p, 0);
+}
+#else
+float RawDepth(float2 uv) {
+    return depthTex.SampleLevel(ps, saturate(uv), 0);
+}
+#endif
 
 float3 ToGamma(float3 c) {
     if (opts.x <= 0) return c;
@@ -176,12 +200,8 @@ float3 DistanceBlur(float2 uv, float3 color) {
         float2(1, 1.7320), float2(-1, 1.7320), float2(-2, 0),
         float2(-1, -1.7320), float2(1, -1.7320), float2(2, 0)
     };
-    uint w, h, samples;
-    depthTex.GetDimensions(w, h, samples);
-    uint2 p = uint2(saturate(uv) * float2(max(w, 1) - 1, max(h, 1) - 1));
-    float raw = 1.0 - depthTex.Load(p, 0);
-    float world = src.z * src.w / max(src.w - raw * (src.w - src.z), 1e-4);
-    float coef = saturate((world - 40.0) / (65.0 - 40.0));
+    float raw = RawDepth(uv);
+    float world = src.z * src.w / max(src.w - raw * (src.w - src.z), 1e-4);    float coef = saturate((world - 40.0) / (65.0 - 40.0));
     if (coef <= 0.0) return color;
     float3 sum = 0;
     float count = 0;
@@ -214,6 +234,53 @@ float3 PcContrast(float3 c) {
     return saturate(c);
 }
 
+// Depth-only ambient occlusion. RawDepth is defined above for both multisampled and
+// single-sample depth; it returns the near-zero convention used by LinearDepth.
+float LinearDepth(float raw) {
+    return src.z * src.w / max(src.w - raw * (src.w - src.z), 1e-4);
+}
+float3 ViewAt(float2 uv, float z) {
+    float2 n = uv * 2.0 - 1.0;
+    return float3(n.x * ao.w * ao.z, -n.y * ao.z, z);
+}
+float SafeDepth(float2 uv, float z) {
+    const float d = LinearDepth(RawDepth(uv));
+    return abs(d - z) < 3.0 ? d : z;
+}
+float AoFactor(float2 uv) {
+    float z = LinearDepth(RawDepth(uv));
+    if (z >= src.w * 0.999) return 1.0;  // sky/far plane
+    float3 p = ViewAt(uv, z);
+    float zr = SafeDepth(uv + float2(src.x, 0), z), zl = SafeDepth(uv - float2(src.x, 0), z);
+    float zd = SafeDepth(uv + float2(0, src.y), z), zu = SafeDepth(uv - float2(0, src.y), z);
+    float3 n = normalize(cross(ViewAt(uv + float2(src.x, 0), zr) - ViewAt(uv - float2(src.x, 0), zl),
+                               ViewAt(uv + float2(0, src.y), zd) - ViewAt(uv - float2(0, src.y), zu)));
+    if (dot(n, p) > 0.0) n = -n;  // face the camera
+    float3 t = normalize(cross(abs(n.z) < 0.99 ? float3(0, 0, 1) : float3(1, 0, 0), n));
+    float3 b = cross(n, t);
+    float2 px = uv / max(src.xy, 1e-5);
+    float ang = frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715)))) * 6.2831853;
+    float cs = cos(ang), sn = sin(ang);
+    static const float3 kernel[8] = {
+        float3(0.5, 0.0, 0.5), float3(-0.5, 0.0, 0.5), float3(0.0, 0.5, 0.5), float3(0.0, -0.5, 0.5),
+        float3(0.35, 0.35, 0.7), float3(-0.35, 0.35, 0.7), float3(-0.35, -0.35, 0.7), float3(0.35, -0.35, 0.7)
+    };
+    float occlusion = 0.0;
+    float count = 0.0;
+    [unroll] for (int i = 0; i < 8; i++) {
+        float3 d = kernel[i];
+        d.xy = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+        float3 sp = p + (t * d.x + b * d.y + n * d.z) * ao.y;
+        if (sp.z <= 0.001) continue;
+        float2 suv = float2(sp.x / (sp.z * ao.w * ao.z), -sp.y / (sp.z * ao.z)) * 0.5 + 0.5;
+        if (suv.x < 0 || suv.x > 1 || suv.y < 0 || suv.y > 1) continue;
+        float diff = sp.z - LinearDepth(RawDepth(suv));
+        count += 1.0;
+        if (diff > 0.02 && diff < ao.y) occlusion += 1.0 - diff / ao.y;
+    }
+    return saturate(1.0 - (occlusion / max(count, 1.0)) * ao.x);
+}
+
 O vs(uint id : SV_VertexID) {
     O o;
     float2 t = float2((id << 1) & 2, id & 2);
@@ -230,6 +297,8 @@ float4 psmain(O i) : SV_Target {
     c /= n * n;
     c.rgb *= opts.w;
     if (post.z > 0) c.rgb = DistanceBlur(i.uv, c.rgb);
+    if (ao.x > 0) c.rgb *= AoFactor(i.uv);
+    else if (ao2.x > 0) c.rgb *= saturate(aoTex.Sample(ls, i.uv).r);
     c.rgb = ToGamma(c.rgb);
     if (post.y > 0) c.rgb += Bloom(i.uv) * 1.2;
     if (post.x > 0) {
@@ -242,6 +311,91 @@ float4 psmain(O i) : SV_Target {
         c.rgb = saturate(c.rgb + d / 255.0);
     }
     return float4(c.rgb, opts.y > 0 ? c.a : 1);
+}
+)";
+
+// Half-resolution ambient occlusion: the same depth kernel as the presentation shader's inline
+// pass, rendered once into an R8 target that the presentation shader then upsamples with the
+// linear sampler. src is (1 / depth width, 1 / depth height, near, far) and ao is
+// (strength, radius, tanHalfFov, aspect).
+const char* kAoHlsl = R"(
+cbuffer B : register(b1) { float4 src; float4 ao; };
+#if DEPTH_MS
+Texture2DMS<float> depthTex : register(t0);
+#else
+Texture2D<float> depthTex : register(t0);
+#endif
+SamplerState ps : register(s1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+
+#if DEPTH_MS
+float RawDepth(float2 uv) {
+    uint w, h, samples;
+    depthTex.GetDimensions(w, h, samples);
+    uint2 p = uint2(saturate(uv) * float2(max(w, 1) - 1, max(h, 1) - 1));
+    return depthTex.Load(p, 0);
+}
+#else
+float RawDepth(float2 uv) {
+    return depthTex.SampleLevel(ps, saturate(uv), 0);
+}
+#endif
+
+float LinearDepth(float raw) {
+    return src.z * src.w / max(src.w - raw * (src.w - src.z), 1e-4);
+}
+float3 ViewAt(float2 uv, float z) {
+    float2 n = uv * 2.0 - 1.0;
+    return float3(n.x * ao.w * ao.z, -n.y * ao.z, z);
+}
+float SafeDepth(float2 uv, float z) {
+    const float d = LinearDepth(RawDepth(uv));
+    return abs(d - z) < 3.0 ? d : z;
+}
+float AoFactor(float2 uv) {
+    float z = LinearDepth(RawDepth(uv));
+    if (z >= src.w * 0.999) return 1.0;  // sky/far plane
+    float3 p = ViewAt(uv, z);
+    float zr = SafeDepth(uv + float2(src.x, 0), z), zl = SafeDepth(uv - float2(src.x, 0), z);
+    float zd = SafeDepth(uv + float2(0, src.y), z), zu = SafeDepth(uv - float2(0, src.y), z);
+    float3 n = normalize(cross(ViewAt(uv + float2(src.x, 0), zr) - ViewAt(uv - float2(src.x, 0), zl),
+                               ViewAt(uv + float2(0, src.y), zd) - ViewAt(uv - float2(0, src.y), zu)));
+    if (dot(n, p) > 0.0) n = -n;  // face the camera
+    float3 t = normalize(cross(abs(n.z) < 0.99 ? float3(0, 0, 1) : float3(1, 0, 0), n));
+    float3 b = cross(n, t);
+    float2 px = uv / max(src.xy, 1e-5);
+    float ang = frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715)))) * 6.2831853;
+    float cs = cos(ang), sn = sin(ang);
+    static const float3 kernel[8] = {
+        float3(0.5, 0.0, 0.5), float3(-0.5, 0.0, 0.5), float3(0.0, 0.5, 0.5), float3(0.0, -0.5, 0.5),
+        float3(0.35, 0.35, 0.7), float3(-0.35, 0.35, 0.7), float3(-0.35, -0.35, 0.7), float3(0.35, -0.35, 0.7)
+    };
+    float occlusion = 0.0;
+    float count = 0.0;
+    [unroll] for (int i = 0; i < 8; i++) {
+        float3 d = kernel[i];
+        d.xy = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+        float3 sp = p + (t * d.x + b * d.y + n * d.z) * ao.y;
+        if (sp.z <= 0.001) continue;
+        float2 suv = float2(sp.x / (sp.z * ao.w * ao.z), -sp.y / (sp.z * ao.z)) * 0.5 + 0.5;
+        if (suv.x < 0 || suv.x > 1 || suv.y < 0 || suv.y > 1) continue;
+        float diff = sp.z - LinearDepth(RawDepth(suv));
+        count += 1.0;
+        if (diff > 0.02 && diff < ao.y) occlusion += 1.0 - diff / ao.y;
+    }
+    return saturate(1.0 - (occlusion / max(count, 1.0)) * ao.x);
+}
+
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float4 psmain(O i) : SV_Target {
+    float f = AoFactor(i.uv);
+    return float4(f, f, f, 1.0);
 }
 )";
 
@@ -498,8 +652,14 @@ struct BlitOptions {
     float post = 0;           // PC contrast strength, 0 off
     float bloom = 0;          // bright-pass bloom strength, 0 off
     float src_w = 0, src_h = 0;  // source size in texels, for the bloom radius
-    ID3D12Resource* depth = nullptr;  // scene depth for the distance blur
+    ID3D12Resource* depth = nullptr;  // scene depth for the distance blur and ambient occlusion
     float dof = 0;            // distance blur strength, 0 off
+    float ao = 0;             // full-resolution ambient occlusion strength, 0 off
+    ID3D12Resource* ao_tex = nullptr;  // half-resolution AO target, sampled when ao_half > 0
+    float ao_half = 0;        // half-resolution ambient occlusion mode, 0 off
+    float ao_radius = 1.5f;   // world-space sampling radius
+    float tan_half_fov = 0.577f;  // tan of half the vertical field of view
+    float aspect = 1.0f;
     float near_z = 0, far_z = 0;  // camera planes for the depth linearisation
 };
 
@@ -741,7 +901,7 @@ private:
     // shaders by source hash: Compile returns the bytecode and sets hash
     ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
     // Blit's pipeline
-    ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples);
+    ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples, bool depth_ms);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv) const;
     // Init, in order, each callee right after its caller
     bool CreateDevice();
@@ -764,6 +924,9 @@ private:
     // SMAA 1x on the finished frame (app::Settings::smaa): the anti-aliased copy of t, null when off or failed
     ID3D12Resource* ApplySmaa(Target& t);
     bool EnsureSmaa(const Target& t);
+    // half-resolution AO (app::Settings::ao == 1): the R8 target and the pass that fills it
+    bool EnsureAoHalf(uint32_t w, uint32_t h);
+    void RenderHalfAo(Target& t);
     void RenderUi();
     void ReleaseOldTextures();
     void ResetFrame();
@@ -931,6 +1094,10 @@ private:
     std::unordered_map<Target*, SceneDepth> scene_depth_;  // per colour target, cleared at present
     ID3D12Resource* dof_depth_ = nullptr;  // this frame's readable depth, set at present
     float dof_near_ = 0.1f, dof_far_ = 1000.0f;
+    ComPtr<ID3D12Resource> ao_half_;  // this frame's half-resolution AO, filled at present
+    D3D12_RESOURCE_STATES ao_half_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    uint32_t ao_half_w_ = 0, ao_half_h_ = 0;
+    bool ao_half_ready_ = false;
     uint32_t guest_w_ = 640;
     uint32_t guest_h_ = 480;
     uint32_t bb_w_ = 0;
@@ -1082,7 +1249,8 @@ bool D3D12Backend::CreateBackBufferViews() {
 bool D3D12Backend::CreateHeaps() {
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
-    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kSmaaRtvs, false, rtv_heap_);
+    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kSmaaRtvs + kAoRtvs, false,
+                          rtv_heap_);
     dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
     CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
     if (!srv_heap_ || !smp_heap_ || !rtv_heap_ || !dsv_heap_ || !ui_heap_) {
@@ -1104,7 +1272,7 @@ bool D3D12Backend::CreateHeaps() {
 bool D3D12Backend::CreateRootSignature() {
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 4;
+    ranges[0].NumDescriptors = 5;  // img, lut, null, depth, half-resolution AO
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
     ranges[1].NumDescriptors = 4;
     D3D12_ROOT_PARAMETER params[4] = {};
@@ -1750,9 +1918,9 @@ void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_AD
 }
 
 void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o) {
-    // a single sampled resource cannot back a Texture2DMS view
-    ID3D12Resource* depth = o.depth && o.depth->GetDesc().SampleDesc.Count > 1 ? o.depth : nullptr;
-    uint32_t slot = AllocSrvSlots(4);
+    ID3D12Resource* depth = o.depth;
+    const bool depth_ms = depth && depth->GetDesc().SampleDesc.Count > 1;
+    uint32_t slot = AllocSrvSlots(5);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -1764,18 +1932,31 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot + 2, srv_inc_));
     sv = {};
     sv.Format = kDepthRead;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (depth_ms) {
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    } else {
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+    }
     dev_->CreateShaderResourceView(depth, &sv, Cpu(srv_heap_.Get(), slot + 3, srv_inc_));
+    sv = {};
+    sv.Format = kAoFormat;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    dev_->CreateShaderResourceView(o.ao_tex, &sv, Cpu(srv_heap_.Get(), slot + 4, srv_inc_));
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
     if (!cb.res) return;
-    float c[16] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
+    float c[24] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                    o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
                    o.post, o.bloom, depth ? o.dof : 0.0f, 0.0f,
-                   o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z};
+                   o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z,
+                   o.ao, o.ao_radius, o.tan_half_fov, o.aspect,
+                   o.ao_half, 0.0f, 0.0f, 0.0f};
     std::memcpy(cb.cpu, c, sizeof(c));
-    DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples), cb.gpu, slot, si);
+    DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples, depth_ms), cb.gpu, slot, si);
 }
 
 // Portable DXBC only: pipeline caches would additionally need adapter/driver keys.
@@ -1933,12 +2114,13 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC D3D12Backend::FullScreenPipelineDesc(ID3DBlob
     return d;
 }
 
-ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples) {
-    auto& pso = blit_psos_[uint64_t(rtv) | uint64_t(over) << 32 | uint64_t(samples) << 33];
+ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples, bool depth_ms) {
+    auto& pso = blit_psos_[uint64_t(rtv) | uint64_t(over) << 32 | uint64_t(samples) << 33 | uint64_t(depth_ms) << 35];
     if (pso) return pso.Get();
     uint64_t h;
-    ID3DBlob* vs = Compile(kBlitHlsl, "vs", "vs_5_0", h);
-    ID3DBlob* ps = Compile(kBlitHlsl, "psmain", "ps_5_0", h);
+    const std::string src = std::string("#define DEPTH_MS ") + (depth_ms ? "1\n" : "0\n") + kBlitHlsl;
+    ID3DBlob* vs = Compile(src, "vs", "vs_5_0", h);
+    ID3DBlob* ps = Compile(src, "psmain", "ps_5_0", h);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
     d.SampleDesc.Count = samples;
     if (over) {
@@ -1983,8 +2165,8 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
                         const float p[8], float blend) {
     ID3D12PipelineState* pso = EnsurePassPipeline(hlsl, entry, rtv, blend);
     if (!pso) return;
-    uint32_t slot = AllocSrvSlots(4);
-    for (int i = 0; i < 4; i++) {
+    uint32_t slot = AllocSrvSlots(5);
+    for (int i = 0; i < 5; i++) {
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
         sv.Format = i < 3 && src[i] ? fmt[i] : kBgra;
         sv.ViewDimension = i < 3 && src[i] && src[i]->GetDesc().SampleDesc.Count > 1
@@ -3675,17 +3857,23 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     c.tscale[1] = TargetScaleY();
     c.tscale[2] = UiSqueeze(s, a, stages);
     if (bound_rt_ && !a.pretransformed) bound_rt_->scene_frame = frame_;
-    // Distance blur only uses this frame's full-size, multisampled scene depth. The allocation can
-    // fall back to one sample, so check the resource, not the configured mode.
-    const bool depth_msaa = bound_ds_ && bound_ds_->res &&
-                            bound_ds_->res->GetDesc().SampleDesc.Count > 1;
-    if (render_.dof && depth_msaa && bound_rt_ && !a.pretransformed && k.zwrite &&
+    // Distance blur and ambient occlusion use this frame's full-size scene depth. The
+    // allocation can fall back to one sample, so check the resource, not the configured mode.
+    const bool depth_available = bound_ds_ && bound_ds_->res;
+    if ((render_.dof || render_.ao) && depth_available && bound_rt_ && !a.pretransformed && k.zwrite &&
         bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ &&
         bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h &&
         s.viewport.w == guest_w_ && s.viewport.h == guest_h_) {
-        const WRange r = ProjectionWRange(s.transforms[kTsProjection].data());
+        WRange r = DrawWRange(s, sh.prog);
+        // A program's w buffer is in buffer units up to zscale. Normalise that scale to the
+        // same world-like span the fixed-function projection uses, so the AO radius and DOF
+        // distance thresholds mean the same thing for both kinds of draw.
+        if (r.far_w > 1000.0f) {
+            r.near_w *= 1000.0f / r.far_w;
+            r.far_w = 1000.0f;
+        }
         if (r.near_w > 0 && r.far_w > r.near_w)
-            scene_depth_.insert_or_assign(bound_rt_, SceneDepth{bound_ds_, r.near_w, r.far_w});
+            scene_depth_.try_emplace(bound_rt_, SceneDepth{bound_ds_, r.near_w, r.far_w});
     }
     if (!UploadConstants(s, sh, k, stages, size, c)) return;
     if (ext_) binds_ = {};
@@ -4109,6 +4297,10 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     // CPU wrote (movies, legal screens) was made for 16:9 and is shown that way in the middle of a wider frame.
     float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
     const bool scene = t.scene_frame == frame_;
+    float tan_half_fov = 0.577f;
+    const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
+    if (fov > 1.0f && fov < 179.0f && aspect > 0.1f)
+        tan_half_fov = std::tan(fov * 3.14159265f / 360.0f) / aspect;
     if (t.cpu || scene) t.picture = t.cpu && !scene;
     t.cpu = false;
     t.scene_frame = ~0ull;
@@ -4126,9 +4318,14 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     const float post = !t.picture && render_.pc_contrast ? 1.0f : 0.0f;
     const float bloom = scene && render_.bloom ? 1.0f : 0.0f;
     const float dof = scene && render_.dof && dof_depth_ ? 1.0f : 0.0f;
+    const float ao = scene && render_.ao == 2 && dof_depth_ ? kAoStrength : 0.0f;
+    const bool ao_half = scene && render_.ao == 1 && ao_half_ready_;
     if (aa) {  // ApplySmaa left it readable
         Blit(aa, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h),
-                             .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_});
+                             .depth = dof_depth_, .dof = dof, .ao = ao,
+                             .ao_tex = ao_half ? ao_half_.Get() : nullptr, .ao_half = ao_half ? 1.0f : 0.0f,
+                             .tan_half_fov = tan_half_fov, .aspect = aspect, .near_z = dof_near_,
+                             .far_z = dof_far_});
         return;
     }
     ID3D12Resource* color = ResolveColor(t);
@@ -4136,7 +4333,10 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     auto& state = color == t.res.Get() ? t.state : t.resolved_state;
     Transition(color, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Blit(color, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h),
-                            .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_});
+                            .depth = dof_depth_, .dof = dof, .ao = ao,
+                            .ao_tex = ao_half ? ao_half_.Get() : nullptr, .ao_half = ao_half ? 1.0f : 0.0f,
+                            .tan_half_fov = tan_half_fov, .aspect = aspect, .near_z = dof_near_,
+                            .far_z = dof_far_});
 }
 
 void D3D12Backend::RenderUi() {
@@ -4345,6 +4545,62 @@ ID3D12Resource* D3D12Backend::ApplySmaa(Target& t) {
     return smaa_.output.res.Get();
 }
 
+// The half-resolution AO target is shared by every frame, so it is only recreated when the render
+// size changes; that is rare, and repointing its fixed RTV slot waits for in-flight lists like SMAA.
+bool D3D12Backend::EnsureAoHalf(uint32_t w, uint32_t h) {
+    const uint32_t aw = std::max(1u, w / 2);
+    const uint32_t ah = std::max(1u, h / 2);
+    if (ao_half_ && ao_half_w_ == aw && ao_half_h_ == ah) return true;
+    if (ao_half_) {
+        Flush();
+        for (auto& f : frames_)
+            if (f.fence && !WaitFence(f.fence)) return false;
+        ao_half_.Reset();
+        ao_half_w_ = ao_half_h_ = 0;
+    }
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = Texture2DDesc(kAoFormat, aw, ah);
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ao_half_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, ao_half_state_, nullptr,
+                                             IID_PPV_ARGS(&ao_half_)))) {
+        LOGE("d3d12: half-resolution AO target could not be created");
+        return false;
+    }
+    dev_->CreateRenderTargetView(ao_half_.Get(), nullptr, Cpu(rtv_heap_.Get(), kAoRtv, rtv_inc_));
+    ao_half_w_ = aw;
+    ao_half_h_ = ah;
+    LOGI("d3d12: half-resolution AO target %ux%u", aw, ah);
+    return true;
+}
+
+// Fill the half-resolution AO target from this frame's scene depth. Runs after Present has made
+// dof_depth_ readable and before SMAA and BlitFrame; the presentation shader upsamples the result.
+void D3D12Backend::RenderHalfAo(Target& t) {
+    ao_half_ready_ = false;
+    if (render_.ao != 1 || !dof_depth_ || t.scene_frame != frame_) return;
+    if (!EnsureAoHalf(t.w, t.h)) return;
+    Transition(ao_half_.Get(), ao_half_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const auto depth_desc = dof_depth_->GetDesc();
+    const float src[4] = {1.0f / float(std::max<uint64_t>(depth_desc.Width, 1)),
+                          1.0f / float(std::max<uint32_t>(depth_desc.Height, 1)), dof_near_, dof_far_};
+    float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
+    float tan_half_fov = 0.577f;
+    const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
+    if (fov > 1.0f && fov < 179.0f && aspect > 0.1f)
+        tan_half_fov = std::tan(fov * 3.14159265f / 360.0f) / aspect;
+    const std::string shader = std::string("#define DEPTH_MS ") +
+                               (depth_desc.SampleDesc.Count > 1 ? "1\n" : "0\n") + kAoHlsl;
+    if (!EnsurePassPipeline(shader.c_str(), "psmain", kAoFormat, -1)) return;
+    ID3D12Resource* depth_src[3] = {dof_depth_, nullptr, nullptr};
+    DXGI_FORMAT depth_fmt[3] = {kDepthRead, kBgra, kBgra};
+    const float p[8] = {src[0], src[1], src[2], src[3], kAoStrength, kAoRadius, tan_half_fov, aspect};
+    Pass(shader.c_str(), "psmain", kAoFormat, Cpu(rtv_heap_.Get(), kAoRtv, rtv_inc_), ao_half_w_, ao_half_h_,
+         depth_src, depth_fmt, p, -1);
+    Transition(ao_half_.Get(), ao_half_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ao_half_ready_ = true;
+}
+
 void D3D12Backend::DrawFrame(Target* t, uint32_t bi, ID3D12Resource* aa) {
     D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -4462,16 +4718,19 @@ void D3D12Backend::Present(const Surface& front) {
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     dof_depth_ = nullptr;
+    ao_half_ready_ = false;
     const auto depth = scene_depth_.find(t);
-    if (t && render_.dof && depth != scene_depth_.end()) {
+    if (t && (render_.dof || render_.ao) && depth != scene_depth_.end()) {
         Target& ds = *depth->second.target;
-        if (ds.res && ds.res->GetDesc().SampleDesc.Count > 1 && ds.w == t->w && ds.h == t->h) {
+        if (ds.res && ds.w == t->w && ds.h == t->h) {
             dof_depth_ = ds.res.Get();
             Transition(dof_depth_, ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             dof_near_ = depth->second.near_z;
             dof_far_ = depth->second.far_z;
         }
     }
+
+    if (t) RenderHalfAo(*t);
 
     ID3D12Resource* aa = t && render_.smaa ? ApplySmaa(*t) : nullptr;
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
