@@ -33,8 +33,8 @@
 - Native Linux target uploads are batched into the current command buffer; staging
   buffers are retired at the frame fence instead of submitting and waiting twice per
   CPU-written surface.
-- Native Linux audio pre-renders through a small jitter buffer; a 60-second Deck run
-  reported zero underruns and zero starvation events.
+- Native Linux audio pre-renders through a small jitter buffer; a 60-second Xbox Ally X
+  (SteamOS) run reported zero underruns and zero starvation events.
 - Native Linux suspend/resume audio pause and device-change handling.
 - Windows exe version 0.9.0.0 and product metadata.
 - Both packages include the SDK licence, project MIT licence, Zydis/SDL/ImGui/toml++/SMAA

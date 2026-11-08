@@ -40,7 +40,9 @@ The package also contains:
   and the shaderc/glslang copyright files when the build host provides them.
 - `assets/PUT-THE-GAME-HERE.txt`; no game files are included.
 
-## Steam and Steam Deck
+## Steam and SteamOS handhelds
+
+Validation was performed on an Xbox Ally X running SteamOS; the same steps apply to Steam Deck and other SteamOS handhelds.
 
 1. Steam -> Games -> **Add a Non-Steam Game** -> **Browse** -> select `TrueCrimeNYC`.
 2. Properties -> Compatibility: leave Proton **off**. This is a native build.
