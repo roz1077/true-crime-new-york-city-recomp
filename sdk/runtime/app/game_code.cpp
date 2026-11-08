@@ -149,7 +149,7 @@ bool Sha1File(const fs::path& path, std::string& out) {
     return true;
 }
 
-// Stamp format shared with the CMake build and relink_game.py: host, XBE, DLL hashes.
+// Stamp format shared with the CMake build: host, XBE, DLL hashes.
 bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& stamp) {
     if (!Sha1File(ExeDir() / (image.exe + L".exe"), stamp)) return false;
     stamp += " " + Sha1(xbe);

@@ -95,9 +95,6 @@ Install Visual Studio 2022 with **Desktop development with C++**, **C++ Clang to
 ### 4. Build the Project
 Run `build.bat`. The first build recompiles the game and takes a while. The exe is written to `out\build\release`.
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for the source layout, regression checks, diagnostics and host-only
-relink workflow.
-
 ## Credits
 
 - [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp), the recompiler and runtime this is built on.
