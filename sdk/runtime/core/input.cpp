@@ -582,11 +582,16 @@ uint16_t HeldOnAnyController() {
     return held;
 }
 
-// the motors run until set again
+// the motors run until set again. A zero duration sends an effect once and never
+// refreshes it, which loses rumble on pads that time an effect out (handheld
+// haptics, DualSense, Switch); the longest SDL duration makes SDL resend the
+// current motors every two seconds until the title sends zero.
+constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+
 void Rumble(int port, uint16_t left, uint16_t right) {
     if (app::kGame.rumble) app::kGame.rumble(port, left, right);
     std::lock_guard lock(g_lock);
-    if (port >= 0 && port < 4 && g_pads[port]) SDL_RumbleGamepad(g_pads[port], left, right, 0);
+    if (port >= 0 && port < 4 && g_pads[port]) SDL_RumbleGamepad(g_pads[port], left, right, kRumbleDurationMs);
 }
 
 }  // namespace input

@@ -5,6 +5,10 @@
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 
+#include <chrono>
+#include <filesystem>
+#include <string>
+
 namespace game {
 uint32_t MainLoopSwapInterval(uint32_t interval);
 }
@@ -20,10 +24,53 @@ bool KeyboardDriving() {
     return kernel::G<uint8_t>(camera + 0x18C) && kernel::G<uint8_t>(camera + 0x19) == 13;
 }
 
+// A missing profile header means a new install/profile. The title starts with
+// vibration on, but if a new profile applies an off default during the first
+// seconds, force it on once before the menu is usable. Existing profiles keep
+// the player's choice.
+bool ProfileHeaderExists() {
+    std::error_code error;
+    const std::filesystem::path udata =
+        std::filesystem::path(app::ExeDir()) / "hdd" / "E" / "UDATA" / "41560045";
+    for (const auto& entry : std::filesystem::directory_iterator(udata, error)) {
+        if (!entry.is_directory(error)) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".bak") == 0) continue;
+        if (std::filesystem::exists(entry.path() / "TCNYC", error)) return true;
+    }
+    return false;
+}
+
+uint64_t NowMs() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+}
+
+bool g_new_profile = false;
+bool g_vibration_defaulted = false;
+uint64_t g_vibration_deadline = 0;
+
+void InitVibrationProfile() {
+    g_new_profile = !ProfileHeaderExists();
+    g_vibration_deadline = NowMs() + 30000;
+}
+
 // scripted or replayed input first, so the Graphics menu sees what the game would
 void FilterPad(int port, input::Pad &pad) {
     game::ApplyPadTools(port, pad);
     game::FilterMenuPad(port, pad);
+    // A new profile can apply an off default after the game object exists;
+    // force it on once, inside the short window before the menu is usable.
+    if (port == 0 && g_new_profile && !g_vibration_defaulted && NowMs() <= g_vibration_deadline &&
+        mem::Base() && mem::IsCommitted(0x360E00) && mem::IsCommitted(0x2ECDB0)) {
+        const uint32_t game = kernel::R32(0x360E00);
+        if (game && mem::IsCommitted(game + 0xFED) && kernel::G<uint8_t>(game + 0xFED) == 0) {
+            kernel::G<uint8_t>(game + 0xFED) = 1;
+            kernel::G<uint8_t>(0x2ECDB0) = 1;
+            g_vibration_defaulted = true;
+        }
+    }
 }
 
 } // namespace
@@ -47,7 +94,7 @@ const app::GameInfo app::kGame = {
                 {"use_key", nullptr, &input::g_use_key}, {"climb_key", nullptr, &input::g_climb_key}},
     .load = nullptr,                      // reads more from the settings file's toml::table
     .save = nullptr,                      // writes more into it
-    .init = nullptr,                      // after the settings load, before the window and boot
+    .init = InitVibrationProfile,         // after the settings load, before the window and boot
     .loaded = nullptr,                    // image in memory, before its entry point runs
     .window = nullptr,                    // the game window is up
     .message = game::GraphicsMenuMessage, // window messages first; true takes one
