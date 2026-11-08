@@ -14,8 +14,6 @@
 - CDROM0 is read-only even when the game runs from extracted assets.
 
 ### Correctness / gameplay
-- Ambient occlusion is available as an optional depth-based screen-space effect on both
-  renderers, off by default.
 - `PulseEvent` releases waiters correctly.
 - Thread/stack creation failures propagate; memory commits report failure; timer
   reinitialisation cancels the old timer.

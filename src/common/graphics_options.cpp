@@ -92,7 +92,6 @@ enum class Row {
     Smaa,
     Bloom,
     DepthOfField,
-    AmbientOcclusion,
     BuildingSeamFix,
     PcContrast,
     VSync,
@@ -115,7 +114,6 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::Smaa,
                          Row::Bloom,
                          Row::DepthOfField,
-                         Row::AmbientOcclusion,
                          Row::BuildingSeamFix,
                          Row::PcContrast,
                          Row::VSync,
@@ -319,7 +317,6 @@ void RestoreDefaults() {
     s.smaa = d.smaa;
     s.bloom = d.bloom;
     s.dof = d.dof;
-    s.ao = d.ao;
     s.building_seam_fix = d.building_seam_fix;
     s.pc_contrast = d.pc_contrast;
     s.custom_textures = d.custom_textures;
@@ -343,7 +340,6 @@ Kind KindOf(Row row) {
     case Row::FrameCap:
     case Row::DumpFormat:
     case Row::Msaa:
-    case Row::AmbientOcclusion:
         return Kind::Choice;
     case Row::Smaa:
     case Row::Bloom:
@@ -390,8 +386,6 @@ const char *Label(Row row) {
         return "Bloom";
     case Row::DepthOfField:
         return "Depth of field";
-    case Row::AmbientOcclusion:
-        return "Ambient occlusion";
     case Row::BuildingSeamFix:
         return "Building seam fix (Experimental)";
     case Row::PcContrast:
@@ -462,8 +456,6 @@ const char *Help(Row row) {
         return "Adds extra bright-pass bloom over the game's own lighting.";
     case Row::DepthOfField:
         return "Adds distance blur to the finished 3D frame when MSAA is enabled.";
-    case Row::AmbientOcclusion:
-        return "Off, half or full resolution depth-based ambient occlusion. Half is cheaper and softer.";
     case Row::BuildingSeamFix:
         return "Experimental: keeps detailed buildings visible where simplified city meshes overlap. Takes effect immediately.";
     case Row::PcContrast:
@@ -548,8 +540,6 @@ std::string Value(Row row) {
         return s.bloom ? "On" : "Off";
     case Row::DepthOfField:
         return s.dof ? "On" : "Off";
-    case Row::AmbientOcclusion:
-        return s.ao == 1 ? "Half" : s.ao == 2 ? "Full" : "Off";
     case Row::BuildingSeamFix:
         return s.building_seam_fix ? "On" : "Off";
     case Row::PcContrast:
@@ -609,9 +599,6 @@ bool Change(Row row, int direction) {
         break;
     case Row::Anisotropic:
         changed = set(s.aniso, choices::Step(choices::kAnisoLevels, s.aniso, direction));
-        break;
-    case Row::AmbientOcclusion:
-        changed = set(s.ao, choices::Step(choices::kAoModes, s.ao, direction));
         break;
     case Row::Msaa: {
         const auto current = app::MsaaSamples();

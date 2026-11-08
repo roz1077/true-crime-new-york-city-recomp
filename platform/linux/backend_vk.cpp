@@ -38,7 +38,6 @@
 #include <vulkan/vulkan.h>
 
 #include "app/app.h"
-#include "common/graphics_menu.h"
 #include "core/log.h"
 #include "gpu/backend.h"
 #include "gpu/shaders.h"
@@ -618,12 +617,6 @@ private:
     bool CreateSmaaImage(SmaaImage& image, uint32_t w, uint32_t h, VkFormat format, bool framebuffer);
     void DrawSmaaPass(uint32_t pass, VkDescriptorSet set, SmaaImage& dst, uint32_t w, uint32_t h);
 
-    // half-resolution ambient occlusion on the scene depth, upsampled at present
-    bool EnsureAoHalf(uint32_t w, uint32_t h);
-    void DrawAoHalf(VkImageView depth_view, const SceneDepth& scene, float tan_half_fov, float aspect,
-                    uint32_t scene_w, uint32_t scene_h);
-    void DestroyAoHalf();
-
     // upload slices: keep the buffer with the offset, because the ring can grow between allocations
     struct UploadAlloc {
         VkBuffer buffer = VK_NULL_HANDLE;
@@ -761,7 +754,6 @@ private:
     std::unordered_map<TargetKey, Target*, TargetKeyHash> targets_;
     std::unordered_map<Target*, SceneDepth> scene_depth_;
     bool scene_dof_ = false;
-    uint32_t scene_ao_ = 0;  // 0 off, 1 half resolution, 2 full resolution
 
     // NOOVERWRITE locks: a small ring of finished copies, delivered without waiting for the GPU
     struct LateSlot {
@@ -818,17 +810,6 @@ private:
     bool smaa_failed_ = false;
     bool dof_active_ = false;
     bool bloom_active_ = false;
-
-    // half-resolution AO: an R8 target sampled back at present with linear filtering
-    SmaaImage ao_half_;
-    uint32_t ao_half_w_ = 0, ao_half_h_ = 0;
-    VkDescriptorSetLayout ao_set_layout_ = VK_NULL_HANDLE;
-    VkDescriptorPool ao_pool_ = VK_NULL_HANDLE;
-    VkDescriptorSet ao_set_ = VK_NULL_HANDLE;
-    VkPipelineLayout ao_pipeline_layout_ = VK_NULL_HANDLE;
-    VkPipeline ao_pipeline_ = VK_NULL_HANDLE;
-    VkShaderModule ao_vs_ = VK_NULL_HANDLE, ao_ps_ = VK_NULL_HANDLE;
-    bool ao_failed_ = false;
 
     // the open pass
     Target* pass_rt_ = nullptr;
@@ -1650,28 +1631,26 @@ bool VulkanBackend::CreatePresent() {
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
     if (vkCreateSampler(device_, &si, nullptr, &present_point_sampler_) != VK_SUCCESS) return false;
 
-    VkDescriptorSetLayoutBinding bind[7]{};
-    const uint32_t image_bindings[4] = {0, 1, 2, 5};  // frame, gamma, depth, half-res AO
-    for (int i = 0; i < 4; i++) {
-        bind[i].binding = image_bindings[i];
+    VkDescriptorSetLayoutBinding bind[5]{};
+    for (int i = 0; i < 3; i++) {
+        bind[i].binding = uint32_t(i);
         bind[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         bind[i].descriptorCount = 1;
         bind[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
-    const uint32_t sampler_bindings[3] = {3, 4, 6};  // frame (linear), depth (point), AO (linear)
-    for (int i = 0; i < 3; i++) {
-        bind[4 + i].binding = sampler_bindings[i];
-        bind[4 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-        bind[4 + i].descriptorCount = 1;
-        bind[4 + i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    for (int i = 0; i < 2; i++) {
+        bind[3 + i].binding = uint32_t(3 + i);
+        bind[3 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        bind[3 + i].descriptorCount = 1;
+        bind[3 + i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 7;
+    li.bindingCount = 5;
     li.pBindings = bind;
     if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &present_set_layout_) != VK_SUCCESS) return false;
 
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4},
-                                     {VK_DESCRIPTOR_TYPE_SAMPLER, 3}};
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3},
+                                     {VK_DESCRIPTOR_TYPE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 1;
     pi.poolSizeCount = 2;
@@ -1686,7 +1665,7 @@ bool VulkanBackend::CreatePresent() {
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &present_set_layout_;
-    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 12};  // contrast, bloom, dof, ao mode, source size, near/far, ao
+    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 8};  // contrast, bloom, dof, source size, near/far
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &push;
     if (vkCreatePipelineLayout(device_, &pl, nullptr, &present_pipeline_layout_) != VK_SUCCESS) return false;
@@ -1695,11 +1674,9 @@ bool VulkanBackend::CreatePresent() {
 [[vk::binding(0, 0)]] Texture2D<float4> frameTex;
 [[vk::binding(1, 0)]] Texture2D<float4> gammaTex;
 [[vk::binding(2, 0)]] Texture2D<float4> depthTex;
-[[vk::binding(5, 0)]] Texture2D<float4> aoTex;
 [[vk::binding(3, 0)]] SamplerState frameSampler;
 [[vk::binding(4, 0)]] SamplerState depthSampler;
-[[vk::binding(6, 0)]] SamplerState aoSampler;
-struct PC { float pc; float bloom; float dof; float aoMode; float2 src; float2 zrange; float4 ao; };
+struct PC { float pc; float bloom; float dof; float pad; float2 src; float2 zrange; };
 [[vk::push_constant]] ConstantBuffer<PC> pc;
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
@@ -1782,62 +1759,9 @@ float3 PcContrast(float3 c) {
     c *= l2 / max(l, 1e-4);
     return saturate(c);
 }
-
-// Depth-only ambient occlusion. The Vulkan depth buffer is resolved to a readable
-// texture and keeps the guest's 0..1 convention (near 0).
-float RawDepth(float2 uv) {
-    return saturate(depthTex.SampleLevel(depthSampler, saturate(uv), 0).r);
-}
-float LinearDepth(float raw) {
-    return pc.zrange.x * pc.zrange.y / max(pc.zrange.y - raw * (pc.zrange.y - pc.zrange.x), 1e-4);
-}
-float3 ViewAt(float2 uv, float z) {
-    float2 n = uv * 2.0 - 1.0;
-    return float3(n.x * pc.ao.w * pc.ao.z, -n.y * pc.ao.z, z);
-}
-float SafeDepth(float2 uv, float z) {
-    const float d = LinearDepth(RawDepth(uv));
-    return abs(d - z) < 3.0 ? d : z;
-}
-float AoFactor(float2 uv) {
-    float z = LinearDepth(RawDepth(uv));
-    if (z >= pc.zrange.y * 0.999) return 1.0;  // sky/far plane
-    float3 p = ViewAt(uv, z);
-    float zr = SafeDepth(uv + float2(pc.src.x, 0), z), zl = SafeDepth(uv - float2(pc.src.x, 0), z);
-    float zd = SafeDepth(uv + float2(0, pc.src.y), z), zu = SafeDepth(uv - float2(0, pc.src.y), z);
-    float3 n = normalize(cross(ViewAt(uv + float2(pc.src.x, 0), zr) - ViewAt(uv - float2(pc.src.x, 0), zl),
-                               ViewAt(uv + float2(0, pc.src.y), zd) - ViewAt(uv - float2(0, pc.src.y), zu)));
-    if (dot(n, p) > 0.0) n = -n;  // face the camera
-    float3 t = normalize(cross(abs(n.z) < 0.99 ? float3(0, 0, 1) : float3(1, 0, 0), n));
-    float3 b = cross(n, t);
-    float2 px = uv / max(pc.src, 1e-5);
-    float ang = frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715)))) * 6.2831853;
-    float cs = cos(ang), sn = sin(ang);
-    static const float3 kernel[8] = {
-        float3(0.5, 0.0, 0.5), float3(-0.5, 0.0, 0.5), float3(0.0, 0.5, 0.5), float3(0.0, -0.5, 0.5),
-        float3(0.35, 0.35, 0.7), float3(-0.35, 0.35, 0.7), float3(-0.35, -0.35, 0.7), float3(0.35, -0.35, 0.7)
-    };
-    float occlusion = 0.0;
-    float count = 0.0;
-    [unroll] for (int i = 0; i < 8; i++) {
-        float3 d = kernel[i];
-        d.xy = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
-        float3 sp = p + (t * d.x + b * d.y + n * d.z) * pc.ao.y;
-        if (sp.z <= 0.001) continue;
-        float2 suv = float2(sp.x / (sp.z * pc.ao.w * pc.ao.z), -sp.y / (sp.z * pc.ao.z)) * 0.5 + 0.5;
-        if (suv.x < 0 || suv.x > 1 || suv.y < 0 || suv.y > 1) continue;
-        float diff = sp.z - LinearDepth(RawDepth(suv));
-        count += 1.0;
-        if (diff > 0.02 && diff < pc.ao.y) occlusion += 1.0 - diff / pc.ao.y;
-    }
-    return saturate(1.0 - (occlusion / max(count, 1.0)) * pc.ao.x);
-}
 float4 psmain(O i) : SV_Target {
     float4 c = frameTex.Sample(frameSampler, i.uv);
     if (pc.dof > 0.0) c.rgb = DistanceBlur(i.uv, c.rgb);
-    // Half mode reads the offscreen half-resolution target; full mode keeps the inline AO.
-    if (pc.aoMode > 0.5) c.rgb *= aoTex.Sample(aoSampler, i.uv).r;
-    else if (pc.ao.x > 0.0) c.rgb *= AoFactor(i.uv);
     c.rgb = ToGamma(c.rgb);
     if (pc.bloom > 0.0) c.rgb += BloomAt(i.uv) * 1.2;
     if (pc.pc > 0.0) {
@@ -1948,9 +1872,7 @@ void VulkanBackend::EndRecord(bool wait) {
 void VulkanBackend::ResetFrame() {
     upload_used_ = 0;
     draw_set_next_ = 0;
-    const app::Settings settings = app::Snapshot();
-    scene_dof_ = settings.dof;
-    scene_ao_ = settings.ao;
+    scene_dof_ = app::Snapshot().dof;
     scene_depth_.clear();
     // the last frame's GPU work is done (present waited on the fence): pack images and late-lock
     // buffers released earlier can go now
@@ -3318,8 +3240,6 @@ bool VulkanBackend::UploadTarget(Target* t) {
     staging_pending_.emplace_back(buffer, memory);
     t->epoch = DirtyEpoch(t->data);
     t->cpu = true;
-    t->scene_frame = ~0ull;
-    scene_depth_.erase(t);
     return true;
 }
 
@@ -4315,9 +4235,6 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
     Target* ds = nullptr;
     BindTargets(s, rt, ds);
     if (!pass_) return;
-    if (rt && (flags & kClearTarget)) scene_depth_.erase(rt);
-    if (ds && (flags & kClearZ))
-        std::erase_if(scene_depth_, [&](const auto& entry) { return entry.second.depth == ds; });
     const Target* sized = rt ? rt : ds;
     const uint32_t tw = sized->w;
     const uint32_t th = sized->h;
@@ -4597,18 +4514,12 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
 
     if (rt && !a.pretransformed) rt->scene_frame = frames_ + 1;
     Target* dof_ds = ds ? ds : pass_ds_;
-    // Distance blur and ambient occlusion use the main target's full-size scene depth.
-    if ((scene_dof_ || scene_ao_) && dof_ds && rt && !a.pretransformed &&
+    // Distance blur only uses the main target's full-size, multisampled scene depth (as d3d12.cpp).
+    if (scene_dof_ && dof_ds && dof_ds->samples > 1 && rt && !a.pretransformed &&
         s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable) && rt->gw == width_ && rt->gh == height_ &&
         dof_ds->w == rt->w && dof_ds->h == rt->h && s.viewport.w == width_ && s.viewport.h == height_) {
-        WRange r = DrawWRange(s, prog);
-        // Program w buffers are in buffer units up to zscale; normalise so AO and DOF use
-        // the same world-like span as fixed-function projection draws.
-        if (r.far_w > 1000.0f) {
-            r.near_w *= 1000.0f / r.far_w;
-            r.far_w = 1000.0f;
-        }
-        if (r.near_w > 0 && r.far_w > r.near_w) scene_depth_.try_emplace(rt, SceneDepth{dof_ds, r.near_w, r.far_w});
+        const WRange r = DrawWRange(s, prog);
+        if (r.near_w > 0 && r.far_w > r.near_w) scene_depth_[rt] = {dof_ds, r.near_w, r.far_w};
     }
     c.tscale[3] = 1.0f;
     for (int i = 0; i < 4; i++)
@@ -5242,262 +5153,6 @@ bool VulkanBackend::EnsureSmaa(uint32_t w, uint32_t h, VkFormat format) {
     return true;
 }
 
-namespace {
-// Half-resolution ambient occlusion. Same depth-only estimate as the present shader's inline
-// AoFactor, but rendered into an R8 target that present upsamples with a linear sampler.
-const char* kAoHlsl = R"(
-[[vk::binding(0, 0)]] Texture2D<float4> depthTex;
-[[vk::binding(1, 0)]] SamplerState depthSampler;
-struct PC { float4 camera; float4 ao; };  // near, far, tanHalfFov, aspect / strength, radius, depth texel size
-[[vk::push_constant]] ConstantBuffer<PC> pc;
-struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-O vs(uint id : SV_VertexID) {
-    O o;
-    float2 t = float2((id << 1) & 2, id & 2);
-    o.uv = t;
-    o.pos = float4(t * float2(2, 2) + float2(-1, -1), 0, 1);
-    return o;
-}
-// The Vulkan depth buffer keeps the guest's 0..1 convention (near 0).
-float RawDepth(float2 uv) {
-    return saturate(depthTex.SampleLevel(depthSampler, saturate(uv), 0).r);
-}
-float LinearDepth(float raw) {
-    return pc.camera.x * pc.camera.y / max(pc.camera.y - raw * (pc.camera.y - pc.camera.x), 1e-4);
-}
-float3 ViewAt(float2 uv, float z) {
-    float2 n = uv * 2.0 - 1.0;
-    return float3(n.x * pc.camera.w * pc.camera.z, -n.y * pc.camera.z, z);
-}
-float SafeDepth(float2 uv, float z) {
-    const float d = LinearDepth(RawDepth(uv));
-    return abs(d - z) < 3.0 ? d : z;
-}
-float AoFactor(float2 uv) {
-    float z = LinearDepth(RawDepth(uv));
-    if (z >= pc.camera.y * 0.999) return 1.0;  // sky/far plane
-    float3 p = ViewAt(uv, z);
-    float zr = SafeDepth(uv + float2(pc.ao.z, 0), z), zl = SafeDepth(uv - float2(pc.ao.z, 0), z);
-    float zd = SafeDepth(uv + float2(0, pc.ao.w), z), zu = SafeDepth(uv - float2(0, pc.ao.w), z);
-    float3 n = normalize(cross(ViewAt(uv + float2(pc.ao.z, 0), zr) - ViewAt(uv - float2(pc.ao.z, 0), zl),
-                               ViewAt(uv + float2(0, pc.ao.w), zd) - ViewAt(uv - float2(0, pc.ao.w), zu)));
-    if (dot(n, p) > 0.0) n = -n;  // face the camera
-    float3 t = normalize(cross(abs(n.z) < 0.99 ? float3(0, 0, 1) : float3(1, 0, 0), n));
-    float3 b = cross(n, t);
-    float2 px = uv / max(pc.ao.zw, 1e-5);
-    float ang = frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715)))) * 6.2831853;
-    float cs = cos(ang), sn = sin(ang);
-    static const float3 kernel[8] = {
-        float3(0.5, 0.0, 0.5), float3(-0.5, 0.0, 0.5), float3(0.0, 0.5, 0.5), float3(0.0, -0.5, 0.5),
-        float3(0.35, 0.35, 0.7), float3(-0.35, 0.35, 0.7), float3(-0.35, -0.35, 0.7), float3(0.35, -0.35, 0.7)
-    };
-    float occlusion = 0.0;
-    float count = 0.0;
-    [unroll] for (int i = 0; i < 8; i++) {
-        float3 d = kernel[i];
-        d.xy = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
-        float3 sp = p + (t * d.x + b * d.y + n * d.z) * pc.ao.y;
-        if (sp.z <= 0.001) continue;
-        float2 suv = float2(sp.x / (sp.z * pc.camera.w * pc.camera.z), -sp.y / (sp.z * pc.camera.z)) * 0.5 + 0.5;
-        if (suv.x < 0 || suv.x > 1 || suv.y < 0 || suv.y > 1) continue;
-        float diff = sp.z - LinearDepth(RawDepth(suv));
-        count += 1.0;
-        if (diff > 0.02 && diff < pc.ao.y) occlusion += 1.0 - diff / pc.ao.y;
-    }
-    return saturate(1.0 - (occlusion / max(count, 1.0)) * pc.ao.x);
-}
-float4 psmain(O i) : SV_Target {
-    float ao = AoFactor(i.uv);
-    return float4(ao, ao, ao, 1.0);
-}
-)";
-} // namespace
-
-void VulkanBackend::DestroyAoHalf() {
-    if (ao_half_.framebuffer) vkDestroyFramebuffer(device_, ao_half_.framebuffer, nullptr);
-    if (ao_half_.view) vkDestroyImageView(device_, ao_half_.view, nullptr);
-    if (ao_half_.image) vkDestroyImage(device_, ao_half_.image, nullptr);
-    if (ao_half_.memory) vkFreeMemory(device_, ao_half_.memory, nullptr);
-    ao_half_ = SmaaImage();
-    ao_half_w_ = ao_half_h_ = 0;
-}
-
-bool VulkanBackend::EnsureAoHalf(uint32_t w, uint32_t h) {
-    if (ao_failed_) return false;
-    if (ao_half_.image && ao_half_w_ == w && ao_half_h_ == h && ao_pipeline_) return true;
-    // the previous frame's AO image may still be sampled by the GPU: mirror EnsureSmaa
-    vkDeviceWaitIdle(device_);
-    DestroyAoHalf();
-
-    if (!ao_set_layout_) {
-        VkDescriptorSetLayoutBinding bind[2]{};
-        bind[0].binding = 0;
-        bind[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        bind[0].descriptorCount = 1;
-        bind[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        bind[1].binding = 1;
-        bind[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-        bind[1].descriptorCount = 1;
-        bind[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        li.bindingCount = 2;
-        li.pBindings = bind;
-        if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &ao_set_layout_) != VK_SUCCESS) {
-            ao_failed_ = true;
-            LOGE("vulkan: half-resolution AO descriptor layout could not be created, AO is off");
-            return false;
-        }
-        VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1},
-                                         {VK_DESCRIPTOR_TYPE_SAMPLER, 1}};
-        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pi.maxSets = 1;
-        pi.poolSizeCount = 2;
-        pi.pPoolSizes = sizes;
-        if (vkCreateDescriptorPool(device_, &pi, nullptr, &ao_pool_) != VK_SUCCESS) {
-            ao_failed_ = true;
-            LOGE("vulkan: half-resolution AO descriptor pool could not be created, AO is off");
-            return false;
-        }
-        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool = ao_pool_;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts = &ao_set_layout_;
-        if (vkAllocateDescriptorSets(device_, &ai, &ao_set_) != VK_SUCCESS) {
-            ao_failed_ = true;
-            LOGE("vulkan: half-resolution AO descriptor set could not be allocated, AO is off");
-            return false;
-        }
-        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        pl.setLayoutCount = 1;
-        pl.pSetLayouts = &ao_set_layout_;
-        VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 8};  // camera and ao constants
-        pl.pushConstantRangeCount = 1;
-        pl.pPushConstantRanges = &push;
-        if (vkCreatePipelineLayout(device_, &pl, nullptr, &ao_pipeline_layout_) != VK_SUCCESS) {
-            ao_failed_ = true;
-            LOGE("vulkan: half-resolution AO pipeline layout could not be created, AO is off");
-            return false;
-        }
-    }
-
-    if (!ao_pipeline_) {
-        ao_vs_ = CompileShader(kAoHlsl, shaderc_vertex_shader, "vs");
-        ao_ps_ = CompileShader(kAoHlsl, shaderc_fragment_shader, "psmain");
-        if (!ao_vs_ || !ao_ps_) {
-            ao_failed_ = true;
-            LOGE("vulkan: half-resolution AO shaders failed to compile, AO is off");
-            return false;
-        }
-        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-        vp.viewportCount = 1;
-        vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode = VK_CULL_MODE_NONE;
-        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth = 1.0f;
-        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-        VkPipelineColorBlendAttachmentState cb{};
-        cb.colorWriteMask = 0xF;
-        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-        blend.attachmentCount = 1;
-        blend.pAttachments = &cb;
-        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = 2;
-        dynamic.pDynamicStates = dyn;
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-        stages[0].module = ao_vs_;
-        stages[0].pName = "vs";
-        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = ao_ps_;
-        stages[1].pName = "psmain";
-        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-        info.stageCount = 2;
-        info.pStages = stages;
-        info.pVertexInputState = &vi;
-        info.pInputAssemblyState = &ia;
-        info.pViewportState = &vp;
-        info.pRasterizationState = &rs;
-        info.pMultisampleState = &ms;
-        info.pDepthStencilState = &dss;
-        info.pColorBlendState = &blend;
-        info.pDynamicState = &dynamic;
-        info.layout = ao_pipeline_layout_;
-        info.renderPass = RenderPassFor(VK_FORMAT_R8_UNORM, VK_FORMAT_UNDEFINED);
-        if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &ao_pipeline_) != VK_SUCCESS) {
-            ao_failed_ = true;
-            LOGE("vulkan: half-resolution AO pipeline could not be created, AO is off");
-            return false;
-        }
-    }
-
-    if (!CreateSmaaImage(ao_half_, w, h, VK_FORMAT_R8_UNORM, true)) {
-        DestroyAoHalf();
-        ao_failed_ = true;
-        LOGE("vulkan: half-resolution AO target could not be created, AO is off");
-        return false;
-    }
-    ao_half_w_ = w;
-    ao_half_h_ = h;
-    LOGR("vulkan: half-resolution AO target %ux%u", w, h);
-    return true;
-}
-
-void VulkanBackend::DrawAoHalf(VkImageView depth_view, const SceneDepth& scene, float tan_half_fov, float aspect,
-                               uint32_t scene_w, uint32_t scene_h) {
-    VkDescriptorImageInfo depth{};
-    depth.imageView = depth_view;
-    depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    VkDescriptorImageInfo sampler{};
-    sampler.sampler = present_point_sampler_;
-    VkWriteDescriptorSet writes[2]{};
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = ao_set_;
-    writes[0].dstBinding = 0;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    writes[0].pImageInfo = &depth;
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = ao_set_;
-    writes[1].dstBinding = 1;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    writes[1].pImageInfo = &sampler;
-    vkUpdateDescriptorSets(device_, 2, writes, 0, nullptr);
-
-    Transition(ao_half_.image, ao_half_.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_FORMAT_R8_UNORM);
-    VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rp.renderPass = RenderPassFor(VK_FORMAT_R8_UNORM, VK_FORMAT_UNDEFINED);
-    rp.framebuffer = ao_half_.framebuffer;
-    rp.renderArea = {{0, 0}, {ao_half_.w, ao_half_.h}};
-    vkCmdBeginRenderPass(cmd_, &rp, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_pipeline_);
-    VkViewport viewport{0, 0, float(ao_half_.w), float(ao_half_.h), 0, 1};
-    VkRect2D scissor{{0, 0}, {ao_half_.w, ao_half_.h}};
-    vkCmdSetViewport(cmd_, 0, 1, &viewport);
-    vkCmdSetScissor(cmd_, 0, 1, &scissor);
-    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_pipeline_layout_, 0, 1, &ao_set_, 0, nullptr);
-    const float constants[8] = {scene.near_w, scene.far_w, tan_half_fov, aspect,
-                                0.6f,        1.5f,
-                                scene_w ? 1.0f / float(scene_w) : 0.0f,
-                                scene_h ? 1.0f / float(scene_h) : 0.0f};
-    vkCmdPushConstants(cmd_, ao_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), constants);
-    vkCmdDraw(cmd_, 3, 1, 0, 0);
-    vkCmdEndRenderPass(cmd_);
-    Transition(ao_half_.image, ao_half_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_FORMAT_R8_UNORM);
-    bound_pipe_ = VK_NULL_HANDLE;
-    viewport_valid_ = false;
-}
-
 void VulkanBackend::Present(const Surface& front) {
     LapTimer present_lap(perf_, &perf_present_ms_);
     if (draw_log_) std::fprintf(draw_log_, "FRAME %llu\n", frames_ + 1);
@@ -5800,56 +5455,6 @@ void VulkanBackend::Present(const Surface& front) {
         gamma_dirty_ = false;
     }
 
-    // Distance blur and ambient occlusion use the main target's scene depth.
-    const SceneDepth* scene = nullptr;
-    if ((snapshot.dof || snapshot.ao) && direct && ft) {
-        auto it = scene_depth_.find(ft);
-        if (it != scene_depth_.end() && it->second.depth && it->second.depth->w == ft->w &&
-            it->second.depth->h == ft->h)
-            scene = &it->second;
-    }
-    const SceneDepth* dof = snapshot.dof && scene && scene->depth->samples > 1 && scene->depth->resolved_image
-                                ? scene
-                                : nullptr;
-    VkImageView depth_view = white_view_;
-    bool depth_readable = false;
-    if (scene) {
-        if (scene->depth->samples > 1 && scene->depth->resolved_image) {
-            depth_view = scene->depth->sample_view;
-            Transition(scene->depth->resolved_image, scene->depth->resolved_layout,
-                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, scene->depth->format);
-            depth_readable = true;
-        } else if (scene->depth->samples == 1) {
-            depth_view = scene->depth->sample_view;
-            Transition(scene->depth->image, scene->depth->layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-                       scene->depth->format);
-            depth_readable = true;
-        }
-    }
-    if ((dof != nullptr) != dof_active_) {
-        dof_active_ = dof != nullptr;
-        LOGR("vulkan: distance blur %s", dof_active_ ? "on" : "off");
-    }
-
-    const float aspect = ft && ft->h ? float(ft->w) / float(ft->h) : 1.0f;
-    float tan_half_fov = 0.577f;
-    const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
-    if (fov > 1.0f && fov < 179.0f && aspect > 0.1f)
-        tan_half_fov = std::tan(fov * 3.14159265f / 360.0f) / aspect;
-
-    // Half-resolution AO: render the depth-only estimate into the offscreen R8 target before the
-    // present pass. Full-resolution AO stays inline in the present shader.
-    const bool ao_full = snapshot.ao == 2 && scene != nullptr && depth_readable;
-    bool ao_half_on = false;
-    if (snapshot.ao == 1 && direct && ft && !ft->depth && ft->w && ft->h && scene && depth_readable) {
-        const uint32_t ao_w = std::max(1u, ft->w / 2);
-        const uint32_t ao_h = std::max(1u, ft->h / 2);
-        if (EnsureAoHalf(ao_w, ao_h)) {
-            DrawAoHalf(depth_view, *scene, tan_half_fov, aspect, ft->w, ft->h);
-            ao_half_on = true;
-        }
-    }
-
     // SMAA 1x on the finished scene, before the post chain samples it
     const bool smaa_on = snapshot.smaa && direct && ft && !ft->depth && ft->w && ft->h;
     if (smaa_on && EnsureSmaa(ft->w, ft->h, ft->format)) {
@@ -5910,40 +5515,54 @@ void VulkanBackend::Present(const Surface& front) {
         source_view = smaa_output_.view;
     }
 
-    VkDescriptorImageInfo ii[4]{};
+    // PC distance blur: the main target's resolved depth, only available with MSAA (as d3d12.cpp)
+    const SceneDepth* dof = nullptr;
+    if (snapshot.dof && direct && ft && msaa_ > 1) {
+        auto it = scene_depth_.find(ft);
+        if (it != scene_depth_.end() && it->second.depth && it->second.depth->samples > 1 &&
+            it->second.depth->resolved_image)
+            dof = &it->second;
+    }
+    VkImageView depth_view = white_view_;
+    if (dof) {
+        depth_view = dof->depth->sample_view;
+        Transition(dof->depth->resolved_image, dof->depth->resolved_layout,
+                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, dof->depth->format);
+    }
+    if ((dof != nullptr) != dof_active_) {
+        dof_active_ = dof != nullptr;
+        LOGR("vulkan: distance blur %s", dof_active_ ? "on" : "off");
+    }
+
+    VkDescriptorImageInfo ii[3]{};
     ii[0].imageView = source_view;
     ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     ii[1].imageView = gamma_view_;
     ii[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     ii[2].imageView = depth_view;
-    ii[2].imageLayout = depth_readable ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                       : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    ii[3].imageView = ao_half_on ? ao_half_.view : white_view_;
-    ii[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkDescriptorImageInfo samplers[3]{};
+    ii[2].imageLayout = dof ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo samplers[2]{};
     samplers[0].sampler = present_sampler_;
     samplers[1].sampler = present_point_sampler_;
-    samplers[2].sampler = present_sampler_;  // linear upsampling of the half-resolution AO
-    VkWriteDescriptorSet writes[7]{};
-    const uint32_t image_bindings[4] = {0, 1, 2, 5};
-    for (int i = 0; i < 4; i++) {
+    VkWriteDescriptorSet writes[5]{};
+    for (int i = 0; i < 3; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = present_set_;
-        writes[i].dstBinding = image_bindings[i];
+        writes[i].dstBinding = uint32_t(i);
         writes[i].descriptorCount = 1;
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         writes[i].pImageInfo = &ii[i];
     }
-    const uint32_t sampler_bindings[3] = {3, 4, 6};
-    for (int i = 0; i < 3; i++) {
-        writes[4 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[4 + i].dstSet = present_set_;
-        writes[4 + i].dstBinding = sampler_bindings[i];
-        writes[4 + i].descriptorCount = 1;
-        writes[4 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-        writes[4 + i].pImageInfo = &samplers[i];
+    for (int i = 0; i < 2; i++) {
+        writes[3 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3 + i].dstSet = present_set_;
+        writes[3 + i].dstBinding = uint32_t(3 + i);
+        writes[3 + i].descriptorCount = 1;
+        writes[3 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[3 + i].pImageInfo = &samplers[i];
     }
-    vkUpdateDescriptorSets(device_, 7, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device_, 5, writes, 0, nullptr);
 
     VkClearValue clear{};
     VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -5967,12 +5586,11 @@ void VulkanBackend::Present(const Surface& front) {
     }
     const uint32_t bloom_w = ft ? ft->w : sw, bloom_h = ft ? ft->h : sh;
     const bool dof_on = dof != nullptr;
-    float present_pc[12] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? 1.0f : 0.0f,
-                            dof_on ? 1.0f : 0.0f, ao_half_on ? 1.0f : 0.0f,
-                            bloom_w ? 1.0f / float(bloom_w) : 0.0f,
-                            bloom_h ? 1.0f / float(bloom_h) : 0.0f,
-                            scene ? scene->near_w : 0.1f, scene ? scene->far_w : 1000.0f,
-                            ao_full ? 0.6f : 0.0f, 1.5f, tan_half_fov, aspect};
+    float present_pc[8] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? 1.0f : 0.0f,
+                           dof_on ? 1.0f : 0.0f, 0.0f,
+                           bloom_w ? 1.0f / float(bloom_w) : 0.0f,
+                           bloom_h ? 1.0f / float(bloom_h) : 0.0f,
+                           dof ? dof->near_w : 0.1f, dof ? dof->far_w : 1000.0f};
     vkCmdPushConstants(cmd_, present_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(present_pc),
                        present_pc);
     vkCmdDraw(cmd_, 3, 1, 0, 0);
