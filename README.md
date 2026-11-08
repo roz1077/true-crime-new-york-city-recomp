@@ -48,7 +48,17 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 - **Modern graphics** — render scale, aspect ratio, field of view, MSAA, SMAA, bloom and depth of field.
 - **Controller and mouse** — Xbox, PlayStation and Switch controllers with hot-plug, rumble and adaptive glyphs; raw mouse aim with separate sensitivity.
 - **Texture tools** — dump textures and load PNG/DDS replacement packs shared between Windows and Linux.
+- **Copland traffic fix** — restores normal civilian traffic after scripted and random-crime vehicle passes, without reducing police or wanted-level spawns.
 - **Quality of life** — 30/60 FPS limiter, Unicode and long-path support, durable saves and a keyboard/mouse/controller graphics menu.
+
+<details>
+<summary><strong>Copland traffic fix</strong></summary>
+
+The scripted/random-crime vehicle queue reserves traffic model records at weight 0. That can drop civilian categories from the availability mask and leave only police spawning — the “Copland” glitch. The port repairs the zero weight from the matching traffic reference and clears the idle bit after the queue call, while still allowing the queue’s own vehicle to spawn.
+
+This repair only restores queue-zeroed model weights; police selection and wanted-level response are untouched.
+
+</details>
 
 ## Graphics menu
 
