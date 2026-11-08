@@ -1,8 +1,6 @@
-<p align="center">
-  <img src="docs/banner.png" alt="Rainy New York City skyline at night with blue circuit lines" width="100%">
-</p>
-
-<h1 align="center">True Crime: New York City — Xbox Recomp</h1>
+<h1 align="center">
+  <img src="docs/banner.png" alt="True Crime: New York City — Xbox Recomp" width="100%">
+</h1>
 
 <p align="center">
   <strong>A native Windows and Linux recompilation port of the original Xbox game, with modern graphics and input options.</strong>
