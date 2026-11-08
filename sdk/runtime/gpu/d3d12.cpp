@@ -602,6 +602,24 @@ public:
     uint64_t Presents() const override { return presents_; }
 
 private:
+    // One deferred draw recorded into a bundle. Bundles cannot set render targets, viewports,
+    // scissors or resource barriers, so those are recorded on the direct list and replayed
+    // immediately before the bundle.
+    struct BundleDesc {
+        ComPtr<ID3D12GraphicsCommandList> list;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+        bool has_rt = false;
+        bool has_ds = false;
+        D3D12_VIEWPORT viewport{};
+        D3D12_RECT scissor{};
+        bool has_viewport = false;
+        bool has_scissor = false;
+        std::array<ID3D12Resource*, 4> reads{};
+        ID3D12Resource* write = nullptr;
+        ID3D12Resource* depth_write = nullptr;
+        bool drew = false;
+    };
     struct Frame {
         ComPtr<ID3D12CommandAllocator> alloc;
         ComPtr<ID3D12Resource> upload;
@@ -614,6 +632,12 @@ private:
         uint64_t readback_bytes = 0;
         uint32_t srv = 0;
         uint32_t smp = 0;
+        // deferred scene display list: bundle lists share this frame's bundle allocator and
+        // are only reset after the frame fence has completed
+        ComPtr<ID3D12CommandAllocator> bundle_alloc;
+        std::vector<ComPtr<ID3D12GraphicsCommandList>> bundle_pool;
+        uint32_t bundle_next = 0;
+        std::vector<BundleDesc> bundles;
     };
     // scratch RTVs borrowed by ResolveDepth/Shrink, never shared inside a frame
     static constexpr uint32_t kScratchViews = 8;
@@ -732,6 +756,24 @@ private:
     void SetBlendFactorStencilRef(const State& s);
     void UpdateTargetUsed(uint32_t data);
     void DrawGeometry(const Assembled& a);
+    // deferred scene display list, active only with TCNYC_DEFER_SCENE=1
+    ID3D12GraphicsCommandList* Cmd() const { return bundle_ ? bundle_ : cl_; }
+    bool DeferredPending() { return !CurrentFrame().bundles.empty(); }
+    bool DeferredPendingResource(ID3D12Resource* r) const {
+        return r && (defer_reads_.count(r) || defer_writes_.count(r));
+    }
+    bool BeginDeferredBundle(const DrawTextures& stages);
+    void EndDeferredBundle();
+    void FlushDeferredScene();
+    void DeferredFallback(const char* why);
+    void ReportDeferred();
+    // ends the bundle on every return from Draw once one was started
+    struct DeferredScope {
+        D3D12Backend* backend;
+        ~DeferredScope() {
+            if (backend->bundle_) backend->EndDeferredBundle();
+        }
+    };
     bool UploadVertexBuffers(const Assembled& a);    // visibility tests
     bool EnsureQueries();
     uint32_t BeginCountedDraw(const State& s);
@@ -884,6 +926,19 @@ private:
     std::array<UsedTarget, 4> recent_used_{};
     uint32_t recent_used_next_ = 0;
     DrawBinds binds_;
+    // TCNYC_DEFER_SCENE=1: main-scene draws are recorded into bundles and replayed at present.
+    // Everything stays on the immediate path when the variable is unset.
+    bool defer_scene_ = false;       // opt-in
+    bool defer_frame_active_ = false;  // a main-scene draw was seen this frame
+    bool defer_abandoned_ = false;   // this frame fell back to immediate drawing
+    bool defer_reported_ = false;    // the first deferred frame has been reported
+    const char* defer_reason_ = nullptr;
+    Target* defer_rt_ = nullptr;     // this frame's full-size scene colour target
+    ID3D12GraphicsCommandList* bundle_ = nullptr;  // the bundle being recorded, if any
+    BundleDesc bundle_desc_;         // its direct-list state
+    std::unordered_set<ID3D12Resource*> defer_reads_;   // resources pending bundles read
+    std::unordered_set<ID3D12Resource*> defer_writes_;  // resources pending bundles write
+    uint32_t defer_bundles_this_frame_ = 0;
     std::unordered_map<uint64_t, Tex> textures_;  // by data address, a P8 texture's with its palette's above
     std::unordered_map<uint64_t, Tex> pack_textures_;  // texture pack images by key, kept for the run
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
@@ -985,6 +1040,8 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     g_reversed_depth = true;
     guest_w_ = width;
     guest_h_ = height;
+    if (const char* e = std::getenv("TCNYC_DEFER_SCENE")) defer_scene_ = *e && std::atoi(e) != 0;
+    if (defer_scene_) LOGR("d3d12: deferred scene display list enabled (TCNYC_DEFER_SCENE=1)");
     HWND hwnd = static_cast<HWND>(app::Window());
     if (!CreateDevice()) return false;
     if (!CreateSwapChain(hwnd)) return false;
@@ -1133,6 +1190,11 @@ bool D3D12Backend::CreateRootSignature() {
 bool D3D12Backend::CreateFrames() {
     for (auto& f : frames_) {
         if (FAILED(dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.alloc)))) return false;
+        if (defer_scene_ &&
+            FAILED(dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&f.bundle_alloc)))) {
+            LOGE("d3d12: no bundle command allocator, deferred scene drawing is off");
+            defer_scene_ = false;
+        }
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
         D3D12_RESOURCE_DESC bd = BufferDesc(kUploadSize);
         if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -1222,7 +1284,10 @@ void D3D12Backend::Submit(bool wait) {
     }
 }
 
-void D3D12Backend::Flush() { Submit(true); }
+void D3D12Backend::Flush() {
+    if (defer_scene_) FlushDeferredScene();
+    Submit(true);
+}
 
 // Every wait is bounded and checks for device removal. An INFINITE wait on a
 // fence that will never be signalled turns a driver reset into a frozen game.
@@ -1321,6 +1386,7 @@ uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
     if (f.srv + n > per) {
         // Never borrow another frame's region: those descriptors may still be
         // referenced by an in-flight command list. Start a new recording frame.
+        if (defer_scene_ && !defer_abandoned_ && !bundle_) DeferredFallback("mid-frame descriptor ring flush");
         LOG_FIRST(4, "d3d12: descriptor ring full within a frame, submitting early");
         Submit(true);
         if (f.srv + n > per) {
@@ -1335,6 +1401,19 @@ uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
 
 void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D12_RESOURCE_STATES want) {
     if (cur == want) return;
+    if (defer_scene_ && r && !CurrentFrame().bundles.empty()) {
+        // A pending bundle must see the resource in the state it was recorded against. A
+        // barrier to another state would change what the later bundle executes with.
+        const bool pending_read = defer_reads_.count(r) != 0;
+        const bool pending_write = defer_writes_.count(r) != 0;
+        if (pending_read || pending_write) {
+            if (want != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE || pending_write) {
+                DeferredFallback(want == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                     ? "scene target sampled after a deferred draw"
+                                     : "target written after a deferred draw");
+            }
+        }
+    }
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = r;
@@ -1347,6 +1426,9 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
 
 // a resized target gives back its view and its resources
 void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
+    if (DeferredPendingResource(it->second.res.Get()) ||
+        (it->second.resolved && DeferredPendingResource(it->second.resolved.Get())))
+        DeferredFallback("target released while deferred");
     if (it->second.depth)
         std::erase_if(scene_depth_, [&](const auto& entry) { return entry.second.target == &it->second; });
     else
@@ -1579,6 +1661,7 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline(uint32_t samples) {
 
 // src's depth drawn into dst's depth buffer
 bool D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* pso) {
+    if (DeferredPending()) DeferredFallback("depth copy after a deferred draw");
     if (cap_) fprintf(cap_, "%04u depth copy %08X to %08X\n", cap_i_++, src.data, dst.data);
     const bool multisampled = src.res->GetDesc().SampleDesc.Count > 1;
     ID3D12Resource* depth = multisampled ? ResolveDepth(src) : src.res.Get();
@@ -1667,6 +1750,7 @@ ComPtr<ID3D12Resource> D3D12Backend::CreatePixelTexture(const std::vector<uint8_
 
 // CPU pixels of a color surface into its host target, scaled
 void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
+    if (DeferredPendingResource(t.res.Get())) DeferredFallback("CPU pixels written to a deferred target");
     g_perf.rtups++;
     TextureDesc d;
     if (!Describe(s.header, d) || Format(d.format).depth) return;
@@ -1738,15 +1822,15 @@ uint32_t D3D12Backend::EnsureBlitSamplers() {
 void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_ADDRESS cb, uint32_t srv_slot,
                                   std::optional<uint32_t> sampler_slot) {
     binds_ = {};
-    cl_->SetPipelineState(pso);
-    cl_->SetGraphicsRootConstantBufferView(0, cb);
-    cl_->SetGraphicsRootConstantBufferView(1, cb);
-    cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), srv_slot, srv_inc_));
+    Cmd()->SetPipelineState(pso);
+    Cmd()->SetGraphicsRootConstantBufferView(0, cb);
+    Cmd()->SetGraphicsRootConstantBufferView(1, cb);
+    Cmd()->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), srv_slot, srv_inc_));
     // without a slot the passes take the blit samplers, looked up at this point as they always were
     uint32_t si = sampler_slot ? *sampler_slot : EnsureBlitSamplers();
-    cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), si, smp_inc_));
-    cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    cl_->DrawInstanced(3, 1, 0, 0);
+    Cmd()->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), si, smp_inc_));
+    Cmd()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    Cmd()->DrawInstanced(3, 1, 0, 0);
 }
 
 void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o) {
@@ -2009,6 +2093,7 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
 
 // a copy of the target to read while drawing to it
 ID3D12Resource* D3D12Backend::Feedback(Target& t) {
+    if (DeferredPendingResource(t.res.Get())) DeferredFallback("scene target copied for feedback");
     if (!t.fb) {
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC td = t.res->GetDesc();
@@ -2255,6 +2340,8 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     TexInfo& info = stages.info[stage];
     D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[stage];
     if (&t == draw_ds_) return nullptr;
+    if (defer_writes_.count(t.res.Get())) DeferredFallback("scene target sampled after a deferred draw");
+    if (t.resolved && defer_writes_.count(t.resolved.Get())) DeferredFallback("scene target sampled after a deferred draw");
     bool feedback = &t == draw_rt_;
     stages.rt[stage] = true;
     info.flags |= kTexTarget;
@@ -3214,8 +3301,8 @@ bool D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
         last_dc_ = c;
         last_dc_gpu_ = dc.gpu;
     }
-    if (last_vsc_gpu_ != binds_.vsc) cl_->SetGraphicsRootConstantBufferView(0, last_vsc_gpu_);
-    if (last_dc_gpu_ != binds_.dc) cl_->SetGraphicsRootConstantBufferView(1, last_dc_gpu_);
+    if (last_vsc_gpu_ != binds_.vsc) Cmd()->SetGraphicsRootConstantBufferView(0, last_vsc_gpu_);
+    if (last_dc_gpu_ != binds_.dc) Cmd()->SetGraphicsRootConstantBufferView(1, last_dc_gpu_);
     binds_.vsc = last_vsc_gpu_;
     binds_.dc = last_dc_gpu_;
     return true;
@@ -3407,10 +3494,10 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
         stages.sv[i].Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     }
     uint32_t views = EnsureViewSet(stages);
-    if (views != binds_.views) cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), views, srv_inc_));
+    if (views != binds_.views) Cmd()->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), views, srv_inc_));
     binds_.views = views;
     uint32_t samplers = EnsureStageSamplers(s, stages, AnyStageWraps(s) && UnitTexcoords(a));
-    if (samplers != binds_.samplers) cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), samplers, smp_inc_));
+    if (samplers != binds_.samplers) Cmd()->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), samplers, smp_inc_));
     binds_.samplers = samplers;
 }
 
@@ -3444,8 +3531,16 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw, uint32_t gh, 
     bool same = binds_.rasterizer && !std::memcmp(&vp, &binds_.viewport, sizeof(vp)) &&
                 !std::memcmp(&rect, &binds_.scissor, sizeof(rect));
     if (same) return;
-    cl_->RSSetViewports(1, &vp);
-    cl_->RSSetScissorRects(1, &rect);
+    if (bundle_) {
+        // Bundles cannot set viewports or scissors: keep them for the direct list at replay.
+        bundle_desc_.viewport = vp;
+        bundle_desc_.scissor = rect;
+        bundle_desc_.has_viewport = true;
+        bundle_desc_.has_scissor = true;
+    } else {
+        cl_->RSSetViewports(1, &vp);
+        cl_->RSSetScissorRects(1, &rect);
+    }
     binds_.rasterizer = true;
     binds_.viewport = vp;
     binds_.scissor = rect;
@@ -3465,8 +3560,8 @@ void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
     }
     uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
     if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
-    cl_->OMSetBlendFactor(bf);
-    cl_->OMSetStencilRef(ref);
+    Cmd()->OMSetBlendFactor(bf);
+    Cmd()->OMSetStencilRef(ref);
     binds_.output = true;
     std::memcpy(binds_.blend, bf, sizeof(bf));
     binds_.stencil = ref;
@@ -3489,14 +3584,14 @@ bool D3D12Backend::UploadVertexBuffers(const Assembled& a) {
         std::memcpy(vb.cpu, b.src, b.bytes);
         vbv[i] = {vb.gpu, b.bytes, b.stride};
     }
-    cl_->IASetVertexBuffers(0, a.buffer_count, vbv);
+    Cmd()->IASetVertexBuffers(0, a.buffer_count, vbv);
     return true;
 }
 
 void D3D12Backend::DrawGeometry(const Assembled& a) {
     if (!UploadVertexBuffers(a)) return;
     D3D_PRIMITIVE_TOPOLOGY topology = PrimitiveTopology(a);
-    if (topology != binds_.topology) cl_->IASetPrimitiveTopology(topology);
+    if (topology != binds_.topology) Cmd()->IASetPrimitiveTopology(topology);
     binds_.topology = topology;
     if (a.index_count) {
         uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
@@ -3504,10 +3599,10 @@ void D3D12Backend::DrawGeometry(const Assembled& a) {
         if (!ib.res) return;
         std::memcpy(ib.cpu, a.index_src, ibytes);
         D3D12_INDEX_BUFFER_VIEW ibv{ib.gpu, ibytes, a.index16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
-        cl_->IASetIndexBuffer(&ibv);
-        cl_->DrawIndexedInstanced(a.index_count, 1, 0, a.base_vertex, 0);
+        Cmd()->IASetIndexBuffer(&ibv);
+        Cmd()->DrawIndexedInstanced(a.index_count, 1, 0, a.base_vertex, 0);
     } else {
-        cl_->DrawInstanced(a.draw_count, 1, 0, 0);
+        Cmd()->DrawInstanced(a.draw_count, 1, 0, 0);
     }
 }
 
@@ -3634,10 +3729,41 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (ext_) ext_->BeginDraw(s);
     Assembled& a = asm_;
     if (!AssembleDraw(s, prim, start, count, indices, a)) return;
+
+    // The full-size scene colour target is the only one whose draws are recorded. Queries,
+    // capture and extension draws need the immediate path.
+    bool scene_sized = false;
+    if (defer_scene_ && s.rt.data) {
+        uint32_t gw;
+        uint32_t gh;
+        SurfaceSize(s.rt, gw, gh);
+        scene_sized = gw == guest_w_ && gh == guest_h_;
+    }
+    bool defer_possible = scene_sized && !defer_abandoned_ && !cap_ && !ext_ && !s.simple[kMCountEnable >> 2];
+    if (defer_possible) defer_frame_active_ = true;
+    else if (scene_sized && !defer_abandoned_) {
+        if (cap_)
+            DeferredFallback("scene capture");
+        else if (ext_)
+            DeferredFallback("scene draw with an extension");
+        else if (s.simple[kMCountEnable >> 2])
+            DeferredFallback("counted scene draw");
+    }
+    // A scene draw that cannot be recorded must run after the pending bundles it overlaps.
+    if (!defer_possible && defer_scene_ && !CurrentFrame().bundles.empty() && FindTarget(s.rt, false) == defer_rt_)
+        DeferredFallback("main scene draw could not be deferred");
+
     // past the ring every upload is a buffer of its own: seconds lost on a frame that draws a whole level once
-    if (CurrentFrame().used > kUploadSize - kUploadReserve) Submit(true);
-    // Keep a margin for this draw's texture views; a wrap would alias descriptors already recorded.
-    if (CurrentFrame().srv + 16 > kSrvCount / kFrames) Submit(true);
+    if (CurrentFrame().used > kUploadSize - kUploadReserve) {
+        if (defer_scene_ && !defer_abandoned_) DeferredFallback("mid-frame upload ring flush");
+        Submit(true);
+    }
+    // Keep a margin for this draw's texture views and any resolves/uploads below; a wrap
+    // would alias descriptors already recorded, including those in pending bundles.
+    if (CurrentFrame().srv + 48 > kSrvCount / kFrames) {
+        if (defer_scene_ && !defer_abandoned_) DeferredFallback("mid-frame descriptor ring flush");
+        Submit(true);
+    }
     if (!BindTargets(s)) return;
     if (bound_ds_) bound_ds_->depth_resolved = false;
     if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
@@ -3651,6 +3777,32 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // stage textures, then the pixel shader made for them
     DrawTextures stages;
     if (!BindStageTexturesAndTargets(s, stages)) return;
+
+    // Only draws into this frame's single full-size scene target are bundled. A draw that
+    // samples a full-size target reads scene contents and stays immediate.
+    bool defer_now = defer_possible && !defer_abandoned_ && bound_rt_ && !bound_rt_->depth &&
+                     bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_;
+    if (defer_now) {
+        if (!defer_rt_) {
+            defer_rt_ = bound_rt_;
+        } else if (defer_rt_ != bound_rt_) {
+            defer_now = false;
+        }
+    }
+    DeferredScope defer_scope{this};
+    if (defer_now && !BeginDeferredBundle(stages)) {
+        defer_now = false;
+        DeferredFallback("bundle allocation failed");
+    }
+    // An immediate draw that touches a pending target must run after the pending bundles.
+    if (!defer_now && DeferredPending()) {
+        bool hit = (bound_rt_ && defer_writes_.count(bound_rt_->res.Get())) ||
+                   (bound_ds_ && defer_writes_.count(bound_ds_->res.Get()));
+        if (hit) {
+            DeferredFallback("main scene target written by an immediate draw");
+            if (!BindTargets(s)) return;
+        }
+    }
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
     sh.pkey = Hash(&pk, sizeof(pk));
@@ -3664,7 +3816,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
     if (!pso) return;
     if (ext_) binds_ = {};  // the extension may set anything
-    if (pso != binds_.pso) cl_->SetPipelineState(pso);
+    if (pso != binds_.pso) Cmd()->SetPipelineState(pso);
     binds_.pso = pso;
 
     // constants
@@ -3703,8 +3855,145 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // geometry, counted while the title runs a visibility test
     uint32_t query = BeginCountedDraw(s);
+    if (defer_now) bundle_desc_.drew = true;
     DrawGeometry(a);
     EndCountedDraw(query);
+}
+
+// Start a bundle for the draw whose direct-list target bind has already been recorded. The
+// bundle carries the PSO, root arguments, descriptor tables, blend state and geometry; the
+// direct list carries the target bind, viewport/scissor and barriers.
+bool D3D12Backend::BeginDeferredBundle(const DrawTextures& stages) {
+    Frame& f = CurrentFrame();
+    if (!f.bundle_alloc) return false;
+    if (f.bundle_next >= f.bundle_pool.size()) {
+        ComPtr<ID3D12GraphicsCommandList> list;
+        const HRESULT hr = dev_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, f.bundle_alloc.Get(), nullptr,
+                                                   IID_PPV_ARGS(&list));
+        if (FAILED(hr)) {
+            LOG_FIRST(1, "d3d12: bundle command list creation failed (0x%08lX)", static_cast<unsigned long>(hr));
+            return false;
+        }
+        // CreateCommandList returns an open list. Close it before the Reset below; Reset on an
+        // open list fails and leaves the allocator unusable.
+        if (FAILED(list->Close())) {
+            LOG_FIRST(1, "d3d12: initial bundle close failed");
+            return false;
+        }
+        f.bundle_pool.push_back(std::move(list));
+    }
+    ID3D12GraphicsCommandList* list = f.bundle_pool[f.bundle_next].Get();
+    const HRESULT hr = list->Reset(f.bundle_alloc.Get(), nullptr);
+    if (FAILED(hr)) {
+        LOG_FIRST(1, "d3d12: bundle command list reset failed (0x%08lX)", static_cast<unsigned long>(hr));
+        return false;
+    }
+    bundle_desc_ = {};
+    bundle_desc_.list = f.bundle_pool[f.bundle_next];
+    bundle_desc_.has_rt = bound_rt_ != nullptr;
+    bundle_desc_.has_ds = bound_ds_ != nullptr;
+    if (bound_rt_) bundle_desc_.rtv = Cpu(rtv_heap_.Get(), bound_rt_->view, rtv_inc_);
+    if (bound_ds_) bundle_desc_.dsv = Cpu(dsv_heap_.Get(), bound_ds_->view, dsv_inc_);
+    bundle_desc_.write = bound_rt_ ? bound_rt_->res.Get() : nullptr;
+    bundle_desc_.depth_write = bound_ds_ ? bound_ds_->res.Get() : nullptr;
+    for (int i = 0; i < 4; i++) bundle_desc_.reads[i] = stages.res[i];
+    bundle_ = list;
+    f.bundle_next++;
+    // The bundle inherits PSO and topology from nowhere: force this draw to set everything.
+    binds_ = {};
+    return true;
+}
+
+void D3D12Backend::EndDeferredBundle() {
+    if (!bundle_) return;
+    ID3D12GraphicsCommandList* list = bundle_;
+    bundle_ = nullptr;
+    const HRESULT hr = list->Close();
+    if (FAILED(hr)) {
+        bundle_desc_ = {};
+        DeviceFailure(hr, "bundle close");
+        return;
+    }
+    if (bundle_desc_.drew) {
+        for (ID3D12Resource* r : bundle_desc_.reads) {
+            if (r) defer_reads_.insert(r);
+        }
+        if (bundle_desc_.write) defer_writes_.insert(bundle_desc_.write);
+        if (bundle_desc_.depth_write) defer_writes_.insert(bundle_desc_.depth_write);
+    }
+    CurrentFrame().bundles.push_back(std::move(bundle_desc_));
+    bundle_desc_ = {};
+    binds_ = {};
+}
+
+// Execute the frame's pending bundles in their original order. Called at present, and before
+// any command that would touch a resource a pending bundle still has to write.
+void D3D12Backend::FlushDeferredScene() {
+    if (bundle_) return;  // bundles are never flushed from inside a recorded draw
+    Frame& f = CurrentFrame();
+    if (f.bundles.empty()) {
+        defer_reads_.clear();
+        defer_writes_.clear();
+        return;
+    }
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
+    cl_->SetDescriptorHeaps(2, heaps);
+    cl_->SetGraphicsRootSignature(root_.Get());
+    binds_ = {};
+    SIZE_T rtv = 0;
+    SIZE_T dsv = 0;
+    for (BundleDesc& b : f.bundles) {
+        const SIZE_T want_rtv = b.has_rt ? b.rtv.ptr : 0;
+        const SIZE_T want_dsv = b.has_ds ? b.dsv.ptr : 0;
+        if (want_rtv != rtv || want_dsv != dsv) {
+            D3D12_CPU_DESCRIPTOR_HANDLE rh{};
+            D3D12_CPU_DESCRIPTOR_HANDLE dh{};
+            if (b.has_rt) rh = b.rtv;
+            if (b.has_ds) dh = b.dsv;
+            cl_->OMSetRenderTargets(b.has_rt ? 1 : 0, b.has_rt ? &rh : nullptr, FALSE, b.has_ds ? &dh : nullptr);
+            rtv = want_rtv;
+            dsv = want_dsv;
+        }
+        if (b.has_viewport) cl_->RSSetViewports(1, &b.viewport);
+        if (b.has_scissor) cl_->RSSetScissorRects(1, &b.scissor);
+        cl_->ExecuteBundle(b.list.Get());
+        // The bundle changed PSO, root arguments and possibly primitive topology on the
+        // calling list; the CPU-side cache no longer describes it.
+        binds_ = {};
+        defer_bundles_this_frame_++;
+    }
+    f.bundles.clear();
+    defer_reads_.clear();
+    defer_writes_.clear();
+    Begin();
+}
+
+// Stop deferring this frame. Pending bundles are executed first so the immediate commands
+// that follow keep the title's original order.
+void D3D12Backend::DeferredFallback(const char* why) {
+    if (!defer_scene_ || defer_abandoned_) return;
+    defer_frame_active_ = true;
+    if (!defer_reason_) defer_reason_ = why;
+    FlushDeferredScene();
+    defer_abandoned_ = true;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+        LOGR("d3d12: deferred scene fell back for frame %llu: %s",
+             static_cast<unsigned long long>(frame_), why);
+}
+
+void D3D12Backend::ReportDeferred() {
+    if (!defer_scene_ || defer_reported_ || !defer_frame_active_) return;
+    if (!defer_bundles_this_frame_ && !defer_abandoned_) return;
+    if (defer_abandoned_) {
+        LOGR("deferred: frame %llu replayed %u bundle(s), fell back to immediate: %s",
+             static_cast<unsigned long long>(frame_), defer_bundles_this_frame_,
+             defer_reason_ ? defer_reason_ : "unknown");
+    } else {
+        LOGR("deferred: frame %llu replayed %u bundle(s), no fallback",
+             static_cast<unsigned long long>(frame_), defer_bundles_this_frame_);
+    }
+    defer_reported_ = true;
 }
 
 // a guest rect scaled to the target and clamped to it
@@ -3802,6 +4091,8 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
     }
     Target* rt = (flags & kClearTarget) ? EnsureTarget(s.rt, false) : nullptr;
     Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true) : nullptr;
+    if ((rt && DeferredPendingResource(rt->res.Get())) || (ds && DeferredPendingResource(ds->res.Get())))
+        DeferredFallback("clear touched a deferred target");
     uint32_t gw;
     uint32_t gh;
     SurfaceSize(rt ? s.rt : s.zs, gw, gh);
@@ -3965,6 +4256,12 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
                         uint32_t dst_points) {
     PerfScope perf_copy{g_perf.copy};
     Target* src_t = FindTarget(src, false);
+    if ((src_t && DeferredPendingResource(src_t->res.Get())) ||
+        [&] {
+            Target* dst_t = FindTarget(dst, false);
+            return dst_t && DeferredPendingResource(dst_t->res.Get());
+        }())
+        DeferredFallback("copy touched a deferred target");
     if (cap_) {
         const char* from = "memory";
         if (src_t) from = src_t->drawn ? "target" : "idle target";
@@ -4391,6 +4688,19 @@ void D3D12Backend::ResetFrame() {
     f.srv = 0;
     f.smp = uint32_t(frame_ % kFrames) * kSamplersPerFrame;
     samplers_[frame_ % kFrames].clear();
+    if (f.bundle_alloc && FAILED(f.bundle_alloc->Reset()))
+        LOGE("d3d12: bundle allocator reset failed for frame slot %u", uint32_t(frame_ % kFrames));
+    f.bundles.clear();
+    f.bundle_next = 0;
+    bundle_ = nullptr;
+    bundle_desc_ = {};
+    defer_reads_.clear();
+    defer_writes_.clear();
+    defer_frame_active_ = false;
+    defer_abandoned_ = false;
+    defer_reason_ = nullptr;
+    defer_rt_ = nullptr;
+    defer_bundles_this_frame_ = 0;
     cl_ = lists_[frame_ % kFrames].Get();
     cl_->Reset(f.alloc.Get(), nullptr);
     Begin();
@@ -4446,6 +4756,7 @@ void LogPerf() {
 
 void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
+    if (defer_scene_) FlushDeferredScene();
     if (cap_) {
         FinishCapture(front);
     } else if (g_capture.exchange(false) && CaptureOn()) {
@@ -4481,6 +4792,7 @@ void D3D12Backend::Present(const Surface& front) {
     Submit(false);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     DeliverReports();
+    if (defer_scene_) ReportDeferred();
     bool vsync = render_.vsync;
     {
         PerfScope perf_swap{g_perf.swap};
@@ -4567,6 +4879,8 @@ void D3D12Backend::ApplySettings() {
 
 // The caller chooses the read state after the hardware resolve.
 ID3D12Resource* D3D12Backend::ResolveColor(Target& t) {
+    if (defer_writes_.count(t.res.Get()) || (t.resolved && defer_writes_.count(t.resolved.Get())))
+        DeferredFallback("resolve of a deferred target");
     if (t.res->GetDesc().SampleDesc.Count == 1) return t.res.Get();
     if (t.depth) return nullptr;
     if (!t.resolved) {
@@ -4587,6 +4901,8 @@ ID3D12Resource* D3D12Backend::ResolveColor(Target& t) {
 
 // Use the nearest covered sample in reversed depth for guest shadow comparisons.
 ID3D12Resource* D3D12Backend::ResolveDepth(Target& t) {
+    if (defer_writes_.count(t.res.Get()) || (t.resolved && defer_writes_.count(t.resolved.Get())))
+        DeferredFallback("resolve of a deferred depth target");
     static constexpr char hlsl[] = R"(
 Texture2DMS<float> depth : register(t0);
 float4 vs(uint id : SV_VertexID) : SV_Position {
@@ -4627,6 +4943,7 @@ float ps(float4 pos : SV_Position) : SV_Target {
 
 // the target resolved, then shrunk with o when it is not guest sized BGRA; res null on failure
 D3D12Backend::CopySource D3D12Backend::PrepareCopySource(Target& t, const ShrinkOptions& o) {
+    if (DeferredPendingResource(t.res.Get())) DeferredFallback("copy of a deferred target");
     Resolve(t);
     CopySource out{ResolveColor(t), nullptr};
     if (!out.res) return out;
@@ -4693,6 +5010,7 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
                   it->second.w, it->second.h);
     }
     Target& t = it->second;
+    if (DeferredPendingResource(t.res.Get())) DeferredFallback("read-back of a deferred target");
     // src.down, when there is one, stays alive until ReadBack is done
     CopySource src = PrepareCopySource(t, {});
     if (!src.res) return;
@@ -4805,6 +5123,7 @@ void D3D12Backend::RecordLate(uint32_t data) {
     auto it = targets_.find(TargetMapKey(data, false));
     if (it == targets_.end() || TargetStale(data)) return;
     Target& t = it->second;
+    if (DeferredPendingResource(t.res.Get())) DeferredFallback("late read-back of a deferred target");
     PerfScope perf_sync{g_perf.sync};
     g_perf.lates++;
     // what DeliverLate or Sync left in guest memory is no CPU write to upload back
