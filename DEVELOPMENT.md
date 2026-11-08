@@ -61,14 +61,8 @@ compiled or linked, so `generated/` should never be patched by hand. The same he
 first-launch compiler. A mismatch in the confirmed city-grid sites fails the build rather than producing
 partially corrected code.
 
-Commit SDK edits from the project root alongside the game changes that depend on them.
-`patches/xboxxberecomp-local.patch` records the same SDK changes as a diff against upstream XboxXBERecomp
-`f7b13fd`, for reviewing or porting them. After changing `sdk/`, regenerate it from a clone of upstream
-(new SDK files must be added to that clone's index first, for example with `git add -N`):
-
-```bash
-git -C <upstream clone> --work-tree="$PWD/sdk" diff --no-ext-diff f7b13fd -- > patches/xboxxberecomp-local.patch
-```
+The SDK is vendored under `sdk/`; commit SDK edits from the project root alongside the game
+changes that depend on them. There is no separate patch artifact to keep in sync.
 
 ## Optional diagnostics
 
@@ -97,7 +91,8 @@ Set variables before launching; the runtime reads most of them once per process.
 
 Ordinary recording does not enable deterministic overrides. Input replay alone cannot guarantee identical
 asynchronous streaming or time of day. Keep captures and heavy logging off when measuring frame times.
-`Play True Crime NYC.cmd`, the development launcher, enables F3 capture and controller recording.
+Launch `out\build\release\TrueCrimeNYC.exe` directly; F3 capture and controller recording are enabled by
+the variables above.
 
 `scripts/summarize_perf.py <log> [<log> ...]` summarizes those performance logs. Its timings are
 one-second averages, not individual-frame percentiles. Shader-cache keys include generated source,
