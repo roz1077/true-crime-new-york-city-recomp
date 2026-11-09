@@ -141,7 +141,7 @@ function(add_xbe_image target xbe config partitions game_dir)
 
     # without a C runtime: the executable passes on what the code calls
     add_library(${target}_code SHARED ${GEN_SOURCES})
-    set_target_properties(${target}_code PROPERTIES OUTPUT_NAME ${target} CXX_EXTENSIONS OFF)
+    set_target_properties(${target}_code PROPERTIES OUTPUT_NAME ${target} PREFIX "" CXX_EXTENSIONS OFF)
     set_source_files_properties(${GEN_SOURCES} PROPERTIES GENERATED TRUE)
     add_dependencies(${target}_code recompile_${target})
     target_include_directories(${target}_code PRIVATE ${XBE_SDK_DIR}/runtime ${GEN})
@@ -150,8 +150,13 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_compile_options(${target}_code PRIVATE -fms-extensions -fms-compatibility-version=19.40 -O2 -fno-strict-aliasing -nostdinc
         -nostdinc++ -w)
     target_link_libraries(${target}_code PRIVATE ${target})
-    target_link_options(${target}_code PRIVATE -fuse-ld=lld -Wl,/noentry,/nodefaultlib,/opt:noicf
-        -Wl,/def:${GEN}/exports.def)
+    target_link_options(${target}_code PRIVATE -fuse-ld=lld -Wl,/noentry,/nodefaultlib,/opt:noicf)
+    # The MinGW lld driver reads /def: as a file name; it takes the .def file as an input instead.
+    if(MINGW)
+        target_link_options(${target}_code PRIVATE ${GEN}/exports.def)
+    else()
+        target_link_options(${target}_code PRIVATE -Wl,/def:${GEN}/exports.def)
+    endif()
     set(stamp_script ${XBE_SDK_DIR}/cmake/StampGameCode.cmake)
     # The import library can remain identical after a host-only edit, but the stamp binds to the EXE.
     set_property(TARGET ${target}_code APPEND PROPERTY LINK_DEPENDS "${stamp_script}" "$<TARGET_FILE:${target}>")

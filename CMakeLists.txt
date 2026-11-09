@@ -42,7 +42,8 @@ target_sources(TrueCrimeNYC PRIVATE launcher/launcher.cpp launcher/version.rc)
 target_include_directories(TrueCrimeNYC PRIVATE launcher)
 set_property(SOURCE launcher/version.rc APPEND PROPERTY OBJECT_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/launcher/TrueCrimeNYC.ico")
-# Merge the long-path manifest into the manifest CMake already embeds.
+# Embed the long-path manifest; lld-link only accepts /MANIFESTINPUT with /manifest:embed.
 target_link_options(TrueCrimeNYC PRIVATE
+    "-Wl,/manifest:embed"
     "-Wl,/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/launcher/TrueCrimeNYC.manifest")
 target_link_libraries(TrueCrimeNYC PRIVATE comdlg32 gdi32 user32)
