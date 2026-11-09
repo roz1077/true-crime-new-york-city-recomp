@@ -365,6 +365,8 @@ PromptStyle ControllerPromptStyle() {
     return g_prompt_style.load(std::memory_order_relaxed);
 }
 
+bool KeyboardMouseActive() { return g_keyboard_mouse_active.load(std::memory_order_relaxed); }
+
 // relative motion and wheel notches from the window thread; the Windows path
 // takes them from WM_INPUT, the SDL path from MOUSE_MOTION / MOUSE_WHEEL events
 void ApplyMouseDelta(int dx, int dy, int wheel) {

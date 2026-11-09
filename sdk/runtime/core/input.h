@@ -15,6 +15,9 @@ struct Pad {
 
 enum class PromptStyle { Original, PlayStation, Xbox, KeyboardMouse };
 PromptStyle ControllerPromptStyle();
+// true while keyboard/mouse is the input the game is following; a pad takes
+// over as soon as it is used
+bool KeyboardMouseActive();
 // keyboard keys that stand in for the two stick clicks, shared by input and
 // the keyboard-mouse prompt glyphs
 inline constexpr char kLeftStickClickKey = 'C';

@@ -2,11 +2,18 @@
 
 ## Unreleased
 
+### Gameplay
+- Direct mouse pitch is held against the on-foot controller's rest-pitch reset and
+  the profile's camera auto-center, so vertical aim accumulates instead of snapping
+  back every frame. Both return to the game's control when a pad takes over.
+- Mouse pitch now follows the stock (non-inverted) vertical direction; the game's
+  invert-Y setting still flips it.
+
 ### Graphics
-- Ambient occlusion (F10: Off / Half / Full, off by default) on Windows (D3D12). It uses GTAO
-  from a depth prepass of world geometry only, and is applied inside the world draws before
-  fog, so light shafts, fog and other effects are not darkened and no longer show as white
-  bands. Vulkan is not ported yet.
+- Ambient occlusion (F10: Off / Half / Full, off by default) on Windows (D3D12) and Linux
+  (Vulkan). It uses GTAO from a depth prepass of world geometry only, and is applied inside
+  the world draws before fog, so light shafts, fog and other effects are not darkened and no
+  longer show as white bands.
 - Fixed an offset copy of the scene that showed along the right and bottom edges of the
   frame and moved with the camera, caused by the game's glow pass reading past its own
   region of a shared render target.

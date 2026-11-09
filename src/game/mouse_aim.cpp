@@ -27,9 +27,24 @@
 // are scaled by fMouseSens (4.0) * RawInputMouse (1.0) / 1000 = 0.004 rad per
 // count, with the same scale on both axes. Its direct camera path also allows
 // -89..+60 degrees of pitch on foot and -89..+10 degrees in a vehicle while
-// the mouse is active, so the controllers' own -40..+60 limit is widened for
-// that one update and restored afterwards. Direct aim stops feeding the stick
-// for 5 s after the last sample, matching the PC fix's idle fallback.
+// the mouse is active (PC convention, positive up; the game's accumulator is
+// positive looking down, so the on-foot clamp below is mirrored), and the
+// controllers' own -40..+60 limit is widened for that one update and restored
+// afterwards. Direct aim stops feeding the stick for 5 s after the last
+// sample, matching the PC fix's idle fallback.
+//
+// The profile's camera auto-center also has to be held off while the mouse is
+// in use. It pulls the pitch back toward the controller's rest angle whenever
+// the right stick is idle, and direct aim keeps the stick centred, so without
+// that it would erase each mouse adjustment on the same frame. The setting is
+// restored after the update; when a controller takes over the input, the
+// game's centering returns with it.
+//
+// The on-foot controller also writes its rest pitch over 0x348A80 before the
+// shared orientation builder runs, independently of the auto-center setting.
+// The mouse therefore keeps its own accumulated pitch and restores it at that
+// builder; reading the global back each frame would only ever apply one frame
+// of vertical movement.
 //
 // In a vehicle the active controller (sub_00024040) recomputes its chase yaw
 // every frame instead of accumulating the stick into the globals, and then
@@ -63,6 +78,10 @@ constexpr uint32_t kActiveFlag = 0x18C;
 constexpr uint32_t kMode = 0x19;       // camera + 0x19 -> camera mode
 constexpr uint32_t kYaw = 0x348B20;    // radians, accumulated by the controller
 constexpr uint32_t kPitch = 0x348A80;  // radians
+// Profile setting: while the right stick is idle, the look controller blends
+// the pitch back toward its rest angle. Set by the game's camera settings
+// update; read only by the shared look-input routine sub_000205A0.
+constexpr uint32_t kAutoCenter = 0x348C24;
 constexpr uint32_t kInvertX = 0xFEF;   // game + 0xFEF
 constexpr uint32_t kInvertY = 0xFEE;   // game + 0xFEE
 
@@ -74,12 +93,13 @@ constexpr uint8_t kModeVehicle = 13;
 constexpr float kRadiansPerPixel = 0.004f;
 constexpr float kPi = 3.14159265358979f;
 
-// The two consumers do not agree on the sign of 0x348A80.  The on-foot
-// controllers build the camera inline (positive looks up); sub_0001FD40
-// negates the value (positive looks down).  Each path keeps the PC view limits
-// in its own sign.
-constexpr float kOnFootPitchMin = -89.0f * kPi / 180.0f;  // view down
-constexpr float kOnFootPitchMax = 60.0f * kPi / 180.0f;   // view up
+// 0x348A80 is positive looking down: sub_0001FD40 negates it when it builds
+// the orientation, and the look controllers subtract a stick-up input from it.
+// The PC fix's limits are quoted in its own positive-up convention, so the
+// on-foot pair is mirrored here (60 up / 89 down). The vehicle controller
+// already uses positive down, so its pair needs no mirroring.
+constexpr float kOnFootPitchMin = -60.0f * kPi / 180.0f;  // view up
+constexpr float kOnFootPitchMax = 89.0f * kPi / 180.0f;   // view down
 constexpr float kVehiclePitchMin = -10.0f * kPi / 180.0f; // view up
 constexpr float kVehiclePitchMax = 89.0f * kPi / 180.0f;  // view down
 
@@ -128,19 +148,45 @@ bool IsGameplayCamera(uint8_t *base, uint32_t camera) {
 struct CameraAim {
     uint32_t controller = 0;
     float yaw = 0;
-    bool active = false;
+    float pitch = 0;
+    bool active = false;   // the mouse sampled recently (yaw handoff)
+    bool mouse_aim = false; // keyboard/mouse owns the aim (pitch hold)
 };
 thread_local CameraAim g_camera_aim;
+
+// Pitch accumulated by the mouse while keyboard/mouse owns the on-foot camera.
+// The controller's target pass writes its rest angle over 0x348A80 before the
+// orientation builder runs, so reading that global back each frame would only
+// ever apply one frame of mouse movement. Keep our own angle instead, seeded
+// from the game's pitch once, and use it for the view and the update.
+struct AimHold {
+    uint32_t controller = 0;
+    uint8_t mode = 0;
+    float pitch = 0;
+    bool held = false;
+};
+thread_local AimHold g_aim_hold;
 
 // Adds the pending raw mouse delta to the camera angles.  The caller injects
 // before the controller runs and widens that controller's own pitch clamp, so
 // the controller does not clamp the result back to its stock -40..+60 range.
-void ApplyAim(uint8_t *base, uint32_t controller, float pitch_min, float pitch_max) {
+// Returns the pitch the view should use and whether the mouse owns the aim.
+float ApplyAim(uint8_t *base, uint32_t controller, uint8_t mode, float pitch_min, float pitch_max, bool &mouse_aim) {
     // tells input this camera is still the one updating; when it stops, input
     // falls back to the right stick for the new camera mode
     input::UseDirectMouseAim();
     float dx = 0, dy = 0;
-    if (!input::ConsumeMouseAim(dx, dy)) return;
+    const bool sampled = input::ConsumeMouseAim(dx, dy);
+    mouse_aim = input::KeyboardMouseActive() || input::DirectAimRecent();
+    if (!mouse_aim) {
+        g_aim_hold.held = false;
+        return RdF(base, kPitch);
+    }
+    if (!g_aim_hold.held || g_aim_hold.controller != controller || g_aim_hold.mode != mode) {
+        // Start from the game's current angle, then keep the mouse's own so the
+        // controller's per-frame rest-pitch reset cannot undo the accumulation.
+        g_aim_hold = {controller, mode, RdF(base, kPitch), true};
+    }
 
     const float percent = float(std::clamp(input::g_mouse_sensitivity_percent, 10u, 400u)) * 0.01f;
     const float vertical = float(std::clamp(input::g_mouse_vertical_sensitivity_percent, 10u, 400u)) * 0.01f;
@@ -148,17 +194,19 @@ void ApplyAim(uint8_t *base, uint32_t controller, float pitch_min, float pitch_m
     const float pitch_scale = kRadiansPerPixel * percent * vertical;
     const uint32_t game = Rd(base, kGame);
     const float yaw_sign = Rd8(base, game + kInvertX) ? -1.0f : 1.0f;
-    // The on-foot controllers build the view from this accumulator with
-    // positive up, while SDL/WM_INPUT report raw Y positive when the mouse
-    // moves down. The default therefore has to negate dy; invert-Y flips it.
-    // This matches the right-stick fallback in input.cpp, which feeds
-    // -g_mouse_y to the pad. Needs live confirmation for both settings.
-    const float pitch_sign = Rd8(base, game + kInvertY) ? 1.0f : -1.0f;
+    // 0x348A80 is positive looking down, and SDL/WM_INPUT report raw Y
+    // positive when the mouse moves down, so the default adds dy. Invert-Y
+    // flips that. Playing with the stock setting must not invert the view.
+    const float pitch_sign = Rd8(base, game + kInvertY) ? -1.0f : 1.0f;
 
-    const float yaw = RdF(base, kYaw) + dx * yaw_scale * yaw_sign;
-    const float pitch = std::clamp(RdF(base, kPitch) + dy * pitch_scale * pitch_sign, pitch_min, pitch_max);
+    float yaw = RdF(base, kYaw);
+    if (sampled) {
+        yaw += dx * yaw_scale * yaw_sign;
+        g_aim_hold.pitch = std::clamp(g_aim_hold.pitch + dy * pitch_scale * pitch_sign, pitch_min, pitch_max);
+    }
     std::memcpy(base + kYaw, &yaw, sizeof(yaw));
-    std::memcpy(base + kPitch, &pitch, sizeof(pitch));
+    std::memcpy(base + kPitch, &g_aim_hold.pitch, sizeof(g_aim_hold.pitch));
+    return g_aim_hold.pitch;
 }
 
 // Widen a look controller's pitch clamp for one update, so the controller's own
@@ -195,14 +243,21 @@ X86_FUNC(sub_0002E200) {
     const bool owned = controller && Rd(base, controller + kOwner) == camera;
     if (input::g_direct_mouse_aim && owned && mode != kModeVehicle && IsGameplayCamera(base, camera)) {
         uint32_t old_min = 0, old_max = 0;
-        ApplyAim(base, controller, kOnFootPitchMin, kOnFootPitchMax);
+        bool mouse_aim = false;
+        const float pitch = ApplyAim(base, controller, mode, kOnFootPitchMin, kOnFootPitchMax, mouse_aim);
         const bool recent = input::DirectAimRecent();
-        const bool widen = recent &&
+        const bool widen = mouse_aim &&
                            WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
+        // The look controller's input step centers the pitch when the stick is
+        // idle. Suppress that for this update, or it pulls the view straight
+        // back to the rest angle the mouse just moved away from.
+        const uint8_t auto_center = Rd8(base, kAutoCenter);
+        if (mouse_aim) base[kAutoCenter] = 0;
         const CameraAim previous = g_camera_aim;
-        g_camera_aim = {controller, RdF(base, kYaw), recent};
+        g_camera_aim = {controller, RdF(base, kYaw), pitch, recent, mouse_aim};
         __imp__sub_0002E200(ctx, base);
         g_camera_aim = previous;
+        if (mouse_aim) base[kAutoCenter] = auto_center;
         if (widen) RestorePitch(base, controller, old_min, old_max);
         return;
     }
@@ -226,10 +281,13 @@ X86_FUNC(sub_0001FD40) {
     static uint32_t last_vehicle_camera = 0, last_vehicle_controller = 0;
 
     const uint32_t controller = ctx.ecx;
-    if (input::g_direct_mouse_aim && g_camera_aim.active && g_camera_aim.controller == controller) {
+    if (input::g_direct_mouse_aim && g_camera_aim.controller == controller) {
         // Applying this after sub_0002E200 returns is too late: this method
         // has already used the controller's replacement yaw to build the view.
-        std::memcpy(base + kYaw, &g_camera_aim.yaw, sizeof(g_camera_aim.yaw));
+        // The same update also rewrites the pitch to the controller's rest
+        // angle before coming here, so put the held mouse pitch back as well.
+        if (g_camera_aim.active) std::memcpy(base + kYaw, &g_camera_aim.yaw, sizeof(g_camera_aim.yaw));
+        if (g_camera_aim.mouse_aim) std::memcpy(base + kPitch, &g_camera_aim.pitch, sizeof(g_camera_aim.pitch));
     }
     if (input::g_direct_mouse_aim) {
         const uint32_t camera = GameplayCamera(base, controller);
@@ -262,10 +320,8 @@ X86_FUNC(sub_0001FD40) {
                     float(std::clamp(input::g_mouse_vertical_sensitivity_percent, 10u, 400u)) * 0.01f;
                 const uint32_t game = Rd(base, kGame);
                 const float yaw_sign = Rd8(base, game + kInvertX) ? -1.0f : 1.0f;
-                // Here the accumulator is positive looking down, the opposite
-                // of the on-foot controllers, so the default does not negate
-                // dy; invert-Y flips that. Matches the stick fallback's
-                // -g_mouse_y sign. Needs live confirmation for both settings.
+                // Here the accumulator is positive looking down as well, so
+                // the default does not negate dy; invert-Y flips that.
                 const float pitch_sign = Rd8(base, game + kInvertY) ? -1.0f : 1.0f;
                 yaw += dx * kRadiansPerPixel * percent * yaw_sign;
                 pitch = std::clamp(pitch + dy * kRadiansPerPixel * percent * vertical * pitch_sign, kVehiclePitchMin,

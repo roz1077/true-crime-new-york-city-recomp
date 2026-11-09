@@ -1,4 +1,5 @@
-"""Regress mouse yaw ordering, stalled-camera counts, and pad/mouse handoff.
+"""Regress mouse yaw ordering, pitch direction, vertical auto-center,
+stalled-camera counts, and pad/mouse handoff.
 
 Compile the actual hooks and input routines; guest update doubles model the
 confirmed yaw overwrite followed by the shared orientation builder. No game or
@@ -31,11 +32,12 @@ struct X86Context { uint32_t ecx = 0; };
 #define X86_MEM8(a) base[a]
 namespace mem { bool IsCommitted(uint32_t a) { return a && a < 0x500000; } }
 namespace input {
-bool g_direct_mouse_aim = true, recent = false;
+bool g_direct_mouse_aim = true, recent = false, mouse_active = false;
 uint32_t g_mouse_sensitivity_percent = 100, g_mouse_vertical_sensitivity_percent = 100;
 float pending_x = 0, pending_y = 0;
 void UseDirectMouseAim() {}
 bool DirectAimRecent() { return recent; }
+bool KeyboardMouseActive() { return mouse_active; }
 bool ConsumeMouseAim(float& x, float& y) {
     x = pending_x; y = pending_y; pending_x = pending_y = 0;
     if (x || y) { recent = true; return true; }
@@ -44,20 +46,36 @@ bool ConsumeMouseAim(float& x, float& y) {
 }
 ''' + hooks + r'''
 constexpr uint32_t camera = 0x11000, controller = 0x12000;
-float built_yaw = 0, replacement = 0;
+constexpr uint32_t kTestAutoCenter = 0x348C24;
+float built_yaw = 0, built_pitch = 0, replacement = 0;
 bool no_target = false, inline_view = false;
-X86_FUNC(__imp__sub_0001FD40) { built_yaw = RdF(base, kYaw); }
+X86_FUNC(__imp__sub_0001FD40) { built_yaw = RdF(base, kYaw); built_pitch = RdF(base, kPitch); }
 X86_FUNC(__imp__sub_0002E200) {
     if (no_target) return;
-    if (!inline_view) std::memcpy(base + kYaw, &replacement, 4);
+    // The guest's look-input step (sub_000205A0): with the profile's
+    // auto-center on and the stick idle, blend the pitch toward the rest
+    // angle. Direct aim keeps the stick idle, so the hook must hold this off.
+    if (base[kTestAutoCenter]) {
+        float pitch = RdF(base, kPitch);
+        pitch += (0.5f - pitch) * 0.5f;
+        std::memcpy(base + kPitch, &pitch, 4);
+    }
+    // The controller's target/rest-pitch pass writes its rest angle over the
+    // accumulator before the shared builder runs.
+    if (!inline_view) {
+        float rest = 0.1f;
+        std::memcpy(base + kPitch, &rest, 4);
+        std::memcpy(base + kYaw, &replacement, 4);
+    }
     if (inline_view) built_yaw = RdF(base, kYaw);
     else { ctx.ecx = controller; sub_0001FD40(ctx, base); }
 }
 void SetFloat(uint8_t* base, uint32_t a, float v) { std::memcpy(base+a, &v, 4); }
 bool Close(float a, float b) { return std::fabs(a-b) < 0.00001f; }
-void Update(uint8_t* base, uint8_t mode, float dx) {
+void Update(uint8_t* base, uint8_t mode, float dx, float dy = 0) {
     base[camera + kMode] = mode;
     input::pending_x = dx;
+    input::pending_y = dy;
     X86Context ctx{camera};
     sub_0002E200(ctx, base);
 }
@@ -114,6 +132,48 @@ extern "C" __declspec(dllexport) int run() {
     if (!Close(built_yaw,1.5f)) return 11;
     input::pending_x=1; sub_0001FD40(ctx,base);
     if (!Close(built_yaw,1.504f)) return 12;
+    // Raw Y is positive moving down and 0x348A80 is positive looking down:
+    // the stock setting must not invert the mouse, and invert-Y must.
+    inline_view = true; base[kTestAutoCenter] = 0;
+    input::mouse_active = true;
+    base[0x10000 + kInvertY] = 0; SetFloat(base, kPitch, 0.0f);
+    Update(base, 5, 0, 10);
+    if (!Close(RdF(base, kPitch), 0.04f)) return 19;
+    base[0x10000 + kInvertY] = 1; SetFloat(base, kPitch, 0.0f);
+    Update(base, 7, 0, 10);
+    if (!Close(RdF(base, kPitch), -0.04f)) return 20;
+    base[0x10000 + kInvertY] = 0;
+    // The controller's rest-pitch pass runs before the shared builder, so the
+    // builder hook has to put the mouse pitch back for the view it builds.
+    inline_view = false; base[kTestAutoCenter] = 0;
+    input::mouse_active = true; input::recent = true;
+    SetFloat(base, kPitch, 0.2f);
+    Update(base, 8, 0, 10);
+    if (!Close(built_pitch, 0.24f)) return 21;
+    if (!Close(RdF(base, kPitch), 0.24f)) return 22;
+    // The mouse pitch is held across frames even while the game rewrites the
+    // global, so movement accumulates instead of resetting each frame.
+    Update(base, 8, 0, 10);
+    if (!Close(built_pitch, 0.28f)) return 23;
+    // The profile's vertical auto-center must not erase mouse pitch while
+    // keyboard/mouse owns the input, even after the 5 s sample window.
+    inline_view = true; base[kTestAutoCenter] = 1;
+    input::mouse_active = true; input::recent = false;
+    SetFloat(base, kPitch, 0.2f);
+    Update(base, 9, 0);
+    if (!Close(RdF(base, kPitch), 0.2f)) return 13;
+    if (base[kTestAutoCenter] != 1) return 16;
+    // A pad taking over brings the game's centering back.
+    input::mouse_active = false; input::recent = false;
+    Update(base, 9, 0);
+    if (!Close(RdF(base, kPitch), 0.35f)) return 14;
+    if (base[kTestAutoCenter] != 1) return 17;
+    // A profile with auto-center already off is left alone.
+    base[kTestAutoCenter] = 0;
+    input::mouse_active = true; SetFloat(base, kPitch, 0.2f);
+    Update(base, 9, 0);
+    if (!Close(RdF(base, kPitch), 0.2f)) return 15;
+    if (base[kTestAutoCenter] != 0) return 18;
     return 0;
 }
 '''

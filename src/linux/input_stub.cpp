@@ -24,6 +24,10 @@ bool DirectAimRecent() {
     return false;
 }
 
+bool KeyboardMouseActive() {
+    return false;
+}
+
 } // namespace input
 
 #endif
