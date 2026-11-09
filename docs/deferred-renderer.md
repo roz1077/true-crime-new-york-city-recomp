@@ -1,10 +1,10 @@
 # Deferred scene renderer for ambient occlusion
 
-Status: **M0 prototype builds; visual validation pending**. `TCNYC_DEFER_SCENE=1` records
-full-size main-scene draws into D3D12 bundles and replays them at present. The first
-runtime run reported `replayed 15 bundle(s), no fallback`; the test capture was partly
-obscured by another window, so a clean corridor comparison is still needed. The next
-milestone is splitting opaque/transparent bundles and inserting AO between them.
+Status: **D3D12 scene-time AO implemented and validated at 3840x2160** on the room save.
+The main full-size scene is recorded into D3D12 bundles, split by depth writing, replayed
+opaque-first, then AO runs from the completed scene depth, then the no-depth-write effects
+replay. The F10 Ambient occlusion row enables the display list automatically. Vulkan has the
+settings/menu but still needs the equivalent display list and AO pass.
 
 ## Goal
 
@@ -87,6 +87,26 @@ MSAA scene targets need the same sample count and resolve handling as the curren
 - **M2**: insert AO between the two groups; tune.
 - **M3**: Vulkan equivalent.
 - **M4**: enable the F10 option and update docs.
+
+## Implementation notes (D3D12)
+
+- Opaque means **depth-writing**, not blend-disabled. The engine blends most world geometry
+  while still writing depth (alpha-tested materials). In the room capture: 280 depth-writing
+  bundles vs 77 no-depth-write effects. The no-depth-write group draws after AO.
+- A materialisation barrier (target sampled, copied, cleared, resolved, read back, or written
+  immediately) flushes pending bundles, keeps the frame deferred, and continues. Only a
+  conflict while a bundle is open falls back to immediate for the rest of the frame.
+- AO runs once per scene view (`defer_ao_applied_`); a clear of the scene colour/depth starts
+  a new view and re-arms it. This avoids double-darkening when a frame has several barriers.
+- Depth range uses `DrawWRange(s, sh.prog)` with the `far > 1000 -> 1000` normalisation. A
+  fixed-function `ProjectionWRange` alone fails on program draws.
+- D3D12 reversed depth is converted with `1 - depth` before the hyperbolic linearisation.
+- The AO kernel is the 8-tap hemisphere estimate: strength 0.5, radius 1.0 world units,
+  depth-aware 5x5 composite blur. Smaller radius reduces the silhouette halo.
+- Static frames where the title does not redraw the scene reuse the previous presented
+  picture; moving frames recompute AO from the new depth.
+- `TCNYC_AO_VIEW=1` writes the AO factor over the scene and `TCNYC_AO_DEPTH=1` writes
+  normalised linear depth, for diagnostics. Both are env-gated and off in normal play.
 
 ## Risks / tests
 

@@ -1079,7 +1079,8 @@ private:
     DrawBinds binds_;
     // TCNYC_DEFER_SCENE=1: main-scene draws are recorded into bundles and replayed at present.
     // Everything stays on the immediate path when the variable is unset.
-    bool defer_scene_ = false;       // opt-in
+    bool defer_scene_ = false;       // ambient occlusion needs the deferred display list
+    bool defer_forced_ = false;      // TCNYC_DEFER_SCENE kept the prototype on regardless of AO
     bool defer_frame_active_ = false;  // a main-scene draw was seen this frame
     bool defer_abandoned_ = false;   // this frame fell back to immediate drawing
     bool defer_reported_ = false;    // the first deferred frame has been reported
@@ -1199,8 +1200,9 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     g_reversed_depth = true;
     guest_w_ = width;
     guest_h_ = height;
-    if (const char* e = std::getenv("TCNYC_DEFER_SCENE")) defer_scene_ = *e && std::atoi(e) != 0;
-    if (defer_scene_) LOGR("d3d12: deferred scene display list enabled (TCNYC_DEFER_SCENE=1)");
+    if (const char* e = std::getenv("TCNYC_DEFER_SCENE")) defer_forced_ = *e && std::atoi(e) != 0;
+    defer_scene_ = defer_forced_ || render_.ao != 0;
+    if (defer_scene_) LOGR("d3d12: deferred scene display list enabled (%s)", defer_forced_ ? "forced" : "AO");
     HWND hwnd = static_cast<HWND>(app::Window());
     if (!CreateDevice()) return false;
     if (!CreateSwapChain(hwnd)) return false;
@@ -1350,10 +1352,10 @@ bool D3D12Backend::CreateRootSignature() {
 bool D3D12Backend::CreateFrames() {
     for (auto& f : frames_) {
         if (FAILED(dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.alloc)))) return false;
-        if (defer_scene_ &&
-            FAILED(dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&f.bundle_alloc)))) {
+        if (FAILED(dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&f.bundle_alloc)))) {
             LOGE("d3d12: no bundle command allocator, deferred scene drawing is off");
             defer_scene_ = false;
+            defer_forced_ = false;
         }
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
         D3D12_RESOURCE_DESC bd = BufferDesc(kUploadSize);
@@ -5307,6 +5309,17 @@ uint32_t D3D12Backend::SupportedMsaa(uint32_t samples) {
 
 void D3D12Backend::ApplySettings() {
     if (texturedumper::Update()) ReleasePackTextures();
+    // Ambient occlusion requires the deferred scene list. Toggle it live so the F10 row
+    // works without a restart.
+    const bool want_defer = defer_forced_ || app::Snapshot().ao != 0;
+    if (want_defer != defer_scene_) {
+        if (defer_scene_) FlushDeferredScene();
+        defer_scene_ = want_defer;
+        defer_abandoned_ = false;
+        defer_ao_applied_ = false;
+        defer_reported_ = false;
+        LOGR("d3d12: deferred scene display list %s", want_defer ? "on" : "off");
+    }
     // Shader microcode variants should not accumulate for the whole session.
     constexpr size_t kMaxDrawPipelines = 4096;
     if (psos_.size() > kMaxDrawPipelines) {
