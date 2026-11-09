@@ -4326,10 +4326,19 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // variant and a depth-only copy for the AO depth prepass; everything else replays as it
     // was drawn, in the original order.
     const bool scene_view = s.viewport.w == guest_w_ && s.viewport.h * 4 >= guest_h_ * 3;
-    const uint8_t ao_roles = render_.ao != 0 && bound_rt_ && bound_ds_ && bound_ds_->res && !a.pretransformed &&
+    uint8_t ao_roles = render_.ao != 0 && bound_rt_ && bound_ds_ && bound_ds_->res && !a.pretransformed &&
                                      scene_view && bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h
                                  ? AoRoles(s)
                                  : 0;
+    // Draws that sample a colour render target (water reflections and refraction, ripple maps,
+    // mirrors) take no AO role. Water is a wavy animated mesh: AO on it darkened the troughs
+    // between its triangles, which turned the smooth bump-mapped surface into faceted spikes,
+    // and liquid and mirror surfaces show no ambient occlusion anyway. A depth target sampled
+    // as a shadow map does not count.
+    bool samples_colour_rt = false;
+    for (int i = 0; i < 4; i++)
+        if (stages.rt[i] && !stages.info[i].shadow) samples_colour_rt = true;
+    if (samples_colour_rt) ao_roles = 0;
     const bool opaque = (ao_roles & kAoDepth) != 0;  // recorded into the AO depth prepass
     if (defer_now && !BeginDeferredBundle(stages, opaque)) {
         defer_now = false;

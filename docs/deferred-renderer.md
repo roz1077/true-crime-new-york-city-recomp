@@ -31,6 +31,10 @@ with a GTAO kernel (see `gtao-plan.md`). Checked in game on Windows at Half and 
   - Colour-writing ones receive AO (`kAoColour`). That includes the alpha colour pass that
     does not write depth.
   - Additive, multiply and other blends are effects and take neither role.
+  - Draws that sample a colour render target (water reflections/refraction, ripple maps,
+    mirrors) take neither role either. AO on the wavy water mesh darkened the troughs between
+    its triangles and turned the smooth bump-mapped water into faceted spikes. Shadow-map
+    (depth target) reads don't count.
 - Each deferred AO-depth draw records its normal bundle **plus a prepass bundle** (same VS, the
   pixel shader's distance variant `PixelKey::ao = 3`, no stencil; recorded in
   `EndDeferredBundle`). The prepass writes depth plus each pixel's **view distance** (clip w)
