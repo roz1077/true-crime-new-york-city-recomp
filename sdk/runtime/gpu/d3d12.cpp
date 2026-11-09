@@ -3353,6 +3353,54 @@ D3D12_SRV_DIMENSION NullViewDimension(uint8_t kind) {
 // pixel centres sample such a quad from its first texel to half a texel short of its far edge; upscaled, the far
 // edge's last half texel is drawn too, and wrapped it blends in the opposite edge (thin dark lines on HUD sprites).
 // Clamped, it takes the edge texel instead, which a wrapped texture used once over 0..1 has there anyway.
+// A screen space pass reading a render target holds its reads to the texels its coordinates span, from the first
+// texel centre to the last. A glow chain keeps several blur levels side by side in one target and scales each up from
+// texel 0.5 to its width + 0.5: the far edge's pixels would blend in the next texel, which belongs to a larger, less
+// blurred level, and show an offset copy of the scene along the right and bottom of the frame.
+void RegionClip(const Assembled& a, const DrawTextures& stages, DrawConstants& c) {
+    constexpr float kOpen = 1e9f;
+    constexpr uint32_t kSmallDrawVertices = 64;
+    for (int i = 0; i < 4; i++) {
+        if (!stages.rt[i]) continue;
+        c.rtclip[i][0] = c.rtclip[i][1] = -kOpen;
+        c.rtclip[i][2] = c.rtclip[i][3] = kOpen;
+    }
+    if (!a.pretransformed || !a.vertices.empty() || !a.vertex_count || a.vertex_count > kSmallDrawVertices) return;
+    // one texture coordinate set: the pass's quad
+    int reg = -1;
+    for (int r = 0; r < 16; r++) {
+        if (!(a.regs >> r & 1) || a.elements[size_t(r)].format != DXGI_FORMAT_R32G32_FLOAT) continue;
+        if (reg >= 0) return;
+        reg = r;
+    }
+    if (reg < 0) return;
+    const VertexElement& e = a.elements[size_t(reg)];
+    const VertexBuffer& vb = a.buffers[e.buffer];
+    if (!vb.src || !vb.stride || uint64_t(a.vertex_count) * vb.stride > vb.bytes) return;
+    float lo[2] = {kOpen, kOpen}, hi[2] = {-kOpen, -kOpen};
+    for (uint32_t v = 0; v < a.vertex_count; v++) {
+        float uv[2];
+        std::memcpy(uv, vb.src + size_t(v) * vb.stride + e.offset, sizeof(uv));
+        for (int k = 0; k < 2; k++) {
+            lo[k] = std::min(lo[k], uv[k]);
+            hi[k] = std::max(hi[k], uv[k]);
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        if (!stages.rt[i] || !stages.desc[i] || !stages.desc[i]->width || !stages.desc[i]->height) continue;
+        const float size[2] = {float(stages.desc[i]->width), float(stages.desc[i]->height)};
+        for (int k = 0; k < 2; k++) {
+            const float n = stages.info[i].rect ? size[k] : 1.0f;  // coordinates per texture width
+            if (hi[k] - lo[k] < 2 * n / size[k]) continue;         // too narrow to be a region
+            // the far edge's last texel centre: as far in from it as the near edge's coordinate is past a texel corner
+            const float texel = n / size[k];
+            const float past = lo[k] / texel - std::floor(lo[k] / texel);
+            c.rtclip[i][k] = lo[k] / n;
+            c.rtclip[i][2 + k] = (hi[k] - (past > 0.25f ? 1.0f : 0.5f) * texel) / n;
+        }
+    }
+}
+
 bool UnitTexcoords(const Assembled& a) {
     constexpr float kLo = -1e-4f;
     constexpr float kHi = 1.0001f;
@@ -3674,6 +3722,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     c.tscale[0] = TargetScale();
     c.tscale[1] = TargetScaleY();
     c.tscale[2] = UiSqueeze(s, a, stages);
+    RegionClip(a, stages, c);
     if (bound_rt_ && !a.pretransformed) bound_rt_->scene_frame = frame_;
     // Distance blur only uses this frame's full-size, multisampled scene depth. The allocation can
     // fall back to one sample, so check the resource, not the configured mode.

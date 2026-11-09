@@ -59,6 +59,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 zclips;
     float4 vdef[16];
     float4 tscale;
+    float4 rtclip[4];
 };
 )";
 
@@ -395,7 +396,8 @@ std::string TexUv(const TexInfo& t, int i, const std::string& uv) {
     if (t.rect) n += F(" / texsize[%d].xy", i);
     n += F(" + texsize[%d].zw", i);
     if (!(t.flags & kTexTarget)) return n;
-    return n + F(" + rtshift[%d] * (ddx(", i) + n + ") * tscale.x + ddy(" + n + ") * tscale.y)";
+    return "clamp(" + n + F(" + rtshift[%d] * (ddx(", i) + n + ") * tscale.x + ddy(" + n +
+           F(") * tscale.y), rtclip[%d].xy, rtclip[%d].zw)", i, i);
 }
 
 // texture shader stage i, per its mode

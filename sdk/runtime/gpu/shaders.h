@@ -110,6 +110,7 @@ struct DrawConstants {
     float vdef[16][4];   // vertex program inputs no stream feeds: State::vdef
     float tscale[4];     // host pixels per console pixel of the bound target along x and y; z scales screen x
                          // about the centre (2D drawn for 16:9 on a wider frame); w unused
+    float rtclip[4][4];  // per kTexTarget stage: uv min xy, max zw its reads are held to (RegionClip)
 };
 
 }  // namespace gpu
