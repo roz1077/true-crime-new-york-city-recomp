@@ -34,6 +34,7 @@
 #include <backends/imgui_impl_win32.h>
 
 #include "app/app.h"
+#include "common/graphics_menu.h"
 // SMAA 1x: the reference shader and its lookup textures (third_party/smaa, MIT)
 #include "../../third_party/smaa/AreaTex.h"
 #include "../../third_party/smaa/SMAAShader.h"
@@ -65,6 +66,11 @@ constexpr uint32_t kSamplerCount = 2048;
 constexpr uint32_t kRtvCount = 1024;
 constexpr uint32_t kDsvCount = 256;
 constexpr uint32_t kSmaaRtvs = 3;  // after the back buffers' views: SMAA edges, weights, output
+constexpr uint32_t kAoRtvs = 1;    // after SMAA: the offscreen AO target
+constexpr uint32_t kAoRtv = kRtvCount + kFrames + kSmaaRtvs;
+constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R8_UNORM;
+constexpr float kAoStrength = 0.5f;
+constexpr float kAoRadius = 1.0f;
 constexpr DXGI_FORMAT kBgra = DXGI_FORMAT_B8G8R8A8_UNORM;
 constexpr uint32_t kQueries = 8192;  // occlusion queries in flight, several frames of counted draws
 constexpr uint32_t kNoQuery = ~0u;
@@ -242,6 +248,145 @@ float4 psmain(O i) : SV_Target {
         c.rgb = saturate(c.rgb + d / 255.0);
     }
     return float4(c.rgb, opts.y > 0 ? c.a : 1);
+}
+)";
+
+// Offscreen scene-time AO. The depth is reversed in D3D12, so RawDepth undoes it before the
+// standard linearisation. Samples are view-space hemisphere taps anchored to the surface.
+const char* kAoHlsl = R"(
+cbuffer B : register(b1) { float4 src; float4 ao; };
+#if DEPTH_MS
+Texture2DMS<float> depthTex : register(t0);
+#else
+Texture2D<float> depthTex : register(t0);
+#endif
+SamplerState ps : register(s1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+#if DEPTH_MS
+float RawDepth(float2 uv) {
+    uint w, h, samples;
+    depthTex.GetDimensions(w, h, samples);
+    uint2 p = uint2(saturate(uv) * float2(max(w, 1) - 1, max(h, 1) - 1));
+    return 1.0 - depthTex.Load(p, 0);
+}
+#else
+float RawDepth(float2 uv) {
+    return 1.0 - depthTex.SampleLevel(ps, saturate(uv), 0);
+}
+#endif
+float LinearDepth(float raw) {
+    return src.z * src.w / max(src.w - raw * (src.w - src.z), 1e-4);
+}
+float3 ViewAt(float2 uv, float z) {
+    float2 n = uv * 2.0 - 1.0;
+    return float3(n.x * ao.w * ao.z, -n.y * ao.z, z);
+}
+float SafeDepth(float2 uv, float z) {
+    const float d = LinearDepth(RawDepth(uv));
+    return abs(d - z) < 3.0 ? d : z;
+}
+float AoFactor(float2 uv) {
+    float z = LinearDepth(RawDepth(uv));
+    if (z >= src.w * 0.999) return 1.0;
+    float3 p = ViewAt(uv, z);
+    float zr = SafeDepth(uv + float2(src.x, 0), z), zl = SafeDepth(uv - float2(src.x, 0), z);
+    float zd = SafeDepth(uv + float2(0, src.y), z), zu = SafeDepth(uv - float2(0, src.y), z);
+    float3 n = normalize(cross(ViewAt(uv + float2(src.x, 0), zr) - ViewAt(uv - float2(src.x, 0), zl),
+                               ViewAt(uv + float2(0, src.y), zd) - ViewAt(uv - float2(0, src.y), zu)));
+    if (dot(n, p) > 0.0) n = -n;
+    float3 t = normalize(cross(abs(n.z) < 0.99 ? float3(0, 0, 1) : float3(1, 0, 0), n));
+    float3 b = cross(n, t);
+    float2 px = uv / max(src.xy, 1e-5);
+    float ang = frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715)))) * 6.2831853;
+    float cs = cos(ang), sn = sin(ang);
+    static const float3 kernel[8] = {
+        float3(0.5, 0.0, 0.5), float3(-0.5, 0.0, 0.5), float3(0.0, 0.5, 0.5), float3(0.0, -0.5, 0.5),
+        float3(0.35, 0.35, 0.7), float3(-0.35, 0.35, 0.7), float3(-0.35, -0.35, 0.7), float3(0.35, -0.35, 0.7)
+    };
+    float occlusion = 0.0;
+    float count = 0.0;
+    [unroll] for (int i = 0; i < 8; i++) {
+        float3 d = kernel[i];
+        d.xy = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+        float3 sp = p + (t * d.x + b * d.y + n * d.z) * ao.y;
+        if (sp.z <= 0.001) continue;
+        float2 suv = float2(sp.x / (sp.z * ao.w * ao.z), -sp.y / (sp.z * ao.z)) * 0.5 + 0.5;
+        if (suv.x < 0 || suv.x > 1 || suv.y < 0 || suv.y > 1) continue;
+        float diff = sp.z - LinearDepth(RawDepth(suv));
+        count += 1.0;
+        if (diff > 0.02 && diff < ao.y) occlusion += 1.0 - diff / ao.y;
+    }
+    return saturate(1.0 - (occlusion / max(count, 1.0)) * ao.x);
+}
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float4 psmain(O i) : SV_Target {
+#ifdef AO_DEPTH_VIEW
+    const float z = LinearDepth(RawDepth(i.uv));
+    const float v = sqrt(saturate(z / 10.0));
+    return float4(v, v, v, 1.0);
+#else
+    float f = AoFactor(i.uv);
+    return float4(f, f, f, 1.0);
+#endif
+}
+)";
+
+// Composite the AO buffer into the scene colour with a 5x5 depth-aware blur. The blend state
+// multiplies it into the destination; this shader only returns the AO factor.
+const char* kAoCompositeHlsl = R"(
+cbuffer B : register(b1) { float4 src; float4 planes; };
+Texture2D<float> aoTex : register(t0);
+#if DEPTH_MS
+Texture2DMS<float> depthTex : register(t1);
+#else
+Texture2D<float> depthTex : register(t1);
+#endif
+SamplerState ls : register(s0);
+SamplerState ps : register(s1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+#if DEPTH_MS
+float RawDepth(float2 uv) {
+    uint w, h, samples;
+    depthTex.GetDimensions(w, h, samples);
+    uint2 p = uint2(saturate(uv) * float2(max(w, 1) - 1, max(h, 1) - 1));
+    return 1.0 - depthTex.Load(p, 0);
+}
+#else
+float RawDepth(float2 uv) { return 1.0 - depthTex.SampleLevel(ps, saturate(uv), 0); }
+#endif
+float LinearDepth(float raw) {
+    return planes.x * planes.y / max(planes.y - raw * (planes.y - planes.x), 1e-4);
+}
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float4 psmain(O i) : SV_Target {
+    const float2 t = src.xy;
+    const float z0 = LinearDepth(RawDepth(i.uv));
+    float a = aoTex.SampleLevel(ls, i.uv, 0).r * 0.04;
+    float wsum = 0.04;
+    [unroll] for (int y = -2; y <= 2; y++) {
+        [unroll] for (int x = -2; x <= 2; x++) {
+            if (x == 0 && y == 0) continue;
+            const float2 uv = i.uv + float2(float(x), float(y)) * t;
+            const float zk = LinearDepth(RawDepth(uv));
+            const float wgt = 0.04 / (1.0 + abs(z0 - zk) * 8.0 / max(z0, 1.0));
+            a += aoTex.SampleLevel(ls, uv, 0).r * wgt;
+            wsum += wgt;
+        }
+    }
+    const float f = saturate(a / wsum);
+    return float4(f, f, f, 1.0);
 }
 )";
 
@@ -619,6 +764,7 @@ private:
         ID3D12Resource* write = nullptr;
         ID3D12Resource* depth_write = nullptr;
         bool drew = false;
+        bool opaque = false;
     };
     struct Frame {
         ComPtr<ID3D12CommandAllocator> alloc;
@@ -762,9 +908,10 @@ private:
     bool DeferredPendingResource(ID3D12Resource* r) const {
         return r && (defer_reads_.count(r) || defer_writes_.count(r));
     }
-    bool BeginDeferredBundle(const DrawTextures& stages);
+    bool BeginDeferredBundle(const DrawTextures& stages, bool opaque);
     void EndDeferredBundle();
     void FlushDeferredScene();
+    bool DeferredBarrier(const char* why);
     void DeferredFallback(const char* why);
     void ReportDeferred();
     // ends the bundle on every return from Draw once one was started
@@ -806,6 +953,10 @@ private:
     // SMAA 1x on the finished frame (app::Settings::smaa): the anti-aliased copy of t, null when off or failed
     ID3D12Resource* ApplySmaa(Target& t);
     bool EnsureSmaa(const Target& t);
+    bool EnsureAoHalf(uint32_t w, uint32_t h);
+    void RenderHalfAo(Target& t);
+    ID3D12PipelineState* EnsureAoCompositePipeline(DXGI_FORMAT rtv, uint32_t samples, bool depth_ms);
+    void CompositeDeferredAo(Target& rt, Target& ds, float near_z, float far_z);
     void RenderUi();
     void ReleaseOldTextures();
     void ResetFrame();
@@ -933,12 +1084,15 @@ private:
     bool defer_abandoned_ = false;   // this frame fell back to immediate drawing
     bool defer_reported_ = false;    // the first deferred frame has been reported
     const char* defer_reason_ = nullptr;
+    bool defer_flush_conflict_ = false;  // Transition flushed pending bundles during this draw
+    bool defer_ao_applied_ = false;      // the scene-time AO pass has run for this frame
     Target* defer_rt_ = nullptr;     // this frame's full-size scene colour target
     ID3D12GraphicsCommandList* bundle_ = nullptr;  // the bundle being recorded, if any
     BundleDesc bundle_desc_;         // its direct-list state
     std::unordered_set<ID3D12Resource*> defer_reads_;   // resources pending bundles read
     std::unordered_set<ID3D12Resource*> defer_writes_;  // resources pending bundles write
     uint32_t defer_bundles_this_frame_ = 0;
+    uint32_t defer_flushes_this_frame_ = 0;
     std::unordered_map<uint64_t, Tex> textures_;  // by data address, a P8 texture's with its palette's above
     std::unordered_map<uint64_t, Tex> pack_textures_;  // texture pack images by key, kept for the run
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
@@ -986,6 +1140,11 @@ private:
     std::unordered_map<Target*, SceneDepth> scene_depth_;  // per colour target, cleared at present
     ID3D12Resource* dof_depth_ = nullptr;  // this frame's readable depth, set at present
     float dof_near_ = 0.1f, dof_far_ = 1000.0f;
+    ComPtr<ID3D12Resource> ao_half_;
+    D3D12_RESOURCE_STATES ao_half_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    uint32_t ao_half_w_ = 0, ao_half_h_ = 0;
+    bool ao_half_ready_ = false;
+    Target* defer_ds_ = nullptr;  // the depth target of this frame's deferred scene
     uint32_t guest_w_ = 640;
     uint32_t guest_h_ = 480;
     uint32_t bb_w_ = 0;
@@ -1139,7 +1298,8 @@ bool D3D12Backend::CreateBackBufferViews() {
 bool D3D12Backend::CreateHeaps() {
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
-    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kSmaaRtvs, false, rtv_heap_);
+    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kSmaaRtvs + kAoRtvs, false,
+                          rtv_heap_);
     dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
     CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
     if (!srv_heap_ || !smp_heap_ || !rtv_heap_ || !dsv_heap_ || !ui_heap_) {
@@ -1386,7 +1546,7 @@ uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
     if (f.srv + n > per) {
         // Never borrow another frame's region: those descriptors may still be
         // referenced by an in-flight command list. Start a new recording frame.
-        if (defer_scene_ && !defer_abandoned_ && !bundle_) DeferredFallback("mid-frame descriptor ring flush");
+        if (defer_scene_ && !defer_abandoned_ && !bundle_) DeferredBarrier("mid-frame descriptor ring flush");
         LOG_FIRST(4, "d3d12: descriptor ring full within a frame, submitting early");
         Submit(true);
         if (f.srv + n > per) {
@@ -1408,9 +1568,17 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
         const bool pending_write = defer_writes_.count(r) != 0;
         if (pending_read || pending_write) {
             if (want != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE || pending_write) {
-                DeferredFallback(want == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                                     ? "scene target sampled after a deferred draw"
-                                     : "target written after a deferred draw");
+                if (!bundle_) {
+                    // Materialise what has been deferred so the transition and the draw that
+                    // needs it happen in the right order, then keep the frame deferred.
+                    FlushDeferredScene();
+                    defer_flush_conflict_ = true;
+                    if (cur == want) return;
+                } else {
+                    DeferredFallback(want == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                         ? "scene target sampled after a deferred draw"
+                                         : "target written after a deferred draw");
+                }
             }
         }
     }
@@ -1427,8 +1595,11 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
 // a resized target gives back its view and its resources
 void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
     if (DeferredPendingResource(it->second.res.Get()) ||
-        (it->second.resolved && DeferredPendingResource(it->second.resolved.Get())))
-        DeferredFallback("target released while deferred");
+        (it->second.resolved && DeferredPendingResource(it->second.resolved.Get()))) {
+        DeferredBarrier("target released while deferred");
+        if (defer_rt_ == &it->second) defer_rt_ = nullptr;
+        if (defer_ds_ == &it->second) defer_ds_ = nullptr;
+    }
     if (it->second.depth)
         std::erase_if(scene_depth_, [&](const auto& entry) { return entry.second.target == &it->second; });
     else
@@ -1661,7 +1832,7 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline(uint32_t samples) {
 
 // src's depth drawn into dst's depth buffer
 bool D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* pso) {
-    if (DeferredPending()) DeferredFallback("depth copy after a deferred draw");
+    if (DeferredPending()) DeferredBarrier("depth copy after a deferred draw");
     if (cap_) fprintf(cap_, "%04u depth copy %08X to %08X\n", cap_i_++, src.data, dst.data);
     const bool multisampled = src.res->GetDesc().SampleDesc.Count > 1;
     ID3D12Resource* depth = multisampled ? ResolveDepth(src) : src.res.Get();
@@ -1750,7 +1921,7 @@ ComPtr<ID3D12Resource> D3D12Backend::CreatePixelTexture(const std::vector<uint8_
 
 // CPU pixels of a color surface into its host target, scaled
 void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
-    if (DeferredPendingResource(t.res.Get())) DeferredFallback("CPU pixels written to a deferred target");
+    if (DeferredPendingResource(t.res.Get())) DeferredBarrier("CPU pixels written to a deferred target");
     g_perf.rtups++;
     TextureDesc d;
     if (!Describe(s.header, d) || Format(d.format).depth) return;
@@ -2093,7 +2264,7 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
 
 // a copy of the target to read while drawing to it
 ID3D12Resource* D3D12Backend::Feedback(Target& t) {
-    if (DeferredPendingResource(t.res.Get())) DeferredFallback("scene target copied for feedback");
+    if (DeferredPendingResource(t.res.Get())) DeferredBarrier("scene target copied for feedback");
     if (!t.fb) {
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC td = t.res->GetDesc();
@@ -2340,8 +2511,16 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     TexInfo& info = stages.info[stage];
     D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[stage];
     if (&t == draw_ds_) return nullptr;
-    if (defer_writes_.count(t.res.Get())) DeferredFallback("scene target sampled after a deferred draw");
-    if (t.resolved && defer_writes_.count(t.resolved.Get())) DeferredFallback("scene target sampled after a deferred draw");
+    if (defer_writes_.count(t.res.Get()) || (t.resolved && defer_writes_.count(t.resolved.Get()))) {
+        // The draw needs the scene as it stands. Materialise the pending bundles, then keep
+        // this draw immediate so it samples what it was just made to wait for.
+        if (!bundle_) {
+            FlushDeferredScene();
+            defer_flush_conflict_ = true;
+        } else {
+            DeferredFallback("scene target sampled after a deferred draw");
+        }
+    }
     bool feedback = &t == draw_rt_;
     stages.rt[stage] = true;
     info.flags |= kTexTarget;
@@ -3743,25 +3922,29 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (defer_possible) defer_frame_active_ = true;
     else if (scene_sized && !defer_abandoned_) {
         if (cap_)
-            DeferredFallback("scene capture");
+            DeferredBarrier("scene capture");
         else if (ext_)
-            DeferredFallback("scene draw with an extension");
+            DeferredBarrier("scene draw with an extension");
         else if (s.simple[kMCountEnable >> 2])
-            DeferredFallback("counted scene draw");
+            DeferredBarrier("counted scene draw");
     }
     // A scene draw that cannot be recorded must run after the pending bundles it overlaps.
-    if (!defer_possible && defer_scene_ && !CurrentFrame().bundles.empty() && FindTarget(s.rt, false) == defer_rt_)
-        DeferredFallback("main scene draw could not be deferred");
+    if (!defer_possible && defer_scene_ && !CurrentFrame().bundles.empty() &&
+        FindTarget(s.rt, false) == defer_rt_) {
+        if (DeferredBarrier("main scene draw could not be deferred")) {
+            if (!BindTargets(s)) return;
+        }
+    }
 
     // past the ring every upload is a buffer of its own: seconds lost on a frame that draws a whole level once
     if (CurrentFrame().used > kUploadSize - kUploadReserve) {
-        if (defer_scene_ && !defer_abandoned_) DeferredFallback("mid-frame upload ring flush");
+        if (defer_scene_ && !bundle_) FlushDeferredScene();
         Submit(true);
     }
     // Keep a margin for this draw's texture views and any resolves/uploads below; a wrap
     // would alias descriptors already recorded, including those in pending bundles.
     if (CurrentFrame().srv + 48 > kSrvCount / kFrames) {
-        if (defer_scene_ && !defer_abandoned_) DeferredFallback("mid-frame descriptor ring flush");
+        if (defer_scene_ && !bundle_) FlushDeferredScene();
         Submit(true);
     }
     if (!BindTargets(s)) return;
@@ -3776,11 +3959,15 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // stage textures, then the pixel shader made for them
     DrawTextures stages;
+    defer_flush_conflict_ = false;
     if (!BindStageTexturesAndTargets(s, stages)) return;
+    // A sampled resource forced a flush while those textures were being bound. The draw must
+    // stay immediate so it sees the scene contents it was just made to wait for.
+    const bool stage_conflict = defer_flush_conflict_;
 
     // Only draws into this frame's single full-size scene target are bundled. A draw that
     // samples a full-size target reads scene contents and stays immediate.
-    bool defer_now = defer_possible && !defer_abandoned_ && bound_rt_ && !bound_rt_->depth &&
+    bool defer_now = defer_possible && !defer_abandoned_ && !stage_conflict && bound_rt_ && !bound_rt_->depth &&
                      bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_;
     if (defer_now) {
         if (!defer_rt_) {
@@ -3790,7 +3977,23 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         }
     }
     DeferredScope defer_scope{this};
-    if (defer_now && !BeginDeferredBundle(stages)) {
+    // The engine enables blending for most depth-writing world geometry (alpha-tested
+    // materials). Depth writing, not blend enable, identifies the opaque scene layer; the
+    // no-depth-write effects are what must draw after AO.
+    const bool opaque = bound_ds_ && s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable) != 0;
+    if (defer_now && (frame_ % 300) == 0) {
+        static uint64_t logged_draw_frame = ~0ull;
+        static int logged_draws = 0;
+        if (logged_draw_frame != frame_) {
+            logged_draw_frame = frame_;
+            logged_draws = 0;
+        }
+        if (logged_draws++ < 4)
+            LOGR("d3d12: deferred draw frame %llu rt %08X ds %08X opaque %d blend %u zw %u", 
+                 static_cast<unsigned long long>(frame_), s.rt.data, bound_ds_ ? s.zs.data : 0, int(opaque),
+                 SimpleState(s, kMBlendEnable), SimpleState(s, kMZWriteEnable));
+    }
+    if (defer_now && !BeginDeferredBundle(stages, opaque)) {
         defer_now = false;
         DeferredFallback("bundle allocation failed");
     }
@@ -3799,8 +4002,9 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         bool hit = (bound_rt_ && defer_writes_.count(bound_rt_->res.Get())) ||
                    (bound_ds_ && defer_writes_.count(bound_ds_->res.Get()));
         if (hit) {
-            DeferredFallback("main scene target written by an immediate draw");
-            if (!BindTargets(s)) return;
+            if (DeferredBarrier("main scene target written by an immediate draw")) {
+                if (!BindTargets(s)) return;
+            }
         }
     }
     PixelKey pk = MakePixelKey(s, stages.info);
@@ -3828,16 +4032,35 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     c.tscale[2] = UiSqueeze(s, a, stages);
     if (bound_rt_ && !a.pretransformed) bound_rt_->scene_frame = frame_;
     // Distance blur only uses this frame's full-size, multisampled scene depth. The allocation can
-    // fall back to one sample, so check the resource, not the configured mode.
-    const bool depth_msaa = bound_ds_ && bound_ds_->res &&
-                            bound_ds_->res->GetDesc().SampleDesc.Count > 1;
-    if (render_.dof && depth_msaa && bound_rt_ && !a.pretransformed && k.zwrite &&
+    // fall back to one sample, so check the resource, not the configured mode. Scene-time AO
+    // supports both sample counts.
+    const bool depth_available = bound_ds_ && bound_ds_->res;
+    // A widescreen game view is full width but shorter than the 640x480 surface (letterboxed
+    // by the title). Accept that as the scene view; a shadow or mirror pass is much smaller.
+    const bool scene_view = s.viewport.w == guest_w_ && s.viewport.h * 4 >= guest_h_ * 3;
+    if (bound_rt_ && bound_ds_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_) {
+        static uint64_t logged_frame = ~0ull;
+        if ((frame_ % 300) == 0 && logged_frame != frame_)
+            LOGR("d3d12: AO depth candidate frame %llu pre %d zwrite %d scene_view %d rt %ux%u ds %ux%u vp %ux%u guest %ux%u",
+                 static_cast<unsigned long long>(frame_), int(a.pretransformed), int(k.zwrite), int(scene_view),
+                 bound_rt_->w, bound_rt_->h, bound_ds_->w, bound_ds_->h, s.viewport.w, s.viewport.h, guest_w_,
+                 guest_h_);
+        if (logged_frame != frame_) logged_frame = frame_;
+    }
+    if ((render_.dof || render_.ao != 0) && depth_available && bound_rt_ && !a.pretransformed && k.zwrite &&
         bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ &&
-        bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h &&
-        s.viewport.w == guest_w_ && s.viewport.h == guest_h_) {
-        const WRange r = ProjectionWRange(s.transforms[kTsProjection].data());
-        if (r.near_w > 0 && r.far_w > r.near_w)
-            scene_depth_.insert_or_assign(bound_rt_, SceneDepth{bound_ds_, r.near_w, r.far_w});
+        bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h && scene_view) {
+        const WRange r = DrawWRange(s, sh.prog);
+        // A program's w buffer is in buffer units up to zscale. Normalise that scale to the
+        // same world-like span the fixed-function projection uses, so the AO radius and DOF
+        // distance thresholds mean the same thing for both kinds of draw.
+        WRange range = r;
+        if (range.far_w > 1000.0f) {
+            range.near_w *= 1000.0f / range.far_w;
+            range.far_w = 1000.0f;
+        }
+        if (range.near_w > 0 && range.far_w > range.near_w)
+            scene_depth_.insert_or_assign(bound_rt_, SceneDepth{bound_ds_, range.near_w, range.far_w});
     }
     if (!UploadConstants(s, sh, k, stages, size, c)) return;
     if (ext_) binds_ = {};
@@ -3863,7 +4086,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 // Start a bundle for the draw whose direct-list target bind has already been recorded. The
 // bundle carries the PSO, root arguments, descriptor tables, blend state and geometry; the
 // direct list carries the target bind, viewport/scissor and barriers.
-bool D3D12Backend::BeginDeferredBundle(const DrawTextures& stages) {
+bool D3D12Backend::BeginDeferredBundle(const DrawTextures& stages, bool opaque) {
     Frame& f = CurrentFrame();
     if (!f.bundle_alloc) return false;
     if (f.bundle_next >= f.bundle_pool.size()) {
@@ -3896,6 +4119,9 @@ bool D3D12Backend::BeginDeferredBundle(const DrawTextures& stages) {
     if (bound_ds_) bundle_desc_.dsv = Cpu(dsv_heap_.Get(), bound_ds_->view, dsv_inc_);
     bundle_desc_.write = bound_rt_ ? bound_rt_->res.Get() : nullptr;
     bundle_desc_.depth_write = bound_ds_ ? bound_ds_->res.Get() : nullptr;
+    bundle_desc_.opaque = opaque;
+    if (!defer_rt_) defer_rt_ = bound_rt_;
+    if (!defer_ds_) defer_ds_ = bound_ds_;
     for (int i = 0; i < 4; i++) bundle_desc_.reads[i] = stages.res[i];
     bundle_ = list;
     f.bundle_next++;
@@ -3940,9 +4166,10 @@ void D3D12Backend::FlushDeferredScene() {
     cl_->SetDescriptorHeaps(2, heaps);
     cl_->SetGraphicsRootSignature(root_.Get());
     binds_ = {};
+    defer_flushes_this_frame_++;
     SIZE_T rtv = 0;
     SIZE_T dsv = 0;
-    for (BundleDesc& b : f.bundles) {
+    auto execute = [&](BundleDesc& b) {
         const SIZE_T want_rtv = b.has_rt ? b.rtv.ptr : 0;
         const SIZE_T want_dsv = b.has_ds ? b.dsv.ptr : 0;
         if (want_rtv != rtv || want_dsv != dsv) {
@@ -3961,11 +4188,63 @@ void D3D12Backend::FlushDeferredScene() {
         // calling list; the CPU-side cache no longer describes it.
         binds_ = {};
         defer_bundles_this_frame_++;
+    };
+    // Opaque draws first, then transparent/effect draws. Scene-time AO is inserted between
+    // the two groups so it only darkens opaque surfaces.
+    uint32_t opaque_count = 0;
+    for (const BundleDesc& b : f.bundles)
+        if (b.opaque) opaque_count++;
+    const uint32_t transparent_count = uint32_t(f.bundles.size()) - opaque_count;
+    for (BundleDesc& b : f.bundles)
+        if (b.opaque) execute(b);
+    if (frame_ % 300 == 0)
+        LOGR("d3d12: deferred AO check frame %llu ao %u applied %d rt %p(%08X) ds %p(%08X) depths %zu found %d",
+             static_cast<unsigned long long>(frame_), render_.ao, int(defer_ao_applied_), static_cast<void*>(defer_rt_),
+             defer_rt_ ? defer_rt_->data : 0, static_cast<void*>(defer_ds_), defer_ds_ ? defer_ds_->data : 0,
+             scene_depth_.size(), int(defer_rt_ && scene_depth_.find(defer_rt_) != scene_depth_.end()));
+    if (opaque_count > 0 && render_.ao != 0 && !defer_ao_applied_ && defer_rt_ && defer_ds_) {
+        const auto depth = scene_depth_.find(defer_rt_);
+        if (depth != scene_depth_.end() && depth->second.target == defer_ds_) {
+            // Clear the pending set first: CompositeDeferredAo transitions scene depth while the
+            // transparent bundles are still pending. It restores their recorded states before
+            // they run, so they see the same targets they were recorded against.
+            defer_reads_.clear();
+            defer_writes_.clear();
+            CompositeDeferredAo(*defer_rt_, *defer_ds_, depth->second.near_z, depth->second.far_z);
+            defer_ao_applied_ = true;
+            rtv = dsv = ~SIZE_T(0);
+            binds_ = {};
+            if ((frame_ % 300) == 0)
+                LOGR("d3d12: deferred AO between %u opaque and %u transparent bundle(s), depth %08X near %.4f far %.4f",
+                     opaque_count, transparent_count, depth->second.target->data, depth->second.near_z,
+                     depth->second.far_z);
+        } else {
+            LOG_FIRST(4, "d3d12: deferred AO skipped on frame %llu, no scene depth for the display list target",
+                      static_cast<unsigned long long>(frame_));
+        }
     }
+    for (BundleDesc& b : f.bundles)
+        if (!b.opaque) execute(b);
     f.bundles.clear();
     defer_reads_.clear();
     defer_writes_.clear();
     Begin();
+}
+
+// Pending bundles must execute before an immediate command that reads or rewrites their
+// targets. This is the normal materialisation path, not a failure: the frame keeps deferring
+// after the command. Only a conflict while a bundle is open forces the old immediate fallback.
+bool D3D12Backend::DeferredBarrier(const char* why) {
+    if (!defer_scene_ || CurrentFrame().bundles.empty()) return false;
+    if (bundle_) {
+        DeferredFallback(why);
+        return false;
+    }
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 40)
+        LOGR("d3d12: deferred barrier frame %llu: %s", static_cast<unsigned long long>(frame_), why);
+    FlushDeferredScene();
+    return true;
 }
 
 // Stop deferring this frame. Pending bundles are executed first so the immediate commands
@@ -3983,15 +4262,16 @@ void D3D12Backend::DeferredFallback(const char* why) {
 }
 
 void D3D12Backend::ReportDeferred() {
-    if (!defer_scene_ || defer_reported_ || !defer_frame_active_) return;
+    if (!defer_scene_ || !defer_frame_active_) return;
     if (!defer_bundles_this_frame_ && !defer_abandoned_) return;
     if (defer_abandoned_) {
-        LOGR("deferred: frame %llu replayed %u bundle(s), fell back to immediate: %s",
-             static_cast<unsigned long long>(frame_), defer_bundles_this_frame_,
+        LOGR("deferred: frame %llu replayed %u bundle(s), %u flush(es), fell back to immediate: %s",
+             static_cast<unsigned long long>(frame_), defer_bundles_this_frame_, defer_flushes_this_frame_,
              defer_reason_ ? defer_reason_ : "unknown");
-    } else {
-        LOGR("deferred: frame %llu replayed %u bundle(s), no fallback",
-             static_cast<unsigned long long>(frame_), defer_bundles_this_frame_);
+    } else if (!defer_reported_ || frame_ % 300 == 0) {
+        LOGR("deferred: frame %llu replayed %u bundle(s), %u flush(es), AO %s, no fallback",
+             static_cast<unsigned long long>(frame_), defer_bundles_this_frame_, defer_flushes_this_frame_,
+             defer_ao_applied_ ? "applied" : "off");
     }
     defer_reported_ = true;
 }
@@ -4091,8 +4371,20 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
     }
     Target* rt = (flags & kClearTarget) ? EnsureTarget(s.rt, false) : nullptr;
     Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true) : nullptr;
-    if ((rt && DeferredPendingResource(rt->res.Get())) || (ds && DeferredPendingResource(ds->res.Get())))
-        DeferredFallback("clear touched a deferred target");
+    const bool scene_clear = (rt && rt == defer_rt_) || (ds && ds == defer_ds_);
+    if ((rt && DeferredPendingResource(rt->res.Get())) || (ds && DeferredPendingResource(ds->res.Get()))) {
+        // The pending draws write this target; run them before the clear. The frame stays
+        // deferred, and a clear of the scene targets starts a new scene for AO tracking.
+        if (!bundle_) DeferredBarrier("clear touched a deferred target");
+        else DeferredFallback("clear touched a deferred target");
+    }
+    if (scene_clear) {
+        LOG_FIRST(4, "d3d12: deferred scene clear rt %08X ds %08X flags %X", rt ? rt->data : 0, ds ? ds->data : 0,
+                  flags);
+        defer_ao_applied_ = false;
+        defer_rt_ = nullptr;
+        defer_ds_ = nullptr;
+    }
     uint32_t gw;
     uint32_t gh;
     SurfaceSize(rt ? s.rt : s.zs, gw, gh);
@@ -4261,7 +4553,7 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
             Target* dst_t = FindTarget(dst, false);
             return dst_t && DeferredPendingResource(dst_t->res.Get());
         }())
-        DeferredFallback("copy touched a deferred target");
+        DeferredBarrier("copy touched a deferred target");
     if (cap_) {
         const char* from = "memory";
         if (src_t) from = src_t->drawn ? "target" : "idle target";
@@ -4642,6 +4934,174 @@ ID3D12Resource* D3D12Backend::ApplySmaa(Target& t) {
     return smaa_.output.res.Get();
 }
 
+bool D3D12Backend::EnsureAoHalf(uint32_t w, uint32_t h) {
+    const uint32_t aw = render_.ao == 1 ? std::max(1u, w / 2) : std::max(1u, w);
+    const uint32_t ah = render_.ao == 1 ? std::max(1u, h / 2) : std::max(1u, h);
+    if (ao_half_ && ao_half_w_ == aw && ao_half_h_ == ah) return true;
+    if (ao_half_) {
+        // Called from the deferred flush, where Flush would re-enter it. Every earlier submit
+        // is already on the queue, so waiting for the fences is enough to release the target.
+        for (auto& f : frames_)
+            if (f.fence && !WaitFence(f.fence)) return false;
+        ao_half_.Reset();
+        ao_half_w_ = ao_half_h_ = 0;
+    }
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = Texture2DDesc(kAoFormat, aw, ah);
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ao_half_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, ao_half_state_, nullptr,
+                                             IID_PPV_ARGS(&ao_half_)))) {
+        LOGE("d3d12: AO target could not be created");
+        return false;
+    }
+    dev_->CreateRenderTargetView(ao_half_.Get(), nullptr, Cpu(rtv_heap_.Get(), kAoRtv, rtv_inc_));
+    ao_half_w_ = aw;
+    ao_half_h_ = ah;
+    LOGR("d3d12: deferred AO target %ux%u", aw, ah);
+    return true;
+}
+
+void D3D12Backend::RenderHalfAo(Target& t) {
+    ao_half_ready_ = false;
+    static std::atomic<int> logged{0};
+    if (render_.ao == 0 || !dof_depth_) {
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            LOGR("d3d12: deferred AO skipped: ao %u depth %p", render_.ao, static_cast<void*>(dof_depth_));
+        return;
+    }
+    if (!EnsureAoHalf(t.w, t.h)) {
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            LOGR("d3d12: deferred AO skipped: target creation failed");
+        return;
+    }
+    Transition(ao_half_.Get(), ao_half_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const auto depth_desc = dof_depth_->GetDesc();
+    const float src[4] = {1.0f / float(std::max<uint64_t>(depth_desc.Width, 1)),
+                          1.0f / float(std::max<uint32_t>(depth_desc.Height, 1)), dof_near_, dof_far_};
+    float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
+    float tan_half_fov = 0.577f;
+    const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
+    if (fov > 1.0f && fov < 179.0f && aspect > 0.1f)
+        tan_half_fov = std::tan(fov * 3.14159265f / 360.0f) / aspect;
+    const std::string shader = std::string("#define DEPTH_MS ") +
+                               (depth_desc.SampleDesc.Count > 1 ? "1\n" : "0\n") +
+                               (std::getenv("TCNYC_AO_DEPTH") ? "#define AO_DEPTH_VIEW 1\n" : "") + kAoHlsl;
+    if (!EnsurePassPipeline(shader.c_str(), "psmain", kAoFormat, -1)) {
+        static std::atomic<int> logged_pipe{0};
+        if (logged_pipe.fetch_add(1, std::memory_order_relaxed) < 4)
+            LOGR("d3d12: deferred AO skipped: pipeline failed");
+        return;
+    }
+    ID3D12Resource* depth_src[3] = {dof_depth_, nullptr, nullptr};
+    DXGI_FORMAT depth_fmt[3] = {kDepthRead, kBgra, kBgra};
+    const float p[8] = {src[0], src[1], src[2], src[3], kAoStrength, kAoRadius, tan_half_fov, aspect};
+    Pass(shader.c_str(), "psmain", kAoFormat, Cpu(rtv_heap_.Get(), kAoRtv, rtv_inc_), ao_half_w_, ao_half_h_,
+         depth_src, depth_fmt, p, -1);
+    Transition(ao_half_.Get(), ao_half_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ao_half_ready_ = true;
+}
+
+ID3D12PipelineState* D3D12Backend::EnsureAoCompositePipeline(DXGI_FORMAT rtv, uint32_t samples, bool depth_ms) {
+    const uint64_t seed = uint64_t(rtv) << 40 | uint64_t(samples) << 8 | uint64_t(depth_ms);
+    auto& pso = blit_psos_[Hash(kAoCompositeHlsl, std::strlen(kAoCompositeHlsl), seed)];
+    if (pso) return pso.Get();
+    uint64_t h;
+    const std::string src = std::string("#define DEPTH_MS ") + (depth_ms ? "1\n" : "0\n") + kAoCompositeHlsl;
+    ID3DBlob* vs = Compile(src, "vs", "vs_5_0", h);
+    ID3DBlob* ps = Compile(src, "psmain", "ps_5_0", h);
+    if (!vs || !ps) return nullptr;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
+    d.SampleDesc.Count = samples;
+    auto& b = d.BlendState.RenderTarget[0];
+    b.BlendEnable = TRUE;
+    b.SrcBlend = D3D12_BLEND_DEST_COLOR;
+    b.DestBlend = D3D12_BLEND_ZERO;
+    b.BlendOp = D3D12_BLEND_OP_ADD;
+    b.SrcBlendAlpha = D3D12_BLEND_ZERO;
+    b.DestBlendAlpha = D3D12_BLEND_ONE;
+    b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    // TCNYC_AO_VIEW=1 writes the AO factor itself over the scene, to check the pass output.
+    static const bool ao_view = std::getenv("TCNYC_AO_VIEW") != nullptr;
+    if (ao_view) {
+        b.SrcBlend = D3D12_BLEND_ONE;
+        b.DestBlend = D3D12_BLEND_ZERO;
+    }
+    b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN |
+                              D3D12_COLOR_WRITE_ENABLE_BLUE;
+    if (FAILED(CreatePipeline(d, pso))) return nullptr;
+    return pso.Get();
+}
+
+void D3D12Backend::CompositeDeferredAo(Target& rt, Target& ds, float near_z, float far_z) {
+    if (render_.ao == 0 || !rt.res || !ds.res) {
+        static std::atomic<int> logged_res{0};
+        if (logged_res.fetch_add(1, std::memory_order_relaxed) < 4)
+            LOGR("d3d12: deferred AO skipped: ao %u rt res %p ds res %p", render_.ao, rt.res.Get(),
+                 ds.res.Get());
+        return;
+    }
+    cl_->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+    bound_rt_ = bound_ds_ = nullptr;
+    binds_ = {};
+    // The transparent bundles are still pending. They were recorded against these states, so
+    // restore them once the AO passes are done; the bundle executor cannot emit barriers.
+    const D3D12_RESOURCE_STATES rt_before = rt.state;
+    const D3D12_RESOURCE_STATES ds_before = ds.state;
+    Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    dof_depth_ = ds.res.Get();
+    dof_near_ = near_z;
+    dof_far_ = far_z;
+    Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    RenderHalfAo(rt);
+    if (ao_half_ready_ && ao_half_) {
+        const auto ad = ao_half_->GetDesc();
+        const bool depth_ms = ds.res->GetDesc().SampleDesc.Count > 1;
+        const uint32_t samples = rt.res->GetDesc().SampleDesc.Count;
+        ID3D12PipelineState* pso = EnsureAoCompositePipeline(rt.fmt, samples, depth_ms);
+        if (pso) {
+            uint32_t slot = AllocSrvSlots(4);
+            D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = kAoFormat;
+            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sv.Texture2D.MipLevels = 1;
+            dev_->CreateShaderResourceView(ao_half_.Get(), &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+            sv = {};
+            sv.Format = kDepthRead;
+            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            if (depth_ms) {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+            } else {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                sv.Texture2D.MipLevels = 1;
+            }
+            dev_->CreateShaderResourceView(ds.res.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
+            sv = {};
+            sv.Format = kBgra;
+            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sv.Texture2D.MipLevels = 1;
+            for (uint32_t i = 2; i < 4; i++)
+                dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+            Alloc cb = Upload(256, 256);
+            if (cb.res) {
+                const float p[8] = {1.0f / float(std::max<uint64_t>(ad.Width, 1)),
+                                    1.0f / float(std::max<uint32_t>(ad.Height, 1)), near_z, far_z, 0, 0, 0, 0};
+                std::memcpy(cb.cpu, p, sizeof(p));
+                D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), rt.view, rtv_inc_);
+                cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+                SetFullViewport(rt.w, rt.h);
+                DrawFullScreen(pso, cb.gpu, slot);
+            }
+        }
+    }
+    Transition(ds.res.Get(), ds.state, ds_before);
+    Transition(rt.res.Get(), rt.state, rt_before);
+    bound_rt_ = bound_ds_ = nullptr;
+    dof_depth_ = nullptr;
+}
+
 void D3D12Backend::DrawFrame(Target* t, uint32_t bi, ID3D12Resource* aa) {
     D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -4700,7 +5160,12 @@ void D3D12Backend::ResetFrame() {
     defer_abandoned_ = false;
     defer_reason_ = nullptr;
     defer_rt_ = nullptr;
+    defer_ds_ = nullptr;
+    defer_flush_conflict_ = false;
+    defer_ao_applied_ = false;
+    ao_half_ready_ = false;
     defer_bundles_this_frame_ = 0;
+    defer_flushes_this_frame_ = 0;
     cl_ = lists_[frame_ % kFrames].Get();
     cl_->Reset(f.alloc.Get(), nullptr);
     Begin();
@@ -4880,7 +5345,7 @@ void D3D12Backend::ApplySettings() {
 // The caller chooses the read state after the hardware resolve.
 ID3D12Resource* D3D12Backend::ResolveColor(Target& t) {
     if (defer_writes_.count(t.res.Get()) || (t.resolved && defer_writes_.count(t.resolved.Get())))
-        DeferredFallback("resolve of a deferred target");
+        DeferredBarrier("resolve of a deferred target");
     if (t.res->GetDesc().SampleDesc.Count == 1) return t.res.Get();
     if (t.depth) return nullptr;
     if (!t.resolved) {
@@ -4902,7 +5367,7 @@ ID3D12Resource* D3D12Backend::ResolveColor(Target& t) {
 // Use the nearest covered sample in reversed depth for guest shadow comparisons.
 ID3D12Resource* D3D12Backend::ResolveDepth(Target& t) {
     if (defer_writes_.count(t.res.Get()) || (t.resolved && defer_writes_.count(t.resolved.Get())))
-        DeferredFallback("resolve of a deferred depth target");
+        DeferredBarrier("resolve of a deferred depth target");
     static constexpr char hlsl[] = R"(
 Texture2DMS<float> depth : register(t0);
 float4 vs(uint id : SV_VertexID) : SV_Position {
@@ -4943,7 +5408,7 @@ float ps(float4 pos : SV_Position) : SV_Target {
 
 // the target resolved, then shrunk with o when it is not guest sized BGRA; res null on failure
 D3D12Backend::CopySource D3D12Backend::PrepareCopySource(Target& t, const ShrinkOptions& o) {
-    if (DeferredPendingResource(t.res.Get())) DeferredFallback("copy of a deferred target");
+    if (DeferredPendingResource(t.res.Get())) DeferredBarrier("copy of a deferred target");
     Resolve(t);
     CopySource out{ResolveColor(t), nullptr};
     if (!out.res) return out;
@@ -5010,7 +5475,7 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
                   it->second.w, it->second.h);
     }
     Target& t = it->second;
-    if (DeferredPendingResource(t.res.Get())) DeferredFallback("read-back of a deferred target");
+    if (DeferredPendingResource(t.res.Get())) DeferredBarrier("read-back of a deferred target");
     // src.down, when there is one, stays alive until ReadBack is done
     CopySource src = PrepareCopySource(t, {});
     if (!src.res) return;
@@ -5123,7 +5588,7 @@ void D3D12Backend::RecordLate(uint32_t data) {
     auto it = targets_.find(TargetMapKey(data, false));
     if (it == targets_.end() || TargetStale(data)) return;
     Target& t = it->second;
-    if (DeferredPendingResource(t.res.Get())) DeferredFallback("late read-back of a deferred target");
+    if (DeferredPendingResource(t.res.Get())) DeferredBarrier("late read-back of a deferred target");
     PerfScope perf_sync{g_perf.sync};
     g_perf.lates++;
     // what DeliverLate or Sync left in guest memory is no CPU write to upload back
