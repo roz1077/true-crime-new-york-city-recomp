@@ -69,7 +69,7 @@ constexpr uint32_t kSmaaRtvs = 3;  // after the back buffers' views: SMAA edges,
 constexpr uint32_t kAoRtvs = 1;    // after SMAA: the offscreen AO target
 constexpr uint32_t kAoRtv = kRtvCount + kFrames + kSmaaRtvs;
 constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R8_UNORM;
-constexpr float kAoStrength = 0.5f;
+constexpr float kAoStrength = 0.15f;
 constexpr float kAoRadius = 1.0f;
 constexpr DXGI_FORMAT kBgra = DXGI_FORMAT_B8G8R8A8_UNORM;
 constexpr uint32_t kQueries = 8192;  // occlusion queries in flight, several frames of counted draws
@@ -347,6 +347,7 @@ Texture2DMS<float> depthTex : register(t1);
 #else
 Texture2D<float> depthTex : register(t1);
 #endif
+Texture2D<float4> sceneTex : register(t2);
 SamplerState ls : register(s0);
 SamplerState ps : register(s1);
 struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
@@ -386,7 +387,15 @@ float4 psmain(O i) : SV_Target {
         }
     }
     const float f = saturate(a / wsum);
-    return float4(f, f, f, 1.0);
+    // Near-camera bright effects (fog, snow, light streaks) would otherwise stay
+    // pure white while AO darkens the scene around them. The present-time
+    // highlight pass (planes.z = 1) compresses them; the far sky is left alone.
+    const float3 scene = sceneTex.SampleLevel(ls, i.uv, 0).rgb;
+    const float lum = dot(scene, float3(0.2126, 0.7152, 0.0722));
+    const float near = 1.0 - smoothstep(0.55, 0.9, z0 / max(planes.y, 1.0));
+    const float bright = smoothstep(0.55, 0.85, lum) * near;
+    const float f2 = planes.z > 0.5 ? lerp(1.0, 0.55, bright) : f;
+    return float4(f2, f2, f2, 1.0);
 }
 )";
 
@@ -956,7 +965,9 @@ private:
     bool EnsureAoHalf(uint32_t w, uint32_t h);
     void RenderHalfAo(Target& t);
     ID3D12PipelineState* EnsureAoCompositePipeline(DXGI_FORMAT rtv, uint32_t samples, bool depth_ms);
-    void CompositeDeferredAo(Target& rt, Target& ds, float near_z, float far_z);
+    void CompositeDeferredAo(Target& rt, Target& ds, float near_z, float far_z, bool apply,
+                             bool highlight_only = false);
+    void ApplyAoHighlight(Target& t);
     void RenderUi();
     void ReleaseOldTextures();
     void ResetFrame();
@@ -1201,8 +1212,10 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     guest_w_ = width;
     guest_h_ = height;
     if (const char* e = std::getenv("TCNYC_DEFER_SCENE")) defer_forced_ = *e && std::atoi(e) != 0;
-    defer_scene_ = defer_forced_ || render_.ao != 0;
-    if (defer_scene_) LOGR("d3d12: deferred scene display list enabled (%s)", defer_forced_ ? "forced" : "AO");
+    // Experimental: the deferred AO path has known bright-effect artifacts. It is
+    // opt-in until the clean-depth/effect-mask plan in docs/deferred-renderer.md is done.
+    defer_scene_ = defer_forced_;
+    if (defer_scene_) LOGR("d3d12: experimental deferred AO enabled (TCNYC_DEFER_SCENE=1)");
     HWND hwnd = static_cast<HWND>(app::Window());
     if (!CreateDevice()) return false;
     if (!CreateSwapChain(hwnd)) return false;
@@ -4204,16 +4217,24 @@ void D3D12Backend::FlushDeferredScene() {
              static_cast<unsigned long long>(frame_), render_.ao, int(defer_ao_applied_), static_cast<void*>(defer_rt_),
              defer_rt_ ? defer_rt_->data : 0, static_cast<void*>(defer_ds_), defer_ds_ ? defer_ds_->data : 0,
              scene_depth_.size(), int(defer_rt_ && scene_depth_.find(defer_rt_) != scene_depth_.end()));
+    Target* ao_rt = nullptr;
+    Target* ao_ds = nullptr;
+    float ao_near = 0.0f, ao_far = 0.0f;
+    bool ao_ready = false;
     if (opaque_count > 0 && render_.ao != 0 && !defer_ao_applied_ && defer_rt_ && defer_ds_) {
         const auto depth = scene_depth_.find(defer_rt_);
         if (depth != scene_depth_.end() && depth->second.target == defer_ds_) {
-            // Clear the pending set first: CompositeDeferredAo transitions scene depth while the
-            // transparent bundles are still pending. It restores their recorded states before
-            // they run, so they see the same targets they were recorded against.
+            // Generate AO from the completed opaque depth. The multiply happens after the
+            // transparent group so the street/reflection/fog over near geometry is darkened
+            // too, while the sky (AO factor 1) stays bright.
             defer_reads_.clear();
             defer_writes_.clear();
-            CompositeDeferredAo(*defer_rt_, *defer_ds_, depth->second.near_z, depth->second.far_z);
-            defer_ao_applied_ = true;
+            CompositeDeferredAo(*defer_rt_, *defer_ds_, depth->second.near_z, depth->second.far_z, false);
+            ao_rt = defer_rt_;
+            ao_ds = defer_ds_;
+            ao_near = depth->second.near_z;
+            ao_far = depth->second.far_z;
+            ao_ready = ao_half_ready_;
             rtv = dsv = ~SIZE_T(0);
             binds_ = {};
             if ((frame_ % 300) == 0)
@@ -4227,6 +4248,13 @@ void D3D12Backend::FlushDeferredScene() {
     }
     for (BundleDesc& b : f.bundles)
         if (!b.opaque) execute(b);
+    if (ao_ready && ao_rt && ao_ds) {
+        defer_reads_.clear();
+        defer_writes_.clear();
+        CompositeDeferredAo(*ao_rt, *ao_ds, ao_near, ao_far, true);
+        defer_ao_applied_ = true;
+        binds_ = {};
+    }
     f.bundles.clear();
     defer_reads_.clear();
     defer_writes_.clear();
@@ -5035,7 +5063,8 @@ ID3D12PipelineState* D3D12Backend::EnsureAoCompositePipeline(DXGI_FORMAT rtv, ui
     return pso.Get();
 }
 
-void D3D12Backend::CompositeDeferredAo(Target& rt, Target& ds, float near_z, float far_z) {
+void D3D12Backend::CompositeDeferredAo(Target& rt, Target& ds, float near_z, float far_z, bool apply,
+                                       bool highlight_only) {
     if (render_.ao == 0 || !rt.res || !ds.res) {
         static std::atomic<int> logged_res{0};
         if (logged_res.fetch_add(1, std::memory_order_relaxed) < 4)
@@ -5055,20 +5084,37 @@ void D3D12Backend::CompositeDeferredAo(Target& rt, Target& ds, float near_z, flo
     dof_near_ = near_z;
     dof_far_ = far_z;
     Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    RenderHalfAo(rt);
-    if (ao_half_ready_ && ao_half_) {
-        const auto ad = ao_half_->GetDesc();
+    if (!apply) {
+        RenderHalfAo(rt);
+    } else if (highlight_only || (ao_half_ready_ && ao_half_)) {
+        const uint32_t aw = ao_half_ ? uint32_t(ao_half_->GetDesc().Width) : rt.w;
+        const uint32_t ah = ao_half_ ? uint32_t(ao_half_->GetDesc().Height) : rt.h;
         const bool depth_ms = ds.res->GetDesc().SampleDesc.Count > 1;
         const uint32_t samples = rt.res->GetDesc().SampleDesc.Count;
         ID3D12PipelineState* pso = EnsureAoCompositePipeline(rt.fmt, samples, depth_ms);
         if (pso) {
+            ID3D12Resource* ao_src = (ao_half_ready_ && ao_half_) ? ao_half_.Get() : nullptr;
+            // A single-sample copy of the scene lets the composite compress near-
+            // camera bright effects that would otherwise stay white next to AO'd
+            // geometry. ResolveColor handles MSAA; Feedback handles single-sample.
+            ID3D12Resource* scene_copy = nullptr;
+            if (samples > 1) {
+                scene_copy = ResolveColor(rt);
+                if (scene_copy) {
+                    Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    Transition(scene_copy, rt.resolved_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                }
+            } else {
+                scene_copy = Feedback(rt);
+                if (scene_copy) Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            }
             uint32_t slot = AllocSrvSlots(4);
             D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
             sv.Format = kAoFormat;
             sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             sv.Texture2D.MipLevels = 1;
-            dev_->CreateShaderResourceView(ao_half_.Get(), &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+            dev_->CreateShaderResourceView(ao_src, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
             sv = {};
             sv.Format = kDepthRead;
             sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -5080,16 +5126,17 @@ void D3D12Backend::CompositeDeferredAo(Target& rt, Target& ds, float near_z, flo
             }
             dev_->CreateShaderResourceView(ds.res.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
             sv = {};
-            sv.Format = kBgra;
+            sv.Format = rt.fmt;
             sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             sv.Texture2D.MipLevels = 1;
-            for (uint32_t i = 2; i < 4; i++)
-                dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+            dev_->CreateShaderResourceView(scene_copy, &sv, Cpu(srv_heap_.Get(), slot + 2, srv_inc_));
+            dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot + 3, srv_inc_));
             Alloc cb = Upload(256, 256);
             if (cb.res) {
-                const float p[8] = {1.0f / float(std::max<uint64_t>(ad.Width, 1)),
-                                    1.0f / float(std::max<uint32_t>(ad.Height, 1)), near_z, far_z, 0, 0, 0, 0};
+                const float p[8] = {1.0f / float(std::max<uint32_t>(aw, 1)),
+                                    1.0f / float(std::max<uint32_t>(ah, 1)), near_z, far_z,
+                                    highlight_only ? 1.0f : 0.0f, 0, 0, 0};
                 std::memcpy(cb.cpu, p, sizeof(p));
                 D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), rt.view, rtv_inc_);
                 cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
@@ -5102,6 +5149,17 @@ void D3D12Backend::CompositeDeferredAo(Target& rt, Target& ds, float near_z, flo
     Transition(rt.res.Get(), rt.state, rt_before);
     bound_rt_ = bound_ds_ = nullptr;
     dof_depth_ = nullptr;
+}
+
+void D3D12Backend::ApplyAoHighlight(Target& t) {
+    if (render_.ao == 0 || !t.res) return;
+    const auto depth = scene_depth_.find(&t);
+    if (depth == scene_depth_.end() || !depth->second.target || !depth->second.target->res) return;
+    if (depth->second.target->w != t.w || depth->second.target->h != t.h) return;
+    defer_reads_.clear();
+    defer_writes_.clear();
+    CompositeDeferredAo(t, *depth->second.target, depth->second.near_z, depth->second.far_z, true, true);
+    binds_ = {};
 }
 
 void D3D12Backend::DrawFrame(Target* t, uint32_t bi, ID3D12Resource* aa) {
@@ -5223,7 +5281,16 @@ void LogPerf() {
 
 void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
+    if (frame_ % 300 == 0)
+        LOGR("d3d12: deferred present frame %llu front %08X display list %08X",
+             static_cast<unsigned long long>(frame_), front.data, defer_rt_ ? defer_rt_->data : 0);
     if (defer_scene_) FlushDeferredScene();
+    // Temporary diagnostic: TCNYC_CAPTURE_AT=<frame> starts an F3-style capture without input.
+    static const long capture_at = [] {
+        const char* e = std::getenv("TCNYC_CAPTURE_AT");
+        return e ? std::atol(e) : 0;
+    }();
+    if (capture_at > 0 && frame_ == uint64_t(capture_at)) g_capture.store(true);
     if (cap_) {
         FinishCapture(front);
     } else if (g_capture.exchange(false) && CaptureOn()) {
@@ -5236,6 +5303,7 @@ void D3D12Backend::Present(const Surface& front) {
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (t) Resolve(*t);
+    if (t && defer_scene_ && render_.ao != 0) ApplyAoHighlight(*t);
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
@@ -5311,14 +5379,15 @@ void D3D12Backend::ApplySettings() {
     if (texturedumper::Update()) ReleasePackTextures();
     // Ambient occlusion requires the deferred scene list. Toggle it live so the F10 row
     // works without a restart.
-    const bool want_defer = defer_forced_ || app::Snapshot().ao != 0;
+    const bool want_defer = defer_forced_;
     if (want_defer != defer_scene_) {
         if (defer_scene_) FlushDeferredScene();
         defer_scene_ = want_defer;
         defer_abandoned_ = false;
         defer_ao_applied_ = false;
         defer_reported_ = false;
-        LOGR("d3d12: deferred scene display list %s", want_defer ? "on" : "off");
+        LOGR("d3d12: deferred scene display list %s (%s)", want_defer ? "on" : "off",
+             "experimental opt-in");
     }
     // Shader microcode variants should not accumulate for the whole session.
     constexpr size_t kMaxDrawPipelines = 4096;

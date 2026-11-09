@@ -1,5 +1,6 @@
 #include "app/app.h"
 #include "core/input.h"
+#include "core/log.h"
 #include "graphics_menu.h"
 #include "pad_tools.h"
 #include "kernel/kernel.h"
@@ -74,6 +75,29 @@ void FilterPad(int port, input::Pad &pad) {
 }
 
 } // namespace
+
+// The gameplay camera follows a pawn; the attract/menu flythrough and most
+// cutscenes do not. Used to keep the deferred AO path out of the front end.
+namespace game {
+bool GameplayCameraActive() {
+    if (!mem::Base() || !mem::IsCommitted(0x360E00)) return false;
+    const uint32_t game = kernel::R32(0x360E00);
+    if (!game || !mem::IsCommitted(game + 0xAC)) return false;
+    const uint32_t camera = kernel::R32(game + 0xAC);
+    if (!camera || !mem::IsCommitted(camera + 0x17C) || !mem::IsCommitted(camera + 0x18C)) return false;
+    const uint8_t active = kernel::G<uint8_t>(camera + 0x18C);
+    const uint8_t mode = kernel::G<uint8_t>(camera + 0x19);
+    const uint32_t target = kernel::R32(camera + 0x17C);
+    static int last_active = -1, last_mode = -1;
+    if (int(active) != last_active || int(mode) != last_mode) {
+        last_active = active;
+        last_mode = mode;
+        LOGR("game camera: active %u mode %u target %08X", active, mode, target);
+    }
+    const bool gameplay_mode = mode == 0 || mode == 5 || mode == 6 || mode == 11 || mode == 13;
+    return active != 0 && target != 0 && gameplay_mode;
+}
+} // namespace game
 
 // what the runtime asks of the game; strings must be set, hooks may stay null
 const app::GameInfo app::kGame = {

@@ -14,8 +14,8 @@
 - CDROM0 is read-only even when the game runs from extracted assets.
 
 ### Correctness / gameplay
-- Ambient occlusion is available as an optional depth-based scene effect on D3D12, off by
-  default; the Vulkan deferred path is in progress.
+- Ambient occlusion is present as an experimental D3D12 path, off and disabled in normal play
+  while bright effect-layer artifacts are resolved; Vulkan remains in progress.
 - `PulseEvent` releases waiters correctly.
 - Thread/stack creation failures propagate; memory commits report failure; timer
   reinitialisation cancels the old timer.
