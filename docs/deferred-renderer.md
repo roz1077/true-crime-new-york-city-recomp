@@ -1,7 +1,7 @@
 # Deferred scene renderer for ambient occlusion
 
-Status: **experimental, D3D12 only**. Setting F10 Ambient occlusion to Half or Full (`ao = 1`
-or `2`) turns on the deferred scene path live; Off returns to the immediate renderer.
+Status: **implemented on D3D12 and Vulkan**. Setting F10 Ambient occlusion to Half or Full
+(`ao = 1` or `2`) turns on the deferred scene path live; Off returns to the immediate renderer.
 `TCNYC_DEFER_SCENE=1` still forces the deferred path with AO off.
 
 The first version (opaque group, AO, effect group, AO multiply, present highlight pass) showed
@@ -85,7 +85,8 @@ with a GTAO kernel (see `gtao-plan.md`). Checked in game on Windows at Half and 
   soften the shadow right at its outline.
 - A wall within the radius darkens a character standing next to it (mild at 0.75).
 - Scene draws that cannot be deferred (rare fallback frames) get no AO.
-- Vulkan is not ported.
+- The Vulkan backend uses the same receiver design with a CPU display list instead of D3D12
+  bundles; see `vulkan-ao-plan.md`.
 
 The sections below are the original design notes and history.
 
@@ -179,8 +180,9 @@ MSAA scene targets need the same sample count and resolve handling as the curren
 - A materialisation barrier (target sampled, copied, cleared, resolved, read back, or written
   immediately) flushes pending bundles, keeps the frame deferred, and continues. Only a
   conflict while a bundle is open falls back to immediate for the rest of the frame.
-- AO runs once per scene view (`defer_ao_applied_`); a clear of the scene colour/depth starts
-  a new view and re-arms it. This avoids double-darkening when a frame has several barriers.
+- AO is recomputed at each flush from the accumulated depth prepass; a clear of the scene
+  depth starts a new view and re-arms the prepass clear. Only newly replayed draws receive
+  the new occlusion, so this does not double-darken earlier draws.
 - Depth range uses `DrawWRange(s, sh.prog)` with the `far > 1000 -> 1000` normalisation. A
   fixed-function `ProjectionWRange` alone fails on program draws.
 - D3D12 reversed depth is converted with `1 - depth` before the hyperbolic linearisation.

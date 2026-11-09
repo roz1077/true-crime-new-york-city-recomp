@@ -197,4 +197,6 @@ struct State {
                          {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}};
 };
 
+inline uint32_t SimpleState(const State& s, uint32_t method) { return s.simple[method >> 2]; }
+
 }  // namespace gpu

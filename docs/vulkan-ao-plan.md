@@ -1,5 +1,12 @@
 # Vulkan port of receiver GTAO
 
+Status: **implemented in `platform/linux/backend_vk.cpp`; Deck performance validation is
+pending**. The shared AO roles, GTAO and occlusion shaders now live in
+`sdk/runtime/gpu/ao.h`; D3D12 and Vulkan compile the same text with backend-specific bindings.
+The Vulkan backend records scene draws into a CPU display list, runs the same
+prepass/GTAO/blur chain, and binds the occlusion image at `t4` as set 1. The extra details
+found while implementing it are listed under "Implementation notes" below.
+
 Goal: the Linux / Steam Deck backend (`platform/linux/backend_vk.cpp`) gets the same ambient
 occlusion as Windows: same look, same settings, same fixes. It should also be fast enough to
 leave on at Half on the Deck.
@@ -164,6 +171,35 @@ helper.
   `VK_ERROR_*`. The validation layers are clean on desktop Linux.
 - **Deck:** Half adds an acceptable frame-time cost at the Deck's native resolution, measured
   in step 6, and holds 60 FPS where the game did before (or 30 with the cap).
+
+## Implementation notes
+
+- The scene display list records fully resolved draws in `DeferredDraw`; a draw records its
+  receiver pipeline, descriptor set, vertex/index views, viewport/scissor, blend and stencil
+  state, and its `ao = 3` prepass pipeline. Replay is plain `vkCmd*` work.
+- The scene MSAA colour and depth/stencil attachments now use `STORE`, not `DONT_CARE`. A
+  deferred flush closes and reopens the scene pass, so discarding the multisample attachments
+  would lose the scene between the AO passes and the replay.
+- AO uses dedicated targets and passes: the prepass has R32F colour + scene-format depth and
+  no resolve attachment; GTAO and the blur are R8 passes. The existing `RenderPassForMs`
+  helper cannot express the two-attachment prepass because it always adds resolve
+  attachments.
+- Receiver draws bind the occlusion image as set 1 (`t4`). A full-size zero R8 image is used
+  when no AO ran, avoiding an out-of-bounds `Load` from a 1x1 image.
+- The AO and occlusion full-screen vertex shaders use Vulkan's NDC direction; D3D12 keeps the
+  original. This is selected with `TCNYC_VULKAN` in `ao.h`.
+- The AO prepass clears depth to the value that passes the scene's compare op (1.0 for
+  LESS/LESS_OR_EQUAL, 0.0 for GREATER/GREATER_OR_EQUAL); the distance target clears to 1e30.
+- AO tracks its scene colour/depth pair from the bound targets directly, so it does not
+  depend on the DOF-only `scene_depth_` map or on MSAA being enabled.
+- The deferred path flushes before clears, copies, resolves, readbacks, target uploads,
+  target release, texture/image replacement and any submission. Texture uploads for images no
+  pending draw samples are allowed to submit without a replay.
+- AO is recomputed at each flush from the accumulated prepass depth, matching D3D12; a
+  full-size depth clear (or a new frame) re-arms the prepass clear.
+- `TCNYC_AO_PROBE=1` writes the first distance and full-size occlusion images to
+  `logs/ao_dist.pgm` and `logs/ao_probe.pgm` for the D3D12 comparison. It skips a
+  multisampled distance target, which `vkCmdCopyImageToBuffer` cannot copy directly.
 
 ## Risks
 

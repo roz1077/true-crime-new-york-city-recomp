@@ -1,6 +1,6 @@
 # GTAO
 
-Status: **implemented on D3D12** (`deferred-ao` branch). It replaces the earlier SSAO
+Status: **implemented on D3D12 and Vulkan**. It replaces the earlier SSAO
 kernel in the receiver AO path described in `deferred-renderer.md`.
 
 ## What is in
@@ -44,8 +44,8 @@ low-end fallback:
 ## Steam Deck / low-end plan
 
 1. Port the receiver AO path and GTAO to Vulkan (`platform/linux/backend_vk.cpp`); see
-   `vulkan-ao-plan.md`. The Deck
-   has none of the deferred AO path yet.
+   `vulkan-ao-plan.md`. **Done:** the same shared shaders and the CPU scene display list are
+   in the Vulkan backend.
 2. Measure frame time on the Deck at Half, AO on against off, in the room, alley, street
    and menu scenes.
 3. Only if GTAO is too heavy there, add a **GTAO quality** setting, not a second method:

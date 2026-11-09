@@ -81,7 +81,7 @@ The game receives no controller input while the menu is open, so pause the game 
 | SMAA | SMAA 1x anti-aliasing on the finished frame. On by default. |
 | Bloom | Optional bright-pass bloom over the game's lighting. On by default. |
 | Depth of field | Distance blur for 3D scenes. Requires MSAA. On by default. |
-| Ambient occlusion | GTAO contact shadows in corners and under objects, applied to world geometry only so lights, fog and effects keep their brightness. Off, Half or Full resolution. Off by default. Windows (D3D12) only; Vulkan pending. |
+| Ambient occlusion | GTAO contact shadows in corners and under objects, applied to world geometry only so lights, fog and effects keep their brightness. Off, Half or Full resolution. Off by default. Windows (D3D12) and Linux (Vulkan). |
 | Building seam fix | Experimental: gives detailed buildings priority over simplified city meshes. On by default. |
 | PC contrast | Softer shadow roll-off inspired by the PC version. On by default. |
 | V-Sync / Frame limit | V-Sync on/off; 30 or 60 FPS. The game's timing is built for at most 60. |

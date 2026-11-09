@@ -885,7 +885,7 @@ std::string PixelHlsl(const PixelKey& k) {
     }
     // occlusion, not brightness: an unset (null) view reads 0 and leaves the colour alone
     // t4: past the stages' t0-t3 (ps_5_0 has no register spaces)
-    if (k.ao) s += "Texture2D<float> aoOcc : register(t4);\n";
+    if (k.ao == 1) s += "Texture2D<float> aoOcc : register(t4);\n";
     s += F("float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {\n");
     s += "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = i.tc3;\n";
     s += k.two_sided ? "    float4 v0 = front ? i.d0 : i.b0, v1 = front ? i.d1 : i.b1;\n" : "    float4 v0 = i.d0, v1 = i.d1;\n";
@@ -961,7 +961,12 @@ std::string PixelHlsl(const PixelKey& k) {
     if (k.alphatest) body += "alphatest(outc.a);\n";
     // AO depth prepass: the view distance (clip w, which SV_Position.w carries into the pixel
     // shader) after the draw's own alpha test and discards
-    if (k.ao == 3) body += "return float4(i.pos.w, 0, 0, 1);\n";
+    if (k.ao == 3)
+        body += "#if TCNYC_VULKAN\n"
+                "return float4(1.0 / i.pos.w, 0, 0, 1);\n"
+                "#else\n"
+                "return float4(i.pos.w, 0, 0, 1);\n"
+                "#endif\n";
     // AO darkens the surface colour before fog, not the fogged result: the colour is already
     // lerp(fog, surface, f), so scaling it by ao and adding back the fog share it took gives
     // lerp(fog, surface * ao, f). Without fog (f = 1) this is a plain multiply.

@@ -38,7 +38,9 @@
 #include <vulkan/vulkan.h>
 
 #include "app/app.h"
+#include "common/graphics_menu.h"
 #include "core/log.h"
+#include "gpu/ao.h"
 #include "gpu/backend.h"
 #include "gpu/shaders.h"
 #include "gpu/texture.h"
@@ -66,7 +68,9 @@ constexpr uint32_t kBaseWidth = 640;
 constexpr uint32_t kBaseHeight = 480;
 constexpr uint64_t kUploadSize = 64ull << 20;
 
-uint32_t SimpleState(const State& s, uint32_t method) { return s.simple[method >> 2]; }
+std::vector<uint8_t> StagingBuffer(VkDevice dev, VkPhysicalDeviceMemoryProperties& props, VkDeviceSize size,
+                                   VkBuffer& buffer, VkDeviceMemory& memory, void** map);
+
 float Bits(uint32_t v) {
     float f;
     std::memcpy(&f, &v, 4);
@@ -245,6 +249,42 @@ struct Tex {
     uint64_t pack_key = 0;
     uint32_t pack_gen = 0;
     Tex* swap = nullptr;
+};
+
+// A renderer-owned image: the AO prepass depth/distance, the half/full AO factor and the
+// full-size occlusion target. Unlike Target these are not guest surfaces.
+struct AoImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t w = 0, h = 0, samples = 1;
+};
+
+// One scene draw recorded into the CPU display list. Everything the replay needs is resolved at
+// record time; replay only binds and draws. The depth pipeline is the ao = 3 variant used by the
+// AO depth prepass.
+struct DeferredDraw {
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkPipeline depth_pipe = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkBuffer vbufs[16]{};
+    VkDeviceSize voffs[16]{};
+    uint32_t vbind[16]{};
+    uint32_t vb_count = 0;
+    VkBuffer ibuf = VK_NULL_HANDLE;
+    VkDeviceSize ioff = 0;
+    VkIndexType itype = VK_INDEX_TYPE_UINT16;
+    uint32_t index_count = 0, vertex_count = 0, base_vertex = 0;
+    VkViewport vp{};
+    VkRect2D sc{};
+    float blend[4]{};
+    uint32_t stencil = 0;
+    uint32_t zfunc = 0;
+    bool receiver = false;  // the receiver pipeline reads t4
+    Target* rt = nullptr;
+    Target* ds = nullptr;
 };
 
 // Pick the best sample count at or below what the user asked for that both attachments support.
@@ -608,8 +648,30 @@ private:
     VkRenderPass RenderPassForMs(VkFormat color, VkFormat depth, uint32_t samples);
     VkFramebuffer FramebufferFor(Target* rt, Target* ds);
     void BindTargets(const State& s, Target*& rt, Target*& ds);
+    void BeginScenePass(Target* rt, Target* ds);
     void FlushPass();
     VkPipeline ClearPipeline(VkFormat format, VkFormat depth, uint32_t mask, uint32_t samples);
+
+    // deferred scene display list and receiver AO
+    bool DeferredPending() const { return !deferred_.empty(); }
+    void FlushDeferredScene();
+    void ReplayDeferred(const std::vector<DeferredDraw>& draws, VkDescriptorSet occlusion);
+    void ResetDeferred();
+    bool CreateAoImage(AoImage& image, uint32_t w, uint32_t h, VkFormat format, uint32_t samples,
+                       VkImageUsageFlags usage);
+    void DestroyAoImage(AoImage& image);
+    bool EnsureAoDepth(uint32_t w, uint32_t h, uint32_t samples);
+    bool EnsureAoHalf(uint32_t w, uint32_t h);
+    bool EnsureAoOcc(uint32_t w, uint32_t h);
+    bool EnsureAoZero(uint32_t w, uint32_t h);
+    bool EnsureAoPipelines(bool depth_ms);
+    VkRenderPass AoPrepassPass(uint32_t samples);
+    VkRenderPass AoColorPass();
+    VkFramebuffer AoFramebuffer(VkRenderPass pass, AoImage* color, AoImage* depth);
+    VkPipeline CreateAoPipeline(VkShaderModule vs, VkShaderModule ps, VkRenderPass pass);
+    VkDescriptorSet AcquireAoSet(VkImageView ao, VkImageView depth, VkImageView occlusion, bool occlusion_set);
+    VkDescriptorSet AcquireAoOcclusionSet(VkImageView view);
+    void DumpAoProbe(AoImage& image);
 
     // SMAA 1x on the finished scene before present
     bool EnsureSmaa(uint32_t w, uint32_t h, VkFormat format);
@@ -630,7 +692,8 @@ private:
     VkShaderModule GeometryShaderFor(bool points, bool sprite);
     VkShaderModule VertexShaderFor(const State& s, const Assembled& a, bool prog, bool sprite, uint64_t& key);
     VkShaderModule PixelShaderFor(const PixelKey& pk, uint64_t& key);
-        bool CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps, VkPipeline& out);
+    bool CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps, VkPipeline& out,
+                        VkRenderPass pass_override = VK_NULL_HANDLE);
 
     // targets and textures
     Target* EnsureTarget(const Surface& s, bool depth);
@@ -744,6 +807,51 @@ private:
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> draw_sets_;
     size_t draw_set_next_ = 0;
+
+    // receiver AO: set 1 is the occlusion texture; the full-screen AO passes have their own
+    // layout (images at 0/1, samplers at 2/3) and a 32 byte push constant block.
+    VkDescriptorSetLayout ao_occ_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool ao_occ_pool_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> ao_occ_sets_;
+    size_t ao_occ_set_next_ = 0;
+    VkDescriptorSetLayout ao_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout ao_pipeline_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool ao_pool_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> ao_sets_;
+    size_t ao_set_next_ = 0;
+
+    // deferred scene display list
+    bool defer_forced_ = false;
+    bool defer_scene_ = false;
+    bool defer_abandoned_ = false;
+    bool defer_ao_applied_ = false;
+    bool flushing_deferred_ = false;
+    bool skip_deferred_flush_ = false;
+    bool ao_depth_clear_ = true;
+    bool ao_probed_ = false;
+    bool ao_dist_probed_ = false;
+    uint32_t ao_mode_ = 0;  // app::Snapshot().ao latched for the frame
+    Target* defer_rt_ = nullptr;
+    Target* defer_ds_ = nullptr;
+    std::vector<DeferredDraw> deferred_;
+    std::unordered_set<Target*> deferred_read_targets_, deferred_write_targets_;
+    std::unordered_set<VkImage> deferred_read_images_;
+
+    // AO targets: prepass depth and view distance, the half/full factor, full-size occlusion,
+    // and a full-size zero occlusion image for flushes that do not run AO.
+    AoImage ao_depth_, ao_dist_, ao_half_, ao_occ_, ao_zero_;
+    std::unordered_map<uint64_t, VkRenderPass> ao_passes_;
+    VkRenderPass ao_color_pass_ = VK_NULL_HANDLE;
+    VkFramebuffer ao_prepass_fb_ = VK_NULL_HANDLE;
+    VkFramebuffer ao_half_fb_ = VK_NULL_HANDLE;
+    VkFramebuffer ao_occ_fb_ = VK_NULL_HANDLE;
+    VkPipeline ao_gtao_pipe_ = VK_NULL_HANDLE;
+    VkPipeline ao_occ_pipe_ = VK_NULL_HANDLE;
+    std::vector<VkPipeline> retired_ao_pipelines_;
+    VkShaderModule ao_gtao_vs_ = VK_NULL_HANDLE, ao_gtao_ps_ = VK_NULL_HANDLE;
+    VkShaderModule ao_occ_vs_ = VK_NULL_HANDLE, ao_occ_ps_ = VK_NULL_HANDLE;
+    bool ao_pipe_depth_ms_ = false;
+    uint32_t ao_pipe_mode_ = 0;
 
     std::unordered_map<uint64_t, VkShaderModule> vs_cache_, ps_cache_;
     VkShaderModule geo_point_ = VK_NULL_HANDLE, geo_line_ = VK_NULL_HANDLE, geo_sprite_ = VK_NULL_HANDLE;
@@ -966,6 +1074,10 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     aspect_ = app::AspectRatio();
     perf_ = std::getenv("TCNYC_PERF") != nullptr;
     trace_ = std::getenv("TCNYC_TRACE") != nullptr;
+    if (const char* e = std::getenv("TCNYC_DEFER_SCENE")) defer_forced_ = *e && std::atoi(e) != 0;
+    ao_mode_ = app::Snapshot().ao;
+    defer_scene_ = defer_forced_ || ao_mode_ != 0;
+    if (defer_scene_) LOGR("vulkan: deferred scene display list enabled (%s)", defer_forced_ ? "TCNYC_DEFER_SCENE" : "ambient occlusion setting");
     if (const char* e = std::getenv("TCNYC_TRACE_PRESENT")) trace_present_ = std::atoi(e) != 0;
     if (const char* e = std::getenv("TCNYC_DUMP_TEX")) {
         const char* p = e;
@@ -1109,13 +1221,52 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     li.bindingCount = 10;
     li.pBindings = bind;
     if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &set_layout_) != VK_SUCCESS) return false;
+
+    // set 1: the receiver AO occlusion image (t4 in the generated pixel shader)
+    VkDescriptorSetLayoutBinding occBind{};
+    occBind.binding = 0;
+    occBind.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    occBind.descriptorCount = 1;
+    occBind.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo oli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    oli.bindingCount = 1;
+    oli.pBindings = &occBind;
+    if (vkCreateDescriptorSetLayout(device_, &oli, nullptr, &ao_occ_set_layout_) != VK_SUCCESS) return false;
+
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pl.setLayoutCount = 1;
-    pl.pSetLayouts = &set_layout_;
+    const VkDescriptorSetLayout scene_sets[2] = {set_layout_, ao_occ_set_layout_};
+    pl.setLayoutCount = 2;
+    pl.pSetLayouts = scene_sets;
     VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};  // the masked-clear colour
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &push;
     if (vkCreatePipelineLayout(device_, &pl, nullptr, &pipeline_layout_) != VK_SUCCESS) return false;
+
+    // the full-screen AO passes: t0/t1 sampled images, s0/s1 samplers, 32 byte push constants
+    VkDescriptorSetLayoutBinding aoBind[4]{};
+    for (int i = 0; i < 2; i++) {
+        aoBind[i].binding = uint32_t(i);
+        aoBind[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        aoBind[i].descriptorCount = 1;
+        aoBind[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    for (int i = 0; i < 2; i++) {
+        aoBind[2 + i].binding = uint32_t(2 + i);
+        aoBind[2 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        aoBind[2 + i].descriptorCount = 1;
+        aoBind[2 + i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo ali{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    ali.bindingCount = 4;
+    ali.pBindings = aoBind;
+    if (vkCreateDescriptorSetLayout(device_, &ali, nullptr, &ao_set_layout_) != VK_SUCCESS) return false;
+    VkPipelineLayoutCreateInfo apl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    apl.setLayoutCount = 1;
+    apl.pSetLayouts = &ao_set_layout_;
+    VkPushConstantRange aoPush{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};  // src + ao/planes
+    apl.pushConstantRangeCount = 1;
+    apl.pPushConstantRanges = &aoPush;
+    if (vkCreatePipelineLayout(device_, &apl, nullptr, &ao_pipeline_layout_) != VK_SUCCESS) return false;
 
     VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * 8192},
                                      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4 * 8192},
@@ -1134,6 +1285,36 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     dai.pSetLayouts = layouts.data();
     draw_sets_.resize(layouts.size());
     if (vkAllocateDescriptorSets(device_, &dai, draw_sets_.data()) != VK_SUCCESS) return false;
+
+    // one occlusion set per flush, and two full-screen AO sets (GTAO then the blur) per flush
+    VkDescriptorPoolSize occSizes{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 512};
+    VkDescriptorPoolCreateInfo occPi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    occPi.maxSets = 512;
+    occPi.poolSizeCount = 1;
+    occPi.pPoolSizes = &occSizes;
+    if (vkCreateDescriptorPool(device_, &occPi, nullptr, &ao_occ_pool_) != VK_SUCCESS) return false;
+    std::vector<VkDescriptorSetLayout> occLayouts(512, ao_occ_set_layout_);
+    VkDescriptorSetAllocateInfo occAi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    occAi.descriptorPool = ao_occ_pool_;
+    occAi.descriptorSetCount = uint32_t(occLayouts.size());
+    occAi.pSetLayouts = occLayouts.data();
+    ao_occ_sets_.resize(occLayouts.size());
+    if (vkAllocateDescriptorSets(device_, &occAi, ao_occ_sets_.data()) != VK_SUCCESS) return false;
+
+    VkDescriptorPoolSize aoSizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2048},
+                                       {VK_DESCRIPTOR_TYPE_SAMPLER, 2048}};
+    VkDescriptorPoolCreateInfo aoPi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    aoPi.maxSets = 1024;
+    aoPi.poolSizeCount = 2;
+    aoPi.pPoolSizes = aoSizes;
+    if (vkCreateDescriptorPool(device_, &aoPi, nullptr, &ao_pool_) != VK_SUCCESS) return false;
+    std::vector<VkDescriptorSetLayout> aoLayouts(1024, ao_set_layout_);
+    VkDescriptorSetAllocateInfo aoAi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    aoAi.descriptorPool = ao_pool_;
+    aoAi.descriptorSetCount = uint32_t(aoLayouts.size());
+    aoAi.pSetLayouts = aoLayouts.data();
+    ao_sets_.resize(aoLayouts.size());
+    if (vkAllocateDescriptorSets(device_, &aoAi, ao_sets_.data()) != VK_SUCCESS) return false;
     if (!CreatePresent()) return false;
 
     LOGR("vulkan: %s, %ux%u swapchain, GPU draws", device_name_.c_str(), extent_.width, extent_.height);
@@ -1797,6 +1978,29 @@ void VulkanBackend::Shutdown() {
         render_done_.clear();
         if (command_pool_) vkDestroyCommandPool(device_, command_pool_, nullptr);
         if (swapchain_) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+        for (VkPipeline p : retired_ao_pipelines_)
+            if (p) vkDestroyPipeline(device_, p, nullptr);
+        retired_ao_pipelines_.clear();
+        if (ao_gtao_pipe_) vkDestroyPipeline(device_, ao_gtao_pipe_, nullptr);
+        if (ao_occ_pipe_) vkDestroyPipeline(device_, ao_occ_pipe_, nullptr);
+        for (VkShaderModule m : {ao_gtao_vs_, ao_gtao_ps_, ao_occ_vs_, ao_occ_ps_})
+            if (m) vkDestroyShaderModule(device_, m, nullptr);
+        for (VkFramebuffer fb : {ao_prepass_fb_, ao_half_fb_, ao_occ_fb_})
+            if (fb) vkDestroyFramebuffer(device_, fb, nullptr);
+        DestroyAoImage(ao_depth_);
+        DestroyAoImage(ao_dist_);
+        DestroyAoImage(ao_half_);
+        DestroyAoImage(ao_occ_);
+        DestroyAoImage(ao_zero_);
+        for (auto& [key, pass] : ao_passes_)
+            if (pass) vkDestroyRenderPass(device_, pass, nullptr);
+        ao_passes_.clear();
+        if (ao_color_pass_) vkDestroyRenderPass(device_, ao_color_pass_, nullptr);
+        if (ao_set_layout_) vkDestroyDescriptorSetLayout(device_, ao_set_layout_, nullptr);
+        if (ao_occ_set_layout_) vkDestroyDescriptorSetLayout(device_, ao_occ_set_layout_, nullptr);
+        if (ao_pipeline_layout_) vkDestroyPipelineLayout(device_, ao_pipeline_layout_, nullptr);
+        if (ao_pool_) vkDestroyDescriptorPool(device_, ao_pool_, nullptr);
+        if (ao_occ_pool_) vkDestroyDescriptorPool(device_, ao_occ_pool_, nullptr);
         vkDestroyDevice(device_, nullptr);
     }
     if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
@@ -1832,11 +2036,15 @@ void VulkanBackend::EndRecord(bool wait) {
     if (!recording_) return;
     if (failed_) {
         // A prior failure left the fence unsignalled: finish the buffer but never wait on it.
+        deferred_.clear();
         FlushPass();
         vkEndCommandBuffer(cmd_);
         recording_ = false;
         return;
     }
+    // Any submit must happen after the deferred scene commands: a texture upload or a copy
+    // recorded before the replay would otherwise change what the pending draws read.
+    if (!flushing_deferred_ && !skip_deferred_flush_ && DeferredPending()) FlushDeferredScene();
     FlushPass();
     vkEndCommandBuffer(cmd_);
     recording_ = false;
@@ -1872,6 +2080,7 @@ void VulkanBackend::EndRecord(bool wait) {
 void VulkanBackend::ResetFrame() {
     upload_used_ = 0;
     draw_set_next_ = 0;
+    ResetDeferred();
     scene_dof_ = app::Snapshot().dof;
     scene_depth_.clear();
     // the last frame's GPU work is done (present waited on the fence): pack images and late-lock
@@ -2179,7 +2388,9 @@ VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint
         att[n].format = color;
         att[n].samples = VkSampleCountFlagBits(samples);
         att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        att[n].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        // Deferred replay closes and reopens the scene pass; per-attachment DONT_CARE discarded
+        // the multisample colour/depth that the reopened pass needs. STORE matches D3D12.
+        att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att[n].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -2201,9 +2412,9 @@ VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint
         att[n].format = depth;
         att[n].samples = VkSampleCountFlagBits(samples);
         att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        att[n].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
         att[n].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         att[n].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth_ref = n++;
@@ -2329,6 +2540,37 @@ void VulkanBackend::FlushPass() {
     }
 }
 
+// Open a render pass on an already resolved RT/DS pair. The deferred replay uses this to
+// re-open the scene pass after the AO passes without going through a guest State.
+void VulkanBackend::BeginScenePass(Target* rt, Target* ds) {
+    FlushPass();
+    if (!rt && !ds) return;
+    pass_rt_ = rt;
+    pass_ds_ = ds;
+    BeginRecord();
+    if (rt) Transition(rt->image, rt->layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, rt->format);
+    if (ds) Transition(ds->image, ds->layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, ds->format);
+    pass_ = (rt && rt->samples > 1) || (ds && ds->samples > 1)
+                ? RenderPassForMs(rt ? rt->format : VK_FORMAT_UNDEFINED,
+                                  ds ? ds->format : VK_FORMAT_UNDEFINED,
+                                  rt ? rt->samples : ds->samples)
+                : RenderPassFor(rt ? rt->format : VK_FORMAT_UNDEFINED, ds ? ds->format : VK_FORMAT_UNDEFINED);
+    pass_fb_ = FramebufferFor(rt, ds);
+    if (pass_ == VK_NULL_HANDLE || pass_fb_ == VK_NULL_HANDLE) {
+        pass_rt_ = pass_ds_ = nullptr;
+        pass_ = VK_NULL_HANDLE;
+        pass_fb_ = VK_NULL_HANDLE;
+        return;
+    }
+    VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    info.renderPass = pass_;
+    info.framebuffer = pass_fb_;
+    info.renderArea = {{0, 0}, {rt ? rt->w : ds->w, rt ? rt->h : ds->h}};
+    vkCmdBeginRenderPass(cmd_, &info, VK_SUBPASS_CONTENTS_INLINE);
+    bound_pipe_ = VK_NULL_HANDLE;
+    viewport_valid_ = false;
+}
+
 void VulkanBackend::BindTargets(const State& s, Target*& rt, Target*& ds) {
     if (perf_) perf_bind_++;
     rt = nullptr;
@@ -2357,26 +2599,707 @@ void VulkanBackend::BindTargets(const State& s, Target*& rt, Target*& ds) {
     // attachment is not usable with this colour target.
     if (rt && ds && (rt->w != ds->w || rt->h != ds->h || rt->samples != ds->samples)) ds = nullptr;
     if (!rt && !ds) return;
-    pass_rt_ = rt;
-    pass_ds_ = ds;
+    // Do not transition a target out of a sampled layout while pending draws still read it.
+    if (DeferredPending() &&
+        ((rt && deferred_read_targets_.count(rt)) || (ds && deferred_read_targets_.count(ds)))) {
+        FlushDeferredScene();
+        if (!rt && !ds) return;
+    }
+    BeginScenePass(rt, ds);
+}
+
+// ---------------------------------------------------------------------------------------------
+// AO targets and full-screen passes
+
+bool VulkanBackend::CreateAoImage(AoImage& image, uint32_t w, uint32_t h, VkFormat format, uint32_t samples,
+                                  VkImageUsageFlags usage) {
+    DestroyAoImage(image);
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {w, h, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VkSampleCountFlagBits(std::max(1u, samples));
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = usage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(device_, image.image, &req);
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = req.size;
+    bool found = false;
+    for (uint32_t i = 0; i < mem_props_.memoryTypeCount; i++)
+        if ((req.memoryTypeBits & (1u << i)) &&
+            (mem_props_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            alloc.memoryTypeIndex = i;
+            found = true;
+            break;
+        }
+    if (!found || vkAllocateMemory(device_, &alloc, nullptr, &image.memory) != VK_SUCCESS) {
+        vkDestroyImage(device_, image.image, nullptr);
+        image.image = VK_NULL_HANDLE;
+        return false;
+    }
+    if (vkBindImageMemory(device_, image.image, image.memory, 0) != VK_SUCCESS) {
+        DestroyAoImage(image);
+        return false;
+    }
+    const bool depth = format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D16_UNORM ||
+                       format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    const bool stencil = format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = image.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = format;
+    view.subresourceRange = {depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                        (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0))
+                                  : VK_IMAGE_ASPECT_COLOR_BIT,
+                             0, 1, 0, 1};
+    if (vkCreateImageView(device_, &view, nullptr, &image.view) != VK_SUCCESS) {
+        DestroyAoImage(image);
+        return false;
+    }
+    image.format = format;
+    image.w = w;
+    image.h = h;
+    image.samples = std::max(1u, samples);
+    image.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    return true;
+}
+
+void VulkanBackend::DestroyAoImage(AoImage& image) {
+    if (image.view) vkDestroyImageView(device_, image.view, nullptr);
+    if (image.image) vkDestroyImage(device_, image.image, nullptr);
+    if (image.memory) vkFreeMemory(device_, image.memory, nullptr);
+    image = {};
+}
+
+bool VulkanBackend::EnsureAoDepth(uint32_t w, uint32_t h, uint32_t samples) {
+    if (ao_depth_.image && ao_dist_.image && ao_depth_.w == w && ao_depth_.h == h &&
+        ao_depth_.samples == samples)
+        return true;
+    if (ao_depth_.image || ao_dist_.image) {
+        EndRecord(true);
+        if (ao_prepass_fb_) vkDestroyFramebuffer(device_, ao_prepass_fb_, nullptr);
+        ao_prepass_fb_ = VK_NULL_HANDLE;
+        DestroyAoImage(ao_depth_);
+        DestroyAoImage(ao_dist_);
+    }
+    const bool ok = CreateAoImage(ao_depth_, w, h, depth_format_, samples, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+                    CreateAoImage(ao_dist_, w, h, VK_FORMAT_R32_SFLOAT, samples,
+                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    if (!ok) {
+        DestroyAoImage(ao_depth_);
+        DestroyAoImage(ao_dist_);
+        return false;
+    }
+    ao_depth_clear_ = true;
+    LOGR("vulkan: AO prepass targets %ux%u, %u sample(s)", w, h, samples);
+    return true;
+}
+
+bool VulkanBackend::EnsureAoHalf(uint32_t w, uint32_t h) {
+    const uint32_t aw = ao_mode_ == 1 ? std::max(1u, w / 2) : std::max(1u, w);
+    const uint32_t ah = ao_mode_ == 1 ? std::max(1u, h / 2) : std::max(1u, h);
+    if (ao_half_.image && ao_half_.w == aw && ao_half_.h == ah) return true;
+    if (ao_half_.image) {
+        EndRecord(true);
+        if (ao_half_fb_) vkDestroyFramebuffer(device_, ao_half_fb_, nullptr);
+        ao_half_fb_ = VK_NULL_HANDLE;
+        DestroyAoImage(ao_half_);
+    }
+    if (!CreateAoImage(ao_half_, aw, ah, VK_FORMAT_R8_UNORM, 1,
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+        return false;
+    LOGR("vulkan: AO factor target %ux%u", aw, ah);
+    return true;
+}
+
+bool VulkanBackend::EnsureAoOcc(uint32_t w, uint32_t h) {
+    if (ao_occ_.image && ao_occ_.w == w && ao_occ_.h == h) return true;
+    if (ao_occ_.image) {
+        EndRecord(true);
+        if (ao_occ_fb_) vkDestroyFramebuffer(device_, ao_occ_fb_, nullptr);
+        ao_occ_fb_ = VK_NULL_HANDLE;
+        DestroyAoImage(ao_occ_);
+    }
+    if (!CreateAoImage(ao_occ_, w, h, VK_FORMAT_R8_UNORM, 1,
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+        return false;
+    LOGR("vulkan: AO occlusion target %ux%u", w, h);
+    return true;
+}
+
+bool VulkanBackend::EnsureAoZero(uint32_t w, uint32_t h) {
+    if (ao_zero_.image && ao_zero_.w == w && ao_zero_.h == h) return true;
+    if (ao_zero_.image) {
+        EndRecord(true);
+        DestroyAoImage(ao_zero_);
+    }
+    if (!CreateAoImage(ao_zero_, w, h, VK_FORMAT_R8_UNORM, 1,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return false;
+    // A receiver recorded with ao = 1 must still have a real, full-size t4. A 1x1 image would
+    // be out of bounds for Load() and Vulkan does not define that without robustImageAccess.
+    FlushPass();
     BeginRecord();
-    if (rt) Transition(rt->image, rt->layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, rt->format);
-    if (ds) Transition(ds->image, ds->layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, ds->format);
-    pass_ = (rt && rt->samples > 1) || (ds && ds->samples > 1)
-                ? RenderPassForMs(rt ? rt->format : VK_FORMAT_UNDEFINED,
-                                  ds ? ds->format : VK_FORMAT_UNDEFINED,
-                                  rt ? rt->samples : ds->samples)
-                : RenderPassFor(rt ? rt->format : VK_FORMAT_UNDEFINED, ds ? ds->format : VK_FORMAT_UNDEFINED);
-    pass_fb_ = FramebufferFor(rt, ds);
-    if (pass_ == VK_NULL_HANDLE || pass_fb_ == VK_NULL_HANDLE) {
-        pass_rt_ = pass_ds_ = nullptr;
+    Transition(ao_zero_.image, ao_zero_.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, ao_zero_.format);
+    VkClearColorValue zero{};
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd_, ao_zero_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+    Transition(ao_zero_.image, ao_zero_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ao_zero_.format);
+    return true;
+}
+
+VkRenderPass VulkanBackend::AoPrepassPass(uint32_t samples) {
+    const uint64_t key = uint64_t(depth_format_) | (uint64_t(samples) << 32) | (1ull << 63);
+    if (auto it = ao_passes_.find(key); it != ao_passes_.end()) return it->second;
+    VkAttachmentDescription att[2]{};
+    att[0].format = VK_FORMAT_R32_SFLOAT;
+    att[0].samples = VkSampleCountFlagBits(std::max(1u, samples));
+    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    att[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    att[1].format = depth_format_;
+    att[1].samples = VkSampleCountFlagBits(std::max(1u, samples));
+    att[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &cref;
+    sub.pDepthStencilAttachment = &dref;
+    VkSubpassDependency dep[2]{};
+    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep[0].dstSubpass = 0;
+    dep[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                          VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep[0].dstStageMask = dep[0].srcStageMask | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep[0].dstAccessMask = dep[0].srcAccessMask | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    dep[1].srcSubpass = 0;
+    dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep[1].srcStageMask = dep[0].dstStageMask;
+    dep[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    dep[1].srcAccessMask = dep[0].dstAccessMask;
+    dep[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    info.attachmentCount = 2;
+    info.pAttachments = att;
+    info.subpassCount = 1;
+    info.pSubpasses = &sub;
+    info.dependencyCount = 2;
+    info.pDependencies = dep;
+    VkRenderPass pass = VK_NULL_HANDLE;
+    if (vkCreateRenderPass(device_, &info, nullptr, &pass) != VK_SUCCESS) return VK_NULL_HANDLE;
+    ao_passes_[key] = pass;
+    return pass;
+}
+
+VkRenderPass VulkanBackend::AoColorPass() {
+    if (ao_color_pass_) return ao_color_pass_;
+    VkAttachmentDescription att{};
+    att.format = VK_FORMAT_R8_UNORM;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    att.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &cref;
+    VkSubpassDependency dep[2]{};
+    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep[0].dstSubpass = 0;
+    dep[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[0].dstStageMask = dep[0].srcStageMask;
+    dep[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    dep[1].srcSubpass = 0;
+    dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep[1].srcStageMask = dep[0].dstStageMask;
+    dep[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    dep[1].srcAccessMask = dep[0].dstAccessMask;
+    dep[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    info.attachmentCount = 1;
+    info.pAttachments = &att;
+    info.subpassCount = 1;
+    info.pSubpasses = &sub;
+    info.dependencyCount = 2;
+    info.pDependencies = dep;
+    if (vkCreateRenderPass(device_, &info, nullptr, &ao_color_pass_) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return ao_color_pass_;
+}
+
+VkFramebuffer VulkanBackend::AoFramebuffer(VkRenderPass pass, AoImage* color, AoImage* depth) {
+    if (!pass || (!color && !depth)) return VK_NULL_HANDLE;
+    VkImageView views[2]{};
+    uint32_t n = 0;
+    if (color) views[n++] = color->view;
+    if (depth) views[n++] = depth->view;
+    VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    info.renderPass = pass;
+    info.attachmentCount = n;
+    info.pAttachments = views;
+    info.width = color ? color->w : depth->w;
+    info.height = color ? color->h : depth->h;
+    info.layers = 1;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    if (vkCreateFramebuffer(device_, &info, nullptr, &fb) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return fb;
+}
+
+VkPipeline VulkanBackend::CreateAoPipeline(VkShaderModule vs, VkShaderModule ps, VkRenderPass pass) {
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "vs";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = ps;
+    stages[1].pName = "psmain";
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cb{};
+    cb.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = 1;
+    blend.pAttachments = &cb;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &vi;
+    info.pInputAssemblyState = &ia;
+    info.pViewportState = &vp;
+    info.pRasterizationState = &rs;
+    info.pMultisampleState = &ms;
+    info.pDepthStencilState = &ds;
+    info.pColorBlendState = &blend;
+    info.pDynamicState = &dynamic;
+    info.layout = ao_pipeline_layout_;
+    info.renderPass = pass;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    return pipeline;
+}
+
+bool VulkanBackend::EnsureAoPipelines(bool depth_ms) {
+    if (ao_gtao_pipe_ && ao_occ_pipe_ && ao_pipe_depth_ms_ == depth_ms && ao_pipe_mode_ == ao_mode_)
+        return true;
+    const VkRenderPass pass = AoColorPass();
+    if (!pass) return false;
+    static const bool ssao = [] {
+        const char* e = std::getenv("TCNYC_AO_METHOD");
+        return e && std::string(e) == "ssao";
+    }();
+    const std::string ms = depth_ms ? "1\n" : "0\n";
+    std::string gtao = std::string("#define DEPTH_MS ") + ms + "#define GTAO_SLICES 3\n#define GTAO_STEPS " +
+                       (ao_mode_ == 1 ? "6\n" : "8\n") + (ssao ? "#define AO_SSAO 1\n" : "") + kAoHlsl;
+    const std::string occ = std::string("#define DEPTH_MS ") + ms + kAoOcclusionHlsl;
+    VkShaderModule gvs = CompileShader(gtao, shaderc_vertex_shader, "vs");
+    VkShaderModule gps = CompileShader(gtao, shaderc_fragment_shader, "psmain");
+    VkShaderModule ovs = CompileShader(occ, shaderc_vertex_shader, "vs");
+    VkShaderModule ops = CompileShader(occ, shaderc_fragment_shader, "psmain");
+    VkPipeline gp = gvs && gps ? CreateAoPipeline(gvs, gps, pass) : VK_NULL_HANDLE;
+    VkPipeline op = ovs && ops ? CreateAoPipeline(ovs, ops, pass) : VK_NULL_HANDLE;
+    if (!gp || !op) {
+        LOG_FIRST(4, "vulkan: AO pipeline creation failed (GTAO %s, occlusion %s)", gp ? "ok" : "failed",
+                  op ? "ok" : "failed");
+        if (gp) vkDestroyPipeline(device_, gp, nullptr);
+        if (op) vkDestroyPipeline(device_, op, nullptr);
+        for (VkShaderModule m : {gvs, gps, ovs, ops})
+            if (m) vkDestroyShaderModule(device_, m, nullptr);
+        return false;
+    }
+    if (ao_gtao_pipe_) retired_ao_pipelines_.push_back(ao_gtao_pipe_);
+    if (ao_occ_pipe_) retired_ao_pipelines_.push_back(ao_occ_pipe_);
+    for (VkShaderModule m : {ao_gtao_vs_, ao_gtao_ps_, ao_occ_vs_, ao_occ_ps_})
+        if (m) vkDestroyShaderModule(device_, m, nullptr);
+    ao_gtao_vs_ = gvs;
+    ao_gtao_ps_ = gps;
+    ao_occ_vs_ = ovs;
+    ao_occ_ps_ = ops;
+    ao_gtao_pipe_ = gp;
+    ao_occ_pipe_ = op;
+    ao_pipe_depth_ms_ = depth_ms;
+    ao_pipe_mode_ = ao_mode_;
+    return true;
+}
+
+VkDescriptorSet VulkanBackend::AcquireAoSet(VkImageView ao, VkImageView depth, VkImageView occlusion,
+                                            bool occlusion_set) {
+    (void)occlusion;
+    if (ao_set_next_ >= ao_sets_.size()) return VK_NULL_HANDLE;
+    VkDescriptorSet set = ao_sets_[ao_set_next_++];
+    VkDescriptorImageInfo image[2]{};
+    image[0].imageView = ao ? ao : white_view_;
+    image[0].imageLayout = ao ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                              : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    image[1].imageView = depth ? depth : white_view_;
+    image[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo sampler[2]{};
+    sampler[0].sampler = occlusion_set ? present_sampler_ : present_point_sampler_;
+    sampler[1].sampler = present_point_sampler_;
+    VkWriteDescriptorSet writes[4]{};
+    for (int i = 0; i < 2; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = uint32_t(i);
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[i].pImageInfo = &image[i];
+    }
+    for (int i = 0; i < 2; i++) {
+        writes[2 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2 + i].dstSet = set;
+        writes[2 + i].dstBinding = uint32_t(2 + i);
+        writes[2 + i].descriptorCount = 1;
+        writes[2 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[2 + i].pImageInfo = &sampler[i];
+    }
+    vkUpdateDescriptorSets(device_, 4, writes, 0, nullptr);
+    return set;
+}
+
+// TCNYC_AO_PROBE=1: dump the first full-size occlusion image as PGM, for a same-scene
+// comparison against D3D12. Diagnostic only; it submits the AO work and restarts the command
+// buffer, so never enable it during normal play.
+void VulkanBackend::DumpAoProbe(AoImage& image) {
+    const bool dist = image.format == VK_FORMAT_R32_SFLOAT;
+    if (!std::getenv("TCNYC_AO_PROBE") || !image.image || image.samples > 1 ||
+        (dist ? ao_dist_probed_ : ao_probed_))
+        return;
+    if (dist)
+        ao_dist_probed_ = true;
+    else
+        ao_probed_ = true;
+    const uint64_t bytes = uint64_t(image.w) * image.h * (dist ? 4 : 1);
+    EndRecord(true);
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* map = nullptr;
+    StagingBuffer(device_, mem_props_, bytes, buffer, memory, &map);
+    if (!map) {
+        BeginRecord();
         return;
     }
-    VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    info.renderPass = pass_;
-    info.framebuffer = pass_fb_;
-    info.renderArea = {{0, 0}, {rt ? rt->w : ds->w, rt ? rt->h : ds->h}};
-    vkCmdBeginRenderPass(cmd_, &info, VK_SUBPASS_CONTENTS_INLINE);
+    BeginRecord();
+    Transition(image.image, image.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.format);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {image.w, image.h, 1};
+    vkCmdCopyImageToBuffer(cmd_, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
+    EndRecord(true);
+    std::error_code ec;
+    std::filesystem::create_directories(app::ExeDir() / "logs", ec);
+    const std::string path = (app::ExeDir() / "logs" / (dist ? "ao_dist.pgm" : "ao_probe.pgm")).string();
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fprintf(f, "P5\n%u %u\n255\n", image.w, image.h);
+        if (dist) {
+            const float* src = static_cast<const float*>(map);
+            std::vector<uint8_t> px(size_t(image.w) * image.h);
+            for (size_t i = 0; i < px.size(); i++) {
+                // Near geometry white, the 1e30 clear black; enough to see the prepass coverage.
+                px[i] = uint8_t(std::clamp(1.0f - src[i] / 50.0f, 0.0f, 1.0f) * 255.0f);
+            }
+            std::fwrite(px.data(), 1, px.size(), f);
+        } else {
+            std::fwrite(map, 1, size_t(image.w) * image.h, f);
+        }
+        std::fclose(f);
+        LOGR("vulkan: AO probe saved to %s", path.c_str());
+    }
+    vkUnmapMemory(device_, memory);
+    vkDestroyBuffer(device_, buffer, nullptr);
+    vkFreeMemory(device_, memory, nullptr);
+    BeginRecord();
+    Transition(image.image, image.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, image.format);
+}
+
+VkDescriptorSet VulkanBackend::AcquireAoOcclusionSet(VkImageView view) {
+    if (!view || ao_occ_set_next_ >= ao_occ_sets_.size()) return VK_NULL_HANDLE;
+    VkDescriptorSet set = ao_occ_sets_[ao_occ_set_next_++];
+    VkDescriptorImageInfo image{};
+    image.imageView = view;
+    image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &image;
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    return set;
+}
+
+void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, VkDescriptorSet occlusion) {
+    for (const DeferredDraw& d : draws) {
+        if (!d.pipe) continue;
+        if (d.pipe != bound_pipe_) {
+            vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe);
+            bound_pipe_ = d.pipe;
+        }
+        for (uint32_t i = 0; i < d.vb_count; i++)
+            vkCmdBindVertexBuffers(cmd_, d.vbind[i], 1, &d.vbufs[i], &d.voffs[i]);
+        if (d.ibuf) vkCmdBindIndexBuffer(cmd_, d.ibuf, d.ioff, d.itype);
+        VkDescriptorSet sets[2] = {d.set, occlusion};
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0,
+                                occlusion ? 2u : 1u, sets, 0, nullptr);
+        vkCmdSetViewport(cmd_, 0, 1, &d.vp);
+        vkCmdSetScissor(cmd_, 0, 1, &d.sc);
+        vkCmdSetBlendConstants(cmd_, d.blend);
+        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, d.stencil);
+        if (d.index_count)
+            vkCmdDrawIndexed(cmd_, d.index_count, 1, 0, d.base_vertex, 0);
+        else
+            vkCmdDraw(cmd_, d.vertex_count, 1, 0, 0);
+        draws_++;
+        if (d.rt) d.rt->drawn = true;
+        if (d.ds) d.ds->drawn = true;
+    }
+    bound_pipe_ = VK_NULL_HANDLE;
+    viewport_valid_ = false;
+}
+
+void VulkanBackend::FlushDeferredScene() {
+    if (deferred_.empty() || flushing_deferred_) return;
+    flushing_deferred_ = true;
+    struct Guard {
+        bool& f;
+        ~Guard() { f = false; }
+    } guard{flushing_deferred_};
+
+    Target* rt = defer_rt_;
+    Target* ds = defer_ds_;
+    std::vector<DeferredDraw> draws;
+    draws.swap(deferred_);
+    deferred_read_targets_.clear();
+    deferred_write_targets_.clear();
+    deferred_read_images_.clear();
+
+    FlushPass();
+    VkDescriptorSet occlusion = VK_NULL_HANDLE;
+    bool ao_ran = false;
+    bool receivers = false, receiver_draws = false;
+    for (const DeferredDraw& d : draws) {
+        receivers = receivers || d.depth_pipe != VK_NULL_HANDLE;
+        receiver_draws = receiver_draws || d.receiver;
+    }
+    if (ao_mode_ != 0 && rt && ds && receivers) {
+        const bool depth_ms = rt->samples > 1;
+        const bool zero_ok = EnsureAoZero(rt->w, rt->h);
+        const bool ready = zero_ok && EnsureAoDepth(rt->w, rt->h, rt->samples) && EnsureAoHalf(rt->w, rt->h) &&
+                           EnsureAoOcc(rt->w, rt->h) && EnsureAoPipelines(depth_ms);
+        if (ready) {
+            BeginRecord();
+            const VkRenderPass prepass = AoPrepassPass(rt->samples);
+            if (!ao_prepass_fb_) ao_prepass_fb_ = AoFramebuffer(prepass, &ao_dist_, &ao_depth_);
+            if (prepass && ao_prepass_fb_) {
+                Transition(ao_depth_.image, ao_depth_.layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                           ao_depth_.format);
+                Transition(ao_dist_.image, ao_dist_.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                           ao_dist_.format);
+                VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+                bi.renderPass = prepass;
+                bi.framebuffer = ao_prepass_fb_;
+                bi.renderArea = {{0, 0}, {ao_dist_.w, ao_dist_.h}};
+                vkCmdBeginRenderPass(cmd_, &bi, VK_SUBPASS_CONTENTS_INLINE);
+                if (ao_depth_clear_) {
+                    float depth_clear = 1.0f;
+                    for (const DeferredDraw& d : draws)
+                        if (d.depth_pipe) {
+                            const uint32_t n = d.zfunc >= 0x200 && d.zfunc <= 0x207 ? d.zfunc - 0x200 : 7;
+                            if (n == 4 || n == 6) depth_clear = 0.0f;
+                            static std::atomic<int> logged_clear{0};
+                            if (logged_clear.fetch_add(1, std::memory_order_relaxed) < 4)
+                                LOGR("vulkan: AO prepass clear %.1f (zfunc 0x%X)", depth_clear, d.zfunc);
+                            break;
+                        }
+                    VkClearAttachment clear[2]{};
+                    clear[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    clear[0].colorAttachment = 0;
+                    clear[0].clearValue.color.float32[0] = kAoDistClear;
+                    clear[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                    clear[1].clearValue.depthStencil.depth = depth_clear;
+                    clear[1].clearValue.depthStencil.stencil = 0;
+                    VkClearRect rect{};
+                    rect.rect = {{0, 0}, {ao_dist_.w, ao_dist_.h}};
+                    rect.baseArrayLayer = 0;
+                    rect.layerCount = 1;
+                    vkCmdClearAttachments(cmd_, 2, clear, 1, &rect);
+                    ao_depth_clear_ = false;
+                }
+                for (const DeferredDraw& d : draws) {
+                    if (!d.depth_pipe) continue;
+                    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, d.depth_pipe);
+                    for (uint32_t i = 0; i < d.vb_count; i++)
+                        vkCmdBindVertexBuffers(cmd_, d.vbind[i], 1, &d.vbufs[i], &d.voffs[i]);
+                    if (d.ibuf) vkCmdBindIndexBuffer(cmd_, d.ibuf, d.ioff, d.itype);
+                    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &d.set,
+                                            0, nullptr);
+                    vkCmdSetViewport(cmd_, 0, 1, &d.vp);
+                    vkCmdSetScissor(cmd_, 0, 1, &d.sc);
+                    if (d.index_count)
+                        vkCmdDrawIndexed(cmd_, d.index_count, 1, 0, d.base_vertex, 0);
+                    else
+                        vkCmdDraw(cmd_, d.vertex_count, 1, 0, 0);
+                }
+                vkCmdEndRenderPass(cmd_);
+                bound_pipe_ = VK_NULL_HANDLE;
+                viewport_valid_ = false;
+                Transition(ao_dist_.image, ao_dist_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           ao_dist_.format);
+                DumpAoProbe(ao_dist_);
+
+                // GTAO from the distance target, sample 0 of the MSAA image.
+                if (!ao_half_fb_) ao_half_fb_ = AoFramebuffer(AoColorPass(), &ao_half_, nullptr);
+                if (ao_half_fb_ && ao_gtao_pipe_) {
+                    Transition(ao_half_.image, ao_half_.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                               ao_half_.format);
+                    VkRenderPassBeginInfo gb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+                    gb.renderPass = AoColorPass();
+                    gb.framebuffer = ao_half_fb_;
+                    gb.renderArea = {{0, 0}, {ao_half_.w, ao_half_.h}};
+                    vkCmdBeginRenderPass(cmd_, &gb, VK_SUBPASS_CONTENTS_INLINE);
+                    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_gtao_pipe_);
+                    VkDescriptorSet set = AcquireAoSet(ao_dist_.view, VK_NULL_HANDLE, VK_NULL_HANDLE, false);
+                    if (set) vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_pipeline_layout_, 0, 1,
+                                                     &set, 0, nullptr);
+                    float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
+                    float tan_half_fov = 0.577f;
+                    const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
+                    if (fov > 1.0f && fov < 179.0f && aspect > 0.1f)
+                        tan_half_fov = std::tan(fov * 3.14159265f / 360.0f) / aspect;
+                    const float push[8] = {1.0f / float(std::max(1u, ao_dist_.w)),
+                                           1.0f / float(std::max(1u, ao_dist_.h)), 0.0f, kAoDistClear,
+                                           kAoStrength, kAoRadius, tan_half_fov, aspect};
+                    vkCmdPushConstants(cmd_, ao_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+                    VkViewport vp{0, 0, float(ao_half_.w), float(ao_half_.h), 0, 1};
+                    VkRect2D sc{{0, 0}, {ao_half_.w, ao_half_.h}};
+                    vkCmdSetViewport(cmd_, 0, 1, &vp);
+                    vkCmdSetScissor(cmd_, 0, 1, &sc);
+                    vkCmdDraw(cmd_, 3, 1, 0, 0);
+                    vkCmdEndRenderPass(cmd_);
+                    bound_pipe_ = VK_NULL_HANDLE;
+                    viewport_valid_ = false;
+                    Transition(ao_half_.image, ao_half_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                               ao_half_.format);
+                }
+
+                // depth-aware blur and upsample into the full-size occlusion target
+                if (!ao_occ_fb_) ao_occ_fb_ = AoFramebuffer(AoColorPass(), &ao_occ_, nullptr);
+                if (ao_occ_fb_ && ao_occ_pipe_) {
+                    Transition(ao_occ_.image, ao_occ_.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                               ao_occ_.format);
+                    VkRenderPassBeginInfo ob{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+                    ob.renderPass = AoColorPass();
+                    ob.framebuffer = ao_occ_fb_;
+                    ob.renderArea = {{0, 0}, {ao_occ_.w, ao_occ_.h}};
+                    vkCmdBeginRenderPass(cmd_, &ob, VK_SUBPASS_CONTENTS_INLINE);
+                    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_occ_pipe_);
+                    VkDescriptorSet set =
+                        AcquireAoSet(ao_half_.view, ao_dist_.view, VK_NULL_HANDLE, true);
+                    if (set) vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_pipeline_layout_, 0, 1,
+                                                     &set, 0, nullptr);
+                    const float push[8] = {1.0f / float(std::max(1u, ao_half_.w)),
+                                           1.0f / float(std::max(1u, ao_half_.h)), 0.0f, 0.0f,
+                                           0.0f, kAoDistClear, 0.0f, 0.0f};
+                    vkCmdPushConstants(cmd_, ao_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+                    VkViewport vp{0, 0, float(ao_occ_.w), float(ao_occ_.h), 0, 1};
+                    VkRect2D sc{{0, 0}, {ao_occ_.w, ao_occ_.h}};
+                    vkCmdSetViewport(cmd_, 0, 1, &vp);
+                    vkCmdSetScissor(cmd_, 0, 1, &sc);
+                    vkCmdDraw(cmd_, 3, 1, 0, 0);
+                    vkCmdEndRenderPass(cmd_);
+                    bound_pipe_ = VK_NULL_HANDLE;
+                    viewport_valid_ = false;
+                    Transition(ao_occ_.image, ao_occ_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                               ao_occ_.format);
+                    DumpAoProbe(ao_occ_);
+                    ao_ran = true;
+                }
+            }
+        }
+        if (!ready) LOG_FIRST(4, "vulkan: deferred AO skipped this flush");
+    }
+    if (ao_ran)
+        occlusion = AcquireAoOcclusionSet(ao_occ_.view);
+    if (!occlusion && ao_mode_ != 0 && rt && receiver_draws) {
+        if (!ao_zero_.image) EnsureAoZero(rt->w, rt->h);
+        if (ao_zero_.image) occlusion = AcquireAoOcclusionSet(ao_zero_.view);
+    }
+
+    BeginScenePass(rt, ds);
+    if (pass_ != VK_NULL_HANDLE) {
+        ReplayDeferred(draws, occlusion);
+    } else {
+        defer_abandoned_ = true;
+        LOGE("vulkan: deferred replay could not reopen the scene pass; dropping %zu draw(s)", draws.size());
+    }
+    defer_ao_applied_ = ao_ran;
+    if (ao_ran) {
+        static std::atomic<bool> logged_ao{false};
+        if (!logged_ao.exchange(true, std::memory_order_relaxed))
+            LOGR("vulkan: receiver GTAO active (%s)", ao_mode_ == 1 ? "Half" : "Full");
+    }
+    static std::atomic<int> logged_flushes{0};
+    if (logged_flushes.fetch_add(1, std::memory_order_relaxed) < 8)
+        LOGR("vulkan: deferred flush %zu draw(s), AO %s", draws.size(), ao_ran ? "applied" : "off");
+    deferred_.swap(draws);  // keep the display list's allocation for the next scene
+    deferred_.clear();
+}
+
+void VulkanBackend::ResetDeferred() {
+    deferred_.clear();
+    deferred_read_targets_.clear();
+    deferred_write_targets_.clear();
+    deferred_read_images_.clear();
+    defer_rt_ = defer_ds_ = nullptr;
+    defer_ao_applied_ = false;
+    defer_abandoned_ = false;
+    ao_depth_clear_ = true;
+    ao_set_next_ = 0;
+    ao_occ_set_next_ = 0;
+    ao_mode_ = app::Snapshot().ao;
+    defer_scene_ = defer_forced_ || ao_mode_ != 0;
+    for (VkPipeline p : retired_ao_pipelines_)
+        if (p) vkDestroyPipeline(device_, p, nullptr);
+    retired_ao_pipelines_.clear();
 }
 
 namespace {
@@ -2398,6 +3321,8 @@ std::string InjectBindings(std::string src) {
             size_t p = trimmed.find(" : register(t") + 13;
             if (p < trimmed.size() && trimmed[p] >= '0' && trimmed[p] <= '3')
                 prefix = "[[vk::binding(" + std::to_string(2 + (trimmed[p] - '0')) + ", 0)]] ";
+            else if (p < trimmed.size() && trimmed[p] == '4')
+                prefix = "[[vk::binding(0, 1)]] ";  // the AO occlusion target
         } else if (trimmed.find(" : register(s") != std::string::npos) {
             size_t p = trimmed.find(" : register(s") + 13;
             if (p < trimmed.size() && trimmed[p] >= '0' && trimmed[p] <= '3')
@@ -2420,7 +3345,10 @@ VkShaderModule VulkanBackend::CompileShader(const std::string& src, shaderc_shad
         shaderc_compile_options_set_auto_map_locations(o, true);
         return o;
     }();
-    const std::string injected0 = InjectBindings(src);
+    std::string injected0 = InjectBindings(src);
+    // The shared HLSL uses this to pick Vulkan bindings/push constants and the full-screen
+    // NDC direction. D3D12 leaves it undefined.
+    injected0 = "#define TCNYC_VULKAN 1\n" + injected0;
     // D3D's viewport maps NDC +y to the top; Vulkan maps it to the bottom. The
     // generated vertex epilogue flips for D3D, so undo that flip for Vulkan.
     std::string injected = injected0;
@@ -2591,7 +3519,8 @@ VkShaderModule VulkanBackend::PixelShaderFor(const PixelKey& pk, uint64_t& key) 
     return module;
 }
 
-bool VulkanBackend::CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps, VkPipeline& out) {
+bool VulkanBackend::CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps, VkPipeline& out,
+                                   VkRenderPass pass_override) {
     VkVertexInputBindingDescription bindings[16]{};
     VkVertexInputAttributeDescription attrs[16]{};
     uint32_t nb = 0, na = 0;
@@ -2717,8 +3646,10 @@ bool VulkanBackend::CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderM
     info.pColorBlendState = &blend;
     info.pDynamicState = &dynamic;
     info.layout = pipeline_layout_;
-    info.renderPass = k.samples > 1 ? RenderPassForMs(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.samples)
-                                   : RenderPassFor(VkFormat(k.rtfmt), VkFormat(k.dsfmt));
+    info.renderPass = pass_override != VK_NULL_HANDLE
+                          ? pass_override
+                          : k.samples > 1 ? RenderPassForMs(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.samples)
+                                          : RenderPassFor(VkFormat(k.rtfmt), VkFormat(k.dsfmt));
     if (info.renderPass == VK_NULL_HANDLE) return false;
     VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &out);
     if (r != VK_SUCCESS) {
@@ -2816,6 +3747,13 @@ void ReadStagePalette(const State& s, int stage, const TextureDesc& d, uint32_t 
 // referenced by the frame being recorded, so they are moved to the retire lists (freed after the
 // next fence wait) instead of being leaked or destroyed under the command buffer.
 void VulkanBackend::RetireTargetResources(Target* t) {
+    if (DeferredPending() &&
+        (deferred_write_targets_.count(t) || deferred_read_targets_.count(t))) {
+        FlushDeferredScene();
+        FlushPass();
+    }
+    if (defer_rt_ == t) defer_rt_ = nullptr;
+    if (defer_ds_ == t) defer_ds_ = nullptr;
     const VkImageView old_view = t->view;
     const VkImageView old_resolved_view = t->resolved_view;
     const VkImageView old_sample_view = t->sample_view;
@@ -3413,6 +4351,8 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
                 LOG_FIRST(24, "vulkan: feedback texture %08X fmt %X rt %08X depth %d", d.data, d.format, s.rt.data,
                           int(depth_tex));
                 if (is_target) *is_target = true;
+                sampled_target_ = target;
+                if (DeferredPending()) FlushDeferredScene();
                 return FeedbackTexture(s, target, d);
             }
             const BorrowKey bkey{target, d.format, uint8_t(depth_tex)};
@@ -3432,6 +4372,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
                 borrowed_[bkey] = tx;
                 it = borrowed_.find(bkey);
             }
+            if (DeferredPending()) FlushDeferredScene();
             FlushPass();
             BeginRecord();
             VkImage target_image = target->samples > 1 ? target->resolved_image : target->image;
@@ -3481,6 +4422,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
     if (!same) {
         if (!t) t = new Tex();
         if (t->image) {
+            if (deferred_read_images_.count(t->image)) FlushDeferredScene();
             vkDestroyImageView(device_, t->view, nullptr);
             vkDestroyImage(device_, t->image, nullptr);
             vkFreeMemory(device_, t->memory, nullptr);
@@ -3669,6 +4611,7 @@ bool VulkanBackend::CreatePackTexture(Tex& r, texturedumper::Image& img) {
 
 // the pack's files changed: each image is made again when next drawn
 void VulkanBackend::ReleasePackTextures() {
+    if (DeferredPending()) FlushDeferredScene();
     for (auto& entry : pack_textures_) pack_textures_retired_.push_back(entry.second);
     pack_textures_.clear();
 }
@@ -3818,6 +4761,10 @@ size_t VulkanBackend::ReleaseOldTextures(bool force) {
     constexpr size_t kTexturesKept = 2048;
     constexpr uint64_t kIdleFrames = 600;
     if (!force && (frames_ % kSweepEvery != 0 || textures_.size() <= kTexturesKept)) return 0;
+    if (DeferredPending()) {
+        FlushDeferredScene();
+        EndRecord(true);  // the retired images may be named by the replay commands
+    }
     const size_t before = textures_.size();
     for (auto it = textures_.begin(); it != textures_.end();) {
         Tex* t = it->second;
@@ -3888,6 +4835,11 @@ void VulkanBackend::UploadTexture(Tex* t, const TextureDesc& d, const uint32_t* 
         std::memcpy(static_cast<uint8_t*>(map) + at, images[i].data(), images[i].size());
         at += images[i].size();
     }
+    // An upload of a texture no pending scene draw uses need not force a replay. The upload
+    // itself stays in submission order before any later deferred replay and cannot affect it.
+    if (deferred_read_images_.count(t->image)) FlushDeferredScene();
+    const bool old_skip = skip_deferred_flush_;
+    skip_deferred_flush_ = true;
     EndRecord(true);
     BeginRecord();
     Transition(t->image, t->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, t->format, t->levels, t->layers);
@@ -3895,6 +4847,7 @@ void VulkanBackend::UploadTexture(Tex* t, const TextureDesc& d, const uint32_t* 
         vkCmdCopyBufferToImage(cmd_, buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     Transition(t->image, t->layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, t->format, t->levels, t->layers);
     EndRecord(true);
+    skip_deferred_flush_ = old_skip;
     vkUnmapMemory(device_, memory);
     vkDestroyBuffer(device_, buffer, nullptr);
     vkFreeMemory(device_, memory, nullptr);
@@ -4231,10 +5184,17 @@ float4 psmain() : SV_Target { return colour; }
 void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                           uint32_t stencil) {
     ScopeTimer timer(perf_, &perf_clear_ms_);
+    // A clear is an immediate command: pending scene draws must run first.
+    if (DeferredPending()) FlushDeferredScene();
     Target* rt = nullptr;
     Target* ds = nullptr;
     BindTargets(s, rt, ds);
     if (!pass_) return;
+    // A full-size depth clear starts a new scene view; the AO prepass starts empty again.
+    if (ds && (flags & kClearZ) && ds->gw == width_ && ds->gh == height_) {
+        ao_depth_clear_ = true;
+        defer_rt_ = defer_ds_ = nullptr;
+    }
     const Target* sized = rt ? rt : ds;
     const uint32_t tw = sized->w;
     const uint32_t th = sized->h;
@@ -4339,6 +5299,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     std::array<TexInfo, 4> info{};
     std::array<TextureDesc, 4> descs{};
     std::array<Tex*, 4> tex{};
+    std::array<Target*, 4> tex_targets{};
     std::array<const char*, 4> tex_reasons{};
     std::array<float, 4> wide{};
     for (int i = 0; i < 4; i++) {
@@ -4349,6 +5310,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (Format(d.format).depth) info[size_t(i)].shadow = uint8_t(d.format == 0x2C || d.format == 0x30 ? 2 : 1);
         bool is_target = false;
         tex[size_t(i)] = EnsureTexture(s, i, &is_target);
+        tex_targets[size_t(i)] = is_target ? sampled_target_ : nullptr;
         tex_reasons[size_t(i)] = tex_reason_;
         if (is_target) info[size_t(i)].flags |= kTexTarget;
         // D3D12 BindTargetTexture: spread taps only when an upscaled target is shrunk into a smaller
@@ -4366,17 +5328,64 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         for (int i = 0; i < 4; i++)
             if (descs[size_t(i)].data) frame_tex_.insert(descs[size_t(i)].data);
     laps.Lap(&perf_pixel_ms_);
-    PixelKey pk = MakePixelKey(s, info.data());
-    pk.quad = count <= 4 && !s.rs[kRsZEnable] && a.topology != Topology::Points;
-    uint64_t pkey = 0;
-    VkShaderModule ps = PixelShaderFor(pk, pkey);
-    if (!ps) return;
-
     laps.Lap(&perf_target_ms_);
     Target* rt = nullptr;
     Target* ds = nullptr;
     BindTargets(s, rt, ds);
     if (!pass_) return;
+
+    // Deferred scene display list: world draws into the full-size game view are recorded and
+    // replayed after the AO prepass. Everything else stays immediate.
+    const bool scene_view = s.viewport.w == width_ && s.viewport.h * 4 >= height_ * 3;
+    const bool scene_sized = rt && !rt->depth && rt->gw == width_ && rt->gh == height_ && ds &&
+                             ds->w == rt->w && ds->h == rt->h && ds->samples == rt->samples;
+    bool samples_colour_rt = false;
+    for (int i = 0; i < 4; i++)
+        if ((info[size_t(i)].flags & kTexTarget) && !info[size_t(i)].shadow) samples_colour_rt = true;
+    const uint8_t ao_roles = ao_mode_ != 0 && scene_sized && !a.pretransformed && scene_view
+                                 ? AoRoles(s, samples_colour_rt)
+                                 : 0;
+    const bool ao_receiver = (ao_roles & kAoColour) != 0;
+    bool defer_now = defer_scene_ && !defer_abandoned_ && scene_sized && !a.pretransformed && scene_view &&
+                     !SimpleState(s, kMCountEnable);
+    if (DeferredPending() &&
+        ((rt && deferred_read_targets_.count(rt)) || (ds && deferred_read_targets_.count(ds)))) {
+        // This draw writes a target the pending list samples.
+        FlushDeferredScene();
+        BindTargets(s, rt, ds);
+        if (!pass_) return;
+    }
+    if (defer_now && DeferredPending() && (defer_rt_ != rt || defer_ds_ != ds)) {
+        FlushDeferredScene();
+        BindTargets(s, rt, ds);
+        if (!pass_) return;
+    }
+    if (defer_now && !DeferredPending()) {
+        defer_rt_ = rt;
+        defer_ds_ = ds;
+    }
+    if (!defer_now && DeferredPending()) {
+        const bool touches = (rt && (rt == defer_rt_ || deferred_read_targets_.count(rt))) ||
+                             (ds && (ds == defer_ds_ || deferred_read_targets_.count(ds)));
+        if (touches) {
+            FlushDeferredScene();
+            BindTargets(s, rt, ds);
+            if (!pass_) return;
+        }
+    }
+
+    PixelKey pk = MakePixelKey(s, info.data());
+    pk.quad = count <= 4 && !s.rs[kRsZEnable] && a.topology != Topology::Points;
+    pk.ao = ao_receiver ? 1 : 0;
+    uint64_t pkey = 0;
+    VkShaderModule ps = PixelShaderFor(pk, pkey);
+    if (!ps && pk.ao) {
+        // The AO variant failed to compile: draw the game's original shader.
+        LOG_FIRST(4, "vulkan: AO pixel shader variant failed, drawing without AO");
+        pk.ao = 0;
+        ps = PixelShaderFor(pk, pkey);
+    }
+    if (!ps) return;
 
     if (draw_log_ || trace_) {
         char head[560];
@@ -4499,6 +5508,32 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (!CreatePipeline(k, vs, ps, pipe)) return;
         pipelines_[k] = pipe;
     }
+
+    // The same draw for the AO depth prepass: depth plus the R32F view distance, with blending
+    // off and only the red channel written. Alpha tests and discards still apply.
+    VkPipeline depth_pipe = VK_NULL_HANDLE;
+    if (defer_now && (ao_roles & kAoDepth)) {
+        PixelKey dpk = pk;
+        dpk.ao = 3;
+        uint64_t dkey = 0;
+        VkShaderModule dps = PixelShaderFor(dpk, dkey);
+        if (dps) {
+            PsoKey dk = k;
+            dk.ps = dkey;
+            dk.rtfmt = uint32_t(VK_FORMAT_R32_SFLOAT);
+            dk.dsfmt = uint32_t(depth_format_);
+            dk.samples = rt->samples;
+            dk.blend = dk.src = dk.dst = dk.op = 0;
+            dk.wmask = 1;  // red
+            dk.sten = dk.sfunc = dk.smask = dk.swmask = dk.sfail = dk.szfail = dk.spass = 0;
+            if (auto it = pipelines_.find(dk); it != pipelines_.end()) {
+                depth_pipe = it->second;
+            } else {
+                const VkRenderPass pass = AoPrepassPass(rt->samples);
+                if (pass && CreatePipeline(dk, vs, dps, depth_pipe, pass)) pipelines_[dk] = depth_pipe;
+            }
+        }
+    }
     laps.Lap(&perf_const_ms_);
 
     // constants
@@ -4619,15 +5654,6 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         index_count = a.index_count;
     }
 
-    laps.Lap(&perf_record_ms_);
-    BeginRecord();
-    if (pipe != bound_pipe_) {
-        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        bound_pipe_ = pipe;
-    }
-    for (uint32_t i = 0; i < nb; i++) vkCmdBindVertexBuffers(cmd_, bound[i], 1, &vbufs[i], &offs[i]);
-    if (idx_buffer) vkCmdBindIndexBuffer(cmd_, idx_buffer, idx_off, idx_type);
-    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
     VkViewport vp{0, 0, float(host_w), float(host_h), 0, 1};
     VkRect2D sc{{0, 0}, {host_w, host_h}};
     if (s.scissor_count) {
@@ -4639,6 +5665,65 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         const int32_t b = std::clamp(int32_t(float(s.scissors[3]) * sy), 0, int32_t(host_h));
         if (r > l && b > t) sc = {{l, t}, {uint32_t(r - l), uint32_t(b - t)}};
     }
+    float blend_color[4];
+    Color(SimpleState(s, kMBlendColor), blend_color);
+    const uint32_t stencil_ref = SimpleState(s, kMStencilRef) & 0xFF;
+
+    laps.Lap(&perf_record_ms_);
+    if (defer_now) {
+        DeferredDraw d;
+        d.pipe = pipe;
+        d.depth_pipe = depth_pipe;
+        d.set = set;
+        d.vb_count = nb;
+        for (uint32_t i = 0; i < nb; i++) {
+            d.vbind[i] = bound[i];
+            d.vbufs[i] = vbufs[i];
+            d.voffs[i] = offs[i];
+        }
+        d.ibuf = idx_buffer;
+        d.ioff = idx_off;
+        d.itype = idx_type;
+        d.index_count = index_count;
+        d.vertex_count = a.vertex_count;
+        d.base_vertex = a.base_vertex;
+        d.vp = vp;
+        d.sc = sc;
+        std::memcpy(d.blend, blend_color, sizeof(d.blend));
+        d.stencil = stencil_ref;
+        d.zfunc = k.zfunc;
+        d.receiver = ao_receiver;
+        d.rt = rt;
+        d.ds = ds;
+        deferred_.push_back(d);
+        if (rt) {
+            rt->drawn = true;
+            deferred_write_targets_.insert(rt);
+        }
+        if (ds) {
+            ds->drawn = true;
+            deferred_write_targets_.insert(ds);
+        }
+        for (int i = 0; i < 4; i++) {
+            if (tex[size_t(i)]) {
+                if (tex[size_t(i)]->image) deferred_read_images_.insert(tex[size_t(i)]->image);
+                if (tex[size_t(i)]->swap && tex[size_t(i)]->swap->image)
+                    deferred_read_images_.insert(tex[size_t(i)]->swap->image);
+            }
+            if (tex_targets[size_t(i)]) deferred_read_targets_.insert(tex_targets[size_t(i)]);
+        }
+        laps.Stop();
+        return;
+    }
+
+    BeginRecord();
+    if (pipe != bound_pipe_) {
+        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        bound_pipe_ = pipe;
+    }
+    for (uint32_t i = 0; i < nb; i++) vkCmdBindVertexBuffers(cmd_, bound[i], 1, &vbufs[i], &offs[i]);
+    if (idx_buffer) vkCmdBindIndexBuffer(cmd_, idx_buffer, idx_off, idx_type);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
     if (!viewport_valid_ || std::memcmp(&vp, &bound_vp_, sizeof(vp)) != 0 ||
         std::memcmp(&sc, &bound_sc_, sizeof(sc)) != 0) {
         vkCmdSetViewport(cmd_, 0, 1, &vp);
@@ -4647,10 +5732,8 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         bound_sc_ = sc;
         viewport_valid_ = true;
     }
-    float blend_color[4];
-    Color(SimpleState(s, kMBlendColor), blend_color);
     vkCmdSetBlendConstants(cmd_, blend_color);
-    vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, SimpleState(s, kMStencilRef) & 0xFF);
+    vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_ref);
     uint32_t query = kOcclusionQueries;
     if (SimpleState(s, kMCountEnable)) LOG_FIRST(1, "vulkan: visibility count enabled");
     if (query_pool_ && SimpleState(s, kMCountEnable) && query_next_ < kOcclusionQueries) {
@@ -4764,6 +5847,7 @@ void VulkanBackend::RecordLate(uint32_t data) {
     Target* t = TargetAt(data, false, true);
     if (!t) return;
     if (!t || t->depth) return;
+    if (DeferredPending()) FlushDeferredScene();
     if (DirtyEpoch(t->data) != t->epoch) return;  // guest memory is newer than the image
     VkImage image = t->samples > 1 ? t->resolved_image : t->image;
     if (!image || !t->w || !t->h) return;

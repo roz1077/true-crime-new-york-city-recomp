@@ -96,6 +96,8 @@ cache is safe and only costs one slower start.
   `TCNYC_TRACE_AT=<frame>` captures that frame without pressing F3;
   `TCNYC_DUMP_TARGETS=1` also writes every live render target, and
   `TCNYC_DUMP_TEX=<hex,hex>` writes named source textures.
+- `TCNYC_AO_PROBE=1 ./TrueCrimeNYC` writes the first AO distance and occlusion images to
+  `logs/ao_dist.pgm` and `logs/ao_probe.pgm` for comparing against Windows.
 - `TCNYC_RENDERER=software ./TrueCrimeNYC` selects the CPU reference renderer
   (very slow). It is useful to check whether a problem is GPU-specific.
 - `SDL_VIDEODRIVER=wayland` or `SDL_VIDEODRIVER=x11` forces a video backend.
