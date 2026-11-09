@@ -227,6 +227,52 @@ their health instead.
   Sour Candy after loading; `0x18DD80` refuses items while set).
 - Game speed: the simulation hook in `timing.cpp` scales the ticks it passes.
 
+## Tommy container prompt bug (investigation, 2026-11-09)
+
+Trace of a full Human Cargo run (`XBE_DEV_TRACE=1`): Tommy's script
+(`AI_BC4M5`) goes StartJing → WaitForNick/RunToNextWaypoint/CallOutGoons
+loops → WaitForTommyFight → TommyFight → TryToFlee. Its only `SetGrabbable`
+call is `SetGrabbable(0)` in StartJing (Tommy can't be grabbed for the whole
+mission), and it never calls a scripted-sequence or prompt native during the
+fight. So the throw-off prompt is not driven by Tommy's script: it's the
+engine's own combat move (C++), probably the HUD hint/prompt path
+(`HUDFetchHintRequest`, `ShowHint`, `Nick_Press_*` names). Next: find and
+trace that path to measure the window.
+
+Update: the container fight is a "sumo" grapple (animations
+`Nick_Grappled_Sumo_*` / `NPC_Grapple_Sumo_*` in `Anims/BC4_M5_CargoShip`),
+run by `0x58D90`: state byte `+0x0C`, timers `+0x30` / `+0x44`, balance
+`+0x40`; it reads the buttons through `0x113D40` and posts
+`BC4_M5_PlayerLosing` to the mission. Its timers count down by the frame time
+`[0x37F630]` (main timer object `0x37F610` + 0x20), so the push-off window is
+measured in time, not frames. The script clock is 60 units a second
+(`Secs2Lux` multiplies by 60.0), so trace timer values divide by 60.
+
+Conclusion: the window's length in seconds is the same in the port as on the
+Xbox; the port just checks the button more often (60 fps instead of the
+Xbox's 30 fps or lower in this scene), so a window that is about one Xbox
+frame long is easier to hit. The Xbox bug is most likely a short window
+combined with frame drops.
+
+Measured (dev build hook on `0x58D90`, `XBE_DEV_TRACE=1`, game at 30 fps):
+the grapple's timers and the frame time are in 1/60 s ticks. Both sides of
+the shove run as grapple objects that take turns (state 3 = winding up for
+about 700-870 ms, then 1 = recovering, 2 = being pushed). Nick's B window is
+state 1 with balance at 1.0 (Tommy at the edge), and it ends when Tommy's side
+starts its next shove. In the run: the window lasted **166 ms (10 ticks, 5
+frames at 30 fps)**; the second time B was pressed 65 ms in and the grapple
+went to state 5 (win). The window is tight, but it lasts the same time in the
+port as the game intends and spans several frames even at 30 fps, so the port
+does not have the one-frame bug.
+
+Fix (all builds): `src/game/sumo_grapple.cpp` hooks `0x58D90` and, while a
+side is in state 1 with the other at the edge (balance ≥ 0.999), runs that
+side's update with the frame time divided by `kWindowScale` (1.5). Measured
+at 30 fps: the window went from 166 ms (5 frames) to 200 ms (6 frames), and
+the push-off was won. The other side's update sometimes runs nested inside
+this one and then also sees the slower clock for that frame, which is
+harmless.
+
 ## Still unknown
 
 1. **Mission jump during gameplay.** Load a save, then trigger
