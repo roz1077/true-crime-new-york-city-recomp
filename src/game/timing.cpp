@@ -31,6 +31,9 @@
 #include "core/log.h"
 #include "kernel/kernel.h"
 #include "xdk/hle.h"
+#if TCNYC_DEV_TOOLS
+#include "dev/dev.h"
+#endif
 
 namespace {
 // guest data
@@ -201,6 +204,9 @@ uint32_t MainLoopSwapInterval(uint32_t interval) { return fast_present && interv
 X86_EXTERN_FUNC(__imp__sub_000A5200);
 X86_FUNC(sub_000A5200) {
     if (X86_MEM32(ctx.esp) != kMainLoopSimulate) return __imp__sub_000A5200(ctx, base);
+#if TCNYC_DEV_TOOLS
+    dev::OnFrame(ctx);
+#endif
     const uint32_t arg = ctx.esp + 4;
     const uint32_t original_ticks = X86_MEM32(arg);
     frame_ticks = original_ticks;
@@ -212,6 +218,9 @@ X86_FUNC(sub_000A5200) {
     } else if (fast_cutscene && cutscene_tick_not_due && original_ticks == 1) {
         frame_ticks = 0;
     }
+#if TCNYC_DEV_TOOLS
+    frame_ticks = dev::AdjustTicks(frame_ticks); // debug menu: pause, slow motion, fast forward
+#endif
     TraceFrame(X86_MEM32(kSimTicks), X86_MEM8(kAudioClockMode) != 0, frame_ticks);
     X86_MEM32(arg) = frame_ticks;
     __imp__sub_000A5200(ctx, base);
@@ -222,7 +231,12 @@ X86_FUNC(sub_000A5200) {
 // The main loop's render step gets the same tick count as the simulation.
 X86_EXTERN_FUNC(__imp__sub_000A73F0);
 X86_FUNC(sub_000A73F0) {
-    if (X86_MEM32(ctx.esp) != kMainLoopRender || (!fast_gameplay && !fast_cutscene))
+#if TCNYC_DEV_TOOLS
+    const bool dev_speed = dev::GameSpeed() != 4;
+#else
+    constexpr bool dev_speed = false;
+#endif
+    if (X86_MEM32(ctx.esp) != kMainLoopRender || (!fast_gameplay && !fast_cutscene && !dev_speed))
         return __imp__sub_000A73F0(ctx, base);
     const uint32_t arg = ctx.esp + 4;
     const uint32_t original_ticks = X86_MEM32(arg);

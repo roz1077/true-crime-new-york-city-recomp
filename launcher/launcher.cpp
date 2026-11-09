@@ -8,6 +8,7 @@
 #include <commdlg.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <filesystem>
 #include <thread>
 
@@ -223,6 +224,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 extern "C" int WINAPI RecompMain(HINSTANCE, HINSTANCE, PWSTR, int);
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show) {
+#if TCNYC_DEV_TOOLS
+    // dev builds: automated tests start the game without the launcher window
+    if (_wgetenv(L"XBE_DEV_SKIP_LAUNCHER")) return RecompMain(instance, previous, args, show);
+#endif
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;

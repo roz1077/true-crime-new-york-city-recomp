@@ -5,6 +5,9 @@
 #include "pad_tools.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
+#if TCNYC_DEV_TOOLS
+#include "dev/dev.h"
+#endif
 
 #include <chrono>
 #include <filesystem>
@@ -99,6 +102,16 @@ bool GameplayCameraActive() {
 }
 } // namespace game
 
+namespace {
+// ImGui each frame: the Graphics menu (F10), and in dev builds the debug menu (F9)
+void DrawUi(double fps) {
+    game::DrawGraphicsMenu(fps);
+#if TCNYC_DEV_TOOLS
+    dev::DrawMenu();
+#endif
+}
+} // namespace
+
 // what the runtime asks of the game; strings must be set, hooks may stay null
 const app::GameInfo app::kGame = {
     .title = L"True Crime: New York City", // window and splash
@@ -122,7 +135,7 @@ const app::GameInfo app::kGame = {
     .loaded = nullptr,                    // image in memory, before its entry point runs
     .window = nullptr,                    // the game window is up
     .message = game::GraphicsMenuMessage, // window messages first; true takes one
-    .ui = game::DrawGraphicsMenu,         // ImGui drawing each frame: the Graphics menu (F10)
+    .ui = DrawUi,                         // ImGui drawing each frame: the Graphics menu (F10)
     .pad = FilterPad,                     // changes a polled pad
     .rumble = nullptr,                    // changes a rumble before it is set
     .swap_interval = game::MainLoopSwapInterval,

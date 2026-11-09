@@ -17,6 +17,12 @@ include(${SDK}/cmake/XbeRecomp.cmake)
 
 file(GLOB XBE_HOST_SOURCES CONFIGURE_DEPENDS src/*/*.cpp)
 list(FILTER XBE_HOST_SOURCES EXCLUDE REGEX "/src/game/")
+# Developer debug tools (docs/debug-menu-plan.md): off unless a dev build asks;
+# release builds do not compile src/dev/ at all
+option(TCNYC_DEV_TOOLS "Build the developer debug tools" OFF)
+if(NOT TCNYC_DEV_TOOLS)
+    list(FILTER XBE_HOST_SOURCES EXCLUDE REGEX "/src/dev/")
+endif()
 
 # partitions as xbe_symbols wrote them into config/game.toml
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS config/game.toml)
@@ -31,6 +37,9 @@ endif()
 
 # target name = GAME_EXE in build.bat, xbe = GAME_XBE
 add_xbe_image(TrueCrimeNYC default.xbe game.toml ${GAME_PARTITIONS} game)
+if(TCNYC_DEV_TOOLS)
+    target_compile_definitions(TrueCrimeNYC PRIVATE TCNYC_DEV_TOOLS=1)
+endif()
 
 # The app uses the per-monitor DPI and dark-mode era APIs; current llvm-mingw still
 # defaults WINVER below Windows 10, which hides their declarations.
