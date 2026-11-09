@@ -2602,6 +2602,11 @@ void VulkanBackend::BindTargets(const State& s, Target*& rt, Target*& ds) {
         ((want_ds && same_target(pass_ds_, ds_data, dd, true)) || (!want_ds && !pass_ds_))) {
         rt = pass_rt_;
         ds = pass_ds_;
+        if (DeferredPending() &&
+            ((rt && deferred_read_targets_.count(rt)) || (ds && deferred_read_targets_.count(ds)))) {
+            FlushDeferredScene();
+            BeginScenePass(rt, ds);
+        }
         return;
     }
     FlushPass();
