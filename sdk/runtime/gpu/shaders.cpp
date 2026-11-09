@@ -954,6 +954,10 @@ std::string PixelHlsl(const PixelKey& k) {
             std::string rgb = FfOp(f[0], FfArg(f[1], i, false), FfArg(f[2], i, false), FfArg(f[3], i, false), i, false);
             std::string a = f[4] <= 1 ? std::string("cur.a") : FfOp(f[4], FfArg(f[5], i, true), FfArg(f[6], i, true), FfArg(f[7], i, true), i, true);
             body += F("{ float3 c3 = saturate(%s); float c1 = saturate(%s); %s = float4(c3, c1); }\n", rgb.c_str(), a.c_str(), dst);
+            // NV2A starts the combiners with r0.a = texture 0's alpha. A first stage that writes TEMP leaves r0
+            // untouched, so later stages reading CURRENT alpha see t0.a, not the diffuse alpha. The building
+            // windows blend lit interiors in by this: glass panes have t0.a 0, frames 1.
+            if (i == 0 && f[8] == 5) body += "cur.a = t0.a;\n";
         }
         body += "cur.rgb = saturate(cur.rgb + v1.rgb);\n";
         body += "float4 outc = float4(lerp(fogin.rgb, cur.rgb, fogin.a), cur.a);\n";
