@@ -30,6 +30,7 @@ struct Settings {
     bool dof = true;                  // distance blur on the finished frame
     uint32_t ao = 0;                  // ambient occlusion: 0 off, 1 half resolution, 2 full resolution
     bool building_seam_fix = true;   // experimental priority for detailed city geometry
+    uint32_t object_detail = 0;      // mesh LOD distance: 0 original, 1 high (2x), 2 very high (4x), 3 maximum
     bool pc_contrast = true;         // PC contrast curve on the finished frame
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe

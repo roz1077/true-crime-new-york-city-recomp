@@ -88,6 +88,7 @@ void Load() {
         s.ao = uint32_t(std::clamp<int64_t>(t["ao"].value_or(int64_t(s.ao)), 0, 2));
     }
     s.building_seam_fix = t["building_seam_fix"].value_or(s.building_seam_fix);
+    s.object_detail = uint32_t(std::clamp<int64_t>(t["object_detail"].value_or(int64_t(s.object_detail)), 0, 3));
     s.pc_contrast = t["pc_contrast"].value_or(s.pc_contrast);
     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
@@ -122,6 +123,7 @@ toml::table Table() {
                   {"dof", s.dof},
                   {"ao", int64_t(s.ao)},
                   {"building_seam_fix", s.building_seam_fix},
+                  {"object_detail", int64_t(s.object_detail)},
                   {"pc_contrast", s.pc_contrast},
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},

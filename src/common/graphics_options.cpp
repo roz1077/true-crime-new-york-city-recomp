@@ -87,6 +87,7 @@ enum class Row {
     AspectRatio,
     RenderScale,
     FieldOfView,
+    ObjectDetail,
     Anisotropic,
     Msaa,
     Smaa,
@@ -110,6 +111,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::AspectRatio,
                          Row::RenderScale,
                          Row::FieldOfView,
+                         Row::ObjectDetail,
                          Row::Anisotropic,
                          Row::Msaa,
                          Row::Smaa,
@@ -321,6 +323,7 @@ void RestoreDefaults() {
     s.dof = d.dof;
     s.ao = d.ao;
     s.building_seam_fix = d.building_seam_fix;
+    s.object_detail = d.object_detail;
     s.pc_contrast = d.pc_contrast;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
@@ -339,6 +342,7 @@ Kind KindOf(Row row) {
     case Row::AspectRatio:
     case Row::RenderScale:
     case Row::FieldOfView:
+    case Row::ObjectDetail:
     case Row::Anisotropic:
     case Row::FrameCap:
     case Row::DumpFormat:
@@ -380,6 +384,8 @@ const char *Label(Row row) {
         return "Render scale";
     case Row::FieldOfView:
         return "Field of view";
+    case Row::ObjectDetail:
+        return "Object detail";
     case Row::Anisotropic:
         return "Anisotropic filtering";
     case Row::Msaa:
@@ -451,6 +457,10 @@ const char *Help(Row row) {
     case Row::FieldOfView:
         return "Widens or narrows the gameplay camera. 100% is the game's own view; aiming still zooms "
                "relative to it. Menus and cutscene previews are unchanged.";
+    case Row::ObjectDetail:
+        return "How far buildings, props and vehicles keep their detailed models before switching to "
+               "simpler ones. Original is the game's own; higher levels look better at a distance but cost "
+               "performance. Distant pedestrians are separate stand-ins and do not change.";
     case Row::Anisotropic:
         return "Keeps textures sharp at glancing angles, such as roads into the distance. Game default uses "
                "the filtering the game asks for.";
@@ -529,6 +539,8 @@ std::string Value(Row row) {
             std::snprintf(text, sizeof(text), "%u%%", g_fov_percent);
         return text;
     }
+    case Row::ObjectDetail:
+        return choices::ObjectDetailName(s.object_detail);
     case Row::Anisotropic:
         if (!s.aniso) return "Game default";
         std::snprintf(text, sizeof(text), "%ux", s.aniso);
@@ -606,6 +618,10 @@ bool Change(Row row, int direction) {
         // read by the camera hooks on the game thread: a single aligned 32-bit store
         changed = set(g_fov_percent,
                       choices::ClampFovPercent(choices::Step(choices::kFovPercents, g_fov_percent, direction)));
+        break;
+    case Row::ObjectDetail:
+        // read by the LOD hooks on the game thread: a single aligned 32-bit store
+        changed = set(s.object_detail, choices::Step(choices::kObjectDetails, s.object_detail, direction));
         break;
     case Row::Anisotropic:
         changed = set(s.aniso, choices::Step(choices::kAnisoLevels, s.aniso, direction));

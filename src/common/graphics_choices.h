@@ -21,6 +21,13 @@ inline constexpr uint32_t kGameFrameLimit = 60;
 // Field of view, as a percentage of the gameplay camera's tan(fov / 2): 100 is the game's own.
 inline constexpr uint32_t kFovPercents[] = {80, 90, 100, 110, 120, 130, 140, 150};
 inline constexpr uint32_t kMinFovPercent = 50, kMaxFovPercent = 200;
+// Object detail (app::Settings::object_detail): how far meshes keep each detail level. 0 is the game's own,
+// then 2x, 4x and always the highest detail.
+inline constexpr uint32_t kObjectDetails[] = {0, 1, 2, 3};
+inline const char *ObjectDetailName(uint32_t level) {
+    static const char *const names[] = {"Original", "High", "Very high", "Maximum"};
+    return names[level < 4 ? level : 0];
+}
 // Frame shapes, width / height x 1000 (app::Settings::aspect): 0 matches the display, then 4:3, 16:10, 16:9, 21:9
 // (64:27) and 32:9. 3D widens to the shape; HUD, menus and movies stay 16:9 in the middle.
 inline constexpr uint32_t kAspects[] = {0, 1333, 1600, 1778, 2370, 3556};
