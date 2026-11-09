@@ -1,7 +1,7 @@
 # Vulkan port of receiver GTAO
 
-Status: **implemented in `platform/linux/backend_vk.cpp`; Deck performance validation is
-pending**. The shared AO roles, GTAO and occlusion shaders now live in
+Status: **implemented and Deck-tested**, with fixed-camera gameplay validation still
+advisable. The shared AO roles, GTAO and occlusion shaders now live in
 `sdk/runtime/gpu/ao.h`; D3D12 and Vulkan compile the same text with backend-specific bindings.
 The Vulkan backend records scene draws into a CPU display list, runs the same
 prepass/GTAO/blur chain, and binds the occlusion image at `t4` as set 1. The extra details
@@ -202,6 +202,28 @@ helper.
 - `TCNYC_AO_PROBE=1` writes the first distance and full-size occlusion images to
   `logs/ao_dist.pgm` and `logs/ao_probe.pgm` for the D3D12 comparison. It skips a
   multisampled distance target, which `vkCmdCopyImageToBuffer` cannot copy directly.
+
+## Deck validation
+
+Tested 2026-11-09 in SteamOS Desktop Mode on RADV (Radeon 890M), 1920x1080 panel with the
+game target at 1280x720, 100%, borderless. The attract scene varied between about 1,200
+and 2,200 draws per frame; these are 50–65 second windows, not a fixed-camera benchmark.
+
+| MSAA | AO Off | AO Half | AO Full |
+|---|---|---|---|
+| 1x | ~18.6 ms / 54 fps | ~24.5 ms / 42 fps | not run |
+| 2x | ~23.9 ms / 42 fps | ~26.3 ms / 40 fps | not run |
+| 4x | ~23.8 ms / 43 fps | ~28–36 ms / 28–40 fps | ~31–33 ms / 31–33 fps |
+
+- AO Half at 1x/2x adds roughly 3–6 ms in this draw-heavy attract scene. At 4x the
+  multisampled prepass is the expensive part: the same scene adds 8–12 ms. Half plus 2x
+  MSAA is the recommended balance; 4x with AO is too heavy for this scene.
+- AO Off and Half reached the scene, initialized the expected 1x/2x/4x prepass targets,
+  and produced no `VK_ERROR_*` or shader failures. Off/Half/Full screenshots showed no
+  white bands or gross edge artifacts, but the attract camera differed between runs, so
+  this is not a pixel-exact comparison. Fixed-camera gameplay capture is still advisable.
+- SteamOS has no Khronos validation layer installed (per `RESULTS.md`); validation was run
+  on llvmpipe on the PC.
 
 ## Risks
 

@@ -47,7 +47,9 @@ low-end fallback:
    `vulkan-ao-plan.md`. **Done:** the same shared shaders and the CPU scene display list are
    in the Vulkan backend.
 2. Measure frame time on the Deck at Half, AO on against off, in the room, alley, street
-   and menu scenes.
+   and menu scenes. **Initial Deck run:** in the draw-heavy attract scene at 1280x720,
+   Half adds about 3–6 ms at 1x/2x and 8–12 ms at 4x. Use Half with 2x MSAA; see
+   `vulkan-ao-plan.md` for the table.
 3. Only if GTAO is too heavy there, add a **GTAO quality** setting, not a second method:
    - **Low:** 1 slice × 4 steps (Half only).
    - **High:** the current 3 × 6 at Half, 3 × 8 at Full.
