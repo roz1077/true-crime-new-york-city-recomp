@@ -489,9 +489,9 @@ const char *Help(Row row) {
         return "Widens or narrows the gameplay camera. 100% is the game's own view; aiming still zooms "
                "relative to it. Menus and cutscene previews are unchanged.";
     case Row::ObjectDetail:
-        return "How far buildings, props and vehicles keep their detailed models before switching to "
+        return "How far buildings and props keep their detailed models before switching to "
                "simpler ones. Original is the game's own; higher levels look better at a distance but cost "
-               "performance. Distant pedestrians are separate stand-ins and do not change.";
+               "performance. Vehicles and distant pedestrians keep the game's own detail.";
     case Row::Anisotropic:
         return "Keeps textures sharp at glancing angles, such as roads into the distance. Game default uses "
                "the filtering the game asks for.";

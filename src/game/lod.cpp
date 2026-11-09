@@ -8,6 +8,10 @@
 //   0x21DC00  scene walker, depth is the 5th argument (also the inline compare at 0x21E057)
 // The two walkers recurse into child nodes with the same depth, so only calls from outside them are scaled.
 //
+// Vehicles are drawn through 0x21E1A0 called from 0x13F5CA. They are left at the game's own depth: a car only
+// sets up its paint and textures once the game itself picks the detailed mesh, so forcing that mesh early
+// draws distant parked cars untextured (black) until the player walks up to them.
+//
 // The object_detail setting scales the depth those selectors see: 1 (original), 1/2, 1/4, or 0 (always the
 // highest detail). Distant pedestrians are not affected: they are LowPed.XB2 stand-ins (0x1B4730, up to
 // seven a frame) until the game swaps in a real pedestrian close by.
@@ -29,6 +33,10 @@ float Scale() {
     return kScales[level < 4 ? level : 0];
 }
 
+// return address of the current 0x21E1A0 call, which tells what kind of object is being drawn
+thread_local uint32_t t_caller = 0;
+constexpr uint32_t kVehicleCaller = 0x13F5CA;
+
 // scales the float argument at esp + offset unless the call comes from inside a walker
 void ScaleDepth(X86Context &ctx, uint8_t *base, uint32_t offset) {
     const float scale = Scale();
@@ -36,6 +44,7 @@ void ScaleDepth(X86Context &ctx, uint8_t *base, uint32_t offset) {
     const uint32_t ret = X86_MEM32(ctx.esp);
     // recursion from inside a walker (0x21CF50..0x21D0E0, 0x21DC00..0x21E1A0) passes an already scaled depth
     if ((ret >= 0x21CF50 && ret < 0x21D0E0) || (ret >= 0x21DC00 && ret < 0x21E1A0)) return;
+    if (ret != 0x61A16 && t_caller == kVehicleCaller) return;
     float depth;
     std::memcpy(&depth, base + ctx.esp + offset, 4);
     depth *= scale;
@@ -43,6 +52,14 @@ void ScaleDepth(X86Context &ctx, uint8_t *base, uint32_t offset) {
 }
 
 } // namespace
+
+X86_EXTERN_FUNC(__imp__sub_0021E1A0);
+X86_FUNC(sub_0021E1A0) {
+    const uint32_t saved = t_caller;
+    t_caller = X86_MEM32(ctx.esp);
+    __imp__sub_0021E1A0(ctx, base);
+    t_caller = saved;
+}
 
 X86_EXTERN_FUNC(__imp__sub_0021C330);
 X86_FUNC(sub_0021C330) {
