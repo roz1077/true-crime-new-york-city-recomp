@@ -3357,7 +3357,7 @@ D3D12_SRV_DIMENSION NullViewDimension(uint8_t kind) {
 // texel centre to the last. A glow chain keeps several blur levels side by side in one target and scales each up from
 // texel 0.5 to its width + 0.5: the far edge's pixels would blend in the next texel, which belongs to a larger, less
 // blurred level, and show an offset copy of the scene along the right and bottom of the frame.
-void RegionClip(const Assembled& a, const DrawTextures& stages, DrawConstants& c) {
+void RegionClip(const Assembled& a, const DrawTextures& stages, uint32_t gw, uint32_t gh, DrawConstants& c) {
     constexpr float kOpen = 1e9f;
     constexpr uint32_t kSmallDrawVertices = 64;
     for (int i = 0; i < 4; i++) {
@@ -3386,6 +3386,22 @@ void RegionClip(const Assembled& a, const DrawTextures& stages, DrawConstants& c
             hi[k] = std::max(hi[k], uv[k]);
         }
     }
+    // the quad covers the whole bound target: a composite over the frame
+    bool full_frame = false;
+    const VertexElement& pe = a.elements[0];
+    const VertexBuffer& pb = a.buffers[pe.buffer];
+    if (gw && gh && (a.regs & 1) && pb.src && pb.stride && uint64_t(a.vertex_count) * pb.stride <= pb.bytes) {
+        float plo[2] = {kOpen, kOpen}, phi[2] = {-kOpen, -kOpen};
+        for (uint32_t v = 0; v < a.vertex_count; v++) {
+            float p[2];
+            std::memcpy(p, pb.src + size_t(v) * pb.stride + pe.offset, sizeof(p));
+            for (int k = 0; k < 2; k++) {
+                plo[k] = std::min(plo[k], p[k]);
+                phi[k] = std::max(phi[k], p[k]);
+            }
+        }
+        full_frame = plo[0] <= 0.5f && plo[1] <= 0.5f && phi[0] >= float(gw) - 0.5f && phi[1] >= float(gh) - 0.5f;
+    }
     for (int i = 0; i < 4; i++) {
         if (!stages.rt[i] || !stages.desc[i] || !stages.desc[i]->width || !stages.desc[i]->height) continue;
         const float size[2] = {float(stages.desc[i]->width), float(stages.desc[i]->height)};
@@ -3397,6 +3413,14 @@ void RegionClip(const Assembled& a, const DrawTextures& stages, DrawConstants& c
             const float past = lo[k] / texel - std::floor(lo[k] / texel);
             c.rtclip[i][k] = lo[k] / n;
             c.rtclip[i][2 + k] = (hi[k] - (past > 0.25f ? 1.0f : 0.5f) * texel) / n;
+            // Unlike the console: a smaller glow target scaled over the whole frame keeps off its outermost texels,
+            // which the title blacks out, so the glow does not fade to nothing along the frame's edges (most visibly
+            // the right and bottom, where the half texel start lands more of the frame on them).
+            const bool whole = lo[k] <= texel * 1.01f && hi[k] >= n - texel * 0.01f;
+            if (full_frame && whole && size[k] < float(k ? gh : gw) && size[k] > 4) {
+                c.rtclip[i][k] += texel / n;
+                c.rtclip[i][2 + k] -= texel / n;
+            }
         }
     }
 }
@@ -3722,7 +3746,9 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     c.tscale[0] = TargetScale();
     c.tscale[1] = TargetScaleY();
     c.tscale[2] = UiSqueeze(s, a, stages);
-    RegionClip(a, stages, c);
+    // the frame's size when the draw targets the frame, for RegionClip's full-frame composites
+    const bool frame = bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_;
+    RegionClip(a, stages, frame ? guest_w_ : 0, frame ? guest_h_ : 0, c);
     if (bound_rt_ && !a.pretransformed) bound_rt_->scene_frame = frame_;
     // Distance blur only uses this frame's full-size, multisampled scene depth. The allocation can
     // fall back to one sample, so check the resource, not the configured mode.
