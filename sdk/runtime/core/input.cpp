@@ -243,7 +243,10 @@ bool ReadKeyboardMouse(Pad& pad) {
         press(0, HeldChar('W')); // A: accelerate
         press(2, HeldChar('S')); // X: brake / reverse
         press(1, held(kKeySpace)); // B: handbrake
-        pad.ly = 0; // steering uses the horizontal stick axis
+        // Steering uses only the horizontal axis. W/S are pedals here, so a
+        // held W must not apply the on-foot diagonal scale to the steering.
+        pad.ly = 0;
+        pad.lx = int16_t(move_x * 32767);
     } else {
         press(0, held(kKeyLCtrl) || held(kKeyRCtrl) || MouseHeld(3)); // A: light attack
         press(2, held(kKeyLAlt) || held(kKeyRAlt) || MouseHeld(4)); // X: heavy attack
