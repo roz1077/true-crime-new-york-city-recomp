@@ -45,7 +45,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 ## Highlights
 
 - **Native renderers** — Direct3D 12 on Windows, Vulkan on Linux; no emulator and no Proton.
-- **Modern graphics** — render scale, aspect ratio, field of view, MSAA, SMAA, bloom and depth of field.
+- **Modern graphics** — render scale, aspect ratio, field of view, MSAA, SMAA, bloom, ambient occlusion and depth of field.
 - **Controller and mouse** — Xbox, PlayStation and Switch controllers with hot-plug, rumble and adaptive glyphs; raw mouse aim with separate sensitivity.
 - **Texture tools** — dump textures and load PNG/DDS replacement packs shared between Windows and Linux.
 - **Copland traffic fix** — restores normal civilian traffic after scripted and random-crime vehicle passes, without reducing police or wanted-level spawns.
@@ -81,6 +81,7 @@ The game receives no controller input while the menu is open, so pause the game 
 | SMAA | SMAA 1x anti-aliasing on the finished frame. On by default. |
 | Bloom | Optional bright-pass bloom over the game's lighting. On by default. |
 | Depth of field | Distance blur for 3D scenes. Requires MSAA. On by default. |
+| Ambient occlusion | Experimental depth-based AO for 3D scenes. Off and disabled in normal play until the bright effect-layer artifacts are resolved; Vulkan pending. |
 | Building seam fix | Experimental: gives detailed buildings priority over simplified city meshes. On by default. |
 | PC contrast | Softer shadow roll-off inspired by the PC version. On by default. |
 | V-Sync / Frame limit | V-Sync on/off; 30 or 60 FPS. The game's timing is built for at most 60. |

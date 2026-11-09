@@ -65,6 +65,7 @@ Settings Snapshot() {
     s.smaa = g.smaa;
     s.bloom = g.bloom;
     s.dof = g.dof;
+    s.ao = g.ao;
     s.building_seam_fix = g.building_seam_fix;
     s.pc_contrast = g.pc_contrast;
     s.custom_textures = g.custom_textures;
@@ -115,6 +116,11 @@ void Load() {
     s.smaa = t["smaa"].value_or(s.smaa);
     s.bloom = t["bloom"].value_or(s.bloom);
     s.dof = t["dof"].value_or(s.dof);
+    if (t["ao"].is_boolean()) {
+        s.ao = t["ao"].value_or(false) ? 2u : 0u;  // older settings stored a boolean
+    } else {
+        s.ao = uint32_t(std::clamp<int64_t>(t["ao"].value_or(int64_t(s.ao)), 0, 2));
+    }
     s.building_seam_fix = t["building_seam_fix"].value_or(s.building_seam_fix);
     s.pc_contrast = t["pc_contrast"].value_or(s.pc_contrast);
     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
@@ -151,6 +157,7 @@ toml::table Table() {
                   {"smaa", s.smaa},
                   {"bloom", s.bloom},
                   {"dof", s.dof},
+                  {"ao", int64_t(s.ao)},
                   {"building_seam_fix", s.building_seam_fix},
                   {"pc_contrast", s.pc_contrast},
                   {"custom_textures", s.custom_textures},
