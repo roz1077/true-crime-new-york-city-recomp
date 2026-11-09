@@ -43,7 +43,8 @@ low-end fallback:
 
 ## Steam Deck / low-end plan
 
-1. Port the receiver AO path and GTAO to Vulkan (`platform/linux/backend_vk.cpp`). The Deck
+1. Port the receiver AO path and GTAO to Vulkan (`platform/linux/backend_vk.cpp`); see
+   `vulkan-ao-plan.md`. The Deck
    has none of the deferred AO path yet.
 2. Measure frame time on the Deck at Half, AO on against off, in the room, alley, street
    and menu scenes.
