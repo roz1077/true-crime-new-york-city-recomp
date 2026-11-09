@@ -750,6 +750,7 @@ private:
     uint32_t max_image_side_ = 16384;
     uint32_t msaa_ = 1;
     uint32_t color_samples_ = 1, depth_samples_ = 1;
+    VkSampleCountFlags ao_color_samples_ = VK_SAMPLE_COUNT_1_BIT;
     uint32_t instance_version_ = VK_API_VERSION_1_0;
     bool depth_resolve_ = false;
     VkResolveModeFlagBits depth_resolve_mode_ = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
@@ -1151,6 +1152,17 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
             LOGR("vulkan: %ux MSAA requested, using %ux%s", requested, msaa_,
                  msaa_ > 1 ? "" : " (unsupported here)");
     }
+    // AO's distance target is R32F. Its supported sample count is independent of the scene
+    // colour/depth target, so cap the prepass samples to it and fall back to one sample.
+    {
+        VkImageFormatProperties props{};
+        if (vkGetPhysicalDeviceImageFormatProperties(physical_, VK_FORMAT_R32_SFLOAT, VK_IMAGE_TYPE_2D,
+                                                     VK_IMAGE_TILING_OPTIMAL,
+                                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                     0, &props) == VK_SUCCESS)
+            ao_color_samples_ = props.sampleCounts;
+        if ((ao_color_samples_ & VK_SAMPLE_COUNT_1_BIT) == 0) ao_color_samples_ = VK_SAMPLE_COUNT_1_BIT;
+    }
     if (!CreateSwapchain() || !CreateCommands() || !CreateUpload()) return false;
 
     // 1x1 white for stages with no texture
@@ -1287,13 +1299,13 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     if (vkAllocateDescriptorSets(device_, &dai, draw_sets_.data()) != VK_SUCCESS) return false;
 
     // one occlusion set per flush, and two full-screen AO sets (GTAO then the blur) per flush
-    VkDescriptorPoolSize occSizes{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 512};
+    VkDescriptorPoolSize occSizes{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2048};
     VkDescriptorPoolCreateInfo occPi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    occPi.maxSets = 512;
+    occPi.maxSets = 2048;
     occPi.poolSizeCount = 1;
     occPi.pPoolSizes = &occSizes;
     if (vkCreateDescriptorPool(device_, &occPi, nullptr, &ao_occ_pool_) != VK_SUCCESS) return false;
-    std::vector<VkDescriptorSetLayout> occLayouts(512, ao_occ_set_layout_);
+    std::vector<VkDescriptorSetLayout> occLayouts(2048, ao_occ_set_layout_);
     VkDescriptorSetAllocateInfo occAi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     occAi.descriptorPool = ao_occ_pool_;
     occAi.descriptorSetCount = uint32_t(occLayouts.size());
@@ -1301,14 +1313,14 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     ao_occ_sets_.resize(occLayouts.size());
     if (vkAllocateDescriptorSets(device_, &occAi, ao_occ_sets_.data()) != VK_SUCCESS) return false;
 
-    VkDescriptorPoolSize aoSizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2048},
-                                       {VK_DESCRIPTOR_TYPE_SAMPLER, 2048}};
+    VkDescriptorPoolSize aoSizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192},
+                                       {VK_DESCRIPTOR_TYPE_SAMPLER, 8192}};
     VkDescriptorPoolCreateInfo aoPi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    aoPi.maxSets = 1024;
+    aoPi.maxSets = 4096;
     aoPi.poolSizeCount = 2;
     aoPi.pPoolSizes = aoSizes;
     if (vkCreateDescriptorPool(device_, &aoPi, nullptr, &ao_pool_) != VK_SUCCESS) return false;
-    std::vector<VkDescriptorSetLayout> aoLayouts(1024, ao_set_layout_);
+    std::vector<VkDescriptorSetLayout> aoLayouts(4096, ao_set_layout_);
     VkDescriptorSetAllocateInfo aoAi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     aoAi.descriptorPool = ao_pool_;
     aoAi.descriptorSetCount = uint32_t(aoLayouts.size());
@@ -1996,11 +2008,12 @@ void VulkanBackend::Shutdown() {
             if (pass) vkDestroyRenderPass(device_, pass, nullptr);
         ao_passes_.clear();
         if (ao_color_pass_) vkDestroyRenderPass(device_, ao_color_pass_, nullptr);
-        if (ao_set_layout_) vkDestroyDescriptorSetLayout(device_, ao_set_layout_, nullptr);
-        if (ao_occ_set_layout_) vkDestroyDescriptorSetLayout(device_, ao_occ_set_layout_, nullptr);
-        if (ao_pipeline_layout_) vkDestroyPipelineLayout(device_, ao_pipeline_layout_, nullptr);
+        // Pools own the sets; destroy them before their set layouts. The scene pipeline layout
+        // still names ao_occ_set_layout_, so that layout intentionally lives to process exit.
         if (ao_pool_) vkDestroyDescriptorPool(device_, ao_pool_, nullptr);
         if (ao_occ_pool_) vkDestroyDescriptorPool(device_, ao_occ_pool_, nullptr);
+        if (ao_pipeline_layout_) vkDestroyPipelineLayout(device_, ao_pipeline_layout_, nullptr);
+        if (ao_set_layout_) vkDestroyDescriptorSetLayout(device_, ao_set_layout_, nullptr);
         vkDestroyDevice(device_, nullptr);
     }
     if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
@@ -3124,13 +3137,14 @@ void VulkanBackend::FlushDeferredScene() {
         receiver_draws = receiver_draws || d.receiver;
     }
     if (ao_mode_ != 0 && rt && ds && receivers) {
-        const bool depth_ms = rt->samples > 1;
+        const uint32_t ao_samples = PickSampleCount(rt->samples, ao_color_samples_);
+        const bool depth_ms = ao_samples > 1;
         const bool zero_ok = EnsureAoZero(rt->w, rt->h);
-        const bool ready = zero_ok && EnsureAoDepth(rt->w, rt->h, rt->samples) && EnsureAoHalf(rt->w, rt->h) &&
+        const bool ready = zero_ok && EnsureAoDepth(rt->w, rt->h, ao_samples) && EnsureAoHalf(rt->w, rt->h) &&
                            EnsureAoOcc(rt->w, rt->h) && EnsureAoPipelines(depth_ms);
         if (ready) {
             BeginRecord();
-            const VkRenderPass prepass = AoPrepassPass(rt->samples);
+            const VkRenderPass prepass = AoPrepassPass(ao_samples);
             if (!ao_prepass_fb_) ao_prepass_fb_ = AoFramebuffer(prepass, &ao_dist_, &ao_depth_);
             if (prepass && ao_prepass_fb_) {
                 Transition(ao_depth_.image, ao_depth_.layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -3143,16 +3157,20 @@ void VulkanBackend::FlushDeferredScene() {
                 bi.renderArea = {{0, 0}, {ao_dist_.w, ao_dist_.h}};
                 vkCmdBeginRenderPass(cmd_, &bi, VK_SUBPASS_CONTENTS_INLINE);
                 if (ao_depth_clear_) {
-                    float depth_clear = 1.0f;
-                    for (const DeferredDraw& d : draws)
-                        if (d.depth_pipe) {
-                            const uint32_t n = d.zfunc >= 0x200 && d.zfunc <= 0x207 ? d.zfunc - 0x200 : 7;
-                            if (n == 4 || n == 6) depth_clear = 0.0f;
-                            static std::atomic<int> logged_clear{0};
-                            if (logged_clear.fetch_add(1, std::memory_order_relaxed) < 4)
-                                LOGR("vulkan: AO prepass clear %.1f (zfunc 0x%X)", depth_clear, d.zfunc);
-                            break;
-                        }
+                    bool wants_zero = false, wants_one = false;
+                    for (const DeferredDraw& d : draws) {
+                        if (!d.depth_pipe) continue;
+                        const uint32_t n = d.zfunc >= 0x200 && d.zfunc <= 0x207 ? d.zfunc - 0x200 : 7;
+                        if (n == 4 || n == 6) wants_zero = true;
+                        else if (n == 1 || n == 3) wants_one = true;
+                    }
+                    // One depth target can only have one clear value. World draws normally share
+                    // the compare op; if they do not, keep the D3D12-compatible far-side default.
+                    const float depth_clear = wants_zero && !wants_one ? 0.0f : 1.0f;
+                    static std::atomic<int> logged_clear{0};
+                    if (logged_clear.fetch_add(1, std::memory_order_relaxed) < 4)
+                        LOGR("vulkan: AO prepass clear %.1f (%s)", depth_clear,
+                             wants_zero && wants_one ? "mixed compare ops" : "scene compare op");
                     VkClearAttachment clear[2]{};
                     clear[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                     clear[0].colorAttachment = 0;
@@ -3177,6 +3195,8 @@ void VulkanBackend::FlushDeferredScene() {
                                             0, nullptr);
                     vkCmdSetViewport(cmd_, 0, 1, &d.vp);
                     vkCmdSetScissor(cmd_, 0, 1, &d.sc);
+                    vkCmdSetBlendConstants(cmd_, d.blend);
+                    vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, d.stencil);
                     if (d.index_count)
                         vkCmdDrawIndexed(cmd_, d.index_count, 1, 0, d.base_vertex, 0);
                     else
@@ -3191,7 +3211,11 @@ void VulkanBackend::FlushDeferredScene() {
 
                 // GTAO from the distance target, sample 0 of the MSAA image.
                 if (!ao_half_fb_) ao_half_fb_ = AoFramebuffer(AoColorPass(), &ao_half_, nullptr);
-                if (ao_half_fb_ && ao_gtao_pipe_) {
+                VkDescriptorSet gtao_set = ao_half_fb_ && ao_gtao_pipe_
+                                               ? AcquireAoSet(ao_dist_.view, VK_NULL_HANDLE, VK_NULL_HANDLE, false)
+                                               : VK_NULL_HANDLE;
+                bool gtao_ok = false;
+                if (gtao_set) {
                     Transition(ao_half_.image, ao_half_.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                ao_half_.format);
                     VkRenderPassBeginInfo gb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -3200,9 +3224,8 @@ void VulkanBackend::FlushDeferredScene() {
                     gb.renderArea = {{0, 0}, {ao_half_.w, ao_half_.h}};
                     vkCmdBeginRenderPass(cmd_, &gb, VK_SUBPASS_CONTENTS_INLINE);
                     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_gtao_pipe_);
-                    VkDescriptorSet set = AcquireAoSet(ao_dist_.view, VK_NULL_HANDLE, VK_NULL_HANDLE, false);
-                    if (set) vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_pipeline_layout_, 0, 1,
-                                                     &set, 0, nullptr);
+                    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_pipeline_layout_, 0, 1,
+                                            &gtao_set, 0, nullptr);
                     float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
                     float tan_half_fov = 0.577f;
                     const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
@@ -3222,11 +3245,18 @@ void VulkanBackend::FlushDeferredScene() {
                     viewport_valid_ = false;
                     Transition(ao_half_.image, ao_half_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                ao_half_.format);
+                    gtao_ok = true;
+                } else {
+                    LOG_FIRST(4, "vulkan: AO GTAO skipped: descriptor or framebuffer unavailable");
                 }
 
                 // depth-aware blur and upsample into the full-size occlusion target
                 if (!ao_occ_fb_) ao_occ_fb_ = AoFramebuffer(AoColorPass(), &ao_occ_, nullptr);
-                if (ao_occ_fb_ && ao_occ_pipe_) {
+                VkDescriptorSet occ_pass_set =
+                    ao_occ_fb_ && ao_occ_pipe_
+                        ? AcquireAoSet(ao_half_.view, ao_dist_.view, VK_NULL_HANDLE, true)
+                        : VK_NULL_HANDLE;
+                if (gtao_ok && occ_pass_set) {
                     Transition(ao_occ_.image, ao_occ_.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                ao_occ_.format);
                     VkRenderPassBeginInfo ob{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -3235,10 +3265,8 @@ void VulkanBackend::FlushDeferredScene() {
                     ob.renderArea = {{0, 0}, {ao_occ_.w, ao_occ_.h}};
                     vkCmdBeginRenderPass(cmd_, &ob, VK_SUBPASS_CONTENTS_INLINE);
                     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_occ_pipe_);
-                    VkDescriptorSet set =
-                        AcquireAoSet(ao_half_.view, ao_dist_.view, VK_NULL_HANDLE, true);
-                    if (set) vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_pipeline_layout_, 0, 1,
-                                                     &set, 0, nullptr);
+                    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_pipeline_layout_, 0, 1,
+                                            &occ_pass_set, 0, nullptr);
                     const float push[8] = {1.0f / float(std::max(1u, ao_half_.w)),
                                            1.0f / float(std::max(1u, ao_half_.h)), 0.0f, 0.0f,
                                            0.0f, kAoDistClear, 0.0f, 0.0f};
@@ -3255,6 +3283,8 @@ void VulkanBackend::FlushDeferredScene() {
                                ao_occ_.format);
                     DumpAoProbe(ao_occ_);
                     ao_ran = true;
+                } else {
+                    LOG_FIRST(4, "vulkan: AO occlusion skipped: descriptor or framebuffer unavailable");
                 }
             }
         }
@@ -3263,8 +3293,13 @@ void VulkanBackend::FlushDeferredScene() {
     if (ao_ran)
         occlusion = AcquireAoOcclusionSet(ao_occ_.view);
     if (!occlusion && ao_mode_ != 0 && rt && receiver_draws) {
-        if (!ao_zero_.image) EnsureAoZero(rt->w, rt->h);
-        if (ao_zero_.image) occlusion = AcquireAoOcclusionSet(ao_zero_.view);
+        bool zero_ok = true;
+        if (!ao_zero_.image || ao_zero_.w != rt->w || ao_zero_.h != rt->h)
+            zero_ok = EnsureAoZero(rt->w, rt->h);
+        if (zero_ok && ao_zero_.image)
+            occlusion = AcquireAoOcclusionSet(ao_zero_.view);
+        else
+            LOG_FIRST(4, "vulkan: AO zero occlusion target unavailable; receiver set 1 is unbound");
     }
 
     BeginScenePass(rt, ds);
@@ -4425,7 +4460,10 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
     if (!same) {
         if (!t) t = new Tex();
         if (t->image) {
-            if (deferred_read_images_.count(t->image)) FlushDeferredScene();
+            if (deferred_read_images_.count(t->image)) {
+                FlushDeferredScene();
+                EndRecord(true);  // the replay commands still name the image being replaced
+            }
             vkDestroyImageView(device_, t->view, nullptr);
             vkDestroyImage(device_, t->image, nullptr);
             vkFreeMemory(device_, t->memory, nullptr);
@@ -5348,9 +5386,11 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     const uint8_t ao_roles = ao_mode_ != 0 && scene_sized && !a.pretransformed && scene_view
                                  ? AoRoles(s, samples_colour_rt)
                                  : 0;
-    const bool ao_receiver = (ao_roles & kAoColour) != 0;
     bool defer_now = defer_scene_ && !defer_abandoned_ && scene_sized && !a.pretransformed && scene_view &&
                      !SimpleState(s, kMCountEnable);
+    // Only a deferred receiver can get the t4 set at replay. Immediate frames (visibility tests,
+    // fallback) must use the game's original pixel shader.
+    const bool ao_receiver = defer_now && (ao_roles & kAoColour) != 0;
     if (DeferredPending() &&
         ((rt && deferred_read_targets_.count(rt)) || (ds && deferred_read_targets_.count(ds)))) {
         // This draw writes a target the pending list samples.
@@ -5525,14 +5565,15 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             dk.ps = dkey;
             dk.rtfmt = uint32_t(VK_FORMAT_R32_SFLOAT);
             dk.dsfmt = uint32_t(depth_format_);
-            dk.samples = rt->samples;
+            const uint32_t ao_samples = PickSampleCount(rt->samples, ao_color_samples_);
+            dk.samples = ao_samples;
             dk.blend = dk.src = dk.dst = dk.op = 0;
             dk.wmask = 1;  // red
             dk.sten = dk.sfunc = dk.smask = dk.swmask = dk.sfail = dk.szfail = dk.spass = 0;
             if (auto it = pipelines_.find(dk); it != pipelines_.end()) {
                 depth_pipe = it->second;
             } else {
-                const VkRenderPass pass = AoPrepassPass(rt->samples);
+                const VkRenderPass pass = AoPrepassPass(ao_samples);
                 if (pass && CreatePipeline(dk, vs, dps, depth_pipe, pass)) pipelines_[dk] = depth_pipe;
             }
         }
@@ -5695,7 +5736,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         std::memcpy(d.blend, blend_color, sizeof(d.blend));
         d.stencil = stencil_ref;
         d.zfunc = k.zfunc;
-        d.receiver = ao_receiver;
+        d.receiver = ao_receiver && pk.ao == 1;
         d.rt = rt;
         d.ds = ds;
         deferred_.push_back(d);

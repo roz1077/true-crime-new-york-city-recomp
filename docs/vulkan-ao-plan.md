@@ -183,7 +183,8 @@ helper.
 - AO uses dedicated targets and passes: the prepass has R32F colour + scene-format depth and
   no resolve attachment; GTAO and the blur are R8 passes. The existing `RenderPassForMs`
   helper cannot express the two-attachment prepass because it always adds resolve
-  attachments.
+  attachments. R32F's own sample-count support is queried; if it is lower than the scene's,
+  the prepass uses the supported count (or one sample) and GTAO switches to `Texture2D`.
 - Receiver draws bind the occlusion image as set 1 (`t4`). A full-size zero R8 image is used
   when no AO ran, avoiding an out-of-bounds `Load` from a 1x1 image.
 - The AO and occlusion full-screen vertex shaders use Vulkan's NDC direction; D3D12 keeps the
