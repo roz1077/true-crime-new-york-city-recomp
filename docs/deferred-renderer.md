@@ -1,16 +1,89 @@
 # Deferred scene renderer for ambient occlusion
 
-Status: **experimental / disabled by default**. The D3D12 deferred path and AO composite are
-retained on the `deferred-ao` branch, but the F10 AO row no longer enables them: normal play
-uses the original immediate renderer. Re-enable only with `TCNYC_DEFER_SCENE=1` and `ao = 1`.
+Status: **experimental, D3D12 only**. Setting F10 Ambient occlusion to Half or Full (`ao = 1`
+or `2`) turns on the deferred scene path live; Off returns to the immediate renderer.
+`TCNYC_DEFER_SCENE=1` still forces the deferred path with AO off.
 
-The room save at 3840x2160 showed correct AO and layer ordering, but open-world/menu scenes
-showed bright white bands across walls and snow, white distant trees/NPCs/buildings, and a
-streetlight/fog streak. The captures (F3 guest frame and host screenshots) show these are
-**bright guest light/fog/effect layers** that AO does not darken; AO's contrast makes them read
-as artifacts. The two-group replay can also reorder transparent effects, so this needs the
-clean-depth + effect-mask/order-preserving design before it can ship. See "Known issue and
-plan" below.
+The first version (opaque group, AO, effect group, AO multiply, present highlight pass) showed
+white bands across walls and snow, white distant trees/NPCs/buildings and a streetlight/fog
+streak in open-world/menu scenes. It has been replaced by the **receiver AO** design below,
+with a GTAO kernel (see `gtao-plan.md`). Checked in game on Windows at Half and Full.
+
+## Receiver AO (current design)
+
+### Why the white bands happened
+
+1. **Effects were in the AO depth.** "Opaque" meant depth-writing only. Light shafts, gobos,
+   fog sheets and flat alpha cards that write depth landed in the AO input. AO on a flat effect
+   quad is 1, so the wall behind it stayed undarkened while the wall around it darkened: a
+   white strip in the effect's shape.
+2. **AO was multiplied after the effects**, so effect brightness depended on the AO under them.
+3. **The present highlight pass** used a non-monotonic curve (brighter pixels came out darker
+   than mid-tones), banding smooth gradients. It also ran over the HUD.
+4. The opaque-then-transparent regrouping reordered order-dependent effects.
+
+### What it does now (D3D12, `sdk/runtime/gpu/d3d12.cpp`)
+
+- **Roles** (`AoRoles`): scene-view, non-pretransformed draws that blend not at all, ONE/ZERO
+  (most of the world) or as plain alpha (SRCALPHA/INVSRCALPHA, add).
+  - Depth-writing ones go into the AO depth (`kAoDepth`). That includes the game's depth-only
+    pass for alpha-tested geometry.
+  - Colour-writing ones receive AO (`kAoColour`). That includes the alpha colour pass that
+    does not write depth.
+  - Additive, multiply and other blends are effects and take neither role.
+- Each deferred AO-depth draw records its normal bundle **plus a prepass bundle** (same VS, the
+  pixel shader's distance variant `PixelKey::ao = 3`, no stencil; recorded in
+  `EndDeferredBundle`). The prepass writes depth plus each pixel's **view distance** (clip w)
+  into an R32F target (`ao_dist_`). AO never converts hyperbolic depth with a guessed
+  near/far: most draws are vertex programs whose projection the port cannot see.
+- `FlushDeferredScene`:
+  1. runs the prepass bundles into `ao_depth_` / `ao_dist_` (cleared to depth 1.0 and
+     distance 1e30 on a full-size depth clear or a new frame);
+  2. runs **GTAO** (`AoGtao` in `kAoHlsl`) from the distance target. It writes a half or
+     full-size R8 factor, which `kAoOcclusionHlsl` blurs (plane- and depth-aware, 4x4 linear
+     taps, seam gaps filled) into a full-size occlusion target;
+  3. replays **every bundle in the game's original order**. Receivers' pixel shaders scale
+     their colour by `1 - occlusion` read at `t4` (root parameter 4, inherited by the
+     bundles), before fog. A null view reads 0.
+
+### Bugs found and fixed while tuning
+
+- Pixel shaders are `ps_5_0`: no register spaces, so the occlusion texture is `t4`.
+- Host depth is 0 near, 1 far (the title's GREATEREQUAL is mirrored to LESSEQUAL): clear the AO
+  depth to 1.0. Copying the game's last clear sometimes cleared to "nearest" and rejected
+  every prepass draw.
+- The occlusion pass constants are `src` (texel size) then `planes` (near/far). Packing near/far
+  into `src` made every pixel read as sky.
+- `ViewAt` must scale screen x/y by distance. Without it every point sat on one plane.
+- Stripes on grazing floors had three causes:
+  - near/far guessed for hyperbolic depth (fixed by the distance target);
+  - comparing a sample's depth with its nearest pixel, which beat against the pixel grid (fixed
+    by the horizon test on the pixel actually read);
+  - half-resolution centres placed half a texel off their own surface (fixed by snapping to the
+    depth texel).
+- Dark lines along edges: normals bent across creases. Normals are now an edge-weighted blend
+  of all four neighbour pairs, which also fixed a beaded line on every crease.
+- MSAA lookups must map uv to `uv * size` texels, not `uv * (size - 1)` (a line across the AO).
+- The blur weighs each tap by the smaller of its plane-predicted and plain relative depth error
+  (stripes on grazing floors, beads on creases). It fills single-pixel mesh-seam gaps from their
+  neighbours and skips them as taps (bright dots along curbs).
+
+### Settings
+
+- F10 Off / Half / Full. Half is GTAO 3 slices × 6 steps at half resolution; Full is 3 × 8.
+- Defaults: radius 0.75 (× 5% of distance), strength 1 (a power on visibility).
+- Overrides: `TCNYC_AO_RADIUS`, `TCNYC_AO_STRENGTH`, and `TCNYC_AO_METHOD=ssao` (the earlier
+  hemisphere kernel, for comparison only).
+
+### Remaining caveats
+
+- Screen-space: hidden geometry casts nothing. A character standing in front of a crease can
+  soften the shadow right at its outline.
+- A wall within the radius darkens a character standing next to it (mild at 0.75).
+- Scene draws that cannot be deferred (rare fallback frames) get no AO.
+- Vulkan is not ported.
+
+The sections below are the original design notes and history.
 
 ## Goal
 
@@ -163,7 +236,7 @@ TCNYC_DEFER_SCENE=1
 ao = 1
 ```
 
-Expect the white-effect artifacts above. `TCNYC_AO_VIEW=1` / `TCNYC_AO_DEPTH=1` show the AO
+Expect the white-effect artifacts above. (Historical: the AO debug views mentioned here were removed.) The AO
 factor/linear depth. The default settings and the F10 row should stay Off until the plan is
 complete.
 

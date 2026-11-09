@@ -881,6 +881,9 @@ std::string PixelHlsl(const PixelKey& k) {
         const char* type = t.shadow ? "Texture2D<float>" : t.kind == kTex3D ? "Texture3D" : t.kind == kTexCube ? "TextureCube" : "Texture2D";
         s += F("%s tex%d : register(t%d);\n%s smp%d : register(s%d);\n", type, i, i, t.shadow ? "SamplerComparisonState" : "SamplerState", i, i);
     }
+    // occlusion, not brightness: an unset (null) view reads 0 and leaves the colour alone
+    // t4: past the stages' t0-t3 (ps_5_0 has no register spaces)
+    if (k.ao) s += "Texture2D<float> aoOcc : register(t4);\n";
     s += F("float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {\n");
     s += "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = i.tc3;\n";
     s += k.two_sided ? "    float4 v0 = front ? i.d0 : i.b0, v1 = front ? i.d1 : i.b1;\n" : "    float4 v0 = i.d0, v1 = i.d1;\n";
@@ -954,6 +957,14 @@ std::string PixelHlsl(const PixelKey& k) {
         body += "float4 outc = float4(lerp(fogin.rgb, cur.rgb, fogin.a), cur.a);\n";
     }
     if (k.alphatest) body += "alphatest(outc.a);\n";
+    // AO depth prepass: the view distance (clip w, which SV_Position.w carries into the pixel
+    // shader) after the draw's own alpha test and discards
+    if (k.ao == 3) body += "return float4(i.pos.w, 0, 0, 1);\n";
+    // AO darkens the surface colour before fog, not the fogged result: the colour is already
+    // lerp(fog, surface, f), so scaling it by ao and adding back the fog share it took gives
+    // lerp(fog, surface * ao, f). Without fog (f = 1) this is a plain multiply.
+    else if (k.ao) body += "{ float ao = 1.0 - aoOcc.Load(int3(i.pos.xy, 0));\n"
+                           "  outc.rgb = outc.rgb * ao + (1.0 - fogin.a) * fogin.rgb * (1.0 - ao); }\n";
     body += Hooks().Output() + "return outc;\n}\n";
     s += body;
     return k.quad ? QuadHlsl(std::move(s)) : s;
