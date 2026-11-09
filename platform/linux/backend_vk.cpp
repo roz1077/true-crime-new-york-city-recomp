@@ -39,6 +39,7 @@
 
 #include "app/app.h"
 #include "common/graphics_menu.h"
+#include "gpu/prompt_glyphs.h"
 #include "core/log.h"
 #include "gpu/ao.h"
 #include "gpu/backend.h"
@@ -245,6 +246,7 @@ struct Tex {
     uint32_t data = 0, guest_format = 0, depth = 1;
     uint64_t epoch = 0, palette = 0;
     uint64_t sig = 0, frame = 0;  // content signature and the frame it was checked on
+    input::PromptStyle prompt_style = input::PromptStyle::Original;  // glyph set baked into the font atlas
     // texture pack replacement: the key whose image is being loaded, and the ready image
     uint64_t pack_key = 0;
     uint32_t pack_gen = 0;
@@ -4515,12 +4517,15 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
 
     // cheap change check once per frame: lock epochs plus a sample of the bytes, so
     // a texture rewritten in place without a lock mark is still uploaded
-    if (!same || t->frame != frames_ + 1 || t->palette != palette_hash) {
+    // the button-glyph atlas is uploaded again when the active input device changes
+    const auto prompt_style = IsPromptAtlas(d) ? input::ControllerPromptStyle() : input::PromptStyle::Original;
+    if (!same || t->frame != frames_ + 1 || t->palette != palette_hash || t->prompt_style != prompt_style) {
         t->frame = frames_ + 1;
         t->palette = palette_hash;
         const uint64_t sig = MemSig(d.data, TotalSize(d)) ^ DirtyEpoch(d.data) ^ palette_hash;
-        if (!same || sig != t->sig) {
+        if (!same || sig != t->sig || t->prompt_style != prompt_style) {
             t->sig = sig;
+            t->prompt_style = prompt_style;
 
             UploadTexture(t, d, palette_va ? colours : nullptr, depth_tex);
             t->pack_gen = 0;  // new bytes: the pack and dump key is taken again
@@ -4866,6 +4871,7 @@ void VulkanBackend::UploadTexture(Tex* t, const TextureDesc& d, const uint32_t* 
                     images.push_back({});
                 }
             } else {
+                if (t->prompt_style != input::PromptStyle::Original) ReplaceControllerGlyphs(px, pitch, t->prompt_style);
                 images.push_back(px);
             }
             VkBufferImageCopy copy{};

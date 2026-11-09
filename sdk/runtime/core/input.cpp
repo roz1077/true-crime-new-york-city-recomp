@@ -5,6 +5,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
 #include <iterator>
 #include <mutex>
 #include <utility>
@@ -35,6 +38,8 @@ bool g_sdl = false;
 SDL_Gamepad* g_pads[4] = {};
 std::atomic<PromptStyle> g_prompt_style{PromptStyle::Original};
 std::atomic<bool> g_keyboard_mouse_active{false};
+// the player is in a vehicle: the keyboard prompts show the pedal keys
+std::atomic<bool> g_keyboard_driving{false};
 // until the camera takes a direct sample the mouse keeps the old stick path,
 // so an unsupported camera mode never loses aiming
 std::atomic<bool> g_direct_confirmed{false};
@@ -53,14 +58,48 @@ bool DirectAimLive(uint64_t now) {
            now - g_direct_at.load(std::memory_order_relaxed) < 100;
 }
 
+// Valve's handheld (DMI product "Jupiter" or "Galileo"): its built-in controller
+// reaches the game through Steam Input as a generic virtual pad
+bool RunningOnSteamDeck() {
+#ifdef _WIN32
+    return false;
+#else
+    static const bool deck = [] {
+        std::ifstream vendor("/sys/devices/virtual/dmi/id/sys_vendor");
+        std::string name;
+        std::getline(vendor, name);
+        return name.rfind("Valve", 0) == 0;
+    }();
+    return deck;
+#endif
+}
+
 void UpdatePromptType() {
-    const SDL_GamepadType type = g_pads[0] ? SDL_GetRealGamepadType(g_pads[0]) : SDL_GAMEPAD_TYPE_UNKNOWN;
+    // Steam Input presents a PlayStation pad as a virtual Xbox pad: the real type is
+    // then the virtual one, while the mapped type names the physical controller.
+    const SDL_GamepadType real = g_pads[0] ? SDL_GetRealGamepadType(g_pads[0]) : SDL_GAMEPAD_TYPE_UNKNOWN;
+    const SDL_GamepadType mapped = g_pads[0] ? SDL_GetGamepadType(g_pads[0]) : SDL_GAMEPAD_TYPE_UNKNOWN;
+    auto playstation = [](SDL_GamepadType t) {
+        return t == SDL_GAMEPAD_TYPE_PS3 || t == SDL_GAMEPAD_TYPE_PS4 || t == SDL_GAMEPAD_TYPE_PS5;
+    };
+    auto xbox = [](SDL_GamepadType t) { return t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE; };
+    // the Deck's own controller: Valve 28DE:1205 when read directly, "Steam Deck" by name
+    const char* name = g_pads[0] ? SDL_GetGamepadName(g_pads[0]) : nullptr;
+    const bool deck_pad = g_pads[0] && ((SDL_GetGamepadVendor(g_pads[0]) == 0x28DE &&
+                                         SDL_GetGamepadProduct(g_pads[0]) == 0x1205) ||
+                                        (name && std::strstr(name, "Steam Deck")));
     PromptStyle style = PromptStyle::Original;
-    if (type == SDL_GAMEPAD_TYPE_PS3 || type == SDL_GAMEPAD_TYPE_PS4 || type == SDL_GAMEPAD_TYPE_PS5)
+    if (playstation(real) || playstation(mapped))
         style = PromptStyle::PlayStation;
-    else if (type == SDL_GAMEPAD_TYPE_XBOX360 || type == SDL_GAMEPAD_TYPE_XBOXONE)
+    else if (deck_pad || (g_pads[0] && RunningOnSteamDeck() && !xbox(mapped)))
+        style = PromptStyle::SteamDeck;
+    else if (xbox(real) || xbox(mapped))
         style = PromptStyle::Xbox;
     g_prompt_style.store(style, std::memory_order_relaxed);
+    if (g_pads[0])
+        LOGR("input: controller 1 prompts: %s %04X:%04X, real type %d, mapped type %d, steam handle %llu, style %d",
+             name ? name : "", SDL_GetGamepadVendor(g_pads[0]), SDL_GetGamepadProduct(g_pads[0]), int(real),
+             int(mapped), (unsigned long long)SDL_GetGamepadSteamHandle(g_pads[0]), int(style));
 }
 
 // Read relative mouse motion from the window thread and hold the sample for a
@@ -195,6 +234,7 @@ bool ReadKeyboardMouse(Pad& pad) {
         if (on) pad.analog[button] = 255;
     };
     const bool driving = app::kGame.keyboard_driving && app::kGame.keyboard_driving();
+    g_keyboard_driving.store(driving, std::memory_order_relaxed);
     if (!ui) {
         press(0, held(kKeyReturn)); // A: menu confirmation
         press(1, held(kKeyBack));   // B: menu cancel
@@ -361,7 +401,9 @@ bool Connected(int port) {
 }
 
 PromptStyle ControllerPromptStyle() {
-    if (g_keyboard_mouse_active.load(std::memory_order_relaxed)) return PromptStyle::KeyboardMouse;
+    if (g_keyboard_mouse_active.load(std::memory_order_relaxed))
+        return g_keyboard_driving.load(std::memory_order_relaxed) ? PromptStyle::KeyboardDriving
+                                                                  : PromptStyle::KeyboardMouse;
     return g_prompt_style.load(std::memory_order_relaxed);
 }
 

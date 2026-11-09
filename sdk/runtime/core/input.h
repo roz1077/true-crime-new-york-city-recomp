@@ -13,7 +13,8 @@ struct Pad {
     int16_t lx = 0, ly = 0, rx = 0, ry = 0;
 };
 
-enum class PromptStyle { Original, PlayStation, Xbox, KeyboardMouse };
+// KeyboardDriving: keyboard prompts with the in-vehicle pedal keys
+enum class PromptStyle { Original, PlayStation, Xbox, KeyboardMouse, KeyboardDriving, SteamDeck };
 PromptStyle ControllerPromptStyle();
 // true while keyboard/mouse is the input the game is following; a pad takes
 // over as soon as it is used
