@@ -16,7 +16,11 @@
 // flags +8, u16 type +0xA, child offset +0xC (from the entry)}.
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -149,5 +153,116 @@ X86_FUNC(sub_000FD220) {
             g_requests.erase(it);
         }
     }
+    const uint32_t before = kernel::R32(instance + kCurrentState);
     __imp__sub_000FD220(ctx, base);
+    const uint32_t after = kernel::R32(instance + kCurrentState);
+    if (dev::TraceScripts() && after != before)
+        LOGR("dev trace: frame %llu script %08X state %s -> %s", static_cast<unsigned long long>(g_frame), instance,
+             dev::ScriptName(before).c_str(), dev::ScriptName(after).c_str());
 }
+
+// Script event trace (debug menu Stages tab): natives that matter for timed moves, with the
+// frame, the running script instance (0x37BE08[[0x2E78BC]]) and its state. A native gets the
+// script VM stack pointer as its argument; its arguments sit just below it.
+namespace {
+constexpr uint32_t kRunningDepth = 0x2E78BC;
+constexpr uint32_t kRunningStack = 0x37BE08;
+
+std::string Running() {
+    const int32_t depth = int32_t(kernel::R32(kRunningDepth));
+    const uint32_t instance = depth >= 0 && depth < 8 ? kernel::R32(kRunningStack + uint32_t(depth) * 4) : 0;
+    if (!Readable(instance + kCurrentState)) return "no script";
+    char text[96];
+    std::snprintf(text, sizeof(text), "script %08X in %s", instance,
+                  dev::ScriptName(kernel::R32(instance + kCurrentState)).c_str());
+    return text;
+}
+
+float StackFloat(uint32_t va) {
+    const uint32_t bits = kernel::R32(va);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+} // namespace
+
+// SetGrabbable(bool) 0x17FA70: character +0xA8 -> +0x24 bit 0x200 = not grabbable
+X86_EXTERN_FUNC(__imp__sub_0017FA70);
+X86_FUNC(sub_0017FA70) {
+    if (dev::TraceScripts()) {
+        const uint32_t vm = kernel::R32(ctx.esp + 4);
+        LOGR("dev trace: frame %llu SetGrabbable(%u) from %s", static_cast<unsigned long long>(g_frame),
+             kernel::G<uint8_t>(vm - 4), Running().c_str());
+    }
+    __imp__sub_0017FA70(ctx, base);
+}
+
+// SetTimer(seconds, id) 0x1828C0
+X86_EXTERN_FUNC(__imp__sub_001828C0);
+X86_FUNC(sub_001828C0) {
+    if (dev::TraceScripts()) {
+        const uint32_t vm = kernel::R32(ctx.esp + 4);
+        LOGR("dev trace: frame %llu SetTimer(%.2f s, %s) from %s", static_cast<unsigned long long>(g_frame),
+             StackFloat(vm - 8), dev::ScriptName(kernel::R32(vm - 4)).c_str(), Running().c_str());
+    }
+    __imp__sub_001828C0(ctx, base);
+}
+
+// EnablePlayerScriptedSequence 0x185D80 / Disable 0x185D90
+X86_EXTERN_FUNC(__imp__sub_00185D80);
+X86_FUNC(sub_00185D80) {
+    if (dev::TraceScripts())
+        LOGR("dev trace: frame %llu EnablePlayerScriptedSequence from %s", static_cast<unsigned long long>(g_frame),
+             Running().c_str());
+    __imp__sub_00185D80(ctx, base);
+}
+X86_EXTERN_FUNC(__imp__sub_00185D90);
+X86_FUNC(sub_00185D90) {
+    if (dev::TraceScripts())
+        LOGR("dev trace: frame %llu DisablePlayerScriptedSequence from %s", static_cast<unsigned long long>(g_frame),
+             Running().c_str());
+    __imp__sub_00185D90(ctx, base);
+}
+
+// The sumo grapple trace (Tommy's container fight in Human Cargo), called around
+// 0x58D90 by src/game/sumo_grapple.cpp: logs every state change and every time the
+// +0x30 timer crosses zero, with real time, so the push-off window can be measured.
+namespace {
+uint8_t g_sumo_state = 0;
+float g_sumo_timer = 0;
+} // namespace
+
+namespace dev {
+
+void SumoBefore(uint32_t grapple) {
+    g_sumo_state = kernel::G<uint8_t>(grapple + 0x0C);
+    g_sumo_timer = StackFloat(grapple + 0x30);
+}
+
+void SumoAfter(uint32_t grapple, bool push_window) {
+    if (!TraceScripts() || !Readable(grapple + 0x44)) return;
+    const uint8_t state = kernel::G<uint8_t>(grapple + 0x0C);
+    const float timer = StackFloat(grapple + 0x30);
+    if (state == g_sumo_state && (g_sumo_timer > 0) == (timer > 0)) return;
+    static const auto start = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    LOGR("dev sumo: %.1f ms frame %llu grapple %08X state %u -> %u, timer %.3f -> %.3f, balance %.3f, "
+         "timer2 %.3f, dt %.4f%s",
+         ms, static_cast<unsigned long long>(g_frame), grapple, g_sumo_state, state, g_sumo_timer, timer,
+         StackFloat(grapple + 0x40), StackFloat(grapple + 0x44), StackFloat(0x37F630),
+         push_window ? " (push window, slowed)" : "");
+}
+
+} // namespace dev
+
+namespace dev {
+namespace {
+// XBE_DEV_TRACE=1 turns it on from the start
+std::atomic<bool> g_trace{std::getenv("XBE_DEV_TRACE") != nullptr};
+}
+bool TraceScripts() { return g_trace; }
+void SetTraceScripts(bool on) {
+    g_trace = on;
+    LOGR("dev trace: %s", on ? "on" : "off");
+}
+} // namespace dev

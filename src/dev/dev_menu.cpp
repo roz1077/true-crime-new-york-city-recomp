@@ -119,6 +119,9 @@ void StagesTab() {
     }
     ImGui::TextWrapped("Live scripts in the current level. \"Go\" switches a script to that stage, as if the "
                        "script had called SetState itself. Start the mission first, then jump.");
+    bool trace = TraceScripts();
+    if (ImGui::Checkbox("Trace script events to the log (stage changes, SetGrabbable, SetTimer)", &trace))
+        SetTraceScripts(trace);
     const std::vector<Script> scripts = LiveScripts();
     // fast-forward: every running script with a "Die" stage goes to it, except bosses
     if (ImGui::Button("Defeat all enemies")) {

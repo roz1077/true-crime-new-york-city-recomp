@@ -46,6 +46,11 @@ std::vector<Script> LiveScripts();
 std::string ScriptName(uint32_t hash);
 void RequestState(uint32_t instance, uint32_t state_hash); // applied at that script's next update
 void ScriptsFrame();                                       // once a frame, from OnFrame
+bool TraceScripts(); // log state changes, SetGrabbable, SetTimer and scripted sequences with frame numbers
+void SetTraceScripts(bool on);
+// around the sumo grapple update (src/game/sumo_grapple.cpp), for the trace
+void SumoBefore(uint32_t grapple);
+void SumoAfter(uint32_t grapple, bool push_window);
 
 // player cheats and game speed (dev_player.cpp)
 bool PlayerStatus(float &health, float &max_health); // false when there is no player
