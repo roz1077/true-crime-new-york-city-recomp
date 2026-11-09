@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Graphics
+- Ambient occlusion (F10: Off / Half / Full, off by default) on Windows (D3D12). It uses GTAO
+  from a depth prepass of world geometry only, and is applied inside the world draws before
+  fog, so light shafts, fog and other effects are not darkened and no longer show as white
+  bands. Vulkan is not ported yet.
+- Fixed an offset copy of the scene that showed along the right and bottom edges of the
+  frame and moved with the camera, caused by the game's glow pass reading past its own
+  region of a shared render target.
+- The game's glow no longer fades to a dark band at the right and bottom edges. This
+  deliberately differs from the console, where the glow texture's black border shows there.
+
 ## 0.9.0.0 — beta hardening (2026-11-07)
 
 ### Stability
