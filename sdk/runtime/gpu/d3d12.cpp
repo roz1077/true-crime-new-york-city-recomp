@@ -58,6 +58,13 @@ namespace {
 
 constexpr int kFrames = 3;
 constexpr uint64_t kStaleFrames = 8;  // frames a target may go unused and still be read back
+// Small targets are cheap and often cached UI slots. The HUD samples its icon
+// target only when that HUD layer redraws, so the readback window is too short
+// to keep it across weapon/menu changes: it would be swept and the game would
+// fall back to the static FS texture sitting in guest memory. Keep them longer;
+// large scene targets still use the short window.
+constexpr uint64_t kSmallTargetFrames = 3600;
+constexpr uint64_t kSmallTargetPixels = 128 * 128;
 constexpr uint64_t kUploadSize = 64ull << 20;
 // a draw starting with less than this left in the frame's ring waits for the GPU and starts the ring over
 constexpr uint64_t kUploadReserve = 8ull << 20;
@@ -5916,7 +5923,11 @@ bool D3D12Backend::TargetStale(uint32_t data) const {
 // long sessions create render targets at new guest addresses; keep only the live set
 void D3D12Backend::SweepTargets() {
     for (auto it = targets_.begin(); it != targets_.end();) {
-        if (TargetStale(it->second.data)) {
+        const Target& t = it->second;
+        auto used_it = target_used_.find(t.data);
+        const uint64_t used = used_it == target_used_.end() ? 0 : used_it->second;
+        const uint64_t keep = uint64_t(t.gw) * t.gh <= kSmallTargetPixels ? kSmallTargetFrames : kStaleFrames;
+        if (frame_ - used > keep) {
             ReleaseTarget(it++);
         } else {
             ++it;
@@ -5939,9 +5950,10 @@ void D3D12Backend::SweepTargets() {
         it = late_.erase(it);
     }
     // The use map is keyed by guest address and otherwise keeps every address
-    // the title has ever rendered to.
+    // the title has ever rendered to. It has to outlive the small-target window
+    // above or those targets would look unused at the next sweep.
     for (auto it = target_used_.begin(); it != target_used_.end();) {
-        if (frame_ > it->second && frame_ - it->second > 2 * kStaleFrames)
+        if (frame_ > it->second && frame_ - it->second > kSmallTargetFrames)
             it = target_used_.erase(it);
         else
             ++it;

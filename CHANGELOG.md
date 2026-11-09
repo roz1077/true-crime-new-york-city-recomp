@@ -19,6 +19,8 @@
   region of a shared render target.
 - The game's glow no longer fades to a dark band at the right and bottom edges. This
   deliberately differs from the console, where the glow texture's black border shows there.
+- Fixed the FS placeholder replacing the top-right HUD slot icon after weapon swaps:
+  small cached HUD render targets are kept across idle frames instead of being swept.
 
 ## 0.9.0.0 — beta hardening (2026-11-07)
 
