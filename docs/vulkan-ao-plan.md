@@ -177,9 +177,10 @@ helper.
 - The scene display list records fully resolved draws in `DeferredDraw`; a draw records its
   receiver pipeline, descriptor set, vertex/index views, viewport/scissor, blend and stencil
   state, and its `ao = 3` prepass pipeline. Replay is plain `vkCmd*` work.
-- The scene MSAA colour and depth/stencil attachments now use `STORE`, not `DONT_CARE`. A
-  deferred flush closes and reopens the scene pass, so discarding the multisample attachments
-  would lose the scene between the AO passes and the replay.
+- The scene MSAA colour and depth/stencil attachments use `STORE` only while the deferred path
+  is active. A deferred flush closes and reopens the scene pass, so discarding the multisample
+  attachments would lose the scene between the AO passes and the replay. With AO off (and no
+  forced deferral) the immediate path keeps the cheaper `DONT_CARE` resolve behavior.
 - AO uses dedicated targets and passes: the prepass has R32F colour + scene-format depth and
   no resolve attachment; GTAO and the blur are R8 passes. The existing `RenderPassForMs`
   helper cannot express the two-attachment prepass because it always adds resolve

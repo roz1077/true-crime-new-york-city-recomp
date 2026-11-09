@@ -349,6 +349,7 @@ struct PsoKey {
     float zslope = 0.0f;  // solid polygon offset, as the D3D12 backend applies it
     uint32_t rtfmt = 0, dsfmt = 0;
     uint32_t samples = 1;
+    uint32_t msaa_store = 0;  // the deferred scene pass needs multisample STORE
     uint32_t sprite = 0;  // a program's point list drawn as point sprites
     bool operator==(const PsoKey&) const = default;
 };
@@ -824,6 +825,7 @@ private:
     // deferred scene display list
     bool defer_forced_ = false;
     bool defer_scene_ = false;
+    bool msaa_store_ = false;  // STORE multisample attachments only while replaying
     bool defer_abandoned_ = false;
     bool defer_ao_applied_ = false;
     bool flushing_deferred_ = false;
@@ -1078,6 +1080,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     if (const char* e = std::getenv("TCNYC_DEFER_SCENE")) defer_forced_ = *e && std::atoi(e) != 0;
     ao_mode_ = app::Snapshot().ao;
     defer_scene_ = defer_forced_ || ao_mode_ != 0;
+    msaa_store_ = defer_scene_;
     if (defer_scene_) LOGR("vulkan: deferred scene display list enabled (%s)", defer_forced_ ? "TCNYC_DEFER_SCENE" : "ambient occlusion setting");
     if (const char* e = std::getenv("TCNYC_TRACE_PRESENT")) trace_present_ = std::atoi(e) != 0;
     if (const char* e = std::getenv("TCNYC_DUMP_TEX")) {
@@ -2388,7 +2391,8 @@ VkRenderPass VulkanBackend::RenderPassFor(VkFormat color, VkFormat depth) {
 }
 
 VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint32_t samples) {
-    uint64_t key = uint64_t(color) | (uint64_t(depth) << 32) | (uint64_t(samples) << 48) | (1ull << 63);
+    uint64_t key = uint64_t(color) | (uint64_t(depth) << 32) | (uint64_t(samples) << 48) | (1ull << 63) |
+                   (msaa_store_ ? (1ull << 62) : 0);
     auto it = passes_.find(key);
     if (it != passes_.end()) return it->second;
 
@@ -2402,8 +2406,8 @@ VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint
         att[n].samples = VkSampleCountFlagBits(samples);
         att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         // Deferred replay closes and reopens the scene pass; per-attachment DONT_CARE discarded
-        // the multisample colour/depth that the reopened pass needs. STORE matches D3D12.
-        att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        // the multisample colour/depth that the reopened pass needs.
+        att[n].storeOp = msaa_store_ ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att[n].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -2425,9 +2429,9 @@ VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint
         att[n].format = depth;
         att[n].samples = VkSampleCountFlagBits(samples);
         att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[n].storeOp = msaa_store_ ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[n].stencilStoreOp = msaa_store_ ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att[n].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         att[n].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth_ref = n++;
@@ -2514,6 +2518,7 @@ VkFramebuffer VulkanBackend::FramebufferFor(Target* rt, Target* ds) {
         if (ds->samples > 1) attach[n++] = ds->resolved_view;
     }
     uint64_t key = Hash(attach, sizeof(VkImageView) * n);
+    key = Hash(&msaa_store_, sizeof(msaa_store_), key);
     auto it = framebuffers_.find(key);
     if (it != framebuffers_.end()) return it->second;
     const uint32_t samples = rt ? rt->samples : ds ? ds->samples : 1;
@@ -3340,6 +3345,7 @@ void VulkanBackend::ResetDeferred() {
     ao_occ_set_next_ = 0;
     ao_mode_ = app::Snapshot().ao;
     defer_scene_ = defer_forced_ || ao_mode_ != 0;
+    msaa_store_ = defer_scene_;
     for (VkPipeline p : retired_ao_pipelines_)
         if (p) vkDestroyPipeline(device_, p, nullptr);
     retired_ao_pipelines_.clear();
@@ -5156,7 +5162,7 @@ void VulkanBackend::FillConstants(const State& s, const PixelKey& pk, const std:
 
 VkPipeline VulkanBackend::ClearPipeline(VkFormat format, VkFormat depth, uint32_t mask, uint32_t samples) {
     const uint64_t key = uint64_t(format) | (uint64_t(depth) << 32) | (uint64_t(mask) << 40) |
-                         (uint64_t(samples) << 48);
+                         (uint64_t(samples) << 48) | (msaa_store_ ? (1ull << 56) : 0);
     if (auto it = clear_pipelines_.find(key); it != clear_pipelines_.end()) return it->second;
     if (!clear_vs_) {
         static const char* kClearHlsl = R"(
@@ -5520,6 +5526,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     k.rtfmt = rt ? uint32_t(rt->format) : 0;
     k.dsfmt = ds ? uint32_t(ds->format) : 0;
     k.samples = rt ? rt->samples : ds ? ds->samples : 1;
+    k.msaa_store = msaa_store_ ? 1 : 0;
     k.blend = SimpleState(s, kMBlendEnable) != 0;
     if (k.blend) {
         k.src = SimpleState(s, kMSrcBlend);
