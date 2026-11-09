@@ -11,6 +11,7 @@
 // rows that scrolls with the cursor. The game's row field (+0x34) keeps the
 // slot, 0 to 4, which its highlight frame follows; the logical row is
 // g_first + slot.
+// Its HDR SETTINGS row swaps the rows for an HDR page (g_page).
 // The rules are in display_rows.h.
 
 #include <atomic>
@@ -24,6 +25,7 @@
 #include "common/graphics_menu.h"
 #include "core/log.h"
 #include "display_rows.h"
+#include "gpu/backend.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
@@ -51,8 +53,10 @@ bool Tracing() {
     return on;
 }
 
-// the resolution row's choice before A applies it, and the sizes it steps through; menu thread only
+// the display mode and resolution rows' choices before A applies them, and the sizes they step through;
+// menu thread only
 uint64_t g_pending_size = 0;
+uint32_t g_pending_mode = 0;
 bool g_pending = false;
 std::vector<uint64_t> g_sizes;
 
@@ -92,12 +96,27 @@ Values Current() {
     app::SettingsLock lock;
     const app::Settings &s = app::Get();
     const uint64_t applied = Size(s.width, s.height);
-    return {s.render_percent, game::g_fov_percent,
-            s.aniso,          app::FrameCap(),
-            s.aspect,         app::MsaaSamples(),
-            s.vsync,          s.smaa,
-            game::ShowFps(),  g_pending ? g_pending_size : applied,
-            applied};
+    const uint32_t applied_mode = uint32_t(s.display_mode);
+    Values v{s.render_percent, game::g_fov_percent,
+             s.aniso,          app::FrameCap(),
+             s.aspect,         app::MsaaSamples(),
+             s.vsync,          s.smaa,
+             game::ShowFps(),  g_pending ? g_pending_size : applied,
+             applied};
+    v.mode = g_pending ? g_pending_mode : applied_mode;
+    v.applied_mode = applied_mode;
+    v.object_detail = s.object_detail;
+    v.ao = s.ao;
+    v.bloom = s.bloom;
+    v.dof = s.dof;
+    v.building_seam_fix = s.building_seam_fix;
+    v.pc_contrast = s.pc_contrast;
+    v.hdr = s.hdr;
+    v.hdr_paper_white = s.hdr_paper_white;
+    v.hdr_peak = s.hdr_peak;
+    v.hdr_highlights = s.hdr_highlights;
+    v.display_peak = gpu::g_hdr_display_peak_nits.load(std::memory_order_relaxed);
+    return v;
 }
 
 // guest thread; the renderer reads these each frame and app::Pace each Swap (aligned 32-bit stores). The
@@ -113,26 +132,37 @@ void Apply(const Values &v) {
     s.vsync = v.vsync;
     app::SetMsaaSamples(v.msaa);
     s.smaa = v.smaa;
+    s.object_detail = v.object_detail;
+    s.ao = v.ao;
+    s.bloom = v.bloom;
+    s.dof = v.dof;
+    s.building_seam_fix = v.building_seam_fix;
+    s.pc_contrast = v.pc_contrast;
+    s.hdr = v.hdr;
+    s.hdr_paper_white = v.hdr_paper_white;
+    s.hdr_peak = v.hdr_peak;
+    s.hdr_highlights = v.hdr_highlights;
     game::SetShowFps(v.show_fps);
     MarkSave();
 }
 
-// sets the output resolution and has the window thread apply it, as the overlay's Apply does
-void ApplySize(uint64_t size) {
+// sets the display mode and output resolution and has the window thread apply them, as the overlay's Apply does
+void ApplyDisplayChoice(uint32_t mode, uint64_t size) {
     g_pending = false;
     app::SettingsLock lock;
     app::Settings &s = app::Get();
     const uint32_t w = uint32_t(size >> 32), h = uint32_t(size);
-    if (s.width == w && s.height == h) return;
+    if (s.width == w && s.height == h && uint32_t(s.display_mode) == mode) return;
+    s.display_mode = app::DisplayMode(mode);
     s.width = w;
     s.height = h;
     app::Save();
     app::ApplyDisplay();
 }
 
-// guest buffers for the row texts, one per added row
+// guest buffers for the row texts, one per option
 uint32_t TextBuffer(uint32_t index) {
-    static const uint32_t buffers = mem::AllocSystem(kExtraRows * kTextBytes, 16);
+    static const uint32_t buffers = mem::AllocSystem(kOptionCount * kTextBytes, 16);
     return buffers + index * uint32_t(kTextBytes);
 }
 
@@ -142,6 +172,7 @@ bool g_entered = false;
 // the logical row shown in the top slot (display_rows.h Scroll); menu thread only. Reset
 // where the game resets the row: entering the tab and cancel.
 uint32_t g_first = 0;
+Page g_page = Page::Main;
 
 } // namespace
 
@@ -155,6 +186,7 @@ X86_FUNC(sub_000B13C0) {
     g_on_entry = Current();
     g_entered = true;
     g_first = 0;
+    g_page = Page::Main;
     g_sizes.clear();
     for (const app::Mode m : game::DisplayModes())
         g_sizes.push_back(Size(m.width, m.height));
@@ -167,10 +199,11 @@ X86_FUNC(sub_000B14F0) {
     __imp__sub_000B14F0(ctx, base);
     if (g_entered) {
         Apply(g_on_entry);
-        ApplySize(g_on_entry.applied);
+        ApplyDisplayChoice(g_on_entry.applied_mode, g_on_entry.applied);
     }
     FlushSettings(); // Back restores and saves before the tab (or menu) closes
     g_first = 0;
+    g_page = Page::Main;
 }
 
 X86_EXTERN_FUNC(__imp__sub_000C7B80);
@@ -188,11 +221,11 @@ X86_FUNC(sub_000C7B80) {
             ::kernel::Return(ctx, 0, 2);
             return;
         }
-        if (row >= kNativeRows) {
-            const uint32_t index = row - kNativeRows;
+        if (row >= NativeRows(g_page) && row < RowCount(g_page)) {
+            const Option option = OptionAt(g_page, row);
             char buffer_text[kTextBytes];
-            Text(Current(), kOptions[index], buffer_text);
-            const uint32_t buffer = TextBuffer(index);
+            Text(Current(), option, buffer_text);
+            const uint32_t buffer = TextBuffer(uint32_t(option));
             std::memcpy(base + buffer, buffer_text, std::strlen(buffer_text) + 1);
             X86_MEM32(out) = buffer;
             ::kernel::Return(ctx, 0, 2);
@@ -232,26 +265,32 @@ X86_FUNC(sub_000CB400) {
         }
     }
     if (event == kInputEvent && page == kDisplayPage && X86_MEM32(self + kFocus) == kRowListFocus) {
-        const Step step = Input(g_first + X86_MEM32(self + kRow), input);
+        const Step step = Input(g_page, g_first + X86_MEM32(self + kRow), input);
         if (step.handled && (!step.apply || g_pending)) {
+            const Page page = g_page; // the page the input's row belongs to
+            if (step.page != g_page) {
+                g_page = step.page;
+                g_first = 0;
+            }
             g_first = Scroll(step.row, g_first);
             X86_MEM32(self + kRow) = step.row - g_first;
             X86_MEM32(self + kFocus) = step.focus;
             if (step.change) {
                 Values v = Current();
-                const Option option = OptionAt(step.row);
+                const Option option = OptionAt(page, step.row);
                 Change(v, option, step.change, g_sizes);
-                if (option == Option::Resolution) {
+                if (option == Option::Resolution || option == Option::DisplayMode) {
                     g_pending_size = v.size;
-                    g_pending = v.size != v.applied;
+                    g_pending_mode = v.mode;
+                    g_pending = DisplayPending(v);
                 } else {
                     Apply(v);
                 }
             }
-            if (step.apply) ApplySize(g_pending_size);
+            if (step.apply) ApplyDisplayChoice(g_pending_mode, g_pending_size);
             // Navigation (no value change) means the arrow steps have settled;
             // leaving the row list/tab also has to save before the hooks stop.
-            // A resolution apply already wrote the file in ApplySize.
+            // A display apply already wrote the file in ApplyDisplayChoice.
             if ((!step.change && !step.apply) || !OnDisplayRows(base, self)) FlushSettings();
             ::kernel::Return(ctx, 0, 3);
             return;
