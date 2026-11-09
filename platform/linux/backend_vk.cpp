@@ -2689,7 +2689,8 @@ bool VulkanBackend::EnsureAoDepth(uint32_t w, uint32_t h, uint32_t samples) {
     }
     const bool ok = CreateAoImage(ao_depth_, w, h, depth_format_, samples, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
                     CreateAoImage(ao_dist_, w, h, VK_FORMAT_R32_SFLOAT, samples,
-                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (!ok) {
         DestroyAoImage(ao_depth_);
         DestroyAoImage(ao_dist_);
@@ -2711,7 +2712,8 @@ bool VulkanBackend::EnsureAoHalf(uint32_t w, uint32_t h) {
         DestroyAoImage(ao_half_);
     }
     if (!CreateAoImage(ao_half_, aw, ah, VK_FORMAT_R8_UNORM, 1,
-                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
         return false;
     LOGR("vulkan: AO factor target %ux%u", aw, ah);
     return true;
@@ -2726,7 +2728,8 @@ bool VulkanBackend::EnsureAoOcc(uint32_t w, uint32_t h) {
         DestroyAoImage(ao_occ_);
     }
     if (!CreateAoImage(ao_occ_, w, h, VK_FORMAT_R8_UNORM, 1,
-                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
         return false;
     LOGR("vulkan: AO occlusion target %ux%u", w, h);
     return true;
