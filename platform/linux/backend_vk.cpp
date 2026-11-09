@@ -635,6 +635,9 @@ private:
     bool CreatePresent();
     bool CreateUi();
     void DestroyUi();
+    bool CreateUiTarget();
+    void DestroyUiTarget();
+    bool CreateUiComposite();
     void RenderUi();
     void Shutdown();
     bool EnsureFrameImage(uint32_t w, uint32_t h);
@@ -781,6 +784,13 @@ private:
     VkExtent2D extent_{};
     VkFormat swapchain_format_ = VK_FORMAT_B8G8R8A8_UNORM;
     bool vsync_ = true;
+    // HDR chosen at swapchain creation, the setting it was built for, and display detection.
+    HdrOutput hdr_output_ = HdrOutput::Off;
+    bool hdr_setting_ = false;
+    uint32_t display_peak_nits_ = 1000;
+    bool swapchain_colorspace_ = false;  // VK_EXT_swapchain_colorspace is enabled
+    bool hdr_metadata_ = false;           // VK_EXT_hdr_metadata is enabled
+    PFN_vkSetHdrMetadataEXT set_hdr_metadata_ = nullptr;
 
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
@@ -959,6 +969,25 @@ private:
     uint8_t gamma_ramp_[3 * 256] = {};
     bool gamma_dirty_ = true;
 
+    // HDR overlays: ImGui renders into a BGRA8 image, then a composite pass puts it over the
+    // HDR swapchain at paper white. In SDR mode ImGui draws into the swapchain pass directly.
+    VkRenderPass ui_pass_ = VK_NULL_HANDLE;
+    VkImage ui_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory ui_memory_ = VK_NULL_HANDLE;
+    VkImageView ui_view_ = VK_NULL_HANDLE;
+    VkFramebuffer ui_fb_ = VK_NULL_HANDLE;
+    VkImageLayout ui_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint32_t ui_w_ = 0, ui_h_ = 0;
+    VkDescriptorSetLayout ui_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool ui_pool_ = VK_NULL_HANDLE;
+    VkDescriptorSet ui_set_ = VK_NULL_HANDLE;
+    VkPipelineLayout ui_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline ui_pipeline_ = VK_NULL_HANDLE;
+    VkFormat ui_pipeline_format_ = VK_FORMAT_UNDEFINED;
+    VkShaderModule ui_vs_ = VK_NULL_HANDLE, ui_ps_ = VK_NULL_HANDLE;
+    VkSampler ui_sampler_ = VK_NULL_HANDLE;
+    bool ui_composite_logged_ = false;  // one error line if the overlay pipeline cannot be made
+
     // F3 diagnostic read-back of the finished swapchain image
     VkBuffer trace_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory trace_memory_ = VK_NULL_HANDLE;
@@ -1032,7 +1061,43 @@ const char* VkError(VkResult r) {
 // F3 diagnostic: write the raw swapchain read-back, i.e. the finished present
 // (gamma ramp, PC contrast, scaling and the overlay all included). Guest-frame
 // TGAs only show the front buffer; this one shows what the display received.
-bool WriteSwapTga(const char* path, const uint8_t* px, uint32_t w, uint32_t h, VkFormat fmt) {
+// HDR swapchain formats are decoded and tonemapped back to SDR so the capture stays readable.
+uint32_t SwapBytesPerPixel(VkFormat fmt) {
+    return fmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+}
+
+float HalfToFloat(uint16_t h) {
+    const uint32_t sign = (h >> 15) & 1u;
+    const uint32_t exp = (h >> 10) & 0x1fu;
+    const uint32_t mant = h & 0x3ffu;
+    float v = 0.0f;
+    if (exp == 0)
+        v = std::ldexp(float(mant), -24);
+    else if (exp == 31)
+        v = 65504.0f;
+    else
+        v = std::ldexp(float(mant + 1024), int(exp) - 25);
+    return sign ? -v : v;
+}
+
+float PqDecode(float e) {
+    const float m1 = 2610.0f / 16384.0f;
+    const float m2 = 2523.0f / 4096.0f * 128.0f;
+    const float c1 = 3424.0f / 4096.0f;
+    const float c2 = 2413.0f / 4096.0f * 32.0f;
+    const float c3 = 2392.0f / 4096.0f * 32.0f;
+    const float p = std::pow(std::max(e, 0.0f), 1.0f / m2);
+    return std::pow(std::max((p - c1) / (c2 - c3 * p), 0.0f), 1.0f / m1);
+}
+
+uint8_t SrgbByte(float linear) {
+    linear = std::clamp(linear, 0.0f, 1.0f);
+    const float encoded = linear <= 0.0031308f ? 12.92f * linear : 1.055f * std::pow(linear, 1.0f / 2.4f) - 0.055f;
+    return uint8_t(std::lround(std::clamp(encoded, 0.0f, 1.0f) * 255.0f));
+}
+
+bool WriteSwapTga(const char* path, const uint8_t* px, uint32_t w, uint32_t h, VkFormat fmt, HdrOutput mode,
+                  float paper_white) {
     FILE* f = std::fopen(path, "wb");
     if (!f) return false;
     uint8_t head[18] = {0, 0, 2};  // uncompressed true colour
@@ -1041,13 +1106,46 @@ bool WriteSwapTga(const char* path, const uint8_t* px, uint32_t w, uint32_t h, V
     head[17] = 0x20;  // top row first
     std::fwrite(head, 1, 18, f);
     const bool bgr = fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    const bool fp16 = mode != HdrOutput::Off && fmt == VK_FORMAT_R16G16B16A16_SFLOAT;
+    const bool pq = mode != HdrOutput::Off && fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    const uint32_t bpp = mode != HdrOutput::Off ? SwapBytesPerPixel(fmt) : 4;
+    const float white = std::max(paper_white, 1.0f);
+    // BT.2020 to BT.709, for reading PQ captures back on an SDR monitor
+    constexpr float k2020to709[3][3] = {
+        {1.6605f, -0.5876f, -0.0728f},
+        {-0.1246f, 1.1329f, -0.0083f},
+        {-0.0182f, -0.1006f, 1.1187f},
+    };
     std::vector<uint8_t> row(size_t(w) * 3);
     for (uint32_t y = 0; y < h; y++) {
         for (uint32_t x = 0; x < w; x++) {
-            const uint8_t* p = px + (size_t(y) * w + x) * 4;
-            row[size_t(x) * 3 + 0] = bgr ? p[2] : p[0];
-            row[size_t(x) * 3 + 1] = p[1];
-            row[size_t(x) * 3 + 2] = bgr ? p[0] : p[2];
+            const uint8_t* p = px + (size_t(y) * w + x) * bpp;
+            if (fp16) {
+                uint16_t hpx[3];
+                std::memcpy(hpx, p, sizeof(hpx));
+                const float r = HalfToFloat(hpx[0]) * 80.0f / white;
+                const float g = HalfToFloat(hpx[1]) * 80.0f / white;
+                const float b = HalfToFloat(hpx[2]) * 80.0f / white;
+                row[size_t(x) * 3 + 0] = SrgbByte(b);
+                row[size_t(x) * 3 + 1] = SrgbByte(g);
+                row[size_t(x) * 3 + 2] = SrgbByte(r);
+            } else if (pq) {
+                uint32_t packed = 0;
+                std::memcpy(&packed, p, sizeof(packed));
+                float rgb[3] = {float(packed & 0x3ffu) / 1023.0f, float((packed >> 10) & 0x3ffu) / 1023.0f,
+                                float((packed >> 20) & 0x3ffu) / 1023.0f};
+                for (float& c : rgb) c = PqDecode(c) * 10000.0f;
+                float out[3];
+                for (int r = 0; r < 3; r++)
+                    out[r] = (k2020to709[r][0] * rgb[0] + k2020to709[r][1] * rgb[1] + k2020to709[r][2] * rgb[2]) / white;
+                row[size_t(x) * 3 + 0] = SrgbByte(out[2]);
+                row[size_t(x) * 3 + 1] = SrgbByte(out[1]);
+                row[size_t(x) * 3 + 2] = SrgbByte(out[0]);
+            } else {
+                row[size_t(x) * 3 + 0] = bgr ? p[2] : p[0];
+                row[size_t(x) * 3 + 1] = p[1];
+                row[size_t(x) * 3 + 2] = bgr ? p[0] : p[2];
+            }
         }
         std::fwrite(row.data(), 1, row.size(), f);
     }
@@ -1349,6 +1447,22 @@ bool VulkanBackend::CreateInstance() {
         LOGE("vulkan: SDL listed no instance extensions: %s", SDL_GetError());
         return false;
     }
+    std::vector<const char*> enabled(extensions, extensions + count);
+    // The color-space extension is optional: without it the surface only offers SDR formats.
+    uint32_t extension_count = 0;
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr) == VK_SUCCESS && extension_count) {
+        std::vector<VkExtensionProperties> properties(extension_count);
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, properties.data()) == VK_SUCCESS) {
+            for (const VkExtensionProperties& property : properties) {
+                if (!std::strcmp(property.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+                    enabled.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                    swapchain_colorspace_ = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!swapchain_colorspace_) LOGR("vulkan: VK_EXT_swapchain_colorspace unavailable, HDR output off");
     // Ask for the newest instance version the loader offers (capped at 1.3). The loader hides
     // 1.2+ device entry points from vkGetDeviceProcAddr when the instance asked for 1.1, which
     // made vkCreateRenderPass2 resolve to a null trampoline.
@@ -1362,8 +1476,8 @@ bool VulkanBackend::CreateInstance() {
     app.apiVersion = instance_version_;
     VkInstanceCreateInfo info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     info.pApplicationInfo = &app;
-    info.enabledExtensionCount = count;
-    info.ppEnabledExtensionNames = extensions;
+    info.enabledExtensionCount = uint32_t(enabled.size());
+    info.ppEnabledExtensionNames = enabled.data();
     VkResult r = vkCreateInstance(&info, nullptr, &instance_);
     if (r != VK_SUCCESS) {
         LOGE("vulkan: vkCreateInstance failed: %s", VkError(r));
@@ -1435,8 +1549,7 @@ bool VulkanBackend::CreateDevice() {
         q.pQueuePriorities = &priority;
         queues.push_back(q);
     }
-    const char* extensions[2] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME};
-    uint32_t extension_count = 1;
+    std::vector<const char*> extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkPhysicalDeviceFeatures supported{};
     vkGetPhysicalDeviceFeatures(physical_, &supported);
     // the guest picks a border colour per texture stage; Vulkan needs VK_EXT_custom_border_color for
@@ -1450,8 +1563,11 @@ bool VulkanBackend::CreateDevice() {
         std::vector<VkExtensionProperties> available(count);
         vkEnumerateDeviceExtensionProperties(physical_, nullptr, &count, available.data());
         bool has_border = false;
-        for (const VkExtensionProperties& e : available)
+        bool has_hdr_metadata = false;
+        for (const VkExtensionProperties& e : available) {
             has_border = has_border || !std::strcmp(e.extensionName, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+            has_hdr_metadata = has_hdr_metadata || !std::strcmp(e.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME);
+        }
         if (has_border) {
             VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
             features2.pNext = &border_features;
@@ -1459,7 +1575,11 @@ bool VulkanBackend::CreateDevice() {
             border_custom_ = border_features.customBorderColors && border_features.customBorderColorWithoutFormat;
             border_features.customBorderColors = border_custom_ ? VK_TRUE : VK_FALSE;
             border_features.customBorderColorWithoutFormat = border_custom_ ? VK_TRUE : VK_FALSE;
-            if (border_custom_) extension_count = 2;
+            if (border_custom_) extensions.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+        }
+        if (has_hdr_metadata) {
+            extensions.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+            hdr_metadata_ = true;
         }
     }
     LOGR("vulkan: custom sampler border colours %s", border_custom_ ? "on" : "off (fixed colours)");
@@ -1477,8 +1597,8 @@ bool VulkanBackend::CreateDevice() {
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.queueCreateInfoCount = uint32_t(queues.size());
     info.pQueueCreateInfos = queues.data();
-    info.enabledExtensionCount = extension_count;
-    info.ppEnabledExtensionNames = extensions;
+    info.enabledExtensionCount = uint32_t(extensions.size());
+    info.ppEnabledExtensionNames = extensions.data();
     info.pEnabledFeatures = &features;
     info.pNext = border_custom_ ? &border_features : nullptr;
     VkResult r = vkCreateDevice(physical_, &info, nullptr, &device_);
@@ -1488,6 +1608,12 @@ bool VulkanBackend::CreateDevice() {
     }
     vkGetDeviceQueue(device_, graphics_family_, 0, &queue_);
     vkGetDeviceQueue(device_, present_family_, 0, &present_queue_);
+    if (hdr_metadata_) {
+        set_hdr_metadata_ =
+            reinterpret_cast<PFN_vkSetHdrMetadataEXT>(vkGetDeviceProcAddr(device_, "vkSetHdrMetadataEXT"));
+        hdr_metadata_ = set_hdr_metadata_ != nullptr;
+        if (!hdr_metadata_) LOGR("vulkan: VK_EXT_hdr_metadata enabled but its entry point is missing");
+    }
     return true;
 }
 
@@ -1505,18 +1631,50 @@ bool VulkanBackend::CreateSwapchain() {
     }
     std::vector<VkSurfaceFormatKHR> formats(format_count);
     vkGetPhysicalDeviceSurfaceFormatsKHR(physical_, surface_, &format_count, formats.data());
+    // SDR selection is unchanged: the first BGRA8/RGBA8 UNORM entry the surface lists.
     VkSurfaceFormatKHR chosen = formats[0];
-    for (const auto& f : formats)
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) {
-            chosen = f;
-            break;
+    VkSurfaceFormatKHR sdr = formats[0], hdr10{}, linear{};
+    bool have_sdr = false, have_hdr10 = false, have_linear = false;
+    for (const auto& f : formats) {
+        if (!have_sdr && (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM)) {
+            sdr = f;
+            have_sdr = true;
         }
+        if (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+            hdr10 = f;
+            have_hdr10 = true;
+        }
+        if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT && f.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
+            linear = f;
+            have_linear = true;
+        }
+    }
+    if (have_sdr) chosen = sdr;
+    const app::Settings settings = app::Snapshot();
+    hdr_setting_ = settings.hdr;
+    const bool hdr_available = swapchain_colorspace_ && (have_hdr10 || have_linear);
+    g_hdr_available.store(hdr_available, std::memory_order_relaxed);
+    // Vulkan has no standard panel-peak query; HDR1000 is the metadata default.
+    display_peak_nits_ = 1000;
+    g_hdr_display_peak_nits.store(hdr_available ? display_peak_nits_ : 0, std::memory_order_relaxed);
+    if (settings.hdr && have_hdr10) {
+        chosen = hdr10;
+        hdr_output_ = HdrOutput::Hdr10;
+    } else if (settings.hdr && have_linear) {
+        chosen = linear;
+        hdr_output_ = HdrOutput::ScRgb;
+    } else {
+        hdr_output_ = HdrOutput::Off;
+        if (settings.hdr)
+            LOGR("vulkan: HDR requested but %s; using SDR output",
+                 swapchain_colorspace_ ? "the surface offers no HDR format" : "VK_EXT_swapchain_colorspace is missing");
+    }
     uint32_t mode_count = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical_, surface_, &mode_count, nullptr);
     std::vector<VkPresentModeKHR> modes(mode_count);
     if (mode_count)
         vkGetPhysicalDeviceSurfacePresentModesKHR(physical_, surface_, &mode_count, modes.data());
-    const bool vsync = app::Snapshot().vsync;
+    const bool vsync = settings.vsync;
     VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
     const VkPresentModeKHR wanted = vsync ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
     bool found = false;
@@ -1555,6 +1713,10 @@ bool VulkanBackend::CreateSwapchain() {
     if (swapchain_) {
         vkDeviceWaitIdle(device_);
         DestroyUi();
+        DestroyUiTarget();
+        if (ui_pipeline_) vkDestroyPipeline(device_, ui_pipeline_, nullptr);
+        ui_pipeline_ = VK_NULL_HANDLE;
+        ui_pipeline_format_ = VK_FORMAT_UNDEFINED;
         for (VkFramebuffer fb : swap_framebuffers_) vkDestroyFramebuffer(device_, fb, nullptr);
         swap_framebuffers_.clear();
         for (VkImageView view : swap_views_) vkDestroyImageView(device_, view, nullptr);
@@ -1600,6 +1762,15 @@ bool VulkanBackend::CreateSwapchain() {
     info.presentMode = present_mode;
     info.clipped = VK_TRUE;
     VkResult r = vkCreateSwapchainKHR(device_, &info, nullptr, &swapchain_);
+    if (r != VK_SUCCESS && hdr_output_ != HdrOutput::Off) {
+        LOGR("vulkan: %s swapchain rejected: %s; using SDR output",
+             hdr_output_ == HdrOutput::Hdr10 ? "HDR10" : "extended sRGB linear", VkError(r));
+        hdr_output_ = HdrOutput::Off;
+        chosen = sdr;
+        info.imageFormat = sdr.format;
+        info.imageColorSpace = sdr.colorSpace;
+        r = vkCreateSwapchainKHR(device_, &info, nullptr, &swapchain_);
+    }
     if (r != VK_SUCCESS) {
         LOGE("vulkan: vkCreateSwapchainKHR failed: %s", VkError(r));
         return false;
@@ -1611,6 +1782,25 @@ bool VulkanBackend::CreateSwapchain() {
     extent_ = extent;
     swapchain_format_ = chosen.format;
     vsync_ = vsync;
+    if (hdr_output_ != HdrOutput::Off) {
+        LOGR("vulkan: %s output, %ux%u %s, peak %u nits",
+             hdr_output_ == HdrOutput::Hdr10 ? "HDR10" : "extended sRGB linear", extent.width, extent.height,
+             hdr_output_ == HdrOutput::Hdr10 ? "A2B10G10R10" : "FP16", display_peak_nits_);
+        if (hdr_output_ == HdrOutput::Hdr10 && hdr_metadata_ && set_hdr_metadata_) {
+            VkHdrMetadataEXT metadata{VK_STRUCTURE_TYPE_HDR_METADATA_EXT};
+            metadata.displayPrimaryRed = {0.708f, 0.292f};
+            metadata.displayPrimaryGreen = {0.170f, 0.797f};
+            metadata.displayPrimaryBlue = {0.131f, 0.046f};
+            metadata.whitePoint = {0.3127f, 0.3290f};
+            metadata.maxLuminance = float(display_peak_nits_);
+            metadata.minLuminance = 0.0f;
+            metadata.maxContentLightLevel = float(display_peak_nits_);
+            metadata.maxFrameAverageLightLevel = float(std::max(settings.hdr_paper_white, 80u));
+            set_hdr_metadata_(device_, 1, &swapchain_, &metadata);
+        }
+    } else {
+        LOGR("vulkan: SDR output, %ux%u format %d", extent.width, extent.height, int(swapchain_format_));
+    }
     for (VkSemaphore s : render_done_)
         if (s) vkDestroySemaphore(device_, s, nullptr);
     render_done_.assign(swapchain_images_.size(), VK_NULL_HANDLE);
@@ -1672,12 +1862,13 @@ bool VulkanBackend::CreateSwapchain() {
         fb.layers = 1;
         if (vkCreateFramebuffer(device_, &fb, nullptr, &swap_framebuffers_[i]) != VK_SUCCESS) return false;
     }
+    CreateUiTarget();
     CreateUi();  // the Graphics overlay is optional; rendering continues without it
     return true;
 }
 
 bool VulkanBackend::CreateUi() {
-    if (ui_initialized_ || !swap_pass_ || !ImGui::GetCurrentContext()) return true;
+    if (ui_initialized_ || !ui_pass_ || !ImGui::GetCurrentContext()) return true;
     std::lock_guard<std::recursive_mutex> guard(app::UiLock());
     const uint32_t images = uint32_t(swapchain_images_.size());
     ImGui_ImplVulkan_InitInfo info{};
@@ -1690,7 +1881,7 @@ bool VulkanBackend::CreateUi() {
     info.DescriptorPoolSize = 64;  // the backend creates its own image descriptor pool
     info.MinImageCount = images >= 2 ? 2 : images;
     info.ImageCount = images;
-    info.PipelineInfoMain.RenderPass = swap_pass_;
+    info.PipelineInfoMain.RenderPass = ui_pass_;
     info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     if (!ImGui_ImplVulkan_Init(&info)) {
         LOGE("vulkan: ImGui Vulkan backend failed to start");
@@ -1706,6 +1897,124 @@ void VulkanBackend::DestroyUi() {
     std::lock_guard<std::recursive_mutex> guard(app::UiLock());
     ImGui_ImplVulkan_Shutdown();
     ui_initialized_ = false;
+}
+
+// The BGRA8 image ImGui renders into, and the pass that clears it and hands it to the HDR
+// composite as a sampled image.
+bool VulkanBackend::CreateUiTarget() {
+    if (!extent_.width || !extent_.height) return false;
+    // ImGui always draws into this BGRA8 image, in SDR too: its pipeline is built for this pass,
+    // and SDR surfaces are not guaranteed to be BGRA8. The composite pass then puts it over the
+    // swapchain image unchanged in SDR, or at paper white in HDR.
+    if (ui_image_ && ui_w_ == extent_.width && ui_h_ == extent_.height && ui_pass_ && ui_fb_) return true;
+    DestroyUiTarget();
+    ui_w_ = extent_.width;
+    ui_h_ = extent_.height;
+
+    VkAttachmentDescription color{};
+    color.format = VK_FORMAT_B8G8R8A8_UNORM;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &ref;
+    VkSubpassDependency deps[2]{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rp.attachmentCount = 1;
+    rp.pAttachments = &color;
+    rp.subpassCount = 1;
+    rp.pSubpasses = &sub;
+    rp.dependencyCount = 2;
+    rp.pDependencies = deps;
+    if (vkCreateRenderPass(device_, &rp, nullptr, &ui_pass_) != VK_SUCCESS) {
+        LOGE("vulkan: HDR overlay render pass failed");
+        return false;
+    }
+
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_B8G8R8A8_UNORM;
+    info.extent = {ui_w_, ui_h_, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (vkCreateImage(device_, &info, nullptr, &ui_image_) != VK_SUCCESS) {
+        LOGE("vulkan: HDR overlay image %ux%u could not be created", ui_w_, ui_h_);
+        DestroyUiTarget();
+        return false;
+    }
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(device_, ui_image_, &req);
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = req.size;
+    for (uint32_t i = 0; i < mem_props_.memoryTypeCount; i++)
+        if ((req.memoryTypeBits & (1u << i)) &&
+            (mem_props_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            alloc.memoryTypeIndex = i;
+            break;
+        }
+    if (vkAllocateMemory(device_, &alloc, nullptr, &ui_memory_) != VK_SUCCESS ||
+        vkBindImageMemory(device_, ui_image_, ui_memory_, 0) != VK_SUCCESS) {
+        DestroyUiTarget();
+        return false;
+    }
+    ui_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = ui_image_;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = VK_FORMAT_B8G8R8A8_UNORM;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(device_, &view, nullptr, &ui_view_) != VK_SUCCESS) {
+        DestroyUiTarget();
+        return false;
+    }
+    VkFramebufferCreateInfo fb{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fb.renderPass = ui_pass_;
+    fb.attachmentCount = 1;
+    fb.pAttachments = &ui_view_;
+    fb.width = ui_w_;
+    fb.height = ui_h_;
+    fb.layers = 1;
+    if (vkCreateFramebuffer(device_, &fb, nullptr, &ui_fb_) != VK_SUCCESS) {
+        DestroyUiTarget();
+        return false;
+    }
+    return true;
+}
+
+void VulkanBackend::DestroyUiTarget() {
+    if (ui_fb_) vkDestroyFramebuffer(device_, ui_fb_, nullptr);
+    ui_fb_ = VK_NULL_HANDLE;
+    if (ui_view_) vkDestroyImageView(device_, ui_view_, nullptr);
+    ui_view_ = VK_NULL_HANDLE;
+    if (ui_image_) vkDestroyImage(device_, ui_image_, nullptr);
+    ui_image_ = VK_NULL_HANDLE;
+    if (ui_memory_) vkFreeMemory(device_, ui_memory_, nullptr);
+    ui_memory_ = VK_NULL_HANDLE;
+    if (ui_pass_) vkDestroyRenderPass(device_, ui_pass_, nullptr);
+    ui_pass_ = VK_NULL_HANDLE;
+    ui_w_ = ui_h_ = 0;
+    ui_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
 void VulkanBackend::RenderUi() {
@@ -1731,6 +2040,157 @@ void VulkanBackend::RenderUi() {
     ImGui::NewFrame();
     if (app::kGame.ui) app::kGame.ui(ui_fps_);
     ImGui::Render();
+}
+
+// The HDR overlay composite: ImGui's sRGB values are put over the encoded swapchain at paper
+// white, with premultiplied-alpha over blending.
+static const char* kHdrUiHlsl = R"(
+[[vk::binding(0, 0)]] Texture2D<float4> uiTex;
+[[vk::binding(1, 0)]] SamplerState uiSampler;
+struct PC { float4 hdr; };
+[[vk::push_constant]] ConstantBuffer<PC> pc;
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.uv = t;
+    o.pos = float4(t * float2(2, 2) + float2(-1, -1), 0, 1);
+    return o;
+}
+float3 SrgbToLinear(float3 c) {
+    float3 lo = c / 12.92;
+    float3 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);
+    return lerp(lo, hi, step(0.04045, c));
+}
+float3 PqEncode(float3 nits) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 4096.0 * 128.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 4096.0 * 32.0;
+    const float c3 = 2392.0 / 4096.0 * 32.0;
+    float3 y = pow(max(nits / 10000.0, 0.0), m1);
+    return pow(max((c1 + c2 * y) / (1.0 + c3 * y), 0.0), m2);
+}
+static const float3x3 Rec709to2020 = float3x3(
+    0.6274040, 0.3292820, 0.0433136,
+    0.0690970, 0.9195400, 0.0113612,
+    0.0163916, 0.0880132, 0.8955950);
+float4 psmain(O i) : SV_Target {
+    float4 c = uiTex.Sample(uiSampler, i.uv);
+    // SDR: the over-blend reproduces ImGui's direct blend exactly.
+    if (pc.hdr.x < 0.5) return c;
+    float3 lin = SrgbToLinear(saturate(c.rgb)) * pc.hdr.y;
+    if (pc.hdr.x < 1.5) return float4(lin / 80.0, c.a);
+    float3 rgb2020 = mul(Rec709to2020, lin);
+    return float4(PqEncode(clamp(rgb2020, 0.0, 10000.0)), c.a);
+}
+)";
+
+bool VulkanBackend::CreateUiComposite() {
+    if (!swap_pass_) return false;
+    if (ui_pipeline_ && ui_pipeline_format_ == swapchain_format_) return true;
+    if (ui_pipeline_) vkDestroyPipeline(device_, ui_pipeline_, nullptr);
+    ui_pipeline_ = VK_NULL_HANDLE;
+    ui_pipeline_format_ = VK_FORMAT_UNDEFINED;
+
+    if (!ui_set_layout_) {
+        VkDescriptorSetLayoutBinding bind[2]{};
+        bind[0].binding = 0;
+        bind[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bind[0].descriptorCount = 1;
+        bind[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bind[1].binding = 1;
+        bind[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        bind[1].descriptorCount = 1;
+        bind[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = 2;
+        li.pBindings = bind;
+        if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &ui_set_layout_) != VK_SUCCESS) return false;
+        VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1}};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = 1;
+        pi.poolSizeCount = 2;
+        pi.pPoolSizes = sizes;
+        if (vkCreateDescriptorPool(device_, &pi, nullptr, &ui_pool_) != VK_SUCCESS) return false;
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = ui_pool_;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &ui_set_layout_;
+        if (vkAllocateDescriptorSets(device_, &ai, &ui_set_) != VK_SUCCESS) return false;
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &ui_set_layout_;
+        VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 4};
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &push;
+        if (vkCreatePipelineLayout(device_, &pl, nullptr, &ui_pipeline_layout_) != VK_SUCCESS) return false;
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (vkCreateSampler(device_, &si, nullptr, &ui_sampler_) != VK_SUCCESS) return false;
+    }
+    if (!ui_vs_) {
+        ui_vs_ = CompileShader(kHdrUiHlsl, shaderc_vertex_shader, "vs");
+        ui_ps_ = CompileShader(kHdrUiHlsl, shaderc_fragment_shader, "psmain");
+        if (!ui_vs_ || !ui_ps_) return false;
+    }
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cb{};
+    cb.colorWriteMask = 0xF;
+    cb.blendEnable = VK_TRUE;
+    cb.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    cb.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cb.colorBlendOp = VK_BLEND_OP_ADD;
+    cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cb.alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = 1;
+    blend.pAttachments = &cb;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dyn;
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = ui_vs_;
+    stages[0].pName = "vs";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = ui_ps_;
+    stages[1].pName = "psmain";
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &vi;
+    info.pInputAssemblyState = &ia;
+    info.pViewportState = &vp;
+    info.pRasterizationState = &rs;
+    info.pMultisampleState = &ms;
+    info.pDepthStencilState = &ds;
+    info.pColorBlendState = &blend;
+    info.pDynamicState = &dynamic;
+    info.layout = ui_pipeline_layout_;
+    info.renderPass = swap_pass_;
+    if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &ui_pipeline_) != VK_SUCCESS)
+        return false;
+    ui_pipeline_format_ = swapchain_format_;
+    return true;
 }
 
 bool VulkanBackend::CreateCommands() {    VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1863,7 +2323,7 @@ bool VulkanBackend::CreatePresent() {
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &present_set_layout_;
-    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 8};  // contrast, bloom, dof, source size, near/far
+    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 12};  // contrast, bloom, dof, source size, near/far, HDR
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &push;
     if (vkCreatePipelineLayout(device_, &pl, nullptr, &present_pipeline_layout_) != VK_SUCCESS) return false;
@@ -1874,7 +2334,7 @@ bool VulkanBackend::CreatePresent() {
 [[vk::binding(2, 0)]] Texture2D<float4> depthTex;
 [[vk::binding(3, 0)]] SamplerState frameSampler;
 [[vk::binding(4, 0)]] SamplerState depthSampler;
-struct PC { float pc; float bloom; float dof; float pad; float2 src; float2 zrange; };
+struct PC { float pc; float bloom; float dof; float pad; float2 src; float2 zrange; float4 hdr; };
 [[vk::push_constant]] ConstantBuffer<PC> pc;
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
@@ -1888,6 +2348,41 @@ float3 ToGamma(float3 c) {
     return float3(gammaTex.Sample(frameSampler, float2(c.r, 0.5)).r,
                   gammaTex.Sample(frameSampler, float2(c.g, 0.5)).g,
                   gammaTex.Sample(frameSampler, float2(c.b, 0.5)).b);
+}
+// Exact piecewise sRGB EOTF, for expanding the finished SDR frame into linear light.
+float3 SrgbToLinear(float3 c) {
+    float3 lo = c / 12.92;
+    float3 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);
+    return lerp(lo, hi, step(0.04045, c));
+}
+// ST.2084 output transfer function: linear nits to PQ code values.
+float3 PqEncode(float3 nits) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 4096.0 * 128.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 4096.0 * 32.0;
+    const float c3 = 2392.0 / 4096.0 * 32.0;
+    float3 y = pow(max(nits / 10000.0, 0.0), m1);
+    return pow(max((c1 + c2 * y) / (1.0 + c3 * y), 0.0), m2);
+}
+static const float3x3 Rec709to2020 = float3x3(
+    0.6274040, 0.3292820, 0.0433136,
+    0.0690970, 0.9195400, 0.0113612,
+    0.0163916, 0.0880132, 0.8955950);
+// Inverse tone map the highlights only: below the knee the SDR colour is unchanged, above it
+// the luminance expands towards P while the hue is preserved.
+// l2 = l + t*t*(P - 1), so l2(knee) = knee with slope 1, l2(1) = P, and P = 1 is identity.
+float3 HdrHighlights(float3 lin, float paper_white, float peak, float strength) {
+    const float knee = 0.75;
+    const float3 luma = float3(0.2126, 0.7152, 0.0722);
+    const float l = dot(lin, luma);
+    const float P = lerp(1.0, max(peak, paper_white) / max(paper_white, 1.0), saturate(strength));
+    float l2 = l;
+    if (l > knee) {
+        const float t = (l - knee) / (1.0 - knee);
+        l2 = l + t * t * (P - 1.0);
+    }
+    return lin * (l2 / max(l, 1e-4));
 }
 // A single-pass approximation of the PC release's bright-pass bloom. Each tap first averages a
 // small box, so thin chrome/specular edges are diluted before the threshold while lamps and neon
@@ -1961,6 +2456,21 @@ float4 psmain(O i) : SV_Target {
     float4 c = frameTex.Sample(frameSampler, i.uv);
     if (pc.dof > 0.0) c.rgb = DistanceBlur(i.uv, c.rgb);
     c.rgb = ToGamma(c.rgb);
+    if (pc.hdr.x > 0.5) {
+        // Match the SDR order through PC contrast: gamma, then bloom, then contrast. The part of
+        // the bloom above white is carried separately so it can exceed white, scaled by highlights.
+        float3 g = c.rgb;
+        float3 b = pc.bloom > 0.0 ? BloomAt(i.uv) * 1.2 : 0;
+        g += b;
+        if (pc.pc > 0.0) g = lerp(g, PcContrast(g), pc.pc);
+        float3 over = max(c.rgb + b - 1.0, 0.0);
+        float3 lin = SrgbToLinear(saturate(g));
+        lin = HdrHighlights(lin, pc.hdr.y, pc.hdr.z, pc.hdr.w) + over * (2.4 * pc.hdr.w);
+        if (pc.hdr.x < 1.5) return float4(lin * (pc.hdr.y / 80.0), c.a);
+        float3 rgb2020 = mul(Rec709to2020, lin);
+        float3 nits = clamp(rgb2020 * pc.hdr.y, 0.0, 10000.0);
+        return float4(PqEncode(nits), c.a);
+    }
     if (pc.bloom > 0.0) c.rgb += BloomAt(i.uv) * 1.2;
     if (pc.pc > 0.0) {
         c.rgb = PcContrast(c.rgb);
@@ -1983,6 +2493,14 @@ void VulkanBackend::Shutdown() {
     // no explicit teardown of every cache: the process is exiting, and freeing in
     // dependency order here would be much longer than the objects are worth.
     if (device_) {
+        if (ui_pipeline_) vkDestroyPipeline(device_, ui_pipeline_, nullptr);
+        if (ui_pipeline_layout_) vkDestroyPipelineLayout(device_, ui_pipeline_layout_, nullptr);
+        if (ui_sampler_) vkDestroySampler(device_, ui_sampler_, nullptr);
+        if (ui_pool_) vkDestroyDescriptorPool(device_, ui_pool_, nullptr);
+        if (ui_set_layout_) vkDestroyDescriptorSetLayout(device_, ui_set_layout_, nullptr);
+        for (VkShaderModule m : {ui_vs_, ui_ps_})
+            if (m) vkDestroyShaderModule(device_, m, nullptr);
+        DestroyUiTarget();
         if (upload_) vkDestroyBuffer(device_, upload_, nullptr);
         if (upload_memory_) vkFreeMemory(device_, upload_memory_, nullptr);
         if (frame_image_) vkDestroyImage(device_, frame_image_, nullptr);
@@ -4266,7 +4784,7 @@ bool VulkanBackend::ReadTarget(Target* t) {
                          t->h, t->w * 4);
         else
             WriteSwapTga((app::ExeDir() / "logs" / name).string().c_str(), static_cast<const uint8_t*>(map), t->w,
-                         t->h, t->format);
+                         t->h, t->format, HdrOutput::Off, 200.0f);
     }
     WriteGuestPixels(t, static_cast<const uint8_t*>(map), t->w, t->h, row);
     vkUnmapMemory(device_, memory);
@@ -6336,11 +6854,11 @@ void VulkanBackend::Present(const Surface& front) {
         viewport_valid_ = false;
         LOGR("linux: MSAA %ux", msaa_);
     }
-    if (app::Snapshot().vsync != vsync_) {
+    const app::Settings snapshot = app::Snapshot();
+    if (snapshot.vsync != vsync_ || snapshot.hdr != hdr_setting_) {
         vkDeviceWaitIdle(device_);
         if (!CreateSwapchain()) return;
     }
-    const app::Settings snapshot = app::Snapshot();
     aniso_setting_ = snapshot.aniso;
     aspect_ = app::AspectRatio();
     if (texturedumper::Update()) ReleasePackTextures();
@@ -6477,7 +6995,7 @@ void VulkanBackend::Present(const Surface& front) {
     }
     const bool record_swap_trace =
         trace_now && trace_present_ && swap_capture_supported_ &&
-        EnsureTraceBuffer(VkDeviceSize(extent_.width) * extent_.height * 4);
+        EnsureTraceBuffer(VkDeviceSize(extent_.width) * extent_.height * SwapBytesPerPixel(swapchain_format_));
     if (!present_pipeline_ || present_format_ != swapchain_format_) {
         if (present_pipeline_) vkDestroyPipeline(device_, present_pipeline_, nullptr);
         present_pipeline_ = VK_NULL_HANDLE;
@@ -6710,6 +7228,54 @@ void VulkanBackend::Present(const Surface& front) {
     }
     vkUpdateDescriptorSets(device_, 5, writes, 0, nullptr);
 
+    const bool hdr = hdr_output_ != HdrOutput::Off;
+    const uint32_t reported_peak = display_peak_nits_ ? display_peak_nits_ : 1000;
+    const float hdr_mode = hdr ? (hdr_output_ == HdrOutput::ScRgb ? 1.0f : 2.0f) : 0.0f;
+    const float hdr_paper = float(snapshot.hdr_paper_white);
+    const float hdr_peak = float(snapshot.hdr_peak ? snapshot.hdr_peak : reported_peak);
+    const float hdr_strength = float(snapshot.hdr_highlights) / 100.0f;
+    const bool ui_data = ui_initialized_ && ImGui::GetDrawData() && ImGui::GetDrawData()->CmdListsCount;
+    bool ui_ready = false;
+    if (ui_data && ui_fb_ && CreateUiComposite()) {
+        Transition(ui_image_, ui_layout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_FORMAT_B8G8R8A8_UNORM);
+        VkClearValue ui_clear{};
+        VkRenderPassBeginInfo ui_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        ui_begin.renderPass = ui_pass_;
+        ui_begin.framebuffer = ui_fb_;
+        ui_begin.renderArea = {{0, 0}, {ui_w_, ui_h_}};
+        ui_begin.clearValueCount = 1;
+        ui_begin.pClearValues = &ui_clear;
+        vkCmdBeginRenderPass(cmd_, &ui_begin, VK_SUBPASS_CONTENTS_INLINE);
+        {
+            std::lock_guard<std::recursive_mutex> guard(app::UiLock());
+            ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd_);
+        }
+        vkCmdEndRenderPass(cmd_);
+        // the pass's final layout transitioned the image for sampling
+        ui_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo image_info{ui_sampler_, ui_view_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo sampler_info{};
+        sampler_info.sampler = ui_sampler_;
+        VkWriteDescriptorSet ui_writes[2]{};
+        ui_writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        ui_writes[0].dstSet = ui_set_;
+        ui_writes[0].dstBinding = 0;
+        ui_writes[0].descriptorCount = 1;
+        ui_writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        ui_writes[0].pImageInfo = &image_info;
+        ui_writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        ui_writes[1].dstSet = ui_set_;
+        ui_writes[1].dstBinding = 1;
+        ui_writes[1].descriptorCount = 1;
+        ui_writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        ui_writes[1].pImageInfo = &sampler_info;
+        vkUpdateDescriptorSets(device_, 2, ui_writes, 0, nullptr);
+        ui_ready = true;
+    } else if (ui_data && !ui_composite_logged_) {
+        LOGE("vulkan: overlay composite unavailable; the Graphics overlay stays hidden");
+        ui_composite_logged_ = true;
+    }
+
     VkClearValue clear{};
     VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rp.renderPass = swap_pass_;
@@ -6732,17 +7298,24 @@ void VulkanBackend::Present(const Surface& front) {
     }
     const uint32_t bloom_w = ft ? ft->w : sw, bloom_h = ft ? ft->h : sh;
     const bool dof_on = dof != nullptr;
-    float present_pc[8] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? 1.0f : 0.0f,
-                           dof_on ? 1.0f : 0.0f, 0.0f,
-                           bloom_w ? 1.0f / float(bloom_w) : 0.0f,
-                           bloom_h ? 1.0f / float(bloom_h) : 0.0f,
-                           dof ? dof->near_w : 0.1f, dof ? dof->far_w : 1000.0f};
+    float present_pc[12] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? 1.0f : 0.0f,
+                            dof_on ? 1.0f : 0.0f, 0.0f,
+                            bloom_w ? 1.0f / float(bloom_w) : 0.0f,
+                            bloom_h ? 1.0f / float(bloom_h) : 0.0f,
+                            dof ? dof->near_w : 0.1f, dof ? dof->far_w : 1000.0f,
+                            hdr_mode, hdr_paper, hdr_peak, hdr_strength};
     vkCmdPushConstants(cmd_, present_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(present_pc),
                        present_pc);
     vkCmdDraw(cmd_, 3, 1, 0, 0);
-    if (ui_initialized_ && ImGui::GetDrawData() && ImGui::GetDrawData()->CmdListsCount) {
-        std::lock_guard<std::recursive_mutex> guard(app::UiLock());
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd_);
+    if (ui_ready) {
+        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_);
+        vkCmdSetViewport(cmd_, 0, 1, &viewport);
+        vkCmdSetScissor(cmd_, 0, 1, &scissor);
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_layout_, 0, 1, &ui_set_, 0,
+                                nullptr);
+        const float ui_pc[4] = {hdr_mode, hdr_paper, hdr_peak, hdr_strength};
+        vkCmdPushConstants(cmd_, ui_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ui_pc), ui_pc);
+        vkCmdDraw(cmd_, 3, 1, 0, 0);
     }
     vkCmdEndRenderPass(cmd_);
     if (record_swap_trace) {
@@ -6804,7 +7377,8 @@ void VulkanBackend::Present(const Surface& front) {
     }
     if (record_swap_trace && waited) {
         const std::string path = trace_base + "_present.tga";
-        if (WriteSwapTga(path.c_str(), trace_ptr_, extent_.width, extent_.height, swapchain_format_))
+        if (WriteSwapTga(path.c_str(), trace_ptr_, extent_.width, extent_.height, swapchain_format_,
+                         hdr_output_, float(snapshot.hdr_paper_white)))
             LOGR("linux: trace present %s saved (%ux%u)", path.c_str(), extent_.width, extent_.height);
     }
     frame_end.finished = true;

@@ -31,6 +31,10 @@ extern "C" __declspec(dllexport) int run() {
  auto near = [](float a, float b) { return a > b - 0.01f && a < b + 0.01f; };
  if (!near(choices::ScaledFovDegrees(70, 100), 70) || !near(choices::ScaledFovDegrees(90, 200), 126.87f)) return 14;
  if (choices::ClampFovPercent(10) != 50 || choices::Step(choices::kFovPercents, 100, 1) != 110) return 15;
+ // HDR: paper white, peak (0 means the display's report) and highlight strength step through their lists
+ if (choices::Step(choices::kHdrPaperWhiteNits, 200, 1) != 210) return 16;
+ if (choices::Step(choices::kHdrPeakNits, 0, -1) != 0 || choices::Step(choices::kHdrPeakNits, 0, 1) != 400) return 17;
+ if (choices::Step(choices::kHdrHighlightPercents, 70, -1) != 60 || choices::Step(choices::kHdrHighlightPercents, 100, 1) != 100) return 18;
 
  // navigation from dpad, stick and face buttons
  input::Pad p; p.connected = true;

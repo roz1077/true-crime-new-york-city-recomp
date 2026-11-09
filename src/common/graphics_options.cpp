@@ -12,6 +12,7 @@
 #include "app/app.h"
 #include "core/log.h"
 #include "graphics_choices.h"
+#include "gpu/backend.h"
 #include "menu_input.h"
 
 #include <imgui.h>
@@ -96,6 +97,10 @@ enum class Row {
     AmbientOcclusion,
     BuildingSeamFix,
     PcContrast,
+    Hdr,
+    HdrPaperWhite,
+    HdrPeak,
+    HdrHighlights,
     VSync,
     FrameCap,
     ShowFps,
@@ -120,6 +125,10 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::AmbientOcclusion,
                          Row::BuildingSeamFix,
                          Row::PcContrast,
+                         Row::Hdr,
+                         Row::HdrPaperWhite,
+                         Row::HdrPeak,
+                         Row::HdrHighlights,
                          Row::VSync,
                          Row::FrameCap,
                          Row::ShowFps,
@@ -328,6 +337,10 @@ void RestoreDefaults() {
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
     s.texture_dump_format = d.texture_dump_format;
+    s.hdr = d.hdr;
+    s.hdr_paper_white = d.hdr_paper_white;
+    s.hdr_peak = d.hdr_peak;
+    s.hdr_highlights = d.hdr_highlights;
     SetShowFps(false);
     g_fov_percent = 100;
     g_menu.mode = d.display_mode; // display changes still wait for Apply
@@ -348,12 +361,16 @@ Kind KindOf(Row row) {
     case Row::DumpFormat:
     case Row::Msaa:
     case Row::AmbientOcclusion:
+    case Row::HdrPaperWhite:
+    case Row::HdrPeak:
+    case Row::HdrHighlights:
         return Kind::Choice;
     case Row::Smaa:
     case Row::Bloom:
     case Row::DepthOfField:
     case Row::BuildingSeamFix:
     case Row::PcContrast:
+    case Row::Hdr:
     case Row::VSync:
     case Row::ShowFps:
     case Row::TextureReplacement:
@@ -367,6 +384,10 @@ Kind KindOf(Row row) {
 bool Enabled(Row row) {
     if (row == Row::ApplyDisplay) return !g_menu.apply_pending && DisplayPending();
     if (row == Row::DumpFormat) return app::Get().dump_textures;
+    // The HDR toggle stays reachable on an SDR display so a failed detection can be retried and
+    // the fallback is visible; its sliders only matter once HDR is actually active.
+    if (row == Row::HdrPaperWhite || row == Row::HdrPeak || row == Row::HdrHighlights)
+        return app::Get().hdr && gpu::g_hdr_available.load(std::memory_order_relaxed);
     return true;
 }
 
@@ -402,6 +423,14 @@ const char *Label(Row row) {
         return "Building seam fix (Experimental)";
     case Row::PcContrast:
         return "PC contrast";
+    case Row::Hdr:
+        return "HDR";
+    case Row::HdrPaperWhite:
+        return "HDR paper white";
+    case Row::HdrPeak:
+        return "HDR peak brightness";
+    case Row::HdrHighlights:
+        return "HDR highlights";
     case Row::VSync:
         return "V-Sync";
     case Row::FrameCap:
@@ -429,6 +458,8 @@ const char *Section(Row row) {
         return "Display";
     case Row::RenderScale:
         return "Rendering";
+    case Row::Hdr:
+        return "HDR output";
     case Row::TextureReplacement:
         return "Textures";
     case Row::Defaults:
@@ -478,6 +509,16 @@ const char *Help(Row row) {
         return "Experimental: keeps detailed buildings visible where simplified city meshes overlap. Takes effect immediately.";
     case Row::PcContrast:
         return "Applies a PC-inspired contrast curve to the finished 3D frame.";
+    case Row::Hdr:
+        return gpu::g_hdr_available.load(std::memory_order_relaxed)
+                   ? "Expands the finished frame's highlights for an HDR display. Off is bit-identical to SDR output."
+                   : "The display does not report HDR; turning this on keeps SDR output and logs the reason.";
+    case Row::HdrPaperWhite:
+        return "Brightness of ordinary SDR white on the HDR display, in nits.";
+    case Row::HdrPeak:
+        return "Peak highlight brightness. Display uses the panel's reported peak; otherwise 1000 nits.";
+    case Row::HdrHighlights:
+        return "How far bright neon, lamps and headlights are pushed above paper white.";
     case Row::VSync:
         return "Waits for the monitor's refresh before showing a frame, which prevents tearing.";
     case Row::FrameCap:
@@ -566,6 +607,22 @@ std::string Value(Row row) {
         return s.building_seam_fix ? "On" : "Off";
     case Row::PcContrast:
         return s.pc_contrast ? "On" : "Off";
+    case Row::Hdr:
+        if (!s.hdr) return "Off";
+        return gpu::g_hdr_available.load(std::memory_order_relaxed) ? "On" : "On (no HDR display)";
+    case Row::HdrPaperWhite:
+        std::snprintf(text, sizeof(text), "%u nits", s.hdr_paper_white);
+        return text;
+    case Row::HdrPeak: {
+        const uint32_t reported = gpu::g_hdr_display_peak_nits.load(std::memory_order_relaxed);
+        const uint32_t peak = s.hdr_peak ? s.hdr_peak : (reported ? reported : 1000);
+        if (!s.hdr_peak) std::snprintf(text, sizeof(text), "Display (%u nits)", peak);
+        else std::snprintf(text, sizeof(text), "%u nits", peak);
+        return text;
+    }
+    case Row::HdrHighlights:
+        std::snprintf(text, sizeof(text), "%u%%", s.hdr_highlights);
+        return text;
     case Row::VSync:
         return s.vsync ? "On" : "Off";
     case Row::ShowFps:
@@ -646,6 +703,15 @@ bool Change(Row row, int direction) {
     case Row::DumpFormat:
         changed = set(s.texture_dump_format, direction > 0 ? 1u : 0u);
         break;
+    case Row::HdrPaperWhite:
+        changed = set(s.hdr_paper_white, choices::Step(choices::kHdrPaperWhiteNits, s.hdr_paper_white, direction));
+        break;
+    case Row::HdrPeak:
+        changed = set(s.hdr_peak, choices::Step(choices::kHdrPeakNits, s.hdr_peak, direction));
+        break;
+    case Row::HdrHighlights:
+        changed = set(s.hdr_highlights, choices::Step(choices::kHdrHighlightPercents, s.hdr_highlights, direction));
+        break;
     default:
         break;
     }
@@ -680,6 +746,9 @@ void Activate(Row row) {
             break;
         case Row::PcContrast:
             s.pc_contrast = !s.pc_contrast;
+            break;
+        case Row::Hdr:
+            s.hdr = !s.hdr;
             break;
         case Row::VSync:
             s.vsync = !s.vsync;

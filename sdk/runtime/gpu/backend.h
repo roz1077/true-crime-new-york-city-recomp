@@ -70,4 +70,11 @@ inline std::atomic<uint64_t> g_perf_sync_late{0}, g_perf_sync_block{0};  // read
 // F3: save the next frame, every draw and target, under diag::CaptureDir
 inline std::atomic<bool> g_capture{false};
 
+// HDR output chosen for the swapchain: linear scRGB/FP16, PQ HDR10, or the SDR path.
+enum class HdrOutput : uint32_t { Off, ScRgb, Hdr10 };
+// The display the window is on reports HDR, and its peak luminance in nits (0 when unknown).
+// Backends refresh these when they (re)create the swapchain; the Graphics menu reads them.
+inline std::atomic<bool> g_hdr_available{false};
+inline std::atomic<uint32_t> g_hdr_display_peak_nits{0};
+
 }  // namespace gpu

@@ -35,6 +35,10 @@ struct Settings {
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
+    bool hdr = false;                // HDR output on the finished frame
+    uint32_t hdr_paper_white = 200;  // SDR white in nits, 80 to 400
+    uint32_t hdr_peak = 0;           // highlight peak in nits; 0 uses the display's reported peak, else 1000
+    uint32_t hdr_highlights = 40;    // inverse tone map strength, percent
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
 };
 

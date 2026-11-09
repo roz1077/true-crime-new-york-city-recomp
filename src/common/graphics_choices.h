@@ -28,6 +28,14 @@ inline const char *ObjectDetailName(uint32_t level) {
     static const char *const names[] = {"Original", "High", "Very high", "Maximum"};
     return names[level < 4 ? level : 0];
 }
+// HDR output: SDR white in nits, the highlight peak (0: the display's reported peak), and the
+// inverse tone map strength in percent.
+inline constexpr uint32_t kHdrPaperWhiteNits[] = {
+    80,  90,  100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240,
+    250, 260, 270, 280, 290, 300, 310, 320, 330, 340, 350, 360, 370, 380, 390, 400};
+inline constexpr uint32_t kHdrPeakNits[] = {0,   400, 500, 600, 700, 800, 900, 1000, 1100,
+                                            1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000};
+inline constexpr uint32_t kHdrHighlightPercents[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
 // Frame shapes, width / height x 1000 (app::Settings::aspect): 0 matches the display, then 4:3, 16:10, 16:9, 21:9
 // (64:27) and 32:9. 3D widens to the shape; HUD, menus and movies stay 16:9 in the middle.
 inline constexpr uint32_t kAspects[] = {0, 1333, 1600, 1778, 2370, 3556};

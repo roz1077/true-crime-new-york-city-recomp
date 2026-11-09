@@ -145,7 +145,7 @@ bool CaptureOn() {
 }
 
 const char* kBlitHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; };
+cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; float4 hdr; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
 Texture2DMS<float> depthTex : register(t3);
@@ -158,6 +158,45 @@ float3 ToGamma(float3 c) {
     return float3(lut.Sample(ps, float2(c.r, 0.5)).r,
                   lut.Sample(ps, float2(c.g, 0.5)).g,
                   lut.Sample(ps, float2(c.b, 0.5)).b);
+}
+
+// Exact piecewise sRGB EOTF, for expanding the finished SDR frame into linear light.
+float3 SrgbToLinear(float3 c) {
+    float3 lo = c / 12.92;
+    float3 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);
+    return lerp(lo, hi, step(0.04045, c));
+}
+
+// ST.2084 output transfer function: linear nits to PQ code values.
+float3 PqEncode(float3 nits) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 4096.0 * 128.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 4096.0 * 32.0;
+    const float c3 = 2392.0 / 4096.0 * 32.0;
+    float3 y = pow(max(nits / 10000.0, 0.0), m1);
+    return pow(max((c1 + c2 * y) / (1.0 + c3 * y), 0.0), m2);
+}
+
+static const float3x3 Rec709to2020 = float3x3(
+    0.6274040, 0.3292820, 0.0433136,
+    0.0690970, 0.9195400, 0.0113612,
+    0.0163916, 0.0880132, 0.8955950);
+
+// Inverse tone map the highlights only: below the knee the SDR colour is unchanged, above it
+// the luminance expands towards P while the hue is preserved.
+// l2 = l + t*t*(P - 1), so l2(knee) = knee with slope 1, l2(1) = P, and P = 1 is identity.
+float3 HdrHighlights(float3 lin, float paper_white, float peak, float strength) {
+    const float knee = 0.75;
+    const float3 luma = float3(0.2126, 0.7152, 0.0722);
+    const float l = dot(lin, luma);
+    const float P = lerp(1.0, max(peak, paper_white) / max(paper_white, 1.0), saturate(strength));
+    float l2 = l;
+    if (l > knee) {
+        const float t = (l - knee) / (1.0 - knee);
+        l2 = l + t * t * (P - 1.0);
+    }
+    return lin * (l2 / max(l, 1e-4));
 }
 
 // A single-pass approximation of the PC release's bright-pass bloom. Each tap first averages a
@@ -250,6 +289,22 @@ float4 psmain(O i) : SV_Target {
     c.rgb *= opts.w;
     if (post.z > 0) c.rgb = DistanceBlur(i.uv, c.rgb);
     c.rgb = ToGamma(c.rgb);
+    if (hdr.x > 0.5) {
+        // Match the SDR order through PC contrast: gamma, then bloom, then contrast. The part of
+        // the bloom that lands above white is carried separately and added in linear light, so it
+        // can exceed white instead of being clipped. No dither: the HDR target has more precision.
+        float3 g = c.rgb;
+        float3 b = post.y > 0 ? Bloom(i.uv) * 1.2 : 0;
+        g += b;
+        if (post.x > 0) g = lerp(g, PcContrast(g), post.x);
+        float3 over = max(c.rgb + b - 1.0, 0.0);
+        float3 lin = SrgbToLinear(saturate(g));
+        lin = HdrHighlights(lin, hdr.y, hdr.z, hdr.w) + over * (2.4 * hdr.w);
+        if (hdr.x < 1.5) return float4(lin * (hdr.y / 80.0), opts.y > 0 ? c.a : 1);
+        float3 rgb2020 = mul(Rec709to2020, lin);
+        float3 nits = clamp(rgb2020 * hdr.y, 0.0, 10000.0);
+        return float4(PqEncode(nits), opts.y > 0 ? c.a : 1);
+    }
     if (post.y > 0) c.rgb += Bloom(i.uv) * 1.2;
     if (post.x > 0) {
         c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
@@ -291,6 +346,48 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 float4 psmain() : SV_Target { return colour; }
+)";
+
+// The HDR overlay composite: ImGui renders sRGB values into a BGRA8 target; this pass puts
+// them over the HDR scene at paper white, encoded like the final present.
+const char* kHdrUiHlsl = R"(
+cbuffer B : register(b1) { float4 hdr; };
+Texture2D img : register(t0);
+SamplerState ps : register(s1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float3 SrgbToLinear(float3 c) {
+    float3 lo = c / 12.92;
+    float3 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);
+    return lerp(lo, hi, step(0.04045, c));
+}
+float3 PqEncode(float3 nits) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 4096.0 * 128.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 4096.0 * 32.0;
+    const float c3 = 2392.0 / 4096.0 * 32.0;
+    float3 y = pow(max(nits / 10000.0, 0.0), m1);
+    return pow(max((c1 + c2 * y) / (1.0 + c3 * y), 0.0), m2);
+}
+static const float3x3 Rec709to2020 = float3x3(
+    0.6274040, 0.3292820, 0.0433136,
+    0.0690970, 0.9195400, 0.0113612,
+    0.0163916, 0.0880132, 0.8955950);
+float4 psmain(O i) : SV_Target {
+    float4 c = img.Sample(ps, i.uv);
+    // ImGui's over-blend leaves premultiplied sRGB in the target.
+    float3 lin = SrgbToLinear(saturate(c.rgb)) * hdr.y;
+    if (hdr.x < 1.5) return float4(lin / 80.0, c.a);
+    float3 rgb2020 = mul(Rec709to2020, lin);
+    return float4(PqEncode(clamp(rgb2020, 0.0, 10000.0)), c.a);
+}
 )";
 
 float Bits(uint32_t v) {
@@ -520,6 +617,10 @@ struct BlitOptions {
     ID3D12Resource* depth = nullptr;  // scene depth for the distance blur
     float dof = 0;            // distance blur strength, 0 off
     float near_z = 0, far_z = 0;  // camera planes for the depth linearisation
+    float hdr_mode = 0;       // 0 SDR, 1 scRGB FP16, 2 HDR10 PQ
+    float paper_white = 200;  // SDR white in nits
+    float peak = 1000;        // highlight peak in nits
+    float highlights = 0.7f;  // inverse tone map strength, 0..1
 };
 
 // Shrink's settings past the source and the size
@@ -825,7 +926,9 @@ private:
     D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv) const;
     // Init, in order, each callee right after its caller
     bool CreateDevice();
+    bool RefreshFactory(bool force = false);
     bool CreateSwapChain(HWND hwnd);
+    DXGI_FORMAT SwapFormat() const;
     bool CreateHeaps();
     uint32_t CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool visible, ComPtr<ID3D12DescriptorHeap>& out);
     bool CreateBackBufferViews();
@@ -851,7 +954,9 @@ private:
     bool EnsureAoOcclusion(uint32_t w, uint32_t h);
     bool RenderAoOcclusion(Target& rt, float near_z, float far_z);
     void BindAoView(ID3D12Resource* occlusion);
-    void RenderUi();
+    void RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE target);
+    bool EnsureHdrUiTarget();
+    ID3D12PipelineState* EnsureHdrUiPipeline(DXGI_FORMAT rtv);
     void ReleaseOldTextures();
     void ResetFrame();
     void CountFps();
@@ -932,6 +1037,20 @@ private:
     ComPtr<ID3D12CommandQueue> queue_;
     ComPtr<IDXGISwapChain3> swap_;
     ComPtr<ID3D12Resource> bb_[kFrames];
+    // HDR overlays render into this BGRA8 target, then composite into the HDR back buffer.
+    ComPtr<ID3D12Resource> ui_target_;
+    uint32_t ui_w_ = 0, ui_h_ = 0;
+    D3D12_RESOURCE_STATES ui_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    bool hdr_ui_failed_logged_ = false;  // one error line if the overlay cannot be composited
+    // HDR output chosen at swapchain creation: the setting it was built for, the display
+    // capability that was found, and the output's peak luminance in nits.
+    HdrOutput hdr_output_ = HdrOutput::Off;
+    bool hdr_setting_ = false;
+    uint32_t display_peak_nits_ = 1000;
+    HMONITOR hdr_monitor_ = nullptr;
+    HdrOutput detected_hdr_ = HdrOutput::Off;  // the display's last reported capability
+    uint64_t hdr_check_ms_ = 0;                 // periodic re-check for WM_DISPLAYCHANGE
+    bool factory_refresh_logged_ = false;
     ComPtr<ID3D12Fence> fence_;
     uint64_t fence_value_ = 0;
     Frame frames_[kFrames];
@@ -991,6 +1110,7 @@ private:
     std::unordered_map<uint64_t, Tex> textures_;  // by data address, a P8 texture's with its palette's above
     std::unordered_map<uint64_t, Tex> pack_textures_;  // texture pack images by key, kept for the run
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
+    std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> hdr_ui_psos_;
     Extension* ext_ = nullptr;
     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
     FILE* cap_ = nullptr;
@@ -1165,28 +1285,155 @@ bool D3D12Backend::CreateDevice() {
     return true;
 }
 
+DXGI_FORMAT D3D12Backend::SwapFormat() const {
+    switch (hdr_output_) {
+        case HdrOutput::ScRgb: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case HdrOutput::Hdr10: return DXGI_FORMAT_R10G10B10A2_UNORM;
+        default: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
+}
+
+// The monitor the window is on reports HDR when DXGI says its colour space is PQ/Rec.2020.
+// Returns the display's peak luminance through peak and the preferred HDR mode.
+HdrOutput DetectHdrOutput(HWND hwnd, IDXGIFactory4* factory, uint32_t& peak) {
+    peak = 0;
+    const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+    for (UINT a = 0;; a++) {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(a, &adapter) == DXGI_ERROR_NOT_FOUND || !adapter) break;
+        for (UINT o = 0;; o++) {
+            ComPtr<IDXGIOutput> output;
+            if (adapter->EnumOutputs(o, &output) == DXGI_ERROR_NOT_FOUND || !output) break;
+            DXGI_OUTPUT_DESC desc{};
+            if (FAILED(output->GetDesc(&desc)) || desc.Monitor != monitor) continue;
+            ComPtr<IDXGIOutput6> output6;
+            if (FAILED(output.As(&output6))) return HdrOutput::Off;
+            DXGI_OUTPUT_DESC1 desc1{};
+            if (FAILED(output6->GetDesc1(&desc1))) return HdrOutput::Off;
+            peak = uint32_t(std::max(0.0f, desc1.MaxLuminance));
+            return desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ? HdrOutput::Hdr10
+                                                                                  : HdrOutput::Off;
+        }
+    }
+    return HdrOutput::Off;
+}
+
+// The factory caches the outputs and colour spaces it saw at creation. Recreate it after a
+// display change (Windows HDR toggle, monitor move) before reading the output capability.
+// IsCurrent is not trustworthy after a swap chain exists on every driver, so the periodic poll
+// forces a fresh factory.
+bool D3D12Backend::RefreshFactory(bool force) {
+    // IsCurrent returns BOOL: TRUE while the factory's adapter/output view is still valid
+    if (!force && factory_ && factory_->IsCurrent()) return true;
+    ComPtr<IDXGIFactory4> factory;
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
+        if (!factory_refresh_logged_) {
+            LOGE("d3d12: could not recreate the DXGI factory after a display change");
+            factory_refresh_logged_ = true;
+        }
+        return false;
+    }
+    factory_ = factory;
+    if (!factory_refresh_logged_) {
+        LOGR("d3d12: DXGI factory refreshed for the HDR capability check");
+        factory_refresh_logged_ = true;
+    }
+    return true;
+}
+
 bool D3D12Backend::CreateSwapChain(HWND hwnd) {
+    RefreshFactory();
     RECT rc;
     GetClientRect(hwnd, &rc);
     bb_w_ = std::max<LONG>(rc.right - rc.left, 1);
     bb_h_ = std::max<LONG>(rc.bottom - rc.top, 1);
-    DXGI_SWAP_CHAIN_DESC1 sd{};
-    sd.Width = bb_w_;
-    sd.Height = bb_h_;
-    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    sd.SampleDesc.Count = 1;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = kFrames;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
-    ComPtr<IDXGISwapChain1> sc1;
-    if (FAILED(factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1))) {
-        LOGE("d3d12: no swap chain");
-        return false;
+    for (auto& buffer : bb_) buffer.Reset();
+    swap_.Reset();
+    hdr_output_ = HdrOutput::Off;
+    const app::Settings settings = app::Snapshot();
+    hdr_setting_ = settings.hdr;
+    hdr_monitor_ = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+    uint32_t display_peak = 0;
+    const HdrOutput display_hdr = DetectHdrOutput(hwnd, factory_.Get(), display_peak);
+    detected_hdr_ = display_hdr;
+    hdr_check_ms_ = GetTickCount64();
+    display_peak_nits_ = display_peak ? display_peak : 1000;
+    g_hdr_available.store(display_hdr != HdrOutput::Off, std::memory_order_relaxed);
+    g_hdr_display_peak_nits.store(display_peak, std::memory_order_relaxed);
+
+    // scRGB is preferred; HDR10 is the fallback for displays or drivers that do not present FP16.
+    HdrOutput candidates[3];
+    int candidate_count = 0;
+    if (settings.hdr && display_hdr != HdrOutput::Off) {
+        candidates[candidate_count++] = HdrOutput::ScRgb;
+        candidates[candidate_count++] = HdrOutput::Hdr10;
+    } else if (settings.hdr) {
+        LOGR("d3d12: HDR requested but the display does not report HDR; using SDR output");
     }
-    factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-    sc1.As(&swap_);
-    return true;
+    candidates[candidate_count++] = HdrOutput::Off;
+
+    for (int i = 0; i < candidate_count; i++) {
+        const HdrOutput mode = candidates[i];
+        const DXGI_FORMAT format = mode == HdrOutput::ScRgb ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                   : mode == HdrOutput::Hdr10 ? DXGI_FORMAT_R10G10B10A2_UNORM
+                                                              : DXGI_FORMAT_B8G8R8A8_UNORM;
+        DXGI_SWAP_CHAIN_DESC1 sd{};
+        sd.Width = bb_w_;
+        sd.Height = bb_h_;
+        sd.Format = format;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = kFrames;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+        ComPtr<IDXGISwapChain1> sc1;
+        HRESULT hr = factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1);
+        if (FAILED(hr)) {
+            if (mode != HdrOutput::Off)
+                LOGR("d3d12: %s swap chain rejected (0x%08lX), trying the next format",
+                     mode == HdrOutput::ScRgb ? "scRGB FP16" : "HDR10", hr);
+            continue;
+        }
+        ComPtr<IDXGISwapChain3> sc3;
+        if (FAILED(sc1.As(&sc3))) {
+            LOGE("d3d12: swap chain has no IDXGISwapChain3");
+            continue;
+        }
+        if (mode != HdrOutput::Off) {
+            const DXGI_COLOR_SPACE_TYPE space = mode == HdrOutput::ScRgb
+                                                    ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                                                    : DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            UINT support = 0;
+            if (FAILED(sc3->CheckColorSpaceSupport(space, &support)) ||
+                !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
+                LOGR("d3d12: %s colour space not presentable, trying the next format",
+                     mode == HdrOutput::ScRgb ? "scRGB" : "HDR10");
+                continue;
+            }
+            if (FAILED(sc3->SetColorSpace1(space))) {
+                LOGR("d3d12: could not set the %s colour space, trying the next format",
+                     mode == HdrOutput::ScRgb ? "scRGB" : "HDR10");
+                continue;
+            }
+        }
+        swap_ = sc3;
+        hdr_output_ = mode;
+        factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+        if (mode == HdrOutput::ScRgb)
+            LOGR("d3d12: HDR scRGB output, %ux%u FP16, peak %u nits", bb_w_, bb_h_, display_peak_nits_);
+        else if (mode == HdrOutput::Hdr10)
+            LOGR("d3d12: HDR10 output, %ux%u, peak %u nits", bb_w_, bb_h_, display_peak_nits_);
+        else
+            LOGR("d3d12: SDR output, %ux%u BGRA8", bb_w_, bb_h_);
+        if (mode == HdrOutput::Off && ui_target_) {
+            // HDR was turned off: the overlay composite no longer needs its full-size target.
+            CurrentFrame().garbage.push_back(std::move(ui_target_));
+            ui_w_ = ui_h_ = 0;
+        }
+        return true;
+    }
+    LOGE("d3d12: no swap chain");
+    return false;
 }
 
 uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool visible,
@@ -1952,10 +2199,11 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
     if (!cb.res) return;
-    float c[16] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
+    float c[20] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                    o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
                    o.post, o.bloom, depth ? o.dof : 0.0f, 0.0f,
-                   o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z};
+                   o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z,
+                   o.hdr_mode, o.paper_white, o.peak, o.highlights};
     std::memcpy(cb.cpu, c, sizeof(c));
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples), cb.gpu, slot, si);
 }
@@ -2135,6 +2383,26 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
         blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     }
     CreatePipeline(d, pso);
+    return pso.Get();
+}
+
+ID3D12PipelineState* D3D12Backend::EnsureHdrUiPipeline(DXGI_FORMAT rtv) {
+    auto& pso = hdr_ui_psos_[uint64_t(rtv)];
+    if (pso) return pso.Get();
+    uint64_t h;
+    ID3DBlob* vs = Compile(kHdrUiHlsl, "vs", "vs_5_0", h);
+    ID3DBlob* ps = Compile(kHdrUiHlsl, "psmain", "ps_5_0", h);
+    if (!vs || !ps) return nullptr;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
+    auto& blend = d.BlendState.RenderTarget[0];
+    // premultiplied colour, the target keeps its alpha
+    blend.BlendEnable = TRUE;
+    blend.SrcBlend = D3D12_BLEND_ONE;
+    blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    blend.SrcBlendAlpha = D3D12_BLEND_ZERO;
+    blend.DestBlendAlpha = D3D12_BLEND_ONE;
+    blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    if (FAILED(CreatePipeline(d, pso))) return nullptr;
     return pso.Get();
 }
 
@@ -4674,7 +4942,27 @@ bool D3D12Backend::ResizeSwap() {
     GetClientRect(hwnd, &rc);
     uint32_t w = std::max<LONG>(rc.right - rc.left, 1);
     uint32_t h = std::max<LONG>(rc.bottom - rc.top, 1);
-    if (w == bb_w_ && h == bb_h_) return std::all_of(std::begin(bb_), std::end(bb_), [](const auto& buffer) { return bool(buffer); });
+    const app::Settings settings = app::Snapshot();
+    const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+    bool chain_change = settings.hdr != hdr_setting_ || monitor != hdr_monitor_;
+    // WM_DISPLAYCHANGE does not reach the renderer directly. Re-read the output's colour
+    // space once a second so toggling HDR in Windows takes effect without a restart.
+    const uint64_t now_ms = GetTickCount64();
+    if (now_ms - hdr_check_ms_ >= 1000) {
+        hdr_check_ms_ = now_ms;
+        RefreshFactory();
+        uint32_t peak = 0;
+        const HdrOutput detected = DetectHdrOutput(hwnd, factory_.Get(), peak);
+        g_hdr_available.store(detected != HdrOutput::Off, std::memory_order_relaxed);
+        g_hdr_display_peak_nits.store(peak, std::memory_order_relaxed);
+        if (peak) display_peak_nits_ = peak;
+        if (detected != detected_hdr_) {
+            detected_hdr_ = detected;
+            if (settings.hdr) chain_change = true;
+        }
+    }
+    if (w == bb_w_ && h == bb_h_ && !chain_change)
+        return std::all_of(std::begin(bb_), std::end(bb_), [](const auto& buffer) { return bool(buffer); });
     Flush();
     for (auto& f : frames_) {
         if (f.fence && !WaitFence(f.fence)) {
@@ -4683,8 +4971,18 @@ bool D3D12Backend::ResizeSwap() {
         }
     }
     for (auto& b : bb_) b.Reset();
+    if (chain_change) {
+        // HDR was toggled or the window moved to another monitor: the swapchain format and
+        // colour space are fixed at creation, so build a new chain rather than resizing it.
+        if (!CreateSwapChain(hwnd)) return false;
+        if (!CreateBackBufferViews()) {
+            LOGE("d3d12: back buffer views failed after rebuilding the swap chain");
+            return false;
+        }
+        return true;
+    }
     const HRESULT hr =
-        swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+        swap_->ResizeBuffers(kFrames, w, h, SwapFormat(), tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     if (FAILED(hr)) {
         // ResizeBuffers leaves the swap chain as it was when it fails; rebuild the views so the
         // frame can continue at the previous size, and report device loss explicitly.
@@ -4696,6 +4994,14 @@ bool D3D12Backend::ResizeSwap() {
     if (!CreateBackBufferViews()) {
         LOGE("d3d12: back buffer views failed after resize to %ux%u; rendering cannot continue", w, h);
         return false;
+    }
+    // ResizeBuffers can reset the chain's colour space; restore it for HDR output.
+    if (hdr_output_ != HdrOutput::Off) {
+        const DXGI_COLOR_SPACE_TYPE space = hdr_output_ == HdrOutput::ScRgb
+                                                ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                                                : DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        const HRESULT space_hr = swap_->SetColorSpace1(space);
+        if (FAILED(space_hr)) LOGE("d3d12: could not restore the HDR colour space after resize (0x%08lX)", space_hr);
     }
     bb_w_ = w;
     bb_h_ = h;
@@ -4781,20 +5087,43 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     const float post = !t.picture && render_.pc_contrast ? 1.0f : 0.0f;
     const float bloom = scene && render_.bloom ? 1.0f : 0.0f;
     const float dof = scene && render_.dof && dof_depth_ ? 1.0f : 0.0f;
+    BlitOptions o{.gamma = gamma_, .rtv = SwapFormat(), .post = post, .bloom = bloom, .src_w = float(t.w),
+                  .src_h = float(t.h), .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_};
+    if (hdr_output_ != HdrOutput::Off) {
+        const uint32_t reported = display_peak_nits_ ? display_peak_nits_ : 1000;
+        o.hdr_mode = hdr_output_ == HdrOutput::ScRgb ? 1.0f : 2.0f;
+        o.paper_white = float(render_.hdr_paper_white);
+        o.peak = float(render_.hdr_peak ? render_.hdr_peak : reported);
+        o.highlights = float(render_.hdr_highlights) / 100.0f;
+    }
     if (aa) {  // ApplySmaa left it readable
-        Blit(aa, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h),
-                             .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_});
+        Blit(aa, t.fmt, uv, o);
         return;
     }
     ID3D12Resource* color = ResolveColor(t);
     if (!color) return;
     auto& state = color == t.res.Get() ? t.state : t.resolved_state;
     Transition(color, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Blit(color, t.fmt, uv, {.gamma = gamma_, .post = post, .bloom = bloom, .src_w = float(t.w), .src_h = float(t.h),
-                            .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_});
+    Blit(color, t.fmt, uv, o);
 }
 
-void D3D12Backend::RenderUi() {
+bool D3D12Backend::EnsureHdrUiTarget() {
+    if (ui_target_ && ui_w_ == bb_w_ && ui_h_ == bb_h_) return true;
+    if (ui_target_) CurrentFrame().garbage.push_back(std::move(ui_target_));
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = Texture2DDesc(kBgra, bb_w_, bb_h_);
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ui_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, ui_state_, nullptr,
+                                             IID_PPV_ARGS(&ui_target_)))) {
+        return false;
+    }
+    ui_w_ = bb_w_;
+    ui_h_ = bb_h_;
+    return true;
+}
+
+void D3D12Backend::RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE target) {
     std::lock_guard lock(app::UiLock());
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -4802,8 +5131,77 @@ void D3D12Backend::RenderUi() {
     if (app::kGame.ui) app::kGame.ui(fps_);
     ImGui::Render();
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
+
+    // SDR: ImGui writes straight into the BGRA8 back buffer, exactly as before.
+    if (hdr_output_ == HdrOutput::Off) {
+        cl_->SetDescriptorHeaps(1, uh);
+        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_);
+        return;
+    }
+
+    // HDR: render the overlay into BGRA8 first, then composite it at paper white. This keeps
+    // ImGui initialised for BGRA8 and out of the HDR swap-chain format entirely.
+    if (!EnsureHdrUiTarget()) {
+        if (!hdr_ui_failed_logged_) {
+            LOGE("d3d12: HDR overlay target could not be created; the overlay is hidden");
+            hdr_ui_failed_logged_ = true;
+        }
+        return;
+    }
+    const uint32_t scratch = ScratchRtv();
+    if (scratch == UINT32_MAX) {
+        if (!hdr_ui_failed_logged_) {
+            LOGE("d3d12: HDR overlay has no scratch RTV; the overlay is hidden");
+            hdr_ui_failed_logged_ = true;
+        }
+        return;
+    }
+    Transition(ui_target_.Get(), ui_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_CPU_DESCRIPTOR_HANDLE ui_rtv = Cpu(rtv_heap_.Get(), scratch, rtv_inc_);
+    dev_->CreateRenderTargetView(ui_target_.Get(), nullptr, ui_rtv);
+    cl_->OMSetRenderTargets(1, &ui_rtv, FALSE, nullptr);
+    SetFullViewport(ui_w_, ui_h_);
+    float clear[4] = {0, 0, 0, 0};
+    cl_->ClearRenderTargetView(ui_rtv, clear, 0, nullptr);
+    binds_ = {};
     cl_->SetDescriptorHeaps(1, uh);
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_);
+    Transition(ui_target_.Get(), ui_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    cl_->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    SetFullViewport(bb_w_, bb_h_);
+    binds_ = {};
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
+    cl_->SetDescriptorHeaps(2, heaps);
+    cl_->SetGraphicsRootSignature(root_.Get());
+    const uint32_t slot = AllocSrvSlots(4);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = kBgra;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    dev_->CreateShaderResourceView(ui_target_.Get(), &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+    dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
+    dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot + 2, srv_inc_));
+    dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot + 3, srv_inc_));
+    const uint32_t si = EnsureBlitSamplers();
+    Alloc cb = Upload(256, 256);
+    if (!cb.res) return;
+    const uint32_t reported = display_peak_nits_ ? display_peak_nits_ : 1000;
+    const float params[4] = {hdr_output_ == HdrOutput::ScRgb ? 1.0f : 2.0f, float(render_.hdr_paper_white),
+                             float(render_.hdr_peak ? render_.hdr_peak : reported),
+                             float(render_.hdr_highlights) / 100.0f};
+    std::memcpy(cb.cpu, params, sizeof(params));
+    ID3D12PipelineState* const pso = EnsureHdrUiPipeline(SwapFormat());
+    if (!pso) {
+        if (!hdr_ui_failed_logged_) {
+            LOGE("d3d12: HDR overlay pipeline could not be created; the overlay is hidden");
+            hdr_ui_failed_logged_ = true;
+        }
+        return;
+    }
+    DrawFullScreen(pso, cb.gpu, slot, si);
+    bound_rt_ = bound_ds_ = nullptr;
 }
 
 // SMAA 1x (third_party/smaa, high preset) on the finished frame before it is shown: luma edges, blending weights
@@ -5087,7 +5485,7 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi, ID3D12Resource* aa) {
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
     if (t) BlitFrame(*t, aa);
-    RenderUi();
+    RenderUi(rh);
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
 }
 

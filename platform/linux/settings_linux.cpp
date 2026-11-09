@@ -93,6 +93,11 @@ void Load() {
     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
+    s.hdr = t["hdr"].value_or(s.hdr);
+    s.hdr_paper_white = std::clamp<uint32_t>(t["hdr_paper_white"].value_or(s.hdr_paper_white), 80u, 400u);
+    s.hdr_peak = std::clamp<uint32_t>(t["hdr_peak"].value_or(s.hdr_peak), 0u, 2000u);
+    if (s.hdr_peak && s.hdr_peak < 400) s.hdr_peak = 400;
+    s.hdr_highlights = std::min(t["hdr_highlights"].value_or(s.hdr_highlights), 100u);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     for (const Option& o : kGame.options) {
         if (o.flag) {
@@ -128,6 +133,10 @@ toml::table Table() {
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},
                   {"texture_dump_format", int64_t(s.texture_dump_format)},
+                  {"hdr", s.hdr},
+                  {"hdr_paper_white", int64_t(s.hdr_paper_white)},
+                  {"hdr_peak", int64_t(s.hdr_peak)},
+                  {"hdr_highlights", int64_t(s.hdr_highlights)},
                   {"join_ip", s.join_ip}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, std::atomic_ref(*o.flag).load(std::memory_order_relaxed));
