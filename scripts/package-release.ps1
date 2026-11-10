@@ -157,7 +157,13 @@ try {
         }
         # xbe_recomp has no --version: started with a missing input it reports that and exits. Only
         # a loader failure (0xC0000135, a DLL not found) means it cannot run from the package.
-        $out = & (Join-Path $isolated 'xbe_recomp.exe') (Join-Path $isolated 'missing.xbe') 2>&1 | Out-String
+        # its error text on stderr is expected here; under 'Stop' PowerShell 5.1 would throw on it
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = & (Join-Path $isolated 'xbe_recomp.exe') (Join-Path $isolated 'missing.xbe') 2>&1 | Out-String
+        } finally {
+            $ErrorActionPreference = 'Stop'
+        }
         if ($LASTEXITCODE -eq -1073741515 -or !$out.Trim()) {
             throw "The bundled compiler/xbe_recomp.exe does not start on its own (exit $LASTEXITCODE). Rebuild it with the MSVC-target clang."
         }
