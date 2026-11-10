@@ -5224,12 +5224,8 @@ void D3D12Backend::RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE target) {
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_);
     Transition(ui_target_.Get(), ui_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    cl_->OMSetRenderTargets(1, &target, FALSE, nullptr);
-    SetFullViewport(bb_w_, bb_h_);
-    binds_ = {};
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
-    cl_->SetDescriptorHeaps(2, heaps);
-    cl_->SetGraphicsRootSignature(root_.Get());
+    // descriptors, samplers and constants first: a full ring submits and starts a new command
+    // list, which would lose a render target and viewport bound before them
     const uint32_t slot = AllocSrvSlots(4);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = kBgra;
@@ -5256,6 +5252,12 @@ void D3D12Backend::RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE target) {
         }
         return;
     }
+    cl_->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    SetFullViewport(bb_w_, bb_h_);
+    binds_ = {};
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
+    cl_->SetDescriptorHeaps(2, heaps);
+    cl_->SetGraphicsRootSignature(root_.Get());
     DrawFullScreen(pso, cb.gpu, slot, si);
     bound_rt_ = bound_ds_ = nullptr;
 }
