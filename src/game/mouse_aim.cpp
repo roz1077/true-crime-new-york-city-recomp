@@ -158,9 +158,12 @@ thread_local CameraAim g_camera_aim;
 // The controller's target pass writes its rest angle over 0x348A80 before the
 // orientation builder runs, so reading that global back each frame would only
 // ever apply one frame of mouse movement. Keep our own angle instead, seeded
-// from the game's pitch once, and use it for the view and the update.
+// from the game's pitch once, and use it for the view and the update. It is
+// seeded again whenever the camera, its controller or the mode changes (a level
+// load builds new ones), or when a pad takes over. A pause or cutscene keeps it,
+// so the view comes back where the player left it.
 struct AimHold {
-    uint32_t controller = 0;
+    uint32_t camera = 0, controller = 0;
     uint8_t mode = 0;
     float pitch = 0;
     bool held = false;
@@ -171,7 +174,8 @@ thread_local AimHold g_aim_hold;
 // before the controller runs and widens that controller's own pitch clamp, so
 // the controller does not clamp the result back to its stock -40..+60 range.
 // Returns the pitch the view should use and whether the mouse owns the aim.
-float ApplyAim(uint8_t *base, uint32_t controller, uint8_t mode, float pitch_min, float pitch_max, bool &mouse_aim) {
+float ApplyAim(uint8_t *base, uint32_t camera, uint32_t controller, uint8_t mode, float pitch_min, float pitch_max,
+               bool &mouse_aim) {
     // tells input this camera is still the one updating; when it stops, input
     // falls back to the right stick for the new camera mode
     input::UseDirectMouseAim();
@@ -182,10 +186,11 @@ float ApplyAim(uint8_t *base, uint32_t controller, uint8_t mode, float pitch_min
         g_aim_hold.held = false;
         return RdF(base, kPitch);
     }
-    if (!g_aim_hold.held || g_aim_hold.controller != controller || g_aim_hold.mode != mode) {
+    if (!g_aim_hold.held || g_aim_hold.camera != camera || g_aim_hold.controller != controller ||
+        g_aim_hold.mode != mode) {
         // Start from the game's current angle, then keep the mouse's own so the
         // controller's per-frame rest-pitch reset cannot undo the accumulation.
-        g_aim_hold = {controller, mode, RdF(base, kPitch), true};
+        g_aim_hold = {camera, controller, mode, RdF(base, kPitch), true};
     }
 
     const float percent = float(std::clamp(input::g_mouse_sensitivity_percent, 10u, 400u)) * 0.01f;
@@ -244,7 +249,7 @@ X86_FUNC(sub_0002E200) {
     if (input::g_direct_mouse_aim && owned && mode != kModeVehicle && IsGameplayCamera(base, camera)) {
         uint32_t old_min = 0, old_max = 0;
         bool mouse_aim = false;
-        const float pitch = ApplyAim(base, controller, mode, kOnFootPitchMin, kOnFootPitchMax, mouse_aim);
+        const float pitch = ApplyAim(base, camera, controller, mode, kOnFootPitchMin, kOnFootPitchMax, mouse_aim);
         const bool recent = input::DirectAimRecent();
         const bool widen = mouse_aim &&
                            WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
