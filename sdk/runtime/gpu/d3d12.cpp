@@ -67,6 +67,7 @@ constexpr uint64_t kStaleFrames = 8;  // frames a target may go unused and still
 // large scene targets still use the short window.
 constexpr uint64_t kSmallTargetFrames = 3600;
 constexpr uint64_t kSmallTargetPixels = 128 * 128;
+constexpr size_t kMaxIdleSmallTargets = 64;  // small targets kept while unused, oldest released first
 constexpr uint64_t kUploadSize = 64ull << 20;
 // a draw starting with less than this left in the frame's ring waits for the GPU and starts the ring over
 constexpr uint64_t kUploadReserve = 8ull << 20;
@@ -1935,6 +1936,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     // an empty pool drops the new resource with t
     if (!CreateTargetView(t)) return nullptr;
     t.data = slot.data;
+    t.guest_bits = Format(s.format).bits;
     t.bytes = GuestPitch(slot.gw) * slot.gh;
     if (depth) {
         // D16/D24 depth surfaces are not four bytes per texel; the signature must not run past them
@@ -3003,7 +3005,11 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     bool box = true;
     if (ext_) ext_->Sample(d.data, fi.depth, stage, alt, stages.k[stage], box);
     auto tit = targets_.find(SizedTargetKey(d.data, fi.depth, d.width, d.height) | alt);
-    if (tit != targets_.end() && !d.cube && d.depth == 1 && !fi.compressed) {
+    // A small target kept while unused may have had its memory reused for an ordinary texture of
+    // the same size: one of another texel size is not the target any more.
+    const bool reused = tit != targets_.end() && tit->second.guest_bits && fi.bits != tit->second.guest_bits &&
+                        TargetStale(d.data);
+    if (tit != targets_.end() && !reused && !d.cube && d.depth == 1 && !fi.compressed) {
         // A target sampled here but not drawn into this frame must stay live: the sweep only
         // retires targets unused for kStaleFrames, and the submitted frame may still read it.
         UpdateTargetUsed(d.data);
@@ -5852,6 +5858,19 @@ void D3D12Backend::SweepTargets() {
         } else {
             ++it;
         }
+    }
+    // the small ones kept while unused are capped: the oldest go first
+    std::vector<std::pair<uint64_t, uint64_t>> idle;  // last use, map key
+    for (const auto& [key, t] : targets_) {
+        if (uint64_t(t.gw) * t.gh > kSmallTargetPixels) continue;
+        auto used_it = target_used_.find(t.data);
+        const uint64_t used = used_it == target_used_.end() ? 0 : used_it->second;
+        if (frame_ - used > kStaleFrames) idle.emplace_back(used, key);
+    }
+    if (idle.size() > kMaxIdleSmallTargets) {
+        std::ranges::sort(idle);
+        for (size_t i = 0; i < idle.size() - kMaxIdleSmallTargets; i++)
+            if (auto it = targets_.find(idle[i].second); it != targets_.end()) ReleaseTarget(it);
     }
     // Late-lock readback buffers are keyed by guest address and never referenced
     // by the target map, so they need their own idle sweep.
