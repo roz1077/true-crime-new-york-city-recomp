@@ -1194,6 +1194,7 @@ private:
     float scale_ = 1.0f;
     float stretch_ = 1.0f;  // app::RenderStretch: targets are this much wider than scale_ makes them
     float aspect_ = 16.0f / 9.0f;  // latched once a frame: UiSqueeze reads it for every draw
+    Picture presented_ = Picture::Unknown;  // what the frame being presented holds, from the title
     // surfaces locked without a wait: copies in flight, the newest finished one goes to guest memory
     struct Late {
         ComPtr<ID3D12Resource> rb[kFrames];
@@ -5108,18 +5109,28 @@ void D3D12Backend::UploadGammaRamp() {
 
 void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     // at the aspect setting (by default the output's shape); 4:3 when the console reports a 4:3 TV. A picture the
-    // CPU wrote (movies, legal screens) was made for 16:9 and is shown that way in the middle of a wider frame.
+    // CPU wrote (movies, legal screens) is laid out by LayoutPicture: movies fill the frame up to 16:9, pages keep 4:3.
     float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
     const bool scene = t.scene_frame == frame_;
-    if (t.cpu || scene) t.picture = t.cpu && !scene;
+    if (t.cpu || scene) {
+        t.picture = t.cpu && !scene;
+        t.picture_kind = t.picture ? presented_ : Picture::Unknown;
+    }
     t.cpu = false;
     t.scene_frame = ~0ull;
-    if (t.picture && aspect > 16.0f / 9.0f) aspect = 16.0f / 9.0f;
+    float uv[4] = {0, 0, 1, 1};
+    if (t.picture) {
+        const PictureLayout l = LayoutPicture(t.picture_kind, aspect);
+        aspect = l.aspect;
+        std::copy(l.uv, l.uv + 4, uv);
+        // in widescreen the legal screen is written 0x54 bytes (21 pixels at 640 wide) left of centre: sample that
+        // much further left so it is shown centred, as at 4:3 (the Linux host moves the surface instead)
+        if (t.picture_kind == Picture::Still && app::Widescreen() && t.gw) uv[0] -= (0x54 / 4.0f) / float(t.gw);
+    }
     float w = float(bb_w_);
     float h = float(bb_h_);
     float vw = std::min(w, h * aspect);
     float vh = vw / aspect;
-    float uv[4] = {0, 0, 1, 1};
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
@@ -5651,6 +5662,7 @@ void D3D12Backend::Present(const Surface& front) {
         LOGE("d3d12: stopping because swap-chain back buffers are unavailable");
         kernel::Shutdown(1);
     }
+    presented_ = front.picture;
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (t) Resolve(*t);

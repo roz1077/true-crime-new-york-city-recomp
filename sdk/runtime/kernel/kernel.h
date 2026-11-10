@@ -263,6 +263,9 @@ const char* ExportName(uint32_t ordinal);
 bool HasExport(uint32_t ordinal);       // implemented as a function or data
 const char* OrdinalName(uint32_t ordinal);  // public name, "?" past the table
 
+// a Bink movie (.bik) is open: the title is playing a movie
+bool MovieOpen();
+
 // guest kernel variables updated by the host
 extern uint32_t g_tick_count_va;
 extern uint32_t g_launch_data_page_va;

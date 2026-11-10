@@ -37,6 +37,7 @@ struct Target {
     // as last presented with either: CPU pixels and no clear or 3D, a picture (a movie frame, a legal screen), shown
     // at 16:9 on a wider frame
     bool picture = false;
+    Picture picture_kind = Picture::Unknown;  // what the picture is, for its layout
     std::vector<uint8_t> read;    // what Sync left in guest memory
     Microsoft::WRL::ComPtr<ID3D12Resource> resolved;
     D3D12_RESOURCE_STATES resolved_state = D3D12_RESOURCE_STATE_RESOLVE_DEST;

@@ -433,6 +433,18 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
 
 fs::path ResolvePath(const std::string& xbox_path, uint32_t root_handle) { return Resolve(xbox_path, root_handle).host; }
 
+bool MovieOpen() {
+    std::lock_guard<std::mutex> lock(g_open_lock);
+    for (const auto& w : g_open_files) {
+        auto f = w.lock();
+        if (!f || f->xbox.size() < 4) continue;
+        std::string ext = f->xbox.substr(f->xbox.size() - 4);
+        for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+        if (ext == ".bik") return true;
+    }
+    return false;
+}
+
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
     constexpr uint64_t kMaxGameFileBytes = 64ull << 20;  // DSP images are small; keep a malformed image from OOMing
     Target t = Resolve(xbox_path, 0);

@@ -449,8 +449,8 @@ const char *Help(Row row) {
     case Row::ApplyDisplay:
         return "Applies the display mode and resolution above.";
     case Row::AspectRatio:
-        return "The picture's shape; Auto matches the display. The 3D view widens to it, while HUD, menus "
-               "and movies stay 16:9 in the middle. 4:3 and the wide shapes switch after a restart.";
+        return "The picture's shape; Auto matches the display. The 3D view widens to it, while HUD and menus "
+               "stay 16:9 in the middle and the intro movies stretch to fill it. 4:3 and the wide shapes switch after a restart.";
     case Row::RenderScale:
         return "Internal resolution relative to the output height. Above 100% renders more pixels for a "
                "sharper image; below 100% is faster.";

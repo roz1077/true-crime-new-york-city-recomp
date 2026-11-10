@@ -152,9 +152,32 @@ struct Viewport {
     float min_z = 0, max_z = 1;
 };
 
+// what a presented frame the CPU wrote holds, when the console reports a widescreen TV
+enum class Picture : uint8_t {
+    Unknown,  // drawn by the GPU, or not told
+    Movie,    // a Bink movie: a 4:3 picture squeezed into the middle 3/4 of the buffer's width
+    Still,    // a page the title wrote (the legal screen): a 4:3 picture across the buffer
+};
+
+// where a picture the CPU wrote is shown: the shape of the screen rectangle, and the part of the buffer drawn into
+// it ({u, v, width, height}). frame_aspect is the frame's shape as shown, 4:3 on a 4:3 TV. A movie's 4:3 picture
+// is stretched across the whole frame; a still page keeps its 4:3 shape, on its own black.
+struct PictureLayout {
+    float aspect;
+    float uv[4];
+};
+inline PictureLayout LayoutPicture(Picture p, float frame_aspect) {
+    constexpr float k4x3 = 4.0f / 3.0f, k16x9 = 16.0f / 9.0f;
+    const float wide = frame_aspect < k16x9 ? frame_aspect : k16x9;
+    if (frame_aspect < 1.5f || p == Picture::Unknown) return {wide, {0, 0, 1, 1}};
+    if (p == Picture::Still) return {k4x3, {0, 0, 1, 1}};
+    return {frame_aspect, {0.125f, 0, 0.75f, 1}};  // the movie's 4:3 picture, stretched across the whole frame
+}
+
 struct Surface {
     uint32_t header = 0;  // guest D3DSurface
     uint32_t data = 0, format = 0, size = 0;
+    Picture picture = Picture::Unknown;  // set on presents only
 };
 
 struct State {

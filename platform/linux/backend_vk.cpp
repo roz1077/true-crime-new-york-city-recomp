@@ -2386,7 +2386,7 @@ bool VulkanBackend::CreatePresent() {
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &present_set_layout_;
-    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 12};  // contrast, bloom, dof, source size, near/far, HDR
+    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 16};  // contrast, bloom, dof, source size, near/far, HDR, source rect
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &push;
     if (vkCreatePipelineLayout(device_, &pl, nullptr, &present_pipeline_layout_) != VK_SUCCESS) return false;
@@ -2397,7 +2397,7 @@ bool VulkanBackend::CreatePresent() {
 [[vk::binding(2, 0)]] Texture2D<float4> depthTex;
 [[vk::binding(3, 0)]] SamplerState frameSampler;
 [[vk::binding(4, 0)]] SamplerState depthSampler;
-struct PC { float pc; float bloom; float dof; float pad; float2 src; float2 zrange; float4 hdr; };
+struct PC { float pc; float bloom; float dof; float pad; float2 src; float2 zrange; float4 hdr; float4 rect; };
 [[vk::push_constant]] ConstantBuffer<PC> pc;
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
@@ -2516,6 +2516,7 @@ float3 PcContrast(float3 c) {
     return saturate(c);
 }
 float4 psmain(O i) : SV_Target {
+    i.uv = pc.rect.xy + i.uv * pc.rect.zw;  // the part of the frame shown: all of it, or a movie's picture
     float4 c = frameTex.Sample(frameSampler, i.uv);
     if (pc.dof > 0.0) c.rgb = DistanceBlur(i.uv, c.rgb);
     c.rgb = ToGamma(c.rgb);
@@ -7446,12 +7447,26 @@ void VulkanBackend::Present(const Surface& front) {
     }
     const uint32_t bloom_w = ft ? ft->w : sw, bloom_h = ft ? ft->h : sh;
     const bool dof_on = dof != nullptr;
-    float present_pc[12] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? 1.0f : 0.0f,
+    // a picture the title wrote (gpu::LayoutPicture): a movie's 4:3 picture stretched across the window, a still
+    // page at 4:3 in the middle
+    float frame_aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
+    const gpu::PictureLayout layout = gpu::LayoutPicture(front.picture, frame_aspect);
+    VkViewport frame_viewport = viewport;
+    if (front.picture == gpu::Picture::Still && layout.aspect < frame_aspect - 1e-3f) {
+        const float w = std::min(float(extent_.width), float(extent_.height) * layout.aspect);
+        frame_viewport.x = (float(extent_.width) - w) / 2;
+        frame_viewport.width = w;
+    }
+    vkCmdSetViewport(cmd_, 0, 1, &frame_viewport);
+    const bool picture = front.picture != gpu::Picture::Unknown;
+    float present_pc[16] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? 1.0f : 0.0f,
                             dof_on ? 1.0f : 0.0f, 0.0f,
                             bloom_w ? 1.0f / float(bloom_w) : 0.0f,
                             bloom_h ? 1.0f / float(bloom_h) : 0.0f,
                             dof ? dof->near_w : 0.1f, dof ? dof->far_w : 1000.0f,
-                            hdr_mode, hdr_paper, hdr_peak, hdr_strength};
+                            hdr_mode, hdr_paper, hdr_peak, hdr_strength,
+                            picture ? layout.uv[0] : 0.0f, picture ? layout.uv[1] : 0.0f,
+                            picture ? layout.uv[2] : 1.0f, picture ? layout.uv[3] : 1.0f};
     vkCmdPushConstants(cmd_, present_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(present_pc),
                        present_pc);
     vkCmdDraw(cmd_, 3, 1, 0, 0);
