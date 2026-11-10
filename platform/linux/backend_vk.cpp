@@ -5166,14 +5166,19 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
             // sampling a target the pending draws render into needs their output first; one they
             // only read can be sampled now (it stays in a read layout)
             if (DeferredWrites(target)) FlushDeferredScene();
-            FlushPass();
-            BeginRecord();
             VkImage target_image = target->samples > 1 ? target->resolved_image : target->image;
             VkImageLayout& target_layout = target->samples > 1 ? target->resolved_layout : target->layout;
-            Transition(target_image, target_layout,
-                       depth_tex ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                       target->format);
+            const VkImageLayout read_layout =
+                depth_tex ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            // A barrier cannot run inside a render pass, so only a target that still has to change layout
+            // ends the open pass. One already readable is sampled in place: ending the scene pass for every
+            // draw that samples a small target (the garage light pools) restarted it ~140 times a frame,
+            // reloading and resolving the whole multisampled frame each time.
+            if (target_layout != read_layout) {
+                FlushPass();
+                BeginRecord();
+                Transition(target_image, target_layout, read_layout, target->format);
+            }
             it->second->layout = target_layout;  // the descriptor must name the image's real layout
             if (is_target) *is_target = true;
             sampled_target_ = target;
