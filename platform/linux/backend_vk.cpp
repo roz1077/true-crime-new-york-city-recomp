@@ -6462,7 +6462,9 @@ void VulkanBackend::RecordLate(uint32_t data) {
     Target* t = TargetAt(data, false, true);
     if (!t) return;
     if (!t || t->depth) return;
-    if (DeferredWrites(t)) FlushDeferredScene();  // the copy must see the pending scene draws
+    // The copy must see the pending draws that write t, and it leaves t in a transfer layout, which
+    // pending draws that sample t cannot replay against: replay first in both cases.
+    if (DeferredWrites(t) || (DeferredPending() && deferred_read_targets_.count(t))) FlushDeferredScene();
     if (DirtyEpoch(t->data) != t->epoch) return;  // guest memory is newer than the image
     VkImage image = t->samples > 1 ? t->resolved_image : t->image;
     if (!image || !t->w || !t->h) return;
