@@ -1719,19 +1719,6 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
     return {r.Get(), 0, p, r->GetGPUVirtualAddress()};
 }
 
-// Two guest formats store a texel the same way: equal, or differing only in tiling (LIN_) or in
-// an unused alpha (X8R8G8B8 against A8R8G8B8), as a target is often sampled through either.
-bool SameTexelLayout(uint32_t a, uint32_t b) {
-    if (a == b) return true;
-    auto layout = [](uint32_t f) {
-        std::string n = Format(f).name;
-        if (n.rfind("LIN_", 0) == 0) n.erase(0, 4);
-        if (!n.empty() && n[0] == 'X') n[0] = 'A';
-        return n;
-    };
-    return layout(a) == layout(b);
-}
-
 uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
     Frame& f = CurrentFrame();
     const uint32_t per = kSrvCount / kFrames;
@@ -3018,9 +3005,11 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     if (ext_) ext_->Sample(d.data, fi.depth, stage, alt, stages.k[stage], box);
     auto tit = targets_.find(SizedTargetKey(d.data, fi.depth, d.width, d.height) | alt);
     // A small target kept while unused may have had its memory reused for an ordinary texture of
-    // the same size: one of another texel layout is not the target any more.
+    // the same size: one of another texel size is not the target any more. Only the size is
+    // compared: the title samples its targets through other formats of the same size (a full
+    // format match made the intro cutscene flash white).
     const bool reused = tit != targets_.end() && tit->second.guest_format != ~0u &&
-                        !SameTexelLayout(d.format, tit->second.guest_format) && TargetStale(d.data);
+                        Format(d.format).bits != Format(tit->second.guest_format).bits && TargetStale(d.data);
     if (tit != targets_.end() && !reused && !d.cube && d.depth == 1 && !fi.compressed) {
         // A target sampled here but not drawn into this frame must stay live: the sweep only
         // retires targets unused for kStaleFrames, and the submitted frame may still read it.
