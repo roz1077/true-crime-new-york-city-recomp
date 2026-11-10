@@ -214,6 +214,7 @@ struct Target {
     float scale = 1.0f, stretch = 1.0f;
     uint32_t w = 0, h = 0, pitch = 0;
     uint32_t samples = 1;
+    uint32_t fallback_samples = 0;  // a sample count whose allocation failed; retried on a setting/size change
     VkImage resolved_image = VK_NULL_HANDLE;
     VkDeviceMemory resolved_memory = VK_NULL_HANDLE;
     VkImageView resolved_view = VK_NULL_HANDLE;
@@ -638,6 +639,7 @@ private:
     bool PickDevice();
     bool CreateDevice();
     bool CreateSwapchain();
+    bool SwapchainFailTest();
     bool CreateCommands();
     bool CreateUpload();
     bool CreateUploadBuffer(uint64_t size, VkBuffer& buffer, VkDeviceMemory& memory, uint8_t*& ptr);
@@ -725,6 +727,8 @@ private:
     void DumpTexture(const Tex* t);
     bool UploadTarget(Target* t);
     bool CreateTargetImages(Target& t);
+    void DestroyTargetImages(Target& t);
+    bool TargetAllocFailTest();
     bool RebuildTargetSingleSample(Target* t);
     bool CreateTargetImage(Target* t);
     void DestroyTargets();
@@ -1665,6 +1669,19 @@ bool VulkanBackend::CreateDevice() {
     return true;
 }
 
+// TCNYC_SWAPCHAIN_FAIL_TEST=N fails the first N swapchain rebuilds (not the first creation), to
+// exercise the retry in Present
+bool VulkanBackend::SwapchainFailTest() {
+    static uint32_t left = [] {
+        const char* v = std::getenv("TCNYC_SWAPCHAIN_FAIL_TEST");
+        return v ? uint32_t(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    if (!left || !extent_.width) return false;  // never the first creation
+    left--;
+    LOGR("vulkan: TCNYC_SWAPCHAIN_FAIL_TEST failing a swapchain rebuild");
+    return true;
+}
+
 bool VulkanBackend::CreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &caps) != VK_SUCCESS) {
@@ -1774,9 +1791,12 @@ bool VulkanBackend::CreateSwapchain() {
         if (present_pipeline_) vkDestroyPipeline(device_, present_pipeline_, nullptr);
         present_pipeline_ = VK_NULL_HANDLE;
         present_format_ = VK_FORMAT_UNDEFINED;
-        vkDestroySwapchainKHR(device_, swapchain_, nullptr);
-        swapchain_ = VK_NULL_HANDLE;
     }
+    // Handed to the driver as oldSwapchain, so it can move the surface over without a gap, and
+    // destroyed once the replacement exists (or failed). A failed rebuild leaves swapchain_ empty
+    // and Present tries again on the next frame.
+    const VkSwapchainKHR old_swapchain = swapchain_;
+    swapchain_ = VK_NULL_HANDLE;
     uint32_t images = caps.minImageCount + 1;
     if (caps.maxImageCount && images > caps.maxImageCount) images = caps.maxImageCount;
 
@@ -1809,7 +1829,9 @@ bool VulkanBackend::CreateSwapchain() {
         }
     info.presentMode = present_mode;
     info.clipped = VK_TRUE;
-    VkResult r = vkCreateSwapchainKHR(device_, &info, nullptr, &swapchain_);
+    info.oldSwapchain = old_swapchain;
+    VkResult r = SwapchainFailTest() ? VK_ERROR_INITIALIZATION_FAILED
+                                     : vkCreateSwapchainKHR(device_, &info, nullptr, &swapchain_);
     if (r != VK_SUCCESS && hdr_output_ != HdrOutput::Off) {
         LOGR("vulkan: %s swapchain rejected: %s; using SDR output",
              hdr_output_ == HdrOutput::Hdr10 ? "HDR10" : "extended sRGB linear", VkError(r));
@@ -1819,8 +1841,10 @@ bool VulkanBackend::CreateSwapchain() {
         info.imageColorSpace = sdr.colorSpace;
         r = vkCreateSwapchainKHR(device_, &info, nullptr, &swapchain_);
     }
+    if (old_swapchain) vkDestroySwapchainKHR(device_, old_swapchain, nullptr);
     if (r != VK_SUCCESS) {
-        LOGE("vulkan: vkCreateSwapchainKHR failed: %s", VkError(r));
+        swapchain_ = VK_NULL_HANDLE;
+        LOG_FIRST(8, "vulkan: vkCreateSwapchainKHR failed: %s; retrying next frame", VkError(r));
         return false;
     }
     uint32_t count = 0;
@@ -2936,8 +2960,8 @@ VkRenderPass VulkanBackend::RenderPassFor(VkFormat color, VkFormat depth) {
         att[n].samples = VK_SAMPLE_COUNT_1_BIT;
         att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[n].stencilLoadOp = depth_has_stencil_ ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att[n].stencilStoreOp = depth_has_stencil_ ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att[n].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         att[n].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth_ref = n;
@@ -3016,8 +3040,8 @@ VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint
         att[n].samples = VkSampleCountFlagBits(samples);
         att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         att[n].storeOp = msaa_store_ ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        att[n].stencilStoreOp = msaa_store_ ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[n].stencilLoadOp = depth_has_stencil_ ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att[n].stencilStoreOp = msaa_store_ && depth_has_stencil_ ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att[n].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         att[n].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth_ref = n++;
@@ -3027,7 +3051,7 @@ VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint
         att[n].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[n].stencilStoreOp = depth_has_stencil_ ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att[n].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         att[n].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
         depth_res = n++;
@@ -3051,7 +3075,7 @@ VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint
         VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE};
     dsr.pDepthStencilResolveAttachment = depth != VK_FORMAT_UNDEFINED ? &dres : nullptr;
     dsr.depthResolveMode = depth_resolve_mode_;
-    dsr.stencilResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+    dsr.stencilResolveMode = depth_has_stencil_ ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE;
 
     VkSubpassDescription2 sub{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
@@ -4573,9 +4597,20 @@ bool VulkanBackend::CreateTargetImages(Target& t) {
         info.usage = resolved ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | attachment)
                               : attachment;
-        if (vkCreateImage(device_, &info, nullptr, &image) != VK_SUCCESS) return false;
+        // build into locals and hand them over only when all three exist; nothing has used a
+        // partial set yet, so it can be destroyed at once
+        VkImage new_image = VK_NULL_HANDLE;
+        VkDeviceMemory new_memory = VK_NULL_HANDLE;
+        VkImageView new_view = VK_NULL_HANDLE;
+        auto fail = [&] {
+            if (new_view) vkDestroyImageView(device_, new_view, nullptr);
+            if (new_image) vkDestroyImage(device_, new_image, nullptr);
+            if (new_memory) vkFreeMemory(device_, new_memory, nullptr);
+            return false;
+        };
+        if (TargetAllocFailTest() || vkCreateImage(device_, &info, nullptr, &new_image) != VK_SUCCESS) return fail();
         VkMemoryRequirements req{};
-        vkGetImageMemoryRequirements(device_, image, &req);
+        vkGetImageMemoryRequirements(device_, new_image, &req);
         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         alloc.allocationSize = req.size;
         bool found = false;
@@ -4586,31 +4621,40 @@ bool VulkanBackend::CreateTargetImages(Target& t) {
                 found = true;
                 break;
             }
-        if (!found || vkAllocateMemory(device_, &alloc, nullptr, &memory) != VK_SUCCESS) return false;
-        vkBindImageMemory(device_, image, memory, 0);
+        if (!found || vkAllocateMemory(device_, &alloc, nullptr, &new_memory) != VK_SUCCESS) return fail();
+        if (vkBindImageMemory(device_, new_image, new_memory, 0) != VK_SUCCESS) return fail();
         VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        view.image = image;
+        view.image = new_image;
         view.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view.format = t.format;
         view.subresourceRange = {t.depth ? DepthAspect()
                                          : VK_IMAGE_ASPECT_COLOR_BIT,
                                  0, 1, 0, 1};
-        return vkCreateImageView(device_, &view, nullptr, &out_view) == VK_SUCCESS;
+        if (vkCreateImageView(device_, &view, nullptr, &new_view) != VK_SUCCESS) return fail();
+        image = new_image;
+        memory = new_memory;
+        out_view = new_view;
+        return true;
     };
-    if (!create_image(t.samples, t.samples == 1, t.image, t.memory, t.view)) {
-        if (t.samples == 1) return false;
-        LOG_FIRST(8, "vulkan: %s target %ux%u %ux allocation failed, using one sample",
-                  t.depth ? "depth" : "color", t.w, t.h, t.samples);
-        t.samples = 1;
-        t.image = VK_NULL_HANDLE;
-        t.memory = VK_NULL_HANDLE;
-        t.view = VK_NULL_HANDLE;
-        if (!create_image(1, true, t.image, t.memory, t.view)) return false;
-    }
+    t.fallback_samples = 0;
     if (t.samples > 1) {
-        if (!create_image(1, true, t.resolved_image, t.resolved_memory, t.resolved_view)) return false;
-        t.resolved_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // the multisampled image and its resolve image succeed or fail together
+        if (create_image(t.samples, false, t.image, t.memory, t.view)) {
+            if (create_image(1, true, t.resolved_image, t.resolved_memory, t.resolved_view)) {
+                t.resolved_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            } else {
+                DestroyTargetImages(t);
+            }
+        }
+        if (!t.image) {
+            LOG_FIRST(8, "vulkan: %s target %ux%u %ux allocation failed, using one sample",
+                      t.depth ? "depth" : "color", t.w, t.h, t.samples);
+            // remembered so an unchanged bind does not retry the failed count every time
+            t.fallback_samples = t.samples;
+            t.samples = 1;
+        }
     }
+    if (t.samples == 1 && !create_image(1, true, t.image, t.memory, t.view)) return false;
     if (t.depth) {
         // shaders read the depth aspect only; the resolved image's combined view stays for present
         VkImageViewCreateInfo sample{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -4618,8 +4662,35 @@ bool VulkanBackend::CreateTargetImages(Target& t) {
         sample.viewType = VK_IMAGE_VIEW_TYPE_2D;
         sample.format = t.format;
         sample.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-        if (vkCreateImageView(device_, &sample, nullptr, &t.sample_view) != VK_SUCCESS) return false;
+        if (vkCreateImageView(device_, &sample, nullptr, &t.sample_view) != VK_SUCCESS) {
+            DestroyTargetImages(t);
+            return false;
+        }
     }
+    return true;
+}
+
+// Frees a target's own images straight away. Only for images no command buffer has used yet
+// (a failed CreateTargetImages); anything recorded goes through RetireTargetResources.
+void VulkanBackend::DestroyTargetImages(Target& t) {
+    for (VkImageView* v : {&t.view, &t.resolved_view, &t.sample_view})
+        if (*v) vkDestroyImageView(device_, *v, nullptr), *v = VK_NULL_HANDLE;
+    for (VkImage* i : {&t.image, &t.resolved_image})
+        if (*i) vkDestroyImage(device_, *i, nullptr), *i = VK_NULL_HANDLE;
+    for (VkDeviceMemory* m : {&t.memory, &t.resolved_memory})
+        if (*m) vkFreeMemory(device_, *m, nullptr), *m = VK_NULL_HANDLE;
+}
+
+// TCNYC_TARGET_FAIL_TEST=N fails every Nth target image creation, to exercise the cleanup paths
+bool VulkanBackend::TargetAllocFailTest() {
+    static const uint32_t every = [] {
+        const char* v = std::getenv("TCNYC_TARGET_FAIL_TEST");
+        return v ? uint32_t(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    if (!every) return false;
+    static uint32_t n = 0;
+    if (++n % every) return false;
+    LOG_FIRST(8, "vulkan: TCNYC_TARGET_FAIL_TEST failing a target image");
     return true;
 }
 
@@ -4646,7 +4717,9 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
         // whose guest bytes are newer this frame skips that restore: UploadTarget needs the
         // single-sample image anyway, so rebuilding to MSAA first is a wasted allocate/free pair.
         const bool needs_upload = !depth && (DirtyEpoch(t->data) != t->epoch || t->upload_pending);
-        const bool restores_samples = t->samples != msaa_;
+        // a target that fell back to one sample after a failed allocation waits for an MSAA
+        // setting change (or a resize, below) instead of retrying on every bind
+        const bool restores_samples = t->samples != msaa_ && t->fallback_samples != msaa_;
         const bool resized = t->scale != scale_ || t->stretch != stretch_;
         if (resized || (restores_samples && !needs_upload)) {
             EndRecord(true);
@@ -7452,10 +7525,15 @@ void VulkanBackend::Present(const Surface& front) {
     float frame_aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
     const gpu::PictureLayout layout = gpu::LayoutPicture(front.picture, frame_aspect);
     VkViewport frame_viewport = viewport;
-    if (front.picture == gpu::Picture::Still && layout.aspect < frame_aspect - 1e-3f) {
-        const float w = std::min(float(extent_.width), float(extent_.height) * layout.aspect);
-        frame_viewport.x = (float(extent_.width) - w) / 2;
+    if (front.picture != gpu::Picture::Unknown) {
+        // as D3D12's BlitFrame: the layout's shape, centred and fitted in both dimensions
+        const float ow = float(extent_.width), oh = float(extent_.height);
+        const float w = std::min(ow, oh * layout.aspect);
+        const float h = w / layout.aspect;
+        frame_viewport.x = (ow - w) / 2;
+        frame_viewport.y = (oh - h) / 2;
         frame_viewport.width = w;
+        frame_viewport.height = h;
     }
     vkCmdSetViewport(cmd_, 0, 1, &frame_viewport);
     const bool picture = front.picture != gpu::Picture::Unknown;
