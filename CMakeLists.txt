@@ -17,6 +17,18 @@ set(SDK ${CMAKE_CURRENT_SOURCE_DIR}/sdk)
 # libc++.dll and libunwind.dll and its bundled clang.exe is a launcher: release packages must be
 # built with the MSVC-target clang that build.bat selects. scripts/package-release.ps1 refuses them.
 if(MINGW)
+    # The presets name the compiler as plain clang/clang++, so a configure (or a regenerate after a
+    # CMakeLists.txt change) in a shell with llvm-mingw first on PATH picks it up. On a regenerate
+    # CMake then wipes the cache and the preset's CMAKE_BUILD_TYPE with it, leaving an unoptimised
+    # MinGW build in the release folder. Stop instead: a Release (or untyped) MinGW build is that.
+    if((CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE) AND NOT TCNYC_ALLOW_MINGW_RELEASE)
+        message(FATAL_ERROR
+            "A MinGW-target clang (${CMAKE_CXX_COMPILER}) was picked for build type "
+            "'${CMAKE_BUILD_TYPE}'. Release builds need the "
+            "MSVC-target clang: run build.bat, or put C:/Program Files/LLVM/bin first on PATH, delete "
+            "${CMAKE_BINARY_DIR}/CMakeCache.txt and configure again. To build with MinGW anyway, pass "
+            "-DTCNYC_ALLOW_MINGW_RELEASE=ON.")
+    endif()
     message(WARNING "Configured with a MinGW-target clang (${CMAKE_CXX_COMPILER}). Fine for local builds; "
                     "release packages need the MSVC-target clang from Visual Studio or C:/Program Files/LLVM.")
 endif()
