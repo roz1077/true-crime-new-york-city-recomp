@@ -249,6 +249,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOVE:
             if (g_captured) ConfinePointer(hwnd);
             break;
+        case WM_DISPLAYCHANGE:
+            gpu::g_display_changed.store(true, std::memory_order_relaxed);
+            break;
         case kCaptureMouse:
             g_capture_wanted = wp != 0;
             ApplyCapture(hwnd, GetForegroundWindow() == hwnd);

@@ -1049,7 +1049,7 @@ private:
     uint32_t display_peak_nits_ = 1000;
     HMONITOR hdr_monitor_ = nullptr;
     HdrOutput detected_hdr_ = HdrOutput::Off;  // the display's last reported capability
-    uint64_t hdr_check_ms_ = 0;                 // periodic re-check for WM_DISPLAYCHANGE
+    uint64_t hdr_check_ms_ = 0;                 // last cheap IsCurrent check (ResizeSwap)
     bool factory_refresh_logged_ = false;
     ComPtr<ID3D12Fence> fence_;
     uint64_t fence_value_ = 0;
@@ -1320,8 +1320,8 @@ HdrOutput DetectHdrOutput(HWND hwnd, IDXGIFactory4* factory, uint32_t& peak) {
 
 // The factory caches the outputs and colour spaces it saw at creation. Recreate it after a
 // display change (Windows HDR toggle, monitor move) before reading the output capability.
-// IsCurrent is not trustworthy after a swap chain exists on every driver, so the periodic poll
-// forces a fresh factory.
+// IsCurrent is not trustworthy after a swap chain exists on every driver, so a display change
+// (ResizeSwap) forces a fresh factory.
 bool D3D12Backend::RefreshFactory(bool force) {
     // IsCurrent returns BOOL: TRUE while the factory's adapter/output view is still valid
     if (!force && factory_ && factory_->IsCurrent()) return true;
@@ -2292,8 +2292,12 @@ const std::filesystem::path& ShaderCacheDirectory() {
 }
 
 ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
-    // one source can hold several entry points. The shared AO HLSL has a Vulkan-only branch.
-    const std::string source = "#define TCNYC_VULKAN 0\n" + src;
+    // one source can hold several entry points. The shared AO HLSL (and the AO prepass variant of
+    // the generated pixel shaders) has a Vulkan-only branch. Only those sources get the define:
+    // it is part of the cache key, and adding it to every shader would make each player's whole
+    // disk shader cache stale at once.
+    const bool vulkan_split = src.find("TCNYC_VULKAN") != std::string::npos;
+    const std::string source = vulkan_split ? "#define TCNYC_VULKAN 0\n" + src : src;
     uint64_t profile_seed = Hash(profile, std::strlen(profile));
     uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
     hash = Hash(source.data(), source.size(), entry_seed);
@@ -4944,18 +4948,29 @@ bool D3D12Backend::ResizeSwap() {
     uint32_t h = std::max<LONG>(rc.bottom - rc.top, 1);
     const app::Settings settings = app::Snapshot();
     const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
-    bool chain_change = settings.hdr != hdr_setting_ || monitor != hdr_monitor_;
-    // WM_DISPLAYCHANGE does not reach the renderer directly. Re-read the output's colour
-    // space once a second so toggling HDR in Windows takes effect without a restart.
+    bool chain_change = settings.hdr != hdr_setting_;
+    // Re-read the display's HDR capability only when something can have changed it: Windows sends
+    // WM_DISPLAYCHANGE when HDR is toggled or a display is added or removed (g_display_changed), the
+    // window moved to another monitor, or the factory reports that its view of the outputs is stale
+    // (IsCurrent, checked once a second; it does not enumerate anything). Listing every adapter and
+    // output costs milliseconds on this thread, so it must never run on a timer.
     const uint64_t now_ms = GetTickCount64();
-    if (now_ms - hdr_check_ms_ >= 1000) {
+    bool recheck = g_display_changed.exchange(false, std::memory_order_relaxed) || monitor != hdr_monitor_;
+    if (!recheck && now_ms - hdr_check_ms_ >= 1000) {
         hdr_check_ms_ = now_ms;
-        RefreshFactory();
+        recheck = factory_ && !factory_->IsCurrent();
+    }
+    if (recheck) {
+        hdr_check_ms_ = now_ms;
+        hdr_monitor_ = monitor;
+        RefreshFactory(true);
         uint32_t peak = 0;
         const HdrOutput detected = DetectHdrOutput(hwnd, factory_.Get(), peak);
         g_hdr_available.store(detected != HdrOutput::Off, std::memory_order_relaxed);
         g_hdr_display_peak_nits.store(peak, std::memory_order_relaxed);
-        if (peak) display_peak_nits_ = peak;
+        display_peak_nits_ = peak ? peak : 1000;
+        // the swap chain's format and colour space only depend on the capability, and only matter
+        // with HDR on: an SDR chain or a move between alike monitors keeps the chain as it is
         if (detected != detected_hdr_) {
             detected_hdr_ = detected;
             if (settings.hdr) chain_change = true;
@@ -5140,7 +5155,10 @@ void D3D12Backend::RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE target) {
     }
 
     // HDR: render the overlay into BGRA8 first, then composite it at paper white. This keeps
-    // ImGui initialised for BGRA8 and out of the HDR swap-chain format entirely.
+    // ImGui initialised for BGRA8 and out of the HDR swap-chain format entirely. With nothing on
+    // screen (no menu, no FPS counter) the clear and the full-screen composite are skipped.
+    const ImDrawData* draw_data = ImGui::GetDrawData();
+    if (!draw_data || !draw_data->CmdListsCount) return;
     if (!EnsureHdrUiTarget()) {
         if (!hdr_ui_failed_logged_) {
             LOGE("d3d12: HDR overlay target could not be created; the overlay is hidden");

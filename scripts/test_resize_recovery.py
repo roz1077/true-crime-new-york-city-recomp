@@ -18,7 +18,8 @@ struct RECT { LONG left,top,right,bottom; };
 RECT client{0,0,1280,720};
 void GetClientRect(HWND,RECT* r) { *r=client; }
 HMONITOR MonitorFromWindow(HWND,unsigned) { return nullptr; }
-uint64_t GetTickCount64() { return 0; }
+uint64_t now_ms=0;
+uint64_t GetTickCount64() { return now_ms; }
 #define MONITOR_DEFAULTTOPRIMARY 1
 #define FAILED(hr) ((hr)<0)
 #define LOGE(...) ((void)0)
@@ -34,8 +35,16 @@ namespace app {
 }
 inline std::atomic<bool> g_hdr_available{false};
 inline std::atomic<uint32_t> g_hdr_display_peak_nits{0};
-struct Factory { void* Get() { return nullptr; } };
-HdrOutput DetectHdrOutput(HWND, void*, uint32_t&) { return HdrOutput::Off; }
+inline std::atomic<bool> g_display_changed{false};
+struct Factory {
+ bool current=true;
+ void* Get() { return nullptr; }
+ Factory* operator->() { return this; }
+ explicit operator bool() const { return true; }
+ bool IsCurrent() const { return current; }
+};
+unsigned detects=0;  // full adapter/output enumerations: expensive, must not run on a timer
+HdrOutput DetectHdrOutput(HWND, void*, uint32_t&) { ++detects; return HdrOutput::Off; }
 struct Buffer { bool valid=true; explicit operator bool() const { return valid; } void Reset() { valid=false; } };
 struct Swap {
  HRESULT result=0; unsigned calls=0; bool valid=true;
@@ -88,9 +97,16 @@ extern "C" __declspec(dllexport) int run() {
  if(!b.ResizeSwap())return 7;
  b.bb_[2].valid=false;
  if(b.ResizeSwap())return 8;
+ // the HDR capability is re-read on a display change or a stale factory, never on a timer
+ b.bb_[2].valid=true; detects=0;
+ for(int i=0;i<10;i++){ now_ms+=1000; if(!b.ResizeSwap())return 9; }
+ if(detects)return 10;
+ g_display_changed=true; if(!b.ResizeSwap() || detects!=1 || g_display_changed)return 11;
+ if(!b.ResizeSwap() || detects!=1)return 12;
+ b.factory_.current=false; now_ms+=1000; if(!b.ResizeSwap() || detects!=2)return 13;
  return 0;
 }
 '''
 result = run_native(source, prefix='tcnyc-resize-', needs_crt=True)
 assert result == 0, f'back-buffer recovery regression {result}'
-print('PASS: resize recovery preserves dimensions, rejects missing buffers and stops on device loss')
+print('PASS: resize recovery preserves dimensions, rejects missing buffers, stops on device loss and re-reads HDR only on display changes')
