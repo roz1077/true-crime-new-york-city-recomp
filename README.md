@@ -54,7 +54,8 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 - **Copland traffic fix** — restores normal civilian traffic after scripted and random-crime vehicle passes, without reducing police or wanted-level spawns.
 - **Car-scrape damage cap** — a passing car can no longer deal thousands of impact damage per second (most noticeable while you enter or exit a vehicle); impact damage to the player is limited to 15% of max health per second.
 - **Voice-volume 0 phone-call fix** — phone calls still start (silently) when voice volume is 0, so informant missions and precinct-cleanup messages are not lost.
-- **Gameplay fixes** — the Human Cargo push-off on the cargo container is no longer frame-perfect, and keyboard driving keeps full steering while accelerating.
+- **Human Cargo fix** — the button prompt to push the boss off the cargo container no longer has game-breaking timing, so the mission can be finished reliably.
+- **Keyboard driving** — full steering stays available while accelerating.
 - **Visual fixes** — no ghost copy or dark band from the glow along the frame's edges, building windows show their lit interiors as on the Xbox, and no white flashes in the intro cutscene.
 - **Quality of life** — 30/60 FPS limiter, saves written safely at shutdown, Unicode and long-path support, and controllers that can be unplugged and plugged back in at any time.
 
