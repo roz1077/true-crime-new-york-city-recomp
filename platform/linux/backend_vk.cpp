@@ -1012,6 +1012,7 @@ private:
     VkDeviceMemory ui_memory_ = VK_NULL_HANDLE;
     VkImageView ui_view_ = VK_NULL_HANDLE;
     VkFramebuffer ui_fb_ = VK_NULL_HANDLE;
+    bool ui_direct_ = false;  // ImGui was set up for swap_pass_ (SDR) rather than ui_pass_ (HDR)
     VkImageLayout ui_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     uint32_t ui_w_ = 0, ui_h_ = 0;
     VkDescriptorSetLayout ui_set_layout_ = VK_NULL_HANDLE;
@@ -1909,13 +1910,21 @@ bool VulkanBackend::CreateSwapchain() {
         fb.layers = 1;
         if (vkCreateFramebuffer(device_, &fb, nullptr, &swap_framebuffers_[i]) != VK_SUCCESS) return false;
     }
-    CreateUiTarget();
+    // HDR composites the overlay from its own BGRA8 image; SDR draws it straight into the swapchain
+    // pass, so the full-size image exists only with HDR on
+    if (hdr_output_ != HdrOutput::Off)
+        CreateUiTarget();
+    else
+        DestroyUiTarget();
     CreateUi();  // the Graphics overlay is optional; rendering continues without it
     return true;
 }
 
 bool VulkanBackend::CreateUi() {
-    if (ui_initialized_ || !ui_pass_ || !ImGui::GetCurrentContext()) return true;
+    // its pipeline is built for one render pass: the swapchain's in SDR, the overlay image's in HDR
+    const bool direct = hdr_output_ == HdrOutput::Off;
+    const VkRenderPass pass = direct ? swap_pass_ : ui_pass_;
+    if (ui_initialized_ || !pass || !ImGui::GetCurrentContext()) return true;
     std::lock_guard<std::recursive_mutex> guard(app::UiLock());
     const uint32_t images = uint32_t(swapchain_images_.size());
     ImGui_ImplVulkan_InitInfo info{};
@@ -1928,14 +1937,15 @@ bool VulkanBackend::CreateUi() {
     info.DescriptorPoolSize = 64;  // the backend creates its own image descriptor pool
     info.MinImageCount = images >= 2 ? 2 : images;
     info.ImageCount = images;
-    info.PipelineInfoMain.RenderPass = ui_pass_;
+    info.PipelineInfoMain.RenderPass = pass;
     info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     if (!ImGui_ImplVulkan_Init(&info)) {
         LOGE("vulkan: ImGui Vulkan backend failed to start");
         return false;
     }
     ui_initialized_ = true;
-    LOGR("vulkan: ImGui overlay ready");
+    ui_direct_ = direct;
+    LOGR("vulkan: ImGui overlay ready (%s)", direct ? "drawn into the swapchain pass" : "HDR composite");
     return true;
 }
 
@@ -6048,8 +6058,12 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     const uint8_t ao_roles = ao_mode_ != 0 && scene_sized && !a.pretransformed && scene_view
                                  ? AoRoles(s, samples_colour_rt())
                                  : 0;
-    bool defer_now = defer_scene_ && !defer_abandoned_ && scene_sized && !a.pretransformed && scene_view &&
-                     !SimpleState(s, kMCountEnable);
+    // Other draws into the open scene list's own targets (screen-space and small-viewport effects
+    // between world draws) join the list in order, without an AO role. Drawing them immediately
+    // would replay the whole list, AO pass included, before each one.
+    const bool joins_scene = DeferredPending() && rt == defer_rt_ && ds == defer_ds_;
+    bool defer_now = defer_scene_ && !defer_abandoned_ && !SimpleState(s, kMCountEnable) &&
+                     ((scene_sized && !a.pretransformed && scene_view) || joins_scene);
     // Only a deferred receiver can get the t4 set at replay. Immediate frames (visibility tests,
     // fallback) must use the game's original pixel shader.
     const bool ao_receiver = defer_now && (ao_roles & kAoColour) != 0;
@@ -7370,7 +7384,7 @@ void VulkanBackend::Present(const Surface& front) {
     const float hdr_strength = float(snapshot.hdr_highlights) / 100.0f;
     const bool ui_data = ui_initialized_ && ImGui::GetDrawData() && ImGui::GetDrawData()->CmdListsCount;
     bool ui_ready = false;
-    if (ui_data && ui_fb_ && CreateUiComposite()) {
+    if (ui_data && !ui_direct_ && ui_fb_ && CreateUiComposite()) {
         Transition(ui_image_, ui_layout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_FORMAT_B8G8R8A8_UNORM);
         VkClearValue ui_clear{};
         VkRenderPassBeginInfo ui_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -7405,7 +7419,7 @@ void VulkanBackend::Present(const Surface& front) {
         ui_writes[1].pImageInfo = &sampler_info;
         vkUpdateDescriptorSets(device_, 2, ui_writes, 0, nullptr);
         ui_ready = true;
-    } else if (ui_data && !ui_composite_logged_) {
+    } else if (ui_data && !ui_direct_ && !ui_composite_logged_) {
         LOGE("vulkan: overlay composite unavailable; the Graphics overlay stays hidden");
         ui_composite_logged_ = true;
     }
@@ -7441,6 +7455,11 @@ void VulkanBackend::Present(const Surface& front) {
     vkCmdPushConstants(cmd_, present_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(present_pc),
                        present_pc);
     vkCmdDraw(cmd_, 3, 1, 0, 0);
+    if (ui_data && ui_direct_) {
+        // SDR: the overlay blends straight over the game image, as the composite would have
+        std::lock_guard<std::recursive_mutex> guard(app::UiLock());
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd_);
+    }
     if (ui_ready) {
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_);
         vkCmdSetViewport(cmd_, 0, 1, &viewport);
