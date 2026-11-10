@@ -6,45 +6,27 @@
 // that wait for a phone call to finish then never advance (no informant
 // missions, no "Precinct Cleaned" call).
 //
-// The table is the game's own mix-bin volume table, so instead of bypassing
-// the check in the stream code, replace an exact 0.0 with a tiny positive
-// value when it is read. The result is inaudible (about -120 dB) but the
-// stream starts and its completion callback runs. Non-zero volumes are left
-// untouched.
-
-#include <cstring>
+// The table holds the player's own settings, so it is left alone: the getter's
+// result is changed instead. An exact 0.0 it returns becomes a tiny positive
+// value. The result is inaudible (about -120 dB) but the stream starts and its
+// completion callback runs. Non-zero volumes are left untouched.
 
 #include "core/log.h"
 #include "kernel/kernel.h"
-#include "kernel/memory.h"
 #include "xdk/hle.h"
 
 namespace {
-constexpr uint32_t kVolumeTable = 0x337640;
-constexpr float kSilentButPlaying = 1.0e-6f;
-
-float F32(uint32_t va) {
-    const uint32_t bits = kernel::R32(va);
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
-
-void W32F(uint32_t va, float f) {
-    uint32_t bits;
-    std::memcpy(&bits, &f, 4);
-    kernel::W32(va, bits);
-}
+constexpr double kSilentButPlaying = 1.0e-6;
 } // namespace
 
-// 0x2291F0 is the mix-bin volume getter: [esp+4] = bin index, returns a float on the x87 stack.
+// 0x2291F0 is the mix-bin volume getter: [esp+4] = bin index, returns
+// [0x337640 + bin * 4] as a float on the x87 stack.
 X86_EXTERN_FUNC(__imp__sub_002291F0);
 X86_FUNC(sub_002291F0) {
     const uint32_t bin = X86_MEM32(ctx.esp + 4);
-    const uint32_t slot = kVolumeTable + bin * 4;
-    if (mem::IsCommitted(slot) && F32(slot) == 0.0f) {
-        W32F(slot, kSilentButPlaying);
-        LOG_FIRST(8, "tcnyc: mix bin %u was 0, raised to %.1e so phone calls can start", bin, kSilentButPlaying);
-    }
     __imp__sub_002291F0(ctx, base);
+    if (X87_ST(0) == 0.0) {
+        X87_ST(0) = kSilentButPlaying;
+        LOG_FIRST(8, "tcnyc: mix bin %u is 0, reported as %.1e so phone calls can start", bin, kSilentButPlaying);
+    }
 }
