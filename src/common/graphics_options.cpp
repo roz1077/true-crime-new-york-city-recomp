@@ -32,19 +32,27 @@
 #include <vector>
 
 namespace app {
-// main.cpp: the window thread applies the current settings and reports success
-// through these, so the frame thread does not hold UiLock across a SendMessage.
-uint64_t RequestDisplayApply();
+// main.cpp: the window thread applies the requested mode, writes it to the settings if it worked
+// and reports the result, so the frame thread does not hold UiLock across a SendMessage.
+uint64_t RequestDisplayApply(DisplayMode mode, uint32_t width, uint32_t height);
 bool DisplayApplyResult(uint64_t request, bool &ok);
 #ifndef _WIN32
-// The SDL hosts already apply display changes through their own window loop
-// and do not report a result; keep the previous optimistic apply there.
-uint64_t RequestDisplayApply() {
+// The SDL hosts apply display changes through their own window loop and do not report a
+// result; the settings are written at once and every request counts as applied.
+uint64_t RequestDisplayApply(DisplayMode mode, uint32_t width, uint32_t height) {
+    static std::atomic<uint64_t> next{0};
+    {
+        SettingsLock lock;
+        Settings &s = Get();
+        s.display_mode = mode;
+        s.width = width;
+        s.height = height;
+    }
     ApplyDisplay();
-    return 1;
+    return next.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 bool DisplayApplyResult(uint64_t request, bool &ok) {
-    if (request != 1) return false;
+    if (!request) return false;
     ok = true;
     return true;
 }
@@ -149,8 +157,6 @@ struct Menu {
     bool apply_pending = false; // the window thread has not reported the display apply yet
     bool apply_failed = false;  // the last display apply was refused
     uint64_t apply_seq = 0;
-    app::DisplayMode old_mode{};
-    app::Mode old_resolution{};
     app::DisplayMode mode{};
     app::Mode resolution{};
     std::vector<app::Mode> resolutions; // index 0 is Desktop (0 x 0)
@@ -191,10 +197,7 @@ std::vector<app::Mode> DisplayModes() {
 namespace {
 
 bool DisplayPending() {
-    // While an apply is in flight the live settings already hold the candidate
-    // values; compare with the last applied mode so the pending marker stays.
-    if (g_menu.apply_pending)
-        return g_menu.mode != g_menu.old_mode || !SameMode(g_menu.resolution, g_menu.old_resolution);
+    // the settings hold the applied mode; they change only once the window thread confirms
     app::SettingsLock lock;
     const app::Settings &s = app::Get();
     return g_menu.mode != s.display_mode || !SameMode(g_menu.resolution, {s.width, s.height});
@@ -229,8 +232,8 @@ void CloseMenu() {
     app::CaptureMouse(true);
 }
 
-// WM_CLOSE/WM_DESTROY bypass CloseMenu. Save live changes, but never persist a
-// display mode that was not applied (or whose apply is still in flight).
+// WM_CLOSE/WM_DESTROY bypass CloseMenu. Save live changes; the settings only ever hold a display
+// mode the window thread applied, so one still in flight is simply not saved.
 #ifdef _WIN32
 void SaveOnExit() {
     // The window handler runs outside UiLock; the menu state is shared with
@@ -240,21 +243,7 @@ void SaveOnExit() {
     static bool saved = false;
     if (saved) return;
     saved = true;
-    if (g_menu.apply_pending) {
-        bool ok = false;
-        // A result already published for a successful apply is safe to keep;
-        // anything still in flight reverts to the last applied mode.
-        if (app::DisplayApplyResult(g_menu.apply_seq, ok) && ok) {
-            g_menu.apply_pending = false;
-        } else {
-            app::SettingsLock lock;
-            app::Settings &s = app::Get();
-            s.display_mode = g_menu.old_mode;
-            s.width = g_menu.old_resolution.width;
-            s.height = g_menu.old_resolution.height;
-            g_menu.apply_pending = false;
-        }
-    }
+    g_menu.apply_pending = false;
     app::Save();
     g_menu.dirty = false;
 }
@@ -262,24 +251,10 @@ void SaveOnExit() {
 
 void ApplyDisplayChanges() {
     if (g_menu.apply_pending) return;
-    {
-        app::SettingsLock lock;
-        app::Settings &s = app::Get();
-        g_menu.old_mode = s.display_mode;
-        g_menu.old_resolution = {s.width, s.height};
-        // ApplyNow reads the settings; the file is written only after the
-        // window thread confirms the mode change (see PollDisplayApply).
-        s.display_mode = g_menu.mode;
-        s.width = g_menu.resolution.width;
-        s.height = g_menu.resolution.height;
-    }
-    const uint64_t request = app::RequestDisplayApply();
+    // the window thread writes the settings once the change works; the file is saved after that
+    // (PollDisplayApply)
+    const uint64_t request = app::RequestDisplayApply(g_menu.mode, g_menu.resolution.width, g_menu.resolution.height);
     if (!request) {
-        app::SettingsLock lock;
-        app::Settings &s = app::Get();
-        s.display_mode = g_menu.old_mode;
-        s.width = g_menu.old_resolution.width;
-        s.height = g_menu.old_resolution.height;
         g_menu.apply_failed = true;
         LOGE("Graphics: could not request a display apply for mode %u, %ux%u", uint32_t(g_menu.mode),
              g_menu.resolution.width, g_menu.resolution.height);
@@ -303,14 +278,7 @@ void PollDisplayApply() {
         g_menu.apply_failed = false;
         return;
     }
-    {
-        app::SettingsLock lock;
-        app::Settings &s = app::Get();
-        s.display_mode = g_menu.old_mode;
-        s.width = g_menu.old_resolution.width;
-        s.height = g_menu.old_resolution.height;
-    }
-    app::ApplyDisplay(); // put the previously applied mode/window back
+    // the window thread already put the previous mode back; the settings never changed
     g_menu.output_height = app::Output().height;
     g_menu.apply_failed = true;
     LOGE("Graphics: display mode %u at %ux%u was refused; kept the previous settings", uint32_t(g_menu.mode),

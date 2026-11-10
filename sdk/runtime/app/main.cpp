@@ -15,6 +15,8 @@
 #include <csignal>
 #include <cstdlib>
 #include <cwchar>
+#include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,11 +41,17 @@ HWND g_hwnd = nullptr;
 constexpr UINT kApplyDisplay = WM_APP + 1, kOpenWindow = WM_APP + 2, kCaptureMouse = WM_APP + 3;
 bool g_mode_changed = false;
 bool g_apply_posted = false;  // a display apply is waiting in the queue or running
-// the last synchronous display apply the menu asked for: the window thread
-// publishes its result here for RequestDisplayApply/DisplayApplyResult
-std::atomic<uint64_t> g_apply_request{0};
-std::atomic<uint64_t> g_apply_finished{0};
-std::atomic<bool> g_apply_ok{false};
+// Display changes the menus asked for (RequestDisplayApply). Each request carries its own values and
+// gets its own result; the settings are written only once the window thread has applied them.
+struct DisplayRequest {
+    DisplayMode mode;
+    uint32_t width, height;
+};
+std::mutex g_requests_lock;
+uint64_t g_next_request = 0;
+std::map<uint64_t, DisplayRequest> g_requests;  // posted, not yet applied
+std::map<uint64_t, bool> g_results;             // applied, not yet collected
+constexpr size_t kMaxResults = 64;              // results a caller gave up on are dropped, oldest first
 bool g_capture_wanted = true; // gameplay wants the pointer hidden and confined
 bool g_captured = false;
 bool g_cursor_hidden = false;
@@ -178,10 +186,16 @@ void DumpThreads() {
         }
 }
 
-// window thread only. false when a requested full-screen mode was refused, so
-// the caller can restore the previous settings instead of saving the new ones.
-bool ApplyNow() {
-    const Settings s = Snapshot();
+// Window thread only. Applies the current settings, or the requested values when request is
+// given. A requested change is written to the settings only if it worked; a refused full-screen
+// mode returns false and the window goes back to the current settings.
+bool ApplyNow(const DisplayRequest* request = nullptr) {
+    Settings s = Snapshot();
+    if (request) {
+        s.display_mode = request->mode;
+        s.width = request->width;
+        s.height = request->height;
+    }
     bool ok = true;
     HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFOEXW mi{};
@@ -191,7 +205,7 @@ bool ApplyNow() {
         ChangeDisplaySettingsExW(mi.szDevice, nullptr, nullptr, 0, nullptr);
         g_mode_changed = false;
     }
-    Mode out = Output();
+    const Mode out = s.width && s.height ? Mode{s.width, s.height} : Desktop();
     LONG_PTR visible = IsWindowVisible(g_hwnd) ? WS_VISIBLE : 0;  // a window held back for a splash or handover stays so
     DEVMODEW desktop{};
     desktop.dmSize = sizeof(desktop);
@@ -207,8 +221,22 @@ bool ApplyNow() {
         const LONG change = ChangeDisplaySettingsExW(mi.szDevice, &dm, nullptr, CDS_FULLSCREEN, nullptr);
         g_mode_changed = change == DISP_CHANGE_SUCCESSFUL;
         ok = g_mode_changed;
-        if (!ok) LOGE("app: fullscreen mode %ux%u refused (%ld)", s.width, s.height, change);
+        if (!ok) {
+            LOGE("app: fullscreen mode %ux%u refused (%ld)", s.width, s.height, change);
+            if (request) {
+                ApplyNow();  // back to the mode in the settings
+                return false;
+            }
+        }
         GetMonitorInfoW(mon, &mi);
+    }
+    if (request) {
+        // before the window is resized, so the renderer sees the new output size with its WM_SIZE
+        SettingsLock lock;
+        Settings& live = Get();
+        live.display_mode = s.display_mode;
+        live.width = s.width;
+        live.height = s.height;
     }
     if (s.display_mode == DisplayMode::Windowed) {
         RECT r{0, 0, LONG(out.width), LONG(out.height)};
@@ -282,9 +310,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case kApplyDisplay:
             if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
             if (wp) {
-                const bool ok = ApplyNow();
-                g_apply_ok.store(ok, std::memory_order_relaxed);
-                g_apply_finished.store(uint64_t(wp), std::memory_order_release);
+                DisplayRequest request{};
+                bool found = false;
+                {
+                    std::lock_guard lock(g_requests_lock);
+                    if (auto it = g_requests.find(uint64_t(wp)); it != g_requests.end()) {
+                        request = it->second;
+                        g_requests.erase(it);
+                        found = true;
+                    }
+                }
+                const bool ok = found && ApplyNow(&request);
+                std::lock_guard lock(g_requests_lock);
+                g_results[uint64_t(wp)] = ok;
+                while (g_results.size() > kMaxResults) g_results.erase(g_results.begin());
             } else {
                 ApplyNow();
             }
@@ -303,7 +342,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;
-        case WM_DESTROY:
+        case WM_DESTROY: {
+            // changes still waiting are answered as refused, so no menu waits on a closed window
+            std::lock_guard lock(g_requests_lock);
+            for (const auto& [id, request] : g_requests) g_results[id] = false;
+            g_requests.clear();
+        }
             ClipCursor(nullptr);
             ShowPointer(true);
             PostQuitMessage(0);
@@ -385,21 +429,29 @@ std::recursive_mutex& UiLock() {
 
 void ApplyDisplay() { PostMessageW(g_hwnd, kApplyDisplay, 0, 0); }
 
-// Posts a display apply and returns a request number, or 0 when the window
-// would not accept the message. The window thread publishes the result; the
-// caller polls DisplayApplyResult from the frame that owns the Graphics menu.
-uint64_t RequestDisplayApply() {
-    const uint64_t request = g_apply_request.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (!PostMessageW(g_hwnd, kApplyDisplay, WPARAM(request), 0)) return 0;
-    return request;
+// Asks the window thread to switch to this mode and size, and returns a request number, or 0 when
+// the window would not accept the message. The settings change only if the switch works; the caller
+// polls DisplayApplyResult for this request's own answer and saves after a success.
+uint64_t RequestDisplayApply(DisplayMode mode, uint32_t width, uint32_t height) {
+    uint64_t id;
+    {
+        std::lock_guard lock(g_requests_lock);
+        id = ++g_next_request;
+        g_requests[id] = {mode, width, height};
+    }
+    if (g_hwnd && PostMessageW(g_hwnd, kApplyDisplay, WPARAM(id), 0)) return id;
+    std::lock_guard lock(g_requests_lock);
+    g_requests.erase(id);
+    return 0;
 }
 
-// Both the F10 menu and the native Display tab request applies, and the window thread answers them
-// in posting order. A later request finishing means an earlier one is finished as well: its values
-// were applied again by the later one, whose result it reports.
+// true once the window thread has answered this request; ok says whether the mode was applied
 bool DisplayApplyResult(uint64_t request, bool &ok) {
-    if (!request || g_apply_finished.load(std::memory_order_acquire) < request) return false;
-    ok = g_apply_ok.load(std::memory_order_relaxed);
+    std::lock_guard lock(g_requests_lock);
+    auto it = g_results.find(request);
+    if (it == g_results.end()) return false;
+    ok = it->second;
+    g_results.erase(it);
     return true;
 }
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }

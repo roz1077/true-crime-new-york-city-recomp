@@ -33,7 +33,7 @@
 namespace app {
 // the window thread applies a display change and reports whether it worked (main.cpp; the SDL
 // hosts answer at once, graphics_options.cpp)
-uint64_t RequestDisplayApply();
+uint64_t RequestDisplayApply(DisplayMode mode, uint32_t width, uint32_t height);
 bool DisplayApplyResult(uint64_t request, bool &ok);
 } // namespace app
 
@@ -78,8 +78,6 @@ std::atomic<uint64_t> g_save_due{0};
 // are in the live settings (the window thread applies from them) but are written to the file only
 // once it confirms them. A refused change is put back. Menu thread only.
 uint64_t g_display_request = 0;
-app::DisplayMode g_display_old_mode{};
-uint32_t g_display_old_w = 0, g_display_old_h = 0;
 
 uint64_t NowMs() {
     return uint64_t(
@@ -105,17 +103,8 @@ void PollDisplayApply() {
     bool ok = false;
     if (!app::DisplayApplyResult(g_display_request, ok)) return;
     g_display_request = 0;
-    if (!ok) {
-        {
-            app::SettingsLock lock;
-            app::Settings &s = app::Get();
-            s.display_mode = g_display_old_mode;
-            s.width = g_display_old_w;
-            s.height = g_display_old_h;
-        }
-        app::ApplyDisplay();
-        LOGE("Display tab: the display change was refused; kept the previous mode");
-    }
+    // a refused change never reached the settings, and the window thread put the previous mode back
+    if (!ok) LOGE("Display tab: the display change was refused; kept the previous mode");
     g_save_dirty.store(true, std::memory_order_release);
     FlushSettings();
 }
@@ -191,25 +180,15 @@ void ApplyDisplayChoice(uint32_t mode, uint64_t size) {
     const uint32_t w = uint32_t(size >> 32), h = uint32_t(size);
     {
         app::SettingsLock lock;
-        app::Settings &s = app::Get();
+        const app::Settings &s = app::Get();
         if (s.width == w && s.height == h && uint32_t(s.display_mode) == mode) {
             g_pending = false;
             return;
         }
-        g_display_old_mode = s.display_mode;
-        g_display_old_w = s.width;
-        g_display_old_h = s.height;
-        s.display_mode = app::DisplayMode(mode);
-        s.width = w;
-        s.height = h;
     }
-    const uint64_t request = app::RequestDisplayApply();
+    // the window thread writes the settings only if the change works
+    const uint64_t request = app::RequestDisplayApply(app::DisplayMode(mode), w, h);
     if (!request) {
-        app::SettingsLock lock;
-        app::Settings &s = app::Get();
-        s.display_mode = g_display_old_mode;
-        s.width = g_display_old_w;
-        s.height = g_display_old_h;
         LOGE("Display tab: could not request a display change to mode %u, %ux%u", mode, w, h);
         return;  // the choice stays pending, so another A retries it
     }
@@ -217,24 +196,24 @@ void ApplyDisplayChoice(uint32_t mode, uint64_t size) {
     g_display_request = request;
 }
 
-// Cancel: put back the mode the tab was entered with. It was in use before, so it is applied
-// without waiting; a change still in flight is superseded (the window thread applies in order).
+// Cancel: put back the mode the tab was entered with. The window thread answers requests in order,
+// so this one also lands after a change still in flight.
 void RestoreDisplayChoice(uint32_t mode, uint64_t size) {
     g_pending = false;
     PollDisplayApply();
-    const bool superseded = g_display_request != 0;
-    g_display_request = 0;
+    const bool in_flight = g_display_request != 0;
     const uint32_t w = uint32_t(size >> 32), h = uint32_t(size);
     {
         app::SettingsLock lock;
-        app::Settings &s = app::Get();
-        if (!superseded && s.width == w && s.height == h && uint32_t(s.display_mode) == mode) return;
-        s.display_mode = app::DisplayMode(mode);
-        s.width = w;
-        s.height = h;
+        const app::Settings &s = app::Get();
+        if (!in_flight && s.width == w && s.height == h && uint32_t(s.display_mode) == mode) return;
     }
-    app::ApplyDisplay();
-    MarkSave();
+    if (const uint64_t request = app::RequestDisplayApply(app::DisplayMode(mode), w, h)) {
+        g_display_request = request;  // the earlier request's answer is dropped; this one is saved
+        return;
+    }
+    g_display_request = 0;
+    LOGE("Display tab: could not request the entry display mode %u, %ux%u back", mode, w, h);
 }
 
 // guest buffers for the row texts, one per option; 0 if they could not be allocated
