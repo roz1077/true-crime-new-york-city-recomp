@@ -46,7 +46,6 @@ constexpr uint32_t kGiveCareer = 0x802E0;
 constexpr uint32_t kInventoryAdd = 0x191650;   // thiscall on the inventory (character, item)
 constexpr uint32_t kGetPosition = 0x21EC70;    // thiscall on an object (out vec4*) -> vec4*
 constexpr uint32_t kSpawnItem = 0x9F460;       // cdecl (item name hash, vec4* position) -> item object
-constexpr uint32_t kAlloc = 0x268B0F;          // cdecl (size) -> guest memory
 constexpr uint32_t kItemInHand = 0x191800;     // thiscall on the inventory (hand: 1 right, 0 left) -> item
 constexpr uint32_t kRemoveNickWeapons = 0x110AD0; // cdecl (character): removes every weapon (RemoveNickWeapon)
 
@@ -213,9 +212,9 @@ void PlayerFrame(X86Context &ctx) {
     const uint32_t inventory = kernel::R32(player + kWallet);
     if (!items.empty() && Readable(inventory) && Readable(kernel::R32(inventory) + 0x24)) {
         const uint32_t vtable = kernel::R32(inventory);
-        // a 16-byte aligned guest buffer for the character's position, from the game's allocator
-        static uint32_t position = 0;
-        if (!position) position = (kernel::CallGuest(ctx, kAlloc, {64}) + 15) & ~15u;
+        // a 16-byte aligned guest buffer for the character's position; host-owned, so nothing the
+        // game frees on a level change can take it away
+        static const uint32_t position = mem::AllocSystem(16, 16);
         for (auto [name, hand] : items) {
             if (!Readable(position, 16)) break;
             // first clear out the old weapons. The inventory has more slots than the two hands (right,

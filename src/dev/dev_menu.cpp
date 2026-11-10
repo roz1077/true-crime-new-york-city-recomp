@@ -258,7 +258,8 @@ void PlayerTab() {
                 if (ImGui::SmallButton("Left")) RequestItem(item, true);
             }
             ImGui::SameLine();
-            ImGui::TextUnformatted(std::strchr(item, '_') + 1);
+            const char *underscore = std::strchr(item, '_');
+            ImGui::TextUnformatted(underscore ? underscore + 1 : item);
             ImGui::PopID();
         }
         ImGui::TreePop();
@@ -308,7 +309,9 @@ void LogTab() {
             std::string text(size_t(size - start), '\0');
             text.resize(std::fread(text.data(), 1, text.size(), f));
             std::fclose(f);
-            size_t pos = start ? text.find('\n') + 1 : 0;
+            // from the tail's first whole line; with no line break at all, the text as it is
+            const size_t first = start ? text.find('\n') : std::string::npos;
+            size_t pos = first == std::string::npos ? 0 : first + 1;
             while (pos < text.size()) {
                 size_t end = text.find('\n', pos);
                 if (end == std::string::npos) end = text.size();

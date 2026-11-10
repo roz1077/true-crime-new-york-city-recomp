@@ -48,11 +48,30 @@ struct Live {
 
 std::mutex g_lock;
 std::unordered_map<uint32_t, Live> g_live;            // instance -> owner, last frame seen
-std::unordered_map<uint32_t, uint32_t> g_requests;    // instance -> state hash
+// a stage jump from the debug menu, for the instance as it was when it was asked for
+struct Request {
+    uint32_t state = 0;
+    uint32_t owner = 0;
+};
+std::unordered_map<uint32_t, Request> g_requests;     // instance -> requested state
 uint64_t g_frame = 0;
 
 bool Readable(uint32_t va, uint32_t size = 4) {
     return va && mem::IsCommitted(va) && mem::IsCommitted(va + size - 1);
+}
+
+// whether the instance's state table has this state (child nodes of type 1)
+bool HasState(uint32_t instance, uint32_t state) {
+    if (!Readable(instance + kStateTable)) return false;
+    const uint32_t table = kernel::R32(instance + kStateTable);
+    if (!Readable(table)) return false;
+    const uint16_t count = kernel::R16(table);
+    for (uint32_t i = 0; i < count && i < 256; ++i) {
+        const uint32_t entry = table + 4 + i * 16;
+        if (!Readable(entry, 16)) return false;
+        if (kernel::R16(entry + 0xA) == 1 && kernel::R32(entry + 4) == state) return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -77,6 +96,9 @@ void ScriptsFrame() {
     // forget instances the game stopped updating (deleted, or the level changed)
     for (auto it = g_live.begin(); it != g_live.end();)
         it = g_frame - it->second.seen > 30 ? g_live.erase(it) : std::next(it);
+    // a jump for an instance that is gone must not reach whatever later reuses its address
+    for (auto it = g_requests.begin(); it != g_requests.end();)
+        it = g_live.count(it->first) ? std::next(it) : g_requests.erase(it);
 }
 
 std::vector<Script> LiveScripts() {
@@ -122,7 +144,9 @@ std::vector<Script> LiveScripts() {
 
 void RequestState(uint32_t instance, uint32_t state_hash) {
     std::lock_guard guard(g_lock);
-    g_requests[instance] = state_hash;
+    auto live = g_live.find(instance);
+    if (live == g_live.end()) return;  // no longer running
+    g_requests[instance] = {state_hash, live->second.owner};
 }
 
 } // namespace dev
@@ -138,11 +162,19 @@ X86_FUNC(sub_000FD220) {
         const uint32_t owner = depth >= 0 && depth < 8 ? kernel::R32(kOwnerStack + uint32_t(depth) * 4) : 0;
         g_live[instance] = {owner, g_frame};
         if (auto it = g_requests.find(instance); it != g_requests.end()) {
-            // as the script's own SetState: the update below enters it
-            kernel::W32(instance + kRequestedState, it->second);
-            LOGR("dev: script %08X (owner %08X): state %s -> %s", instance, owner,
-                 dev::ScriptName(kernel::R32(instance + kCurrentState)).c_str(), dev::ScriptName(it->second).c_str());
+            const Request request = it->second;
             g_requests.erase(it);
+            if (request.owner != owner || !HasState(instance, request.state) ||
+                !Readable(instance + kRequestedState)) {
+                LOGR("dev: script %08X changed since state %s was asked for; not applied", instance,
+                     dev::ScriptName(request.state).c_str());
+            } else {
+                // as the script's own SetState: the update below enters it
+                kernel::W32(instance + kRequestedState, request.state);
+                LOGR("dev: script %08X (owner %08X): state %s -> %s", instance, owner,
+                     dev::ScriptName(kernel::R32(instance + kCurrentState)).c_str(),
+                     dev::ScriptName(request.state).c_str());
+            }
         }
     }
     const uint32_t before = kernel::R32(instance + kCurrentState);
@@ -177,8 +209,9 @@ X86_EXTERN_FUNC(__imp__sub_0017FA70);
 X86_FUNC(sub_0017FA70) {
     if (dev::TraceScripts()) {
         const uint32_t vm = kernel::R32(ctx.esp + 4);
-        LOGR("dev trace: frame %llu SetGrabbable(%u) from %s", static_cast<unsigned long long>(g_frame),
-             kernel::G<uint8_t>(vm - 4), Running().c_str());
+        if (Readable(vm - 4))
+            LOGR("dev trace: frame %llu SetGrabbable(%u) from %s", static_cast<unsigned long long>(g_frame),
+                 kernel::G<uint8_t>(vm - 4), Running().c_str());
     }
     __imp__sub_0017FA70(ctx, base);
 }
@@ -188,8 +221,9 @@ X86_EXTERN_FUNC(__imp__sub_001828C0);
 X86_FUNC(sub_001828C0) {
     if (dev::TraceScripts()) {
         const uint32_t vm = kernel::R32(ctx.esp + 4);
-        LOGR("dev trace: frame %llu SetTimer(%.2f s, %s) from %s", static_cast<unsigned long long>(g_frame),
-             guest::ReadF32(vm - 8), dev::ScriptName(kernel::R32(vm - 4)).c_str(), Running().c_str());
+        if (Readable(vm - 8, 8))
+            LOGR("dev trace: frame %llu SetTimer(%.2f s, %s) from %s", static_cast<unsigned long long>(g_frame),
+                 guest::ReadF32(vm - 8), dev::ScriptName(kernel::R32(vm - 4)).c_str(), Running().c_str());
     }
     __imp__sub_001828C0(ctx, base);
 }
