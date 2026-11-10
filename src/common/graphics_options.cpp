@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <chrono>
 #include <cstdio>
 #include <mutex>
@@ -805,6 +806,9 @@ void DrawRows(float scale) {
     const float left_x = value_x - arrow;
     const ImVec2 mouse_delta = ImGui::GetIO().MouseDelta;
     const bool mouse_moved = mouse_delta.x != 0 || mouse_delta.y != 0;
+    // the row the keyboard or pad last moved to, kept in view when the list is taller than the screen
+    static int scrolled_to = -1;
+    const bool follow = g_menu.selected != scrolled_to;
 
     for (int i = 0; i < kRowCount; ++i) {
         const Row row = kRows[i];
@@ -822,6 +826,14 @@ void DrawRows(float scale) {
 
         const bool clicked =
             ImGui::Selectable(Label(row), g_menu.selected == i, ImGuiSelectableFlags_AllowOverlap, {0, arrow});
+        if (follow && g_menu.selected == i && !(mouse_moved && ImGui::IsItemHovered())) {
+            // the first row takes its section heading with it; others only move as far as they must
+            if (i == 0)
+                ImGui::SetScrollY(0);
+            else if (!ImGui::IsItemVisible() || ImGui::GetItemRectMax().y > ImGui::GetWindowPos().y + ImGui::GetWindowHeight() ||
+                     ImGui::GetItemRectMin().y < ImGui::GetWindowPos().y)
+                ImGui::SetScrollHereY(ImGui::GetItemRectMin().y < ImGui::GetWindowPos().y ? 0.0f : 1.0f);
+        }
         if (enabled && mouse_moved && ImGui::IsItemHovered()) g_menu.selected = i;
         if (clicked && enabled) {
             g_menu.selected = i;
@@ -845,6 +857,7 @@ void DrawRows(float scale) {
         ImGui::EndDisabled();
         ImGui::PopID();
     }
+    scrolled_to = g_menu.selected;
 }
 
 void DrawMenu(double fps) {
@@ -874,7 +887,14 @@ void DrawMenu(double fps) {
         ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - ImGui::CalcTextSize(rate).x);
         ImGui::TextDisabled("%s", rate);
 
+        // The rows scroll when the whole menu would be taller than the screen (a low resolution or a
+        // handheld), leaving room for the heading above and the help and key lines below.
+        const float line = ImGui::GetTextLineHeightWithSpacing();
+        const float rows_max = std::max(line * 4, viewport->Size.y * 0.92f - line * 7 - 40 * scale);
+        ImGui::SetNextWindowSizeConstraints({0, 0}, {FLT_MAX, rows_max});
+        ImGui::BeginChild("rows", {0, 0}, ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoNav);
         DrawRows(scale);
+        ImGui::EndChild();
 
         ImGui::Spacing();
         ImGui::Separator();
