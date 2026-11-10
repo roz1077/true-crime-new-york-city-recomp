@@ -82,8 +82,9 @@ bool ApplyWindowMode(DisplayMode mode, uint32_t width, uint32_t height) {
 void ApplyDisplayRequests() {
     std::map<uint64_t, DisplayRequest> requests;
     {
+        // copied, not moved: each stays queued until its result is stored
         std::lock_guard<std::mutex> guard(g_display_lock);
-        requests.swap(g_requests);
+        requests = g_requests;
     }
     for (const auto& [id, r] : requests) {
         const bool ok = ApplyWindowMode(r.mode, r.width, r.height);
@@ -98,6 +99,7 @@ void ApplyDisplayRequests() {
             ApplyWindowMode(s.display_mode, s.width, s.height);
         }
         std::lock_guard<std::mutex> guard(g_display_lock);
+        g_requests.erase(id);
         g_results[id] = ok;
         while (g_results.size() > kMaxResults) g_results.erase(g_results.begin());
     }
@@ -340,7 +342,14 @@ bool DisplayApplyResult(uint64_t request, bool& ok) {
     if (!request) return false;
     std::lock_guard<std::mutex> guard(g_display_lock);
     auto it = g_results.find(request);
-    if (it == g_results.end()) return false;
+    if (it == g_results.end()) {
+        // answered but dropped from the full results list: refused, not still pending
+        if (request <= g_next_request && !g_requests.count(request)) {
+            ok = false;
+            return true;
+        }
+        return false;
+    }
     ok = it->second;
     g_results.erase(it);
     return true;

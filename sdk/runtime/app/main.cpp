@@ -333,14 +333,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 bool found = false;
                 {
                     std::lock_guard lock(g_requests_lock);
+                    // stays queued until its result is stored, so a poll never finds it in neither map
                     if (auto it = g_requests.find(uint64_t(wp)); it != g_requests.end()) {
                         request = it->second;
-                        g_requests.erase(it);
                         found = true;
                     }
                 }
                 const bool ok = found && ApplyNow(&request);
                 std::lock_guard lock(g_requests_lock);
+                g_requests.erase(uint64_t(wp));
                 g_results[uint64_t(wp)] = ok;
                 while (g_results.size() > kMaxResults) g_results.erase(g_results.begin());
             } else {
@@ -468,7 +469,15 @@ uint64_t RequestDisplayApply(DisplayMode mode, uint32_t width, uint32_t height) 
 bool DisplayApplyResult(uint64_t request, bool &ok) {
     std::lock_guard lock(g_requests_lock);
     auto it = g_results.find(request);
-    if (it == g_results.end()) return false;
+    if (it == g_results.end()) {
+        // neither waiting nor answered: its answer was dropped from the full results list, so
+        // report it as refused rather than leave the caller waiting
+        if (request && request <= g_next_request && !g_requests.count(request)) {
+            ok = false;
+            return true;
+        }
+        return false;
+    }
     ok = it->second;
     g_results.erase(it);
     return true;

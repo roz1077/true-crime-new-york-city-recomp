@@ -314,7 +314,7 @@ X86_FUNC(sub_000CB400) {
     MaybeSave();
     const uint32_t self = ctx.ecx, event = X86_MEM32(ctx.esp + 4), input = X86_MEM32(ctx.esp + 8);
     const uint32_t page = self ? X86_MEM32(self + kPage) : 0;
-    if (Tracing() && event == kInputEvent && page >= 0x0F && page <= 0x12) {
+    if (self && Tracing() && event == kInputEvent && page >= 0x0F && page <= 0x12) {
         const uint32_t row = X86_MEM32(self + kRow), focus = X86_MEM32(self + kFocus);
         static thread_local uint32_t last[4] = {UINT32_MAX};
         const uint32_t now[4] = {input, page, row, focus};
@@ -324,7 +324,7 @@ X86_FUNC(sub_000CB400) {
                  focus, input);
         }
     }
-    if (event == kInputEvent && page == kDisplayPage && X86_MEM32(self + kFocus) == kRowListFocus) {
+    if (self && event == kInputEvent && page == kDisplayPage && X86_MEM32(self + kFocus) == kRowListFocus) {
         const Step step = Input(g_page, g_first + X86_MEM32(self + kRow), input);
         if (step.handled && (!step.apply || g_pending)) {
             const Page page = g_page; // the page the input's row belongs to

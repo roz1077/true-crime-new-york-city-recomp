@@ -305,10 +305,13 @@ Mode CachedOutput() {
         if (now == key && mode.height) return mode;
     }
     const Mode out = s.width && s.height ? Mode{s.width, s.height} : Desktop();
+    // the settings may have changed while Desktop() ran: keep that result out of the cache
+    const Settings after = Snapshot();
+    if (after.width != s.width || after.height != s.height) return out;
     std::lock_guard<std::mutex> guard(lock);
     key = now;
     mode = out;
-    return mode;
+    return out;
 }
 
 float AspectRatio() {

@@ -817,6 +817,8 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         shown = Dev(kDevBackBuffer);
     if (g_backend) {
         gpu::Surface picture = SurfaceOf(shown);
+        // one look at the open files per present, so the offset and the picture kind agree
+        const bool movie = !g_frame_draws && kernel::MovieOpen();
 #ifndef _WIN32
         // The legal screen is written at its buffer's base; the console presents that base.
         // The Linux surface data field starts 0x54 bytes (its frame header) into that
@@ -825,13 +827,13 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         // finds targets by this address, so it moves the legal screen in BlitFrame instead.
         const uint32_t saved_data = picture.header ? R32(picture.header + 4) : 0;
         // Bink movie frames are written at the normal position: moving them puts the picture 21 pixels right
-        if (!g_frame_draws && picture.data >= 0x54 && !kernel::MovieOpen()) {
+        if (!g_frame_draws && picture.data >= 0x54 && !movie) {
             picture.data -= 0x54;
             if (picture.header) W32(picture.header + 4, picture.data);
         }
 #endif
         // a frame with no draws is a picture the title wrote: a movie frame while a Bink file is open, else a page
-        if (!g_frame_draws) picture.picture = kernel::MovieOpen() ? gpu::Picture::Movie : gpu::Picture::Still;
+        if (!g_frame_draws) picture.picture = movie ? gpu::Picture::Movie : gpu::Picture::Still;
         g_backend->Present(picture);
 #ifndef _WIN32
         if (saved_data) W32(picture.header + 4, saved_data);
