@@ -32,31 +32,10 @@
 #include <vector>
 
 namespace app {
-// main.cpp: the window thread applies the requested mode, writes it to the settings if it worked
+// main.cpp (app_sdl.cpp on Linux): the window thread applies the requested mode, writes it to the settings if it worked
 // and reports the result, so the frame thread does not hold UiLock across a SendMessage.
 uint64_t RequestDisplayApply(DisplayMode mode, uint32_t width, uint32_t height);
 bool DisplayApplyResult(uint64_t request, bool &ok);
-#ifndef _WIN32
-// The SDL hosts apply display changes through their own window loop and do not report a
-// result; the settings are written at once and every request counts as applied.
-uint64_t RequestDisplayApply(DisplayMode mode, uint32_t width, uint32_t height) {
-    static std::atomic<uint64_t> next{0};
-    {
-        SettingsLock lock;
-        Settings &s = Get();
-        s.display_mode = mode;
-        s.width = width;
-        s.height = height;
-    }
-    ApplyDisplay();
-    return next.fetch_add(1, std::memory_order_relaxed) + 1;
-}
-bool DisplayApplyResult(uint64_t request, bool &ok) {
-    if (!request) return false;
-    ok = true;
-    return true;
-}
-#endif
 } // namespace app
 
 namespace game {

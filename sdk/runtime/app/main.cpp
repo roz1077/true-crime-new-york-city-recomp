@@ -230,26 +230,45 @@ bool ApplyNow(const DisplayRequest* request = nullptr) {
         }
         GetMonitorInfoW(mon, &mi);
     }
+    DisplayRequest previous{};
     if (request) {
         // before the window is resized, so the renderer sees the new output size with its WM_SIZE
         SettingsLock lock;
         Settings& live = Get();
+        previous = {live.display_mode, live.width, live.height};
         live.display_mode = s.display_mode;
         live.width = s.width;
         live.height = s.height;
     }
+    BOOL placed;
     if (s.display_mode == DisplayMode::Windowed) {
         RECT r{0, 0, LONG(out.width), LONG(out.height)};
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
         int w = r.right - r.left, h = r.bottom - r.top;
         const RECT& a = mi.rcWork;
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | visible);
-        SetWindowPos(g_hwnd, HWND_NOTOPMOST, a.left + (a.right - a.left - w) / 2, a.top + (a.bottom - a.top - h) / 2, w, h,
-                     SWP_FRAMECHANGED);
+        placed = SetWindowPos(g_hwnd, HWND_NOTOPMOST, a.left + (a.right - a.left - w) / 2,
+                              a.top + (a.bottom - a.top - h) / 2, w, h, SWP_FRAMECHANGED);
     } else {
         const RECT& m = mi.rcMonitor;
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | visible);
-        SetWindowPos(g_hwnd, HWND_NOTOPMOST, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED);
+        placed = SetWindowPos(g_hwnd, HWND_NOTOPMOST, m.left, m.top, m.right - m.left, m.bottom - m.top,
+                              SWP_FRAMECHANGED);
+    }
+    if (!placed) {
+        LOGE("app: SetWindowPos failed (%lu)", GetLastError());
+        ok = false;
+        if (request) {
+            // the request is refused: put the saved mode back in the settings and on screen
+            {
+                SettingsLock lock;
+                Settings& live = Get();
+                live.display_mode = previous.mode;
+                live.width = previous.width;
+                live.height = previous.height;
+            }
+            ApplyNow();
+        }
     }
     return ok;
 }

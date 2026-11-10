@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -36,6 +37,71 @@ std::atomic<uint32_t> g_window_w{1280}, g_window_h{720};
 std::atomic<float> g_refresh{0.0f};
 std::mutex g_modes_lock;
 std::vector<Mode> g_modes;
+
+// Display changes from the menus (graphics_options.cpp, native_graphics.cpp): queued with their
+// own values, applied by the window loop, written to the settings only if SDL accepted them.
+struct DisplayRequest {
+    DisplayMode mode;
+    uint32_t width, height;
+};
+std::mutex g_display_lock;
+uint64_t g_next_request = 0;
+std::map<uint64_t, DisplayRequest> g_requests;  // waiting for the window loop
+std::map<uint64_t, bool> g_results;             // applied, not yet collected
+constexpr size_t kMaxResults = 64;
+
+// Puts the window into a mode; false if SDL refused any step.
+bool ApplyWindowMode(DisplayMode mode, uint32_t width, uint32_t height) {
+    if (!g_window) return false;
+    bool ok = true;
+    if (mode == DisplayMode::Borderless) {
+        ok &= SDL_SetWindowFullscreen(g_window, false);
+        ok &= SDL_SetWindowBordered(g_window, false);
+        const Mode desktop = Desktop();
+        if (desktop.width && desktop.height)
+            ok &= SDL_SetWindowSize(g_window, int(desktop.width), int(desktop.height));
+        ok &= SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    } else {
+        const bool fullscreen = mode == DisplayMode::Fullscreen;
+        if (!fullscreen) ok &= SDL_SetWindowFullscreen(g_window, false);
+        ok &= SDL_SetWindowBordered(g_window, true);
+        if (width && height) ok &= SDL_SetWindowSize(g_window, int(width), int(height));
+        if (fullscreen) {
+            SDL_DisplayMode closest{};
+            ok &= SDL_GetClosestFullscreenDisplayMode(SDL_GetPrimaryDisplay(), int(width), int(height), 0.0f,
+                                                      true, &closest) &&
+                  SDL_SetWindowFullscreenMode(g_window, &closest);
+            ok &= SDL_SetWindowFullscreen(g_window, true);
+        }
+    }
+    if (!ok) LOGE("app: display change refused by SDL: %s", SDL_GetError());
+    return ok;
+}
+
+// Window loop: applies each queued request; a refused one puts the saved mode back.
+void ApplyDisplayRequests() {
+    std::map<uint64_t, DisplayRequest> requests;
+    {
+        std::lock_guard<std::mutex> guard(g_display_lock);
+        requests.swap(g_requests);
+    }
+    for (const auto& [id, r] : requests) {
+        const bool ok = ApplyWindowMode(r.mode, r.width, r.height);
+        if (ok) {
+            std::lock_guard<std::recursive_mutex> settings(g_settings_lock);
+            Settings& s = Get();
+            s.display_mode = r.mode;
+            s.width = r.width;
+            s.height = r.height;
+        } else if (g_window) {
+            const Settings s = Snapshot();
+            ApplyWindowMode(s.display_mode, s.width, s.height);
+        }
+        std::lock_guard<std::mutex> guard(g_display_lock);
+        g_results[id] = ok;
+        while (g_results.size() > kMaxResults) g_results.erase(g_results.begin());
+    }
+}
 
 // newest finished frame from the render thread, shown by UpdateWindow on the window thread
 std::mutex g_frame_lock;
@@ -140,26 +206,9 @@ void UpdateWindow() {
     }
     if (g_apply_pending.exchange(false, std::memory_order_relaxed) && g_window) {
         const Settings s = Snapshot();
-        const bool fullscreen = s.display_mode == DisplayMode::Fullscreen;
-        if (s.display_mode == DisplayMode::Borderless) {
-            SDL_SetWindowFullscreen(g_window, false);
-            SDL_SetWindowBordered(g_window, false);
-            const Mode desktop = Desktop();
-            if (desktop.width && desktop.height) SDL_SetWindowSize(g_window, int(desktop.width), int(desktop.height));
-            SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-        } else {
-            SDL_SetWindowBordered(g_window, true);
-            if (s.width && s.height) SDL_SetWindowSize(g_window, int(s.width), int(s.height));
-            if (fullscreen) {
-                SDL_DisplayMode closest{};
-                const int w = s.width ? int(s.width) : 0;
-                const int h = s.height ? int(s.height) : 0;
-                if (SDL_GetClosestFullscreenDisplayMode(SDL_GetPrimaryDisplay(), w, h, 0.0f, true, &closest))
-                    SDL_SetWindowFullscreenMode(g_window, &closest);
-            }
-            SDL_SetWindowFullscreen(g_window, fullscreen);
-        }
+        ApplyWindowMode(s.display_mode, s.width, s.height);
     }
+    ApplyDisplayRequests();
     static bool captured = false;
     const bool want = g_capture_wanted.load(std::memory_order_relaxed);
     if (want != captured && g_window) {
@@ -279,6 +328,23 @@ void CloseSplash() {}
 void OpenGameWindow(bool) { g_open_pending.store(true, std::memory_order_relaxed); }
 
 void ApplyDisplay() { g_apply_pending.store(true, std::memory_order_relaxed); }
+
+uint64_t RequestDisplayApply(DisplayMode mode, uint32_t width, uint32_t height) {
+    std::lock_guard<std::mutex> guard(g_display_lock);
+    const uint64_t id = ++g_next_request;
+    g_requests[id] = {mode, width, height};
+    return id;
+}
+
+bool DisplayApplyResult(uint64_t request, bool& ok) {
+    if (!request) return false;
+    std::lock_guard<std::mutex> guard(g_display_lock);
+    auto it = g_results.find(request);
+    if (it == g_results.end()) return false;
+    ok = it->second;
+    g_results.erase(it);
+    return true;
+}
 
 void CaptureMouse(bool capture) { g_capture_wanted.store(capture, std::memory_order_relaxed); }
 
