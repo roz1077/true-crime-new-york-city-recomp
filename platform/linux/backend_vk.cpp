@@ -21,7 +21,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
+#include <source_location>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -672,11 +674,12 @@ private:
         return t && DeferredPending() &&
                (t == defer_rt_ || t == defer_ds_ || deferred_write_targets_.count(const_cast<Target*>(t)));
     }
-    void FlushDeferredScene();
+    // where is the caller, counted by line with TCNYC_PERF so the frequent flush reasons show
+    void FlushDeferredScene(std::source_location where = std::source_location::current());
     void ReplayDeferred(const std::vector<DeferredDraw>& draws, const std::vector<DeferredPlain>& plain,
                         VkDescriptorSet occlusion);
     VkPipeline PlainPipeline(DeferredPlain p);
-    void ResetDeferred();
+    void ResetDeferred(uint32_t ao_wanted);  // ao_wanted: the AO setting for the next frame
     bool CreateAoImage(AoImage& image, uint32_t w, uint32_t h, VkFormat format, uint32_t samples,
                        VkImageUsageFlags usage);
     void DestroyAoImage(AoImage& image);
@@ -1063,6 +1066,7 @@ private:
     unsigned long long perf_bind_ = 0, perf_pass_new_ = 0, perf_fb_new_ = 0, perf_target_new_ = 0;
     unsigned long long perf_target_upload_ = 0, perf_feedback_ = 0;
     unsigned long long perf_defer_flushes_ = 0, perf_ao_runs_ = 0;  // deferred replays and AO passes
+    std::map<uint32_t, unsigned long long> perf_flush_lines_;        // deferred replays by caller line
     // reused across draws: the assembled vertex/index buffers keep their capacity
     Assembled scratch_;
     std::chrono::steady_clock::time_point perf_log_at_{};
@@ -2666,8 +2670,9 @@ void VulkanBackend::EndRecord(bool wait) {
 void VulkanBackend::ResetFrame() {
     upload_used_ = 0;
     draw_set_next_ = 0;
-    ResetDeferred();
-    scene_dof_ = app::Snapshot().dof;
+    const app::Settings settings = app::Snapshot();  // one copy for the whole reset
+    ResetDeferred(settings.ao);
+    scene_dof_ = settings.dof;
     scene_depth_.clear();
     // the last frame's GPU work is done (present waited on the fence): pack images and late-lock
     // buffers released earlier can go now
@@ -3677,6 +3682,8 @@ VkPipeline VulkanBackend::PlainPipeline(DeferredPlain p) {
 void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, const std::vector<DeferredPlain>& plain,
                                    VkDescriptorSet occlusion) {
     size_t fallback = 0, skipped = 0;
+    // dynamic state as last set in this replay; consecutive draws mostly share it
+    const DeferredDraw* last = nullptr;
     for (const DeferredDraw& d : draws) {
         if (!d.pipe) continue;
         VkPipeline pipe = d.pipe;
@@ -3701,10 +3708,12 @@ void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, const
         VkDescriptorSet sets[2] = {d.set, occlusion};
         vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0,
                                 occlusion ? 2u : 1u, sets, 0, nullptr);
-        vkCmdSetViewport(cmd_, 0, 1, &d.vp);
-        vkCmdSetScissor(cmd_, 0, 1, &d.sc);
-        vkCmdSetBlendConstants(cmd_, d.blend);
-        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, d.stencil);
+        if (!last || std::memcmp(&last->vp, &d.vp, sizeof(d.vp))) vkCmdSetViewport(cmd_, 0, 1, &d.vp);
+        if (!last || std::memcmp(&last->sc, &d.sc, sizeof(d.sc))) vkCmdSetScissor(cmd_, 0, 1, &d.sc);
+        if (!last || std::memcmp(last->blend, d.blend, sizeof(d.blend))) vkCmdSetBlendConstants(cmd_, d.blend);
+        if (!last || last->stencil != d.stencil)
+            vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, d.stencil);
+        last = &d;
         if (d.index_count)
             vkCmdDrawIndexed(cmd_, d.index_count, 1, 0, d.base_vertex, 0);
         else
@@ -3719,10 +3728,13 @@ void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, const
     viewport_valid_ = false;
 }
 
-void VulkanBackend::FlushDeferredScene() {
+void VulkanBackend::FlushDeferredScene(std::source_location where) {
     if (deferred_.empty() || flushing_deferred_) return;
     flushing_deferred_ = true;
-    if (perf_) perf_defer_flushes_++;
+    if (perf_) {
+        perf_defer_flushes_++;
+        perf_flush_lines_[where.line()]++;
+    }
     struct Guard {
         bool& f;
         ~Guard() { f = false; }
@@ -3946,7 +3958,7 @@ void VulkanBackend::FlushDeferredScene() {
     deferred_plain_.clear();
 }
 
-void VulkanBackend::ResetDeferred() {
+void VulkanBackend::ResetDeferred(uint32_t ao_wanted) {
     deferred_.clear();
     deferred_plain_.clear();
     deferred_read_targets_.clear();
@@ -3959,7 +3971,6 @@ void VulkanBackend::ResetDeferred() {
     ao_set_next_ = 0;
     ao_occ_set_next_ = 0;
     for (auto& cached : ao_occ_cached_) cached = {};
-    const uint32_t ao_wanted = app::Snapshot().ao;
     if (ao_failed_ && (ao_wanted != ao_failed_setting_ || ++ao_failed_frames_ >= kAoRetryFrames)) {
         ao_failed_ = false;  // a new setting, size or memory situation may work now
         LOGR("vulkan: trying ambient occlusion again");
@@ -6028,11 +6039,14 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     const bool scene_view = s.viewport.w == width_ && s.viewport.h * 4 >= height_ * 3;
     const bool scene_sized = rt && !rt->depth && rt->gw == width_ && rt->gh == height_ && ds &&
                              ds->w == rt->w && ds->h == rt->h && ds->samples == rt->samples;
-    bool samples_colour_rt = false;
-    for (int i = 0; i < 4; i++)
-        if ((info[size_t(i)].flags & kTexTarget) && !info[size_t(i)].shadow) samples_colour_rt = true;
+    // only looked at with AO on
+    auto samples_colour_rt = [&] {
+        for (int i = 0; i < 4; i++)
+            if ((info[size_t(i)].flags & kTexTarget) && !info[size_t(i)].shadow) return true;
+        return false;
+    };
     const uint8_t ao_roles = ao_mode_ != 0 && scene_sized && !a.pretransformed && scene_view
-                                 ? AoRoles(s, samples_colour_rt)
+                                 ? AoRoles(s, samples_colour_rt())
                                  : 0;
     bool defer_now = defer_scene_ && !defer_abandoned_ && scene_sized && !a.pretransformed && scene_view &&
                      !SimpleState(s, kMCountEnable);
@@ -7529,6 +7543,19 @@ void VulkanBackend::Present(const Surface& front) {
             perf_sync_ms_ = perf_copy_ms_ = perf_clear_ms_ = perf_present_ms_ = 0.0;
             perf_direct_ = perf_stale_ = perf_readback_ = 0;
             perf_bind_ = perf_pass_new_ = perf_fb_new_ = perf_target_new_ = perf_target_upload_ = 0;
+            if (!perf_flush_lines_.empty()) {
+                // the callers that flushed the deferred scene most in this sample, by source line
+                std::vector<std::pair<unsigned long long, uint32_t>> top;
+                for (auto [line, count] : perf_flush_lines_) top.emplace_back(count, line);
+                std::ranges::sort(top, std::greater{});
+                char text[160] = "";
+                size_t used = 0;
+                for (size_t i = 0; i < top.size() && i < 4 && used < sizeof(text); i++)
+                    used += size_t(std::snprintf(text + used, sizeof(text) - used, " line %u: %.1f/frame",
+                                                 top[i].second, double(top[i].first) / 60.0));
+                LOGI("renderer: deferred flushes by caller (backend_vk.cpp):%s", text);
+                perf_flush_lines_.clear();
+            }
             perf_defer_flushes_ = perf_ao_runs_ = 0;
         } else {
             size_t late_count = 0;

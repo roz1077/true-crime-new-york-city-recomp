@@ -4127,12 +4127,15 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // between its triangles, which turned the smooth bump-mapped surface into faceted spikes,
     // and liquid and mirror surfaces show no ambient occlusion anyway. A depth target sampled
     // as a shadow map does not count.
-    bool samples_colour_rt = false;
-    for (int i = 0; i < 4; i++)
-        if (stages.rt[i] && !stages.info[i].shadow) samples_colour_rt = true;
+    // only looked at with AO on
+    auto samples_colour_rt = [&] {
+        for (int i = 0; i < 4; i++)
+            if (stages.rt[i] && !stages.info[i].shadow) return true;
+        return false;
+    };
     uint8_t ao_roles = render_.ao != 0 && bound_rt_ && bound_ds_ && bound_ds_->res && !a.pretransformed &&
                                      scene_view && bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h
-                                 ? AoRoles(s, samples_colour_rt)
+                                 ? AoRoles(s, samples_colour_rt())
                                  : 0;
     const bool opaque = (ao_roles & kAoDepth) != 0;  // recorded into the AO depth prepass
     if (defer_now && !BeginDeferredBundle(stages, opaque)) {
@@ -5693,8 +5696,8 @@ void D3D12Backend::Present(const Surface& front) {
     ResetFrame();
     CountFps();
     if (diag::Perf()) LogPerf();
-    ApplySettings();
     render_ = app::Snapshot();
+    ApplySettings();  // reads render_
 }
 
 // the slot is not reused before the caller's wait: the title runs at most one present ahead
@@ -5723,7 +5726,7 @@ void D3D12Backend::ApplySettings() {
     if (texturedumper::Update()) ReleasePackTextures();
     // Ambient occlusion requires the deferred scene list. Toggle it live so the F10 row
     // works without a restart.
-    const bool want_defer = defer_forced_ || app::Snapshot().ao != 0;
+    const bool want_defer = defer_forced_ || render_.ao != 0;
     if (want_defer != defer_scene_) {
         if (defer_scene_) FlushDeferredScene();
         defer_scene_ = want_defer;
