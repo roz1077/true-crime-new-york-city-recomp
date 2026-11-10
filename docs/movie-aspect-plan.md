@@ -1,5 +1,9 @@
 # Intro movies and legal screen: aspect ratio plan
 
+Status: **implemented** (`900435e`, `57dd715`): the intro movies stretch across the frame at every
+aspect setting and the legal page stays 4:3, centred, on both renderers. Linux also writes the
+front-buffer clear between pictures to memory (`21a83ff`). The probe described below was removed.
+
 Goal: the intro movies and the legal page fill the screen on wide displays, with no new setting.
 
 ## What step 1 found (probe runs, 2026-11-10)

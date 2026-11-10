@@ -1,5 +1,9 @@
 # Developer debug menu: plan
 
+Status: **implemented** in `src/dev/`, built only by the `dev` CMake preset (`TCNYC_DEV_TOOLS=ON`).
+Release builds leave it out entirely; `scripts/test_no_dev_tools.py` and the release packaging
+check that.
+
 A developer-only ImGui overlay for testing: start or skip missions, move the
 player around, change game state, and inspect what the game is doing. It is
 built only into dev builds; release builds contain no debug code, no symbols

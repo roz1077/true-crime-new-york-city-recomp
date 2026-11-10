@@ -1,5 +1,9 @@
 # HDR fixes plan
 
+Status: **done.** The fixes below were applied before the HDR work was committed in `353055f`; the
+"uncommitted" and "do not commit" rules applied to that pass only. Later overlay fixes: `b23c89d`
+(straight colour before decoding), `0567665` (descriptor order), `bafbafa` (exact below the knee).
+
 Brief for an agent fixing the review findings on the HDR output work described in
 `docs/hdr-plan.md`. Read that document's "What shipped" section first, then this one.
 

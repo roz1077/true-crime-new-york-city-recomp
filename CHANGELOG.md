@@ -67,12 +67,22 @@
   detail level, so distant parked cars are never drawn untextured.
 - Building windows blend their lit interiors as on the console: a fixed-function stage
   that writes a temporary register now leaves texture 0's alpha as the current alpha.
+- Fixed an occasional white flash in the intro cutscene: a cutscene frame that comes
+  early now waits for the audio clock instead of drawing a frame in which nothing moved.
+- Linux: fixed a band of the last intro movie frame that sometimes showed under the legal
+  page; a front-buffer clear between pictures now reaches the buffer's memory too.
 
 ### Menus
 - The native Options > Display tab has the remaining Graphics options: display mode,
   object detail, bloom, depth of field, ambient occlusion, seam fix, PC contrast, and an
   HDR SETTINGS page. A display change there is saved only once it has been applied, and
   a refused change is rolled back.
+- Display changes from either menu are applied with their own values and reported per
+  request on Windows and Linux; a refused or failed change (including a failed window
+  move) puts the previous mode back, and Back during an apply restores the entry mode
+  without saving the cancelled one.
+- The F10 Graphics menu scrolls when it is taller than the screen, and keeps the row
+  highlighted by the keyboard or a pad in view.
 
 ### Developer
 - A `dev` CMake preset builds a debug menu (F9: mission and stage jumps, player cheats,

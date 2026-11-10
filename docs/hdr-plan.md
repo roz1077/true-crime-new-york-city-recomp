@@ -1,5 +1,9 @@
 # HDR output plan
 
+Status: **implemented on D3D12 and Vulkan** (`353055f`), with the review fixes from
+`docs/hdr-fixes-plan.md` and later overlay fixes (`b23c89d`, `0567665`, `bafbafa`). Kept as the
+design record; HDR is off by default.
+
 Brief for an agent implementing HDR display output. Read the whole document before editing.
 
 ## Goal
