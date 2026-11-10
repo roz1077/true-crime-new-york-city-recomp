@@ -382,11 +382,16 @@ static const float3x3 Rec709to2020 = float3x3(
     0.0163916, 0.0880132, 0.8955950);
 float4 psmain(O i) : SV_Target {
     float4 c = img.Sample(ps, i.uv);
-    // ImGui's over-blend leaves premultiplied sRGB in the target.
-    float3 lin = SrgbToLinear(saturate(c.rgb)) * hdr.y;
-    if (hdr.x < 1.5) return float4(lin / 80.0, c.a);
+    // The target holds premultiplied sRGB (ImGui's over-blend into a cleared target). Undo the
+    // premultiply before the non-linear decode, then premultiply again in the output encoding:
+    // decoding premultiplied values made half-covered text edges and panels far too dark.
+    const float a = saturate(c.a);
+    const float3 straight = a > 1e-5 ? saturate(c.rgb / a) : float3(0, 0, 0);
+    float3 lin = SrgbToLinear(straight) * hdr.y;
+    if (hdr.x < 1.5) return float4(lin / 80.0 * a, a);
+    // HDR10 blends in the PQ domain: an approximation for partial coverage, exact at 0 and 1.
     float3 rgb2020 = mul(Rec709to2020, lin);
-    return float4(PqEncode(clamp(rgb2020, 0.0, 10000.0)), c.a);
+    return float4(PqEncode(clamp(rgb2020, 0.0, 10000.0)) * a, a);
 }
 )";
 
