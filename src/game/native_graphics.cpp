@@ -78,6 +78,11 @@ std::atomic<uint64_t> g_save_due{0};
 // are in the live settings (the window thread applies from them) but are written to the file only
 // once it confirms them. A refused change is put back. Menu thread only.
 uint64_t g_display_request = 0;
+// A cancel while an apply is still in flight waits for that answer, then asks for the mode the
+// tab was entered with. Keeping this separate stops the superseded request's result being saved.
+bool g_restore_pending = false;
+uint32_t g_restore_mode = 0;
+uint64_t g_restore_size = 0;
 
 uint64_t NowMs() {
     return uint64_t(
@@ -96,15 +101,39 @@ void FlushSettings() {
     app::Save();
 }
 
+void PostRestoreDisplayChoice() {
+    const uint32_t w = uint32_t(g_restore_size >> 32), h = uint32_t(g_restore_size);
+    const uint64_t request = app::RequestDisplayApply(app::DisplayMode(g_restore_mode), w, h);
+    if (!request) {
+        g_restore_pending = false;
+        LOGE("Display tab: could not request the entry display mode %u, %ux%u back", g_restore_mode, w, h);
+        return;
+    }
+    g_display_request = request;
+}
+
 // the window thread's answer to the display change in flight: keep and save it, or put the
 // previous mode back
 void PollDisplayApply() {
-    if (!g_display_request) return;
+    if (!g_display_request) {
+        if (g_restore_pending) {
+            g_restore_pending = false;
+            PostRestoreDisplayChoice();
+        }
+        return;
+    }
     bool ok = false;
     if (!app::DisplayApplyResult(g_display_request, ok)) return;
     g_display_request = 0;
     // a refused change never reached the settings, and the window thread put the previous mode back
     if (!ok) LOGE("Display tab: the display change was refused; kept the previous mode");
+    if (g_restore_pending) {
+        // The cancel was requested while this apply was in flight. Wait for its own answer, then
+        // put the entry mode back; do not save the superseded request's mode.
+        g_restore_pending = false;
+        PostRestoreDisplayChoice();
+        if (g_display_request) return;
+    }
     g_save_dirty.store(true, std::memory_order_release);
     FlushSettings();
 }
@@ -196,24 +225,22 @@ void ApplyDisplayChoice(uint32_t mode, uint64_t size) {
     g_display_request = request;
 }
 
-// Cancel: put back the mode the tab was entered with. The window thread answers requests in order,
-// so this one also lands after a change still in flight.
+// Cancel: put back the mode the tab was entered with. If a change is still in flight, remember the
+// restore target and post it after that request's own answer arrives.
 void RestoreDisplayChoice(uint32_t mode, uint64_t size) {
     g_pending = false;
-    PollDisplayApply();
-    const bool in_flight = g_display_request != 0;
     const uint32_t w = uint32_t(size >> 32), h = uint32_t(size);
-    {
+    if (!g_display_request) {
         app::SettingsLock lock;
         const app::Settings &s = app::Get();
-        if (!in_flight && s.width == w && s.height == h && uint32_t(s.display_mode) == mode) return;
+        if (s.width == w && s.height == h && uint32_t(s.display_mode) == mode) return;
     }
-    if (const uint64_t request = app::RequestDisplayApply(app::DisplayMode(mode), w, h)) {
-        g_display_request = request;  // the earlier request's answer is dropped; this one is saved
-        return;
-    }
-    g_display_request = 0;
-    LOGE("Display tab: could not request the entry display mode %u, %ux%u back", mode, w, h);
+    // Set the restore target before polling: if the in-flight request has just finished, Poll must
+    // post the restore instead of saving the superseded request's mode.
+    g_restore_mode = mode;
+    g_restore_size = size;
+    g_restore_pending = true;
+    PollDisplayApply();
 }
 
 // guest buffers for the row texts, one per option; 0 if they could not be allocated
