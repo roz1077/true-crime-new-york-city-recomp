@@ -102,22 +102,26 @@ void UpdatePromptType() {
     auto contains = [&](const char* text) { return name && std::strstr(name, text); };
     const bool playstation_name = contains("PS3") || contains("PS4") || contains("PS5") || contains("DualSense") ||
                                   contains("DualShock") || contains("Sony");
-    // On a Deck, Steam Input hands the built-in controller over as a virtual pad (a Steam handle, often
-    // typed Xbox). That is the Deck's own controller unless the pad says it is something else; an
-    // external Xbox pad there can be picked with prompt_style.
-    const bool deck_virtual = g_pads[0] && RunningOnSteamDeck() && SDL_GetGamepadSteamHandle(g_pads[0]) != 0;
     PromptStyle style = PromptStyle::Original;
     if (playstation(real) || playstation(mapped) || playstation_name)
         style = PromptStyle::PlayStation;
-    else if (deck_pad || deck_virtual || (g_pads[0] && RunningOnSteamDeck() && !xbox(mapped)))
+    else if (deck_pad || (g_pads[0] && RunningOnSteamDeck() && !xbox(mapped)))
         style = PromptStyle::SteamDeck;
     else if (xbox(real) || xbox(mapped))
+        style = PromptStyle::Xbox;
+    // Elsewhere (a ROG Ally or Legion Go on SteamOS, a desktop with Steam Input) a pad Steam presents
+    // without a type of its own is the handheld's or a generic Xbox-layout controller: Xbox prompts,
+    // not the original console glyphs.
+    else if (g_pads[0] && SDL_GetGamepadSteamHandle(g_pads[0]) != 0)
         style = PromptStyle::Xbox;
     constexpr PromptStyle kOverrides[] = {PromptStyle::Original, PromptStyle::Original, PromptStyle::Xbox,
                                           PromptStyle::PlayStation, PromptStyle::SteamDeck};
     if (g_prompt_override > 0 && g_prompt_override < 5) style = kOverrides[g_prompt_override];
+    // also called while a pad is in use, so only a change is logged
+    static std::string last_logged;
+    const std::string what = std::string(name ? name : "") + char('0' + int(style));
     g_prompt_style.store(style, std::memory_order_relaxed);
-    if (g_pads[0])
+    if (g_pads[0] && what != last_logged && (last_logged = what, true))
         LOGR("input: controller 1 prompts: %s %04X:%04X, real type %d, mapped type %d, steam handle %llu, style %d",
              name ? name : "", SDL_GetGamepadVendor(g_pads[0]), SDL_GetGamepadProduct(g_pads[0]), int(real),
              int(mapped), (unsigned long long)SDL_GetGamepadSteamHandle(g_pads[0]), int(style));
@@ -615,6 +619,15 @@ Pad Poll(int port) {
         if (active || !p.connected) g_keyboard_mouse_active.store(true, std::memory_order_relaxed);
         else if (controller_active) {
             g_keyboard_mouse_active.store(false, std::memory_order_relaxed);
+            // Steam Input re-routes its virtual pads as controllers come and go, so the pad behind
+            // port 0 can change without an add or remove: look at it again while it is in use
+            static uint64_t prompt_checked_at = 0;
+            const uint64_t now = SDL_GetTicks();
+            if (now - prompt_checked_at >= 1000) {
+                prompt_checked_at = now;
+                std::lock_guard pads(g_lock);
+                UpdatePromptType();
+            }
             // Relinquish held camera angles immediately. The next mouse
             // sample starts from the controller's current heading.
             std::lock_guard lock(g_mouse_lock);

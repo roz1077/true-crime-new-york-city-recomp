@@ -30,8 +30,9 @@
 - Button prompts follow the active device on Linux as well as Windows, including
   PlayStation pads behind Steam Input.
 - The Steam Deck's built-in controller gets its own glyphs (lettered face buttons,
-  View and Menu), also when Steam Input presents it as an Xbox pad; PlayStation
-  prompts show Share and Options.
+  View and Menu); PlayStation prompts show Share and Options. Other handhelds' built-in
+  controllers under Steam Input (ROG Ally, Legion Go) get Xbox prompts, and prompts
+  follow a controller swapped in through Steam Input while it is in use.
 - `prompt_style` in `settings.toml` overrides the automatic prompt choice: 0 automatic,
   1 original, 2 Xbox, 3 PlayStation, 4 Steam Deck.
 - Keyboard prompts switch to the pedal keys (W, S, Space) in a vehicle and show the
