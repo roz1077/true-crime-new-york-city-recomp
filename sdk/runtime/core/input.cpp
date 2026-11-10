@@ -58,17 +58,23 @@ bool DirectAimLive(uint64_t now) {
            now - g_direct_at.load(std::memory_order_relaxed) < 100;
 }
 
-// Valve's handheld (DMI product "Jupiter" or "Galileo"): its built-in controller
-// reaches the game through Steam Input as a generic virtual pad
+// Valve's handheld (DMI product "Jupiter" for the LCD model, "Galileo" for the OLED one): its
+// built-in controller reaches the game through Steam Input as a generic virtual pad. Other Valve
+// hardware has its own product names and keeps the pad's own prompts.
 bool RunningOnSteamDeck() {
 #ifdef _WIN32
     return false;
 #else
     static const bool deck = [] {
-        std::ifstream vendor("/sys/devices/virtual/dmi/id/sys_vendor");
-        std::string name;
-        std::getline(vendor, name);
-        return name.rfind("Valve", 0) == 0;
+        auto read = [](const char* path) {
+            std::ifstream file(path);
+            std::string line;
+            std::getline(file, line);
+            return line;
+        };
+        if (read("/sys/devices/virtual/dmi/id/sys_vendor").rfind("Valve", 0) != 0) return false;
+        const std::string product = read("/sys/devices/virtual/dmi/id/product_name");
+        return product == "Jupiter" || product == "Galileo";
     }();
     return deck;
 #endif
