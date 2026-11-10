@@ -5760,6 +5760,83 @@ bool AnyStageWraps(const State& s) {
 // Screen space draws onto a back buffer sized target are the title's 2D layer: HUD, text, menus,
 // full screen pictures and movies, fades and passes. Titles lay that layer out for 16:9 at most; on
 // a wider frame it would stretch, so it is drawn at 16:9 in the middle (mirrors d3d12.cpp UiSqueeze).
+// D3D12's RegionClip (d3d12.cpp), for the shared TexUv clamp. A screen space pass reading a render target holds its
+// reads to the texels its coordinates span, from the first texel centre to the last: the glow chain keeps several
+// blur levels side by side in one target, and the far edge's pixels would blend in the next, less blurred level (an
+// offset copy of the scene along the right and bottom of the frame). A smaller glow target composited over the whole
+// frame also keeps off its outermost texels, which the title blacks out, so the glow does not fade to a dark band at
+// the frame's edges (unlike the console). Every other target read stays open.
+void RegionClip(const Assembled& a, const std::array<TexInfo, 4>& info, const std::array<TextureDesc, 4>& descs,
+                uint32_t gw, uint32_t gh, DrawConstants& c) {
+    constexpr float kOpen = 1e9f;
+    constexpr uint32_t kSmallDrawVertices = 64;
+    constexpr uint8_t kR32G32Float = 16;
+    for (int i = 0; i < 4; i++) {
+        if (!(info[size_t(i)].flags & kTexTarget)) continue;
+        c.rtclip[i][0] = c.rtclip[i][1] = -kOpen;
+        c.rtclip[i][2] = c.rtclip[i][3] = kOpen;
+    }
+    if (!a.pretransformed || !a.vertices.empty() || !a.vertex_count || a.vertex_count > kSmallDrawVertices) return;
+    // one texture coordinate set: the pass's quad
+    int reg = -1;
+    for (int r = 0; r < 16; r++) {
+        if (!(a.regs >> r & 1) || a.elements[size_t(r)].format != kR32G32Float) continue;
+        if (reg >= 0) return;
+        reg = r;
+    }
+    if (reg < 0) return;
+    const VertexElement& e = a.elements[size_t(reg)];
+    if (e.buffer >= a.buffers.size()) return;
+    const VertexBuffer& vb = a.buffers[e.buffer];
+    if (!vb.src || !vb.stride || uint64_t(a.vertex_count) * vb.stride > vb.bytes) return;
+    float lo[2] = {kOpen, kOpen}, hi[2] = {-kOpen, -kOpen};
+    for (uint32_t v = 0; v < a.vertex_count; v++) {
+        float uv[2];
+        std::memcpy(uv, vb.src + size_t(v) * vb.stride + e.offset, sizeof(uv));
+        for (int k = 0; k < 2; k++) {
+            lo[k] = std::min(lo[k], uv[k]);
+            hi[k] = std::max(hi[k], uv[k]);
+        }
+    }
+    // the quad covers the whole bound target: a composite over the frame
+    bool full_frame = false;
+    const VertexElement& pe = a.elements[0];
+    if (gw && gh && (a.regs & 1) && pe.buffer < a.buffers.size()) {
+        const VertexBuffer& pb = a.buffers[pe.buffer];
+        if (pb.src && pb.stride && uint64_t(a.vertex_count) * pb.stride <= pb.bytes) {
+            float plo[2] = {kOpen, kOpen}, phi[2] = {-kOpen, -kOpen};
+            for (uint32_t v = 0; v < a.vertex_count; v++) {
+                float p[2];
+                std::memcpy(p, pb.src + size_t(v) * pb.stride + pe.offset, sizeof(p));
+                for (int k = 0; k < 2; k++) {
+                    plo[k] = std::min(plo[k], p[k]);
+                    phi[k] = std::max(phi[k], p[k]);
+                }
+            }
+            full_frame = plo[0] <= 0.5f && plo[1] <= 0.5f && phi[0] >= float(gw) - 0.5f && phi[1] >= float(gh) - 0.5f;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        const TextureDesc& d = descs[size_t(i)];
+        if (!(info[size_t(i)].flags & kTexTarget) || !d.width || !d.height) continue;
+        const float size[2] = {float(d.width), float(d.height)};
+        for (int k = 0; k < 2; k++) {
+            const float n = info[size_t(i)].rect ? size[k] : 1.0f;  // coordinates per texture width
+            if (hi[k] - lo[k] < 2 * n / size[k]) continue;          // too narrow to be a region
+            // the far edge's last texel centre: as far in from it as the near edge's coordinate is past a texel corner
+            const float texel = n / size[k];
+            const float past = lo[k] / texel - std::floor(lo[k] / texel);
+            c.rtclip[i][k] = lo[k] / n;
+            c.rtclip[i][2 + k] = (hi[k] - (past > 0.25f ? 1.0f : 0.5f) * texel) / n;
+            const bool whole = lo[k] <= texel * 1.01f && hi[k] >= n - texel * 0.01f;
+            if (full_frame && whole && size[k] < float(k ? gh : gw) && size[k] > 4) {
+                c.rtclip[i][k] += texel / n;
+                c.rtclip[i][2 + k] -= texel / n;
+            }
+        }
+    }
+}
+
 float VulkanBackend::UiSqueeze(const State& s, const Assembled& a, const std::array<TexInfo, 4>& info,
                                const std::array<Tex*, 4>& tex, const Target* rt) const {
     constexpr float kUiAspect = 16.0f / 9.0f;
@@ -6367,6 +6444,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     c.tscale[0] = float(host_w) / float(std::max(1u, size.w));
     c.tscale[1] = float(host_h) / float(std::max(1u, size.h));
     c.tscale[2] = UiSqueeze(s, a, info, tex, rt);
+    // the frame's size when the draw targets the frame, for RegionClip's full-frame composites
+    const bool frame = rt && rt->gw == width_ && rt->gh == height_;
+    RegionClip(a, info, descs, frame ? width_ : 0, frame ? height_ : 0, c);
 
     if (rt && !a.pretransformed) rt->scene_frame = frames_ + 1;
     Target* dof_ds = ds ? ds : pass_ds_;
