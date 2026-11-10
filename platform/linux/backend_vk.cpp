@@ -812,6 +812,10 @@ private:
     std::vector<VkSemaphore> render_done_;  // one per swapchain image: a present may still own the previous one
     VkFormat depth_format_ = VK_FORMAT_D24_UNORM_S8_UINT;
     bool depth_has_stencil_ = true;
+    // the aspects of depth_format_: a device without a depth/stencil format has no stencil to view
+    VkImageAspectFlags DepthAspect() const {
+        return VK_IMAGE_ASPECT_DEPTH_BIT | (depth_has_stencil_ ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+    }
     VkFence fence_ = VK_NULL_HANDLE;
     bool failed_ = false;  // a submit or acquire failure stops presenting instead of waiting on a dead fence
     bool recording_ = false;
@@ -1296,6 +1300,13 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
                                                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                                      0, &props) == VK_SUCCESS)
             ao_color_samples_ = props.sampleCounts;
+        // the prepass also needs a depth target of depth_format_ at the same sample count
+        VkImageFormatProperties depth_props{};
+        if (vkGetPhysicalDeviceImageFormatProperties(physical_, depth_format_, VK_IMAGE_TYPE_2D,
+                                                     VK_IMAGE_TILING_OPTIMAL,
+                                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
+                                                     &depth_props) == VK_SUCCESS)
+            ao_color_samples_ &= depth_props.sampleCounts;
         if ((ao_color_samples_ & VK_SAMPLE_COUNT_1_BIT) == 0) ao_color_samples_ = VK_SAMPLE_COUNT_1_BIT;
     }
     if (!CreateSwapchain() || !CreateCommands() || !CreateUpload()) return false;
@@ -4559,7 +4570,7 @@ bool VulkanBackend::CreateTargetImages(Target& t) {
         view.image = image;
         view.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view.format = t.format;
-        view.subresourceRange = {t.depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+        view.subresourceRange = {t.depth ? DepthAspect()
                                          : VK_IMAGE_ASPECT_COLOR_BIT,
                                  0, 1, 0, 1};
         return vkCreateImageView(device_, &view, nullptr, &out_view) == VK_SUCCESS;
@@ -4758,7 +4769,7 @@ bool VulkanBackend::RebuildTargetSingleSample(Target* t) {
             view.image = t->image;
             view.viewType = VK_IMAGE_VIEW_TYPE_2D;
             view.format = t->format;
-            view.subresourceRange = {t->depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+            view.subresourceRange = {t->depth ? DepthAspect()
                                               : VK_IMAGE_ASPECT_COLOR_BIT,
                                      0, 1, 0, 1};
             ok = vkCreateImageView(device_, &view, nullptr, &t->view) == VK_SUCCESS;
@@ -5905,6 +5916,7 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
         Color(color, att[na].clearValue.color.float32);
         na++;
     }
+    if (!depth_has_stencil_) flags &= ~kClearStencil;
     if (ds && (flags & (kClearZ | kClearStencil))) {
         att[na].aspectMask = ((flags & kClearZ) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
                              ((flags & kClearStencil) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
