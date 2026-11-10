@@ -29,6 +29,10 @@
   configured heavy-attack key.
 
 ### Graphics
+- The intro movies (Activision, Luxoflux, Exakt) fill wide screens: their 4:3
+  picture is stretched across the whole frame at every aspect setting instead of
+  sitting squeezed in the middle. The legal page keeps its 4:3 shape, centred. On
+  Linux the movies are no longer shifted 21 pixels to the right.
 - Ambient occlusion (F10: Off / Half / Full, off by default) on Windows (D3D12) and Linux
   (Vulkan). It uses GTAO from a depth prepass of world geometry only, and is applied inside
   the world draws before fog, so light shafts, fog and other effects are not darkened and no

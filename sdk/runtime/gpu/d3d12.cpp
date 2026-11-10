@@ -5109,7 +5109,8 @@ void D3D12Backend::UploadGammaRamp() {
 
 void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     // at the aspect setting (by default the output's shape); 4:3 when the console reports a 4:3 TV. A picture the
-    // CPU wrote (movies, legal screens) is laid out by LayoutPicture: movies fill the frame up to 16:9, pages keep 4:3.
+    // CPU wrote (movies, legal screens) is laid out by LayoutPicture: a movie's 4:3 picture is stretched across the
+    // whole frame at any aspect setting, pages keep 4:3.
     float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
     const bool scene = t.scene_frame == frame_;
     if (t.cpu || scene) {

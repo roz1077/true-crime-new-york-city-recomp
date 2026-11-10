@@ -90,13 +90,13 @@ page gets a centred 4:3 viewport. Checked under Xvfb at 1280x720 with the valida
 ### 4. Help text
 
 Update "HUD, menus and movies stay 16:9 in the middle" (`src/common/graphics_choices.h:40`,
-`src/common/graphics_options.cpp:453`): movies fill the screen up to 16:9.
+`src/common/graphics_options.cpp:453`): movies stretch to fill the screen.
 
 ### 5. Testing
 
 At 4:3, 16:10, 16:9, 21:9 and 32:9:
 
-- Activision, Luxoflux and Exakt: fill the screen up to 16:9, not stretched, logos whole.
+- Activision, Luxoflux and Exakt: fill the whole screen at every shape (stretched from 4:3), logos whole.
 - Legal page: correct shape, text whole, no visible bars on 16:9.
 - 4:3: same as today.
 - Skipping a movie with a button press, and the first menu frame after the legal page: no leftover crop.
