@@ -285,6 +285,7 @@ struct DeferredDraw {
     uint32_t stencil = 0;
     uint32_t zfunc = 0;
     bool receiver = false;  // the receiver pipeline reads t4
+    int32_t plain = -1;     // receivers: index of the DeferredPlain to draw with when no AO set exists
     Target* rt = nullptr;
     Target* ds = nullptr;
 };
@@ -357,6 +358,13 @@ struct PsoKey {
 
 struct PsoKeyHash {
     size_t operator()(const PsoKey& k) const { return size_t(Hash(&k, sizeof(k))); }
+};
+
+// what a deferred AO receiver needs to build its ordinary pipeline if no occlusion set can be bound
+struct DeferredPlain {
+    PsoKey key;
+    PixelKey pk;  // with ao = 0
+    VkShaderModule vs = VK_NULL_HANDLE;
 };
 
 // A target is identified by the surface's address and shape: the guest reuses one address for
@@ -665,7 +673,9 @@ private:
                (t == defer_rt_ || t == defer_ds_ || deferred_write_targets_.count(const_cast<Target*>(t)));
     }
     void FlushDeferredScene();
-    void ReplayDeferred(const std::vector<DeferredDraw>& draws, VkDescriptorSet occlusion);
+    void ReplayDeferred(const std::vector<DeferredDraw>& draws, const std::vector<DeferredPlain>& plain,
+                        VkDescriptorSet occlusion);
+    VkPipeline PlainPipeline(DeferredPlain p);
     void ResetDeferred();
     bool CreateAoImage(AoImage& image, uint32_t w, uint32_t h, VkFormat format, uint32_t samples,
                        VkImageUsageFlags usage);
@@ -853,7 +863,11 @@ private:
     bool ao_depth_clear_ = true;
     bool ao_probed_ = false;
     bool ao_dist_probed_ = false;
-    bool ao_failed_ = false;  // no occlusion image could be bound: AO stays off for the rest of the run
+    bool ao_failed_ = false;  // no occlusion image could be bound: AO is paused (see ResetFrame)
+    uint32_t ao_failed_setting_ = 0;
+    bool ao_fail_test_ = false;
+    uint32_t ao_failed_frames_ = 0;
+    static constexpr uint32_t kAoRetryFrames = 600;  // about ten seconds
     // occlusion sets written this frame, by view. Every replay binds one of at most two views (the
     // occlusion target or the zero image), so a frame needs two sets however often it flushes. The
     // cache is dropped with the frame and whenever an AO image (and so a view handle) is destroyed.
@@ -862,6 +876,7 @@ private:
     Target* defer_rt_ = nullptr;
     Target* defer_ds_ = nullptr;
     std::vector<DeferredDraw> deferred_;
+    std::vector<DeferredPlain> deferred_plain_;  // fallback pipelines for the receivers in deferred_
     std::unordered_set<Target*> deferred_read_targets_, deferred_write_targets_;
     std::unordered_set<VkImage> deferred_read_images_;
 
@@ -1191,6 +1206,8 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     aniso_setting_ = app::Snapshot().aniso;
     aspect_ = app::AspectRatio();
     perf_ = std::getenv("TCNYC_PERF") != nullptr;
+    // testing only: no occlusion set can be bound, to exercise the non-AO receiver fallback
+    ao_fail_test_ = std::getenv("TCNYC_AO_FAIL_TEST") != nullptr;
     trace_ = std::getenv("TCNYC_TRACE") != nullptr;
     if (const char* e = std::getenv("TCNYC_DEFER_SCENE")) defer_forced_ = *e && std::atoi(e) != 0;
     ao_mode_ = app::Snapshot().ao;
@@ -2594,6 +2611,7 @@ void VulkanBackend::EndRecord(bool wait) {
     if (failed_) {
         // A prior failure left the fence unsignalled: finish the buffer but never wait on it.
         deferred_.clear();
+        deferred_plain_.clear();
         FlushPass();
         vkEndCommandBuffer(cmd_);
         recording_ = false;
@@ -3612,7 +3630,7 @@ void VulkanBackend::DumpAoProbe(AoImage& image) {
 }
 
 VkDescriptorSet VulkanBackend::AcquireAoOcclusionSet(VkImageView view) {
-    if (!view) return VK_NULL_HANDLE;
+    if (!view || ao_fail_test_) return VK_NULL_HANDLE;
     for (const auto& [cached_view, cached_set] : ao_occ_cached_)
         if (cached_view == view) return cached_set;
     if (ao_occ_set_next_ >= ao_occ_sets_.size()) return VK_NULL_HANDLE;
@@ -3632,19 +3650,39 @@ VkDescriptorSet VulkanBackend::AcquireAoOcclusionSet(VkImageView view) {
     return set;
 }
 
-void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, VkDescriptorSet occlusion) {
-    size_t skipped = 0;
+// the game's own pipeline for a receiver; built on first use, which only happens when AO failed
+VkPipeline VulkanBackend::PlainPipeline(DeferredPlain p) {
+    uint64_t pkey = 0;
+    VkShaderModule ps = PixelShaderFor(p.pk, pkey);
+    if (!ps || !p.vs) return VK_NULL_HANDLE;
+    p.key.ps = pkey;
+    if (auto it = pipelines_.find(p.key); it != pipelines_.end()) return it->second;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (!CreatePipeline(p.key, p.vs, ps, pipe)) return VK_NULL_HANDLE;
+    pipelines_[p.key] = pipe;
+    return pipe;
+}
+
+void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, const std::vector<DeferredPlain>& plain,
+                                   VkDescriptorSet occlusion) {
+    size_t fallback = 0, skipped = 0;
     for (const DeferredDraw& d : draws) {
         if (!d.pipe) continue;
-        // A receiver's pipeline reads set 1. Without an occlusion set (no AO image could be made,
-        // FlushDeferredScene turned AO off from the next frame) it cannot be drawn safely.
+        VkPipeline pipe = d.pipe;
+        // A receiver's AO pipeline reads set 1. Without an occlusion set (no AO image could be
+        // made) it is drawn with the game's own pipeline instead, without AO.
         if (d.receiver && !occlusion) {
-            ++skipped;
-            continue;
+            pipe = d.plain >= 0 && size_t(d.plain) < plain.size() ? PlainPipeline(plain[size_t(d.plain)])
+                                                                  : VK_NULL_HANDLE;
+            if (!pipe) {
+                ++skipped;
+                continue;
+            }
+            ++fallback;
         }
-        if (d.pipe != bound_pipe_) {
-            vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe);
-            bound_pipe_ = d.pipe;
+        if (pipe != bound_pipe_) {
+            vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            bound_pipe_ = pipe;
         }
         for (uint32_t i = 0; i < d.vb_count; i++)
             vkCmdBindVertexBuffers(cmd_, d.vbind[i], 1, &d.vbufs[i], &d.voffs[i]);
@@ -3664,7 +3702,8 @@ void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, VkDes
         if (d.rt) d.rt->drawn = true;
         if (d.ds) d.ds->drawn = true;
     }
-    if (skipped) LOGE("vulkan: %zu AO receiver draw(s) skipped this frame: no occlusion image", skipped);
+    if (fallback) LOG_FIRST(4, "vulkan: %zu AO receiver draw(s) drawn without AO: no occlusion image", fallback);
+    if (skipped) LOGE("vulkan: %zu AO receiver draw(s) skipped: no occlusion image or ordinary pipeline", skipped);
     bound_pipe_ = VK_NULL_HANDLE;
     viewport_valid_ = false;
 }
@@ -3682,6 +3721,8 @@ void VulkanBackend::FlushDeferredScene() {
     Target* ds = defer_ds_;
     std::vector<DeferredDraw> draws;
     draws.swap(deferred_);
+    std::vector<DeferredPlain> plain;
+    plain.swap(deferred_plain_);
     deferred_read_targets_.clear();
     deferred_write_targets_.clear();
     deferred_read_images_.clear();
@@ -3863,16 +3904,18 @@ void VulkanBackend::FlushDeferredScene() {
             ao_occ_.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
             occlusion = AcquireAoOcclusionSet(ao_occ_.view);
         if (!occlusion && !ao_failed_) {
-            // the receivers were recorded with the AO shader variant, which needs set 1; turn AO
-            // off from the next frame so they are recorded with the game's own shaders again
+            // this replay draws the receivers with their ordinary pipelines; AO stays off until the
+            // setting changes or kAoRetryFrames pass, then it is tried again
             ao_failed_ = true;
-            LOGE("vulkan: no AO occlusion image could be bound; ambient occlusion is off for this run");
+            ao_failed_setting_ = ao_mode_;
+            ao_failed_frames_ = 0;
+            LOGE("vulkan: no AO occlusion image could be bound; ambient occlusion is paused");
         }
     }
 
     BeginScenePass(rt, ds);
     if (pass_ != VK_NULL_HANDLE) {
-        ReplayDeferred(draws, occlusion);
+        ReplayDeferred(draws, plain, occlusion);
     } else {
         defer_abandoned_ = true;
         LOGE("vulkan: deferred replay could not reopen the scene pass; dropping %zu draw(s)", draws.size());
@@ -3886,12 +3929,15 @@ void VulkanBackend::FlushDeferredScene() {
     static std::atomic<int> logged_flushes{0};
     if (logged_flushes.fetch_add(1, std::memory_order_relaxed) < 8)
         LOGR("vulkan: deferred flush %zu draw(s), AO %s", draws.size(), ao_ran ? "applied" : "off");
-    deferred_.swap(draws);  // keep the display list's allocation for the next scene
+    deferred_.swap(draws);  // keep the display list's allocations for the next scene
     deferred_.clear();
+    deferred_plain_.swap(plain);
+    deferred_plain_.clear();
 }
 
 void VulkanBackend::ResetDeferred() {
     deferred_.clear();
+    deferred_plain_.clear();
     deferred_read_targets_.clear();
     deferred_write_targets_.clear();
     deferred_read_images_.clear();
@@ -3902,7 +3948,12 @@ void VulkanBackend::ResetDeferred() {
     ao_set_next_ = 0;
     ao_occ_set_next_ = 0;
     for (auto& cached : ao_occ_cached_) cached = {};
-    ao_mode_ = ao_failed_ ? 0 : app::Snapshot().ao;
+    const uint32_t ao_wanted = app::Snapshot().ao;
+    if (ao_failed_ && (ao_wanted != ao_failed_setting_ || ++ao_failed_frames_ >= kAoRetryFrames)) {
+        ao_failed_ = false;  // a new setting, size or memory situation may work now
+        LOGR("vulkan: trying ambient occlusion again");
+    }
+    ao_mode_ = ao_failed_ ? 0 : ao_wanted;
     defer_scene_ = defer_forced_ || ao_mode_ != 0;
     msaa_store_ = defer_scene_;
     for (VkPipeline p : retired_ao_pipelines_)
@@ -6322,6 +6373,12 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         d.stencil = stencil_ref;
         d.zfunc = k.zfunc;
         d.receiver = ao_receiver && pk.ao == 1;
+        if (d.receiver) {
+            PixelKey plain_pk = pk;
+            plain_pk.ao = 0;
+            d.plain = int32_t(deferred_plain_.size());
+            deferred_plain_.push_back({k, plain_pk, vs});
+        }
         d.rt = rt;
         d.ds = ds;
         deferred_.push_back(d);
