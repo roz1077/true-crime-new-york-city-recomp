@@ -77,8 +77,15 @@ void Load() {
     SetFrameCap(t["fps_cap"].value_or(FrameCap()));
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
-    const auto samples = t["msaa"].value_or(t["msaa"].value_or(false) ? 4u : 0u);
-    SetMsaaSamples(samples == 2 || samples == 4 || samples == 8 ? samples : 0);
+    // as settings.cpp: a file without the key keeps the built-in default (2x), not "off"; older
+    // files stored msaa = true for 4x
+    const auto msaa = t["msaa"];
+    if (!msaa) {
+        SetMsaaSamples(2);
+    } else {
+        const auto samples = msaa.value_or(msaa.value_or(false) ? 4u : 0u);
+        SetMsaaSamples(samples == 2 || samples == 4 || samples == 8 ? samples : 0);
+    }
     s.smaa = t["smaa"].value_or(s.smaa);
     s.bloom = t["bloom"].value_or(s.bloom);
     s.dof = t["dof"].value_or(s.dof);

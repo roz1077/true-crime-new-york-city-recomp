@@ -4814,11 +4814,16 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
         return nullptr;
     }
     targets_[key] = t;
-    // a reused address can collect a few shapes; drop the ones idle for a long time
+    // a reused address can collect a few shapes; drop the ones idle for a long time. Small targets
+    // stay for a minute, as on D3D12 (76e299a): the top-right HUD icon is a 104x60 target the game
+    // redraws on weapon changes but samples only when the HUD layer redraws, and once dropped the
+    // game falls back to the static FS texture in guest memory.
     if (targets_.size() > 64) {
+        constexpr uint64_t kSmallTargetPixels = 128 * 128;
         for (auto e = targets_.begin(); e != targets_.end();) {
             Target* c = e->second;
-            if (c != t && c->last_use + 600 < frames_) {
+            const uint64_t keep = uint64_t(c->gw) * c->gh <= kSmallTargetPixels ? 3600 : 600;
+            if (c != t && c->last_use + keep < frames_) {
                 RetireTargetResources(c);
                 delete c;
                 e = targets_.erase(e);
