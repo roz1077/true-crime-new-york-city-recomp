@@ -857,6 +857,8 @@ private:
     VkPipelineLayout ao_pipeline_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool ao_pool_ = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> ao_sets_;
+    bool ao_pools_tried_ = false;
+    bool EnsureAoPools();
     size_t ao_set_next_ = 0;
 
     // deferred scene display list
@@ -1453,20 +1455,42 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     draw_sets_.resize(layouts.size());
     if (vkAllocateDescriptorSets(device_, &dai, draw_sets_.data()) != VK_SUCCESS) return false;
 
+    // the AO pools are made on first AO use (EnsureAoPools): with AO off they are never needed
+    if (!CreatePresent()) return false;
+
+    LOGR("vulkan: %s, %ux%u swapchain, GPU draws", device_name_.c_str(), extent_.width, extent_.height);
+    return true;
+}
+
+// The AO descriptor pools, made the first time AO runs. One try: a failure leaves the set lists
+// empty, and the AO set accessors then report no set, which draws the receivers without AO.
+bool VulkanBackend::EnsureAoPools() {
+    if (!ao_sets_.empty()) return true;
+    if (ao_pools_tried_) return false;
+    ao_pools_tried_ = true;
+    auto fail = [&] {
+        LOGE("vulkan: AO descriptor pools could not be created");
+        ao_occ_sets_.clear();
+        ao_sets_.clear();
+        if (ao_occ_pool_) vkDestroyDescriptorPool(device_, ao_occ_pool_, nullptr);
+        if (ao_pool_) vkDestroyDescriptorPool(device_, ao_pool_, nullptr);
+        ao_occ_pool_ = ao_pool_ = VK_NULL_HANDLE;
+        return false;
+    };
     // one occlusion set per flush, and two full-screen AO sets (GTAO then the blur) per flush
     VkDescriptorPoolSize occSizes{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2048};
     VkDescriptorPoolCreateInfo occPi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     occPi.maxSets = 2048;
     occPi.poolSizeCount = 1;
     occPi.pPoolSizes = &occSizes;
-    if (vkCreateDescriptorPool(device_, &occPi, nullptr, &ao_occ_pool_) != VK_SUCCESS) return false;
+    if (vkCreateDescriptorPool(device_, &occPi, nullptr, &ao_occ_pool_) != VK_SUCCESS) return fail();
     std::vector<VkDescriptorSetLayout> occLayouts(2048, ao_occ_set_layout_);
     VkDescriptorSetAllocateInfo occAi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     occAi.descriptorPool = ao_occ_pool_;
     occAi.descriptorSetCount = uint32_t(occLayouts.size());
     occAi.pSetLayouts = occLayouts.data();
     ao_occ_sets_.resize(occLayouts.size());
-    if (vkAllocateDescriptorSets(device_, &occAi, ao_occ_sets_.data()) != VK_SUCCESS) return false;
+    if (vkAllocateDescriptorSets(device_, &occAi, ao_occ_sets_.data()) != VK_SUCCESS) return fail();
 
     VkDescriptorPoolSize aoSizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192},
                                        {VK_DESCRIPTOR_TYPE_SAMPLER, 8192}};
@@ -1474,17 +1498,15 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     aoPi.maxSets = 4096;
     aoPi.poolSizeCount = 2;
     aoPi.pPoolSizes = aoSizes;
-    if (vkCreateDescriptorPool(device_, &aoPi, nullptr, &ao_pool_) != VK_SUCCESS) return false;
+    if (vkCreateDescriptorPool(device_, &aoPi, nullptr, &ao_pool_) != VK_SUCCESS) return fail();
     std::vector<VkDescriptorSetLayout> aoLayouts(4096, ao_set_layout_);
     VkDescriptorSetAllocateInfo aoAi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     aoAi.descriptorPool = ao_pool_;
     aoAi.descriptorSetCount = uint32_t(aoLayouts.size());
     aoAi.pSetLayouts = aoLayouts.data();
     ao_sets_.resize(aoLayouts.size());
-    if (vkAllocateDescriptorSets(device_, &aoAi, ao_sets_.data()) != VK_SUCCESS) return false;
-    if (!CreatePresent()) return false;
-
-    LOGR("vulkan: %s, %ux%u swapchain, GPU draws", device_name_.c_str(), extent_.width, extent_.height);
+    if (vkAllocateDescriptorSets(device_, &aoAi, ao_sets_.data()) != VK_SUCCESS) return fail();
+    LOGR("vulkan: AO descriptor pools created");
     return true;
 }
 
@@ -3592,7 +3614,7 @@ bool VulkanBackend::EnsureAoPipelines(bool depth_ms) {
 }
 
 VkDescriptorSet VulkanBackend::AcquireAoSet(VkImageView ao, VkImageView depth, bool occlusion_set) {
-    if (ao_set_next_ >= ao_sets_.size()) return VK_NULL_HANDLE;
+    if (!EnsureAoPools() || ao_set_next_ >= ao_sets_.size()) return VK_NULL_HANDLE;
     VkDescriptorSet set = ao_sets_[ao_set_next_++];
     VkDescriptorImageInfo image[2]{};
     image[0].imageView = ao ? ao : white_view_;
@@ -3682,7 +3704,7 @@ VkDescriptorSet VulkanBackend::AcquireAoOcclusionSet(VkImageView view) {
     if (!view || ao_fail_test_) return VK_NULL_HANDLE;
     for (const auto& [cached_view, cached_set] : ao_occ_cached_)
         if (cached_view == view) return cached_set;
-    if (ao_occ_set_next_ >= ao_occ_sets_.size()) return VK_NULL_HANDLE;
+    if (!EnsureAoPools() || ao_occ_set_next_ >= ao_occ_sets_.size()) return VK_NULL_HANDLE;
     VkDescriptorSet set = ao_occ_sets_[ao_occ_set_next_++];
     auto& slot = ao_occ_cached_[0].first ? ao_occ_cached_[1] : ao_occ_cached_[0];
     slot = {view, set};
