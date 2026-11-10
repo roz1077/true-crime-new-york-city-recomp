@@ -11,6 +11,11 @@
 // view. Keep the requested heading for this update and restore it immediately
 // before their shared orientation builder reads it.
 //
+// Some camera paths (precision aim among them) run a look controller's own
+// input step without the shared update. Those controllers are hooked directly
+// as a fallback; they reuse the same request and put it back after their target
+// pass, except while a lock-on target is active, where the game's snap wins.
+//
 // The look controllers accumulate a yaw and a pitch in 0x348B20 (yaw) and
 // 0x348A80 (pitch); the camera update turns those globals into the final
 // orientation later in the frame.
@@ -83,6 +88,8 @@ constexpr uint32_t kPitch = 0x348A80;  // radians
 // the pitch back toward its rest angle. Set by the game's camera settings
 // update; read only by the shared look-input routine sub_000205A0.
 constexpr uint32_t kAutoCenter = 0x348C24;
+constexpr uint32_t kPlayer = 0x37D284; // [0x37D284] -> local player pawn
+constexpr uint32_t kLockTarget = 0xB4; // player + 0xB4 -> locked pawn
 constexpr uint32_t kInvertX = 0xFEF;   // game + 0xFEF
 constexpr uint32_t kInvertY = 0xFEE;   // game + 0xFEE
 
@@ -103,6 +110,9 @@ constexpr float kOnFootPitchMin = -60.0f * kPi / 180.0f;  // view up
 constexpr float kOnFootPitchMax = 89.0f * kPi / 180.0f;   // view down
 constexpr float kVehiclePitchMin = -10.0f * kPi / 180.0f; // view up
 constexpr float kVehiclePitchMax = 89.0f * kPi / 180.0f;  // view down
+// Just above the game's right-stick dead zone: enough for its aim assist to
+// run, small enough not to move the view when no target is under the crosshair.
+constexpr int16_t kLockStick = 1200;
 
 uint32_t Rd(uint8_t *base, uint32_t va) { return mem::IsCommitted(va) ? X86_MEM32(va) : 0; }
 uint8_t Rd8(uint8_t *base, uint32_t va) { return mem::IsCommitted(va) ? X86_MEM8(va) : 0; }
@@ -143,15 +153,30 @@ bool IsGameplayCamera(uint8_t *base, uint32_t camera) {
     return Rd8(base, camera + kActiveFlag) != 0;
 }
 
+// The gameplay camera for a look controller that is active right now. Unlike
+// GameplayCamera, a followed target is not required: the precision-aim look
+// step still accumulates the mouse while a transition has cleared the target.
+uint32_t ActiveGameplayCamera(uint8_t *base, uint32_t controller) {
+    if (!controller || !mem::IsCommitted(controller + kOwner)) return 0;
+    const uint32_t camera = X86_MEM32(controller + kOwner);
+    const uint32_t game = Rd(base, kGame);
+    if (!camera || !game || camera != Rd(base, game + kCamera)) return 0;
+    if (Rd(base, camera + kActive) != controller || !Rd8(base, camera + kActiveFlag)) return 0;
+    return camera;
+}
+
 // Scoped to a shared camera update: other cameras and unrelated calls to the
 // orientation builder must keep their own angles. Thread-local because guest
 // threads can build other cameras while the gameplay update is running.
 struct CameraAim {
+    uint32_t camera = 0;
     uint32_t controller = 0;
     float yaw = 0;
     float pitch = 0;
     bool active = false;   // the mouse sampled recently (yaw handoff)
     bool mouse_aim = false; // keyboard/mouse owns the aim (pitch hold)
+    bool valid = false;
+    uint64_t at = 0;       // when this request was made
 };
 thread_local CameraAim g_camera_aim;
 
@@ -221,6 +246,34 @@ float ApplyAim(uint8_t *base, uint32_t camera, uint32_t controller, uint8_t mode
     return g_aim_hold.pitch;
 }
 
+// A request made by the shared camera update is consumed by the controller it
+// is about to run. The window is short: it only has to cover that one update,
+// and it keeps an early-returned controller from restoring a stale heading.
+bool AimRequested(uint32_t controller) {
+    return g_camera_aim.valid && g_camera_aim.controller == controller &&
+           NowMs() - g_camera_aim.at < 100;
+}
+
+// True while the game has a lock-on target. Its own camera pass then owns the
+// heading: restoring the mouse here would leave the crosshair beside the target
+// instead of snapping onto it.
+bool LockTargetActive(uint8_t *base) {
+    const uint32_t player = Rd(base, kPlayer);
+    if (!player || !mem::IsCommitted(player + kLockTarget)) return false;
+    return Rd(base, player + kLockTarget) != 0;
+}
+
+// Put the heading the mouse asked for back after a controller's own target or
+// transition pass. Only the values already requested by this update are
+// written, so this cannot consume a delta twice.
+bool RestoreRequestedAim(uint8_t *base, uint32_t controller) {
+    if (!input::g_direct_mouse_aim || !AimRequested(controller)) return false;
+    if (LockTargetActive(base)) return false;
+    if (g_camera_aim.active) std::memcpy(base + kYaw, &g_camera_aim.yaw, sizeof(g_camera_aim.yaw));
+    if (g_camera_aim.mouse_aim) std::memcpy(base + kPitch, &g_camera_aim.pitch, sizeof(g_camera_aim.pitch));
+    return true;
+}
+
 // Widen a look controller's pitch clamp for one update, so the controller's own
 // clamp does not undo the PC range.  The stock fields are restored by the
 // caller before it returns, keeping the gamepad path original.
@@ -236,6 +289,49 @@ bool WidenPitch(uint8_t *base, uint32_t controller, float min, float max, uint32
 void RestorePitch(uint8_t *base, uint32_t controller, uint32_t old_min, uint32_t old_max) {
     std::memcpy(base + controller + 0x20, &old_min, sizeof(old_min));
     std::memcpy(base + controller + 0x24, &old_max, sizeof(old_max));
+}
+
+using GuestFunc = void (*)(X86Context &, uint8_t *);
+
+// Some camera paths run a look controller's own input step without going
+// through sub_0002E200; precision aim is one of them. Apply the same mouse aim
+// there when the shared update did not, but never consume the delta twice.
+// The requested heading is put back after the controller's own target pass,
+// except while a lock-on target is active, where the game's snap wins.
+void RunControllerAim(X86Context &ctx, uint8_t *base, GuestFunc original) {
+    const uint32_t controller = ctx.ecx;
+    const uint32_t camera = input::g_direct_mouse_aim ? ActiveGameplayCamera(base, controller) : 0;
+    const bool requested = AimRequested(controller);
+    if (!camera || !input::g_direct_mouse_aim || Rd8(base, camera + kMode) == kModeVehicle) {
+        original(ctx, base);
+        return;
+    }
+
+    uint32_t old_min = 0, old_max = 0;
+    bool mouse_aim = false;
+    bool widen = false;
+    uint8_t auto_center = 0;
+    const CameraAim previous = g_camera_aim;
+    if (!requested) {
+        const uint8_t mode = Rd8(base, camera + kMode);
+        const float pitch = ApplyAim(base, camera, controller, mode, kOnFootPitchMin, kOnFootPitchMax, mouse_aim);
+        input::SetLockOnStick(mouse_aim && LockTargetActive(base) ? kLockStick : 0, 0);
+        const bool recent = input::DirectAimRecent();
+        g_camera_aim = {camera, controller, RdF(base, kYaw), pitch, recent, mouse_aim, true, NowMs()};
+        widen = mouse_aim &&
+                WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
+        auto_center = Rd8(base, kAutoCenter);
+        if (mouse_aim) base[kAutoCenter] = 0;
+    }
+
+    original(ctx, base);
+    RestoreRequestedAim(base, controller);
+
+    if (!requested) {
+        if (mouse_aim) base[kAutoCenter] = auto_center;
+        if (widen) RestorePitch(base, controller, old_min, old_max);
+        g_camera_aim = previous;
+    }
 }
 
 } // namespace
@@ -257,6 +353,7 @@ X86_FUNC(sub_0002E200) {
         uint32_t old_min = 0, old_max = 0;
         bool mouse_aim = false;
         const float pitch = ApplyAim(base, camera, controller, mode, kOnFootPitchMin, kOnFootPitchMax, mouse_aim);
+        input::SetLockOnStick(mouse_aim && LockTargetActive(base) ? kLockStick : 0, 0);
         const bool recent = input::DirectAimRecent();
         const bool widen = mouse_aim &&
                            WidenPitch(base, controller, kOnFootPitchMin, kOnFootPitchMax, old_min, old_max);
@@ -266,7 +363,7 @@ X86_FUNC(sub_0002E200) {
         const uint8_t auto_center = Rd8(base, kAutoCenter);
         if (mouse_aim) base[kAutoCenter] = 0;
         const CameraAim previous = g_camera_aim;
-        g_camera_aim = {controller, RdF(base, kYaw), pitch, recent, mouse_aim};
+        g_camera_aim = {camera, controller, RdF(base, kYaw), pitch, recent, mouse_aim, true, NowMs()};
         __imp__sub_0002E200(ctx, base);
         g_camera_aim = previous;
         if (mouse_aim) base[kAutoCenter] = auto_center;
@@ -293,14 +390,11 @@ X86_FUNC(sub_0001FD40) {
     static uint32_t last_vehicle_camera = 0, last_vehicle_controller = 0;
 
     const uint32_t controller = ctx.ecx;
-    if (input::g_direct_mouse_aim && g_camera_aim.controller == controller) {
-        // Applying this after sub_0002E200 returns is too late: this method
-        // has already used the controller's replacement yaw to build the view.
-        // The same update also rewrites the pitch to the controller's rest
-        // angle before coming here, so put the held mouse pitch back as well.
-        if (g_camera_aim.active) std::memcpy(base + kYaw, &g_camera_aim.yaw, sizeof(g_camera_aim.yaw));
-        if (g_camera_aim.mouse_aim) std::memcpy(base + kPitch, &g_camera_aim.pitch, sizeof(g_camera_aim.pitch));
-    }
+    // Applying this after sub_0002E200 returns is too late: this method has
+    // already used the controller's replacement yaw to build the view. The same
+    // update also rewrites the pitch to the controller's rest angle before
+    // coming here, so put the held mouse pitch back as well.
+    RestoreRequestedAim(base, controller);
     if (input::g_direct_mouse_aim) {
         const uint32_t camera = GameplayCamera(base, controller);
         if (camera && Rd(base, camera + kActive) == controller && Rd8(base, camera + kMode) != kModeVehicle)
@@ -352,3 +446,17 @@ X86_FUNC(sub_0001FD40) {
 
     __imp__sub_0001FD40(ctx, base);
 }
+
+// Precision aim (mode 6) and the crosshair/on-foot controllers run their own
+// input step. Some camera paths do not call sub_0002E200 at all, so these are
+// the fallback that keeps the mouse live there. They also put the requested
+// heading back after the controller's target/lock-on pass, which would
+// otherwise leave the view on the target while the mouse is moving.
+X86_EXTERN_FUNC(__imp__sub_000205A0);
+X86_FUNC(sub_000205A0) { RunControllerAim(ctx, base, __imp__sub_000205A0); }
+
+X86_EXTERN_FUNC(__imp__sub_00029A40);
+X86_FUNC(sub_00029A40) { RunControllerAim(ctx, base, __imp__sub_00029A40); }
+
+X86_EXTERN_FUNC(__imp__sub_00025910);
+X86_FUNC(sub_00025910) { RunControllerAim(ctx, base, __imp__sub_00025910); }

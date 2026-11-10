@@ -19,6 +19,9 @@
   the game's auto-center, and ends on a level load or when a pad takes over.
 - Mouse pitch now follows the stock (non-inverted) vertical direction; the game's
   invert-Y setting still flips it.
+- Direct mouse aim now also drives the precision-aim camera. Its own look step
+  receives the mouse, and an active lock-on target snaps the crosshair onto it
+  while the game's aim assist runs.
 - Human Cargo: the push-off window on the cargo container fight with Tommy lasts
   about 250 ms instead of 166 ms, so the B press is no longer frame-perfect.
 - Keyboard driving keeps full steering while W (accelerate) is held.

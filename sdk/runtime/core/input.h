@@ -19,6 +19,10 @@ PromptStyle ControllerPromptStyle();
 // true while keyboard/mouse is the input the game is following; a pad takes
 // over as soon as it is used
 bool KeyboardMouseActive();
+// While a lock-on target is active, the game's own aim assist needs a small
+// right-stick deflection to run. Direct mouse aim otherwise leaves the stick
+// centred, which skips that pass.
+void SetLockOnStick(int16_t x, int16_t y);
 // keyboard keys that stand in for the two stick clicks, shared by input and
 // the keyboard-mouse prompt glyphs
 inline constexpr char kLeftStickClickKey = 'C';

@@ -30,6 +30,9 @@ uint32_t g_mouse_vertical_sensitivity_percent = 100;
 uint32_t g_reload_key = 'R', g_heavy_attack_key = 0, g_use_key = 'E', g_climb_key = 'G';
 bool g_direct_mouse_aim = true;
 uint32_t g_prompt_override = 0;
+// A small right-stick sample used only while a lock-on target is active; the
+// game's aim assist reads the stick and snaps the crosshair onto the target.
+std::atomic<int16_t> g_lock_stick_x{0}, g_lock_stick_y{0};
 
 namespace {
 
@@ -327,9 +330,17 @@ bool ReadKeyboardMouse(Pad& pad) {
         mouse_active = g_mouse_rx || g_mouse_ry || g_hold_rx || g_hold_ry || g_aim_x || g_aim_y ||
                        (g_direct_mouse_aim && g_direct_confirmed.load(std::memory_order_relaxed) &&
                         g_aim_at && now - g_aim_at < 150);
-        // the camera applies the pixels itself while direct aim is live
-        pad.rx = (direct || ui) ? 0 : g_hold_rx;
-        pad.ry = (direct || ui) ? 0 : g_hold_ry;
+        // the camera applies the pixels itself while direct aim is live; a lock
+        // target still needs a small stick sample for the game's aim assist
+        if (ui) {
+            pad.rx = pad.ry = 0;
+        } else if (direct) {
+            pad.rx = g_lock_stick_x.load(std::memory_order_relaxed);
+            pad.ry = g_lock_stick_y.load(std::memory_order_relaxed);
+        } else {
+            pad.rx = g_hold_rx;
+            pad.ry = g_hold_ry;
+        }
         // The PC wheel changes weapon on foot and camera in a vehicle; the pad
         // reaches both through the D-pad.
         if (g_wheel_steps > 0) {
@@ -429,6 +440,11 @@ PromptStyle ControllerPromptStyle() {
 }
 
 bool KeyboardMouseActive() { return g_keyboard_mouse_active.load(std::memory_order_relaxed); }
+
+void SetLockOnStick(int16_t x, int16_t y) {
+    g_lock_stick_x.store(x, std::memory_order_relaxed);
+    g_lock_stick_y.store(y, std::memory_order_relaxed);
+}
 
 // relative motion and wheel notches from the window thread; the Windows path
 // takes them from WM_INPUT, the SDL path from MOUSE_MOTION / MOUSE_WHEEL events

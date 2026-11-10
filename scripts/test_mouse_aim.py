@@ -21,10 +21,11 @@ else:
 
 hooks = read('src/game/mouse_aim.cpp')
 hooks = '\n'.join(line for line in hooks.splitlines() if not line.startswith('#include "'))
-source = r'''
+source = ('#define BASELINE 1\n' if old else '') + r'''
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#define LOGR(...) ((void)0)
 struct X86Context { uint32_t ecx = 0; };
 #define X86_FUNC(name) void name(X86Context& ctx, uint8_t* base)
 #define X86_EXTERN_FUNC(name) X86_FUNC(name)
@@ -37,6 +38,7 @@ bool g_direct_mouse_aim = true, recent = false, mouse_active = false;
 uint32_t g_mouse_sensitivity_percent = 100, g_mouse_vertical_sensitivity_percent = 100;
 float pending_x = 0, pending_y = 0;
 void UseDirectMouseAim() {}
+void SetLockOnStick(int16_t, int16_t) {}
 bool DirectAimRecent() { return recent; }
 bool KeyboardMouseActive() { return mouse_active; }
 bool ConsumeMouseAim(float& x, float& y) {
@@ -71,6 +73,16 @@ X86_FUNC(__imp__sub_0002E200) {
     if (inline_view) built_yaw = RdF(base, kYaw);
     else { ctx.ecx = controller; sub_0001FD40(ctx, base); }
 }
+// The precision-aim input step (mode 6). It is not reached through the shared
+// update double above; the wrapper has to apply the mouse itself and restore
+// the requested heading after this lock-on pass.
+X86_FUNC(__imp__sub_00029A40) {
+    float locked = 9.0f, rest = 0.1f;
+    std::memcpy(base + kYaw, &locked, 4);
+    std::memcpy(base + kPitch, &rest, 4);
+}
+X86_FUNC(__imp__sub_000205A0) {}
+X86_FUNC(__imp__sub_00025910) {}
 void SetFloat(uint8_t* base, uint32_t a, float v) { std::memcpy(base+a, &v, 4); }
 bool Close(float a, float b) { return std::fabs(a-b) < 0.00001f; }
 void Update(uint8_t* base, uint8_t mode, float dx, float dy = 0) {
@@ -193,6 +205,37 @@ extern "C" __declspec(dllexport) int run() {
     SetFloat(base, kPitch, 0.2f);
     Update(base, 9, 0);
     if (!Close(RdF(base, kPitch), 0.35f)) return 31;
+#ifndef BASELINE
+    // Precision aim (mode 6) can run its own input step without the shared
+    // camera update. The per-controller fallback must apply the mouse delta and
+    // put the requested heading back after that step's lock-on pass.
+    inline_view = false;
+    base[camera + kMode] = 6;
+    X86_MEM32(camera + kActive) = controller;
+    X86_MEM32(camera + kTarget) = 0x13000;
+    X86_MEM32(controller + kOwner) = camera;
+    base[camera + kActiveFlag] = 1;
+    input::mouse_active = true; input::recent = true;
+    input::pending_x = 1; input::pending_y = 0;
+    SetFloat(base, kYaw, 1.0f); SetFloat(base, kPitch, 0.0f);
+    X86Context direct{controller};
+    sub_00029A40(direct, base);
+    if (!Close(RdF(base, kYaw), 1.004f)) return 32;
+    if (!Close(RdF(base, kPitch), 0.0f)) return 33;
+    // An active lock target owns the heading: the game's snap must survive.
+    X86_MEM32(0x37D284) = 0x14000;
+    X86_MEM32(0x14000 + 0xB4) = 0x15000;
+    input::pending_x = 1; input::recent = true;
+    SetFloat(base, kYaw, 1.0f);
+    sub_00029A40(direct, base);
+    if (!Close(RdF(base, kYaw), 9.0f)) return 34;
+    // With the target gone the mouse heading is restored again.
+    X86_MEM32(0x14000 + 0xB4) = 0;
+    input::pending_x = 1;
+    SetFloat(base, kYaw, 1.0f);
+    sub_00029A40(direct, base);
+    if (!Close(RdF(base, kYaw), 1.004f)) return 35;
+#endif
     return 0;
 }
 '''
@@ -224,6 +267,7 @@ constexpr int VK_UP=1,VK_DOWN=2,VK_LEFT=3,VK_RIGHT=4,VK_ESCAPE=5,VK_TAB=6,
  VK_LCONTROL=23,VK_RCONTROL=25,VK_LMENU=24,VK_RMENU=26,VK_RSHIFT=27,VK_NUMPAD7=17,VK_NUMPAD9=18,VK_NUMPAD5=19,VK_CAPITAL=20,VK_ADD=21,VK_OEM_PLUS=22;
 uint64_t now=1000;
 uint64_t GetTickCount64() { return now; }
+uint64_t SDL_GetTicks() { return now; }
 bool focus=true;
 void* GetForegroundWindow() { return focus ? reinterpret_cast<void*>(1) : nullptr; }
 bool keys[256]{};
