@@ -91,7 +91,7 @@ struct Values {
     uint32_t mode = 1, applied_mode = 1; // app::DisplayMode: 0 fullscreen, 1 borderless, 2 windowed
     uint32_t object_detail = 0, ao = 0;
     bool bloom = true, dof = true, building_seam_fix = true, pc_contrast = true, hdr = false;
-    uint32_t hdr_paper_white = 200, hdr_peak = 0, hdr_highlights = 70;
+    uint32_t hdr_paper_white = 200, hdr_peak = 0, hdr_highlights = 40;  // app::Settings defaults
     uint32_t display_peak = 0; // the HDR display's reported peak in nits, 0 when unknown (read only)
 };
 

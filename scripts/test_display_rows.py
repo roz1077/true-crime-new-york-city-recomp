@@ -66,7 +66,7 @@ extern "C" __declspec(dllexport) int run() {
  Change(v, Option::Hdr, 1, sizes); if (!v.hdr) return 35;
  Change(v, Option::HdrPaperWhite, 1, sizes); if (v.hdr_paper_white != 210) return 36;
  Change(v, Option::HdrPeak, 1, sizes); if (v.hdr_peak != 400) return 37;
- Change(v, Option::HdrHighlights, -1, sizes); if (v.hdr_highlights != 60) return 38;
+ Change(v, Option::HdrHighlights, -1, sizes); if (v.hdr_highlights != 30) return 38;
  Change(v, Option::DisplayMode, 1, sizes); Change(v, Option::DisplayMode, 1, sizes); if (v.mode != 2) return 39;
 
  char text[kTextBytes];
