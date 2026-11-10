@@ -620,7 +620,7 @@ struct BlitOptions {
     float hdr_mode = 0;       // 0 SDR, 1 scRGB FP16, 2 HDR10 PQ
     float paper_white = 200;  // SDR white in nits
     float peak = 1000;        // highlight peak in nits
-    float highlights = 0.7f;  // inverse tone map strength, 0..1
+    float highlights = 0.4f;  // inverse tone map strength, 0..1 (app::Settings::hdr_highlights / 100)
 };
 
 // Shrink's settings past the source and the size
@@ -5466,14 +5466,8 @@ void D3D12Backend::RenderHalfAo(Target& t) {
     const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
     if (fov > 1.0f && fov < 179.0f && aspect > 0.1f)
         tan_half_fov = std::tan(fov * 3.14159265f / 360.0f) / aspect;
-    static const bool ao_ssao = [] {
-        const char* e = std::getenv("TCNYC_AO_METHOD");
-        return e && std::string(e) == "ssao";
-    }();
     const std::string shader = std::string("#define DEPTH_MS ") +
                                (depth_desc.SampleDesc.Count > 1 ? "1\n" : "0\n") +
-                               // GTAO by default; TCNYC_AO_METHOD=ssao keeps the earlier kernel to compare
-                               (ao_ssao ? "#define AO_SSAO 1\n" : "") +
                                // GTAO cost: slices x steps per side, 3 x 6 at Half (a quarter of the
                                // pixels, so a third slice is cheap and 2 left visible grain), 3 x 8 at Full
                                (render_.ao == 1 ? "#define GTAO_SLICES 3\n#define GTAO_STEPS 6\n"
@@ -5616,7 +5610,7 @@ void LogPerf() {
 void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
     if (defer_scene_) FlushDeferredScene();
-    // Temporary diagnostic: TCNYC_CAPTURE_AT=<frame> starts an F3-style capture without input.
+    // Diagnostic: TCNYC_CAPTURE_AT=<frame> starts an F3-style capture without input.
     static const long capture_at = [] {
         const char* e = std::getenv("TCNYC_CAPTURE_AT");
         return e ? std::atol(e) : 0;

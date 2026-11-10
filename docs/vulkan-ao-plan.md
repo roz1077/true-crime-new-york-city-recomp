@@ -37,8 +37,8 @@ reused as-is, not rewritten.
 
   Move `AoRoles` into shared code, taking `State` and the per-stage "samples a colour target"
   flags.
-- **Settings.** `render_.ao` (Off / Half / Full) and the `TCNYC_AO_RADIUS`, `TCNYC_AO_STRENGTH`
-  and `TCNYC_AO_METHOD` overrides. `settings_linux.cpp` already loads `ao`.
+- **Settings.** `render_.ao` (Off / Half / Full) and the `TCNYC_AO_RADIUS` and
+  `TCNYC_AO_STRENGTH` overrides. `settings_linux.cpp` already loads `ao`.
 
 ## What differs on Vulkan, and the design for each
 

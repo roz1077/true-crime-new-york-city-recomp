@@ -38,8 +38,8 @@ low-end fallback:
 - **GTAO scales lower:** a 1 × 4 preset is about 9 reads, half the old kernel's.
 - **Resolution is the bigger lever:** Half already cuts the AO work by 4×.
 
-`TCNYC_AO_METHOD=ssao` stays as a hidden developer switch for A/B comparisons only. Remove it
-(and `AoFactor`) once GTAO is settled.
+The `TCNYC_AO_METHOD=ssao` switch and the old `AoFactor` kernel were removed for Beta 2 once
+GTAO was settled.
 
 ## Steam Deck / low-end plan
 

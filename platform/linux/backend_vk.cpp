@@ -679,7 +679,7 @@ private:
     VkRenderPass AoColorPass();
     VkFramebuffer AoFramebuffer(VkRenderPass pass, AoImage* color, AoImage* depth);
     VkPipeline CreateAoPipeline(VkShaderModule vs, VkShaderModule ps, VkRenderPass pass);
-    VkDescriptorSet AcquireAoSet(VkImageView ao, VkImageView depth, VkImageView occlusion, bool occlusion_set);
+    VkDescriptorSet AcquireAoSet(VkImageView ao, VkImageView depth, bool occlusion_set);
     VkDescriptorSet AcquireAoOcclusionSet(VkImageView view);
     void DumpAoProbe(AoImage& image);
 
@@ -853,6 +853,11 @@ private:
     bool ao_depth_clear_ = true;
     bool ao_probed_ = false;
     bool ao_dist_probed_ = false;
+    bool ao_failed_ = false;  // no occlusion image could be bound: AO stays off for the rest of the run
+    // occlusion sets written this frame, by view. Every replay binds one of at most two views (the
+    // occlusion target or the zero image), so a frame needs two sets however often it flushes. The
+    // cache is dropped with the frame and whenever an AO image (and so a view handle) is destroyed.
+    std::pair<VkImageView, VkDescriptorSet> ao_occ_cached_[2]{};
     uint32_t ao_mode_ = 0;  // app::Snapshot().ao latched for the frame
     Target* defer_rt_ = nullptr;
     Target* defer_ds_ = nullptr;
@@ -977,8 +982,9 @@ private:
     uint8_t gamma_ramp_[3 * 256] = {};
     bool gamma_dirty_ = true;
 
-    // HDR overlays: ImGui renders into a BGRA8 image, then a composite pass puts it over the
-    // HDR swapchain at paper white. In SDR mode ImGui draws into the swapchain pass directly.
+    // Overlays: ImGui renders into a BGRA8 image (its pipeline is built for that pass), then a
+    // composite pass puts it over the swapchain, unchanged in SDR and at paper white in HDR. Both
+    // are skipped while nothing is on screen.
     VkRenderPass ui_pass_ = VK_NULL_HANDLE;
     VkImage ui_image_ = VK_NULL_HANDLE;
     VkDeviceMemory ui_memory_ = VK_NULL_HANDLE;
@@ -3221,6 +3227,7 @@ bool VulkanBackend::CreateAoImage(AoImage& image, uint32_t w, uint32_t h, VkForm
 }
 
 void VulkanBackend::DestroyAoImage(AoImage& image) {
+    for (auto& cached : ao_occ_cached_) cached = {};
     if (image.view) vkDestroyImageView(device_, image.view, nullptr);
     if (image.image) vkDestroyImage(device_, image.image, nullptr);
     if (image.memory) vkFreeMemory(device_, image.memory, nullptr);
@@ -3477,13 +3484,9 @@ bool VulkanBackend::EnsureAoPipelines(bool depth_ms) {
         return true;
     const VkRenderPass pass = AoColorPass();
     if (!pass) return false;
-    static const bool ssao = [] {
-        const char* e = std::getenv("TCNYC_AO_METHOD");
-        return e && std::string(e) == "ssao";
-    }();
     const std::string ms = depth_ms ? "1\n" : "0\n";
     std::string gtao = std::string("#define DEPTH_MS ") + ms + "#define GTAO_SLICES 3\n#define GTAO_STEPS " +
-                       (ao_mode_ == 1 ? "6\n" : "8\n") + (ssao ? "#define AO_SSAO 1\n" : "") + kAoHlsl;
+                       (ao_mode_ == 1 ? "6\n" : "8\n") + kAoHlsl;
     const std::string occ = std::string("#define DEPTH_MS ") + ms + kAoOcclusionHlsl;
     VkShaderModule gvs = CompileShader(gtao, shaderc_vertex_shader, "vs");
     VkShaderModule gps = CompileShader(gtao, shaderc_fragment_shader, "psmain");
@@ -3515,15 +3518,12 @@ bool VulkanBackend::EnsureAoPipelines(bool depth_ms) {
     return true;
 }
 
-VkDescriptorSet VulkanBackend::AcquireAoSet(VkImageView ao, VkImageView depth, VkImageView occlusion,
-                                            bool occlusion_set) {
-    (void)occlusion;
+VkDescriptorSet VulkanBackend::AcquireAoSet(VkImageView ao, VkImageView depth, bool occlusion_set) {
     if (ao_set_next_ >= ao_sets_.size()) return VK_NULL_HANDLE;
     VkDescriptorSet set = ao_sets_[ao_set_next_++];
     VkDescriptorImageInfo image[2]{};
     image[0].imageView = ao ? ao : white_view_;
-    image[0].imageLayout = ao ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                              : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    image[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     image[1].imageView = depth ? depth : white_view_;
     image[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkDescriptorImageInfo sampler[2]{};
@@ -3606,8 +3606,13 @@ void VulkanBackend::DumpAoProbe(AoImage& image) {
 }
 
 VkDescriptorSet VulkanBackend::AcquireAoOcclusionSet(VkImageView view) {
-    if (!view || ao_occ_set_next_ >= ao_occ_sets_.size()) return VK_NULL_HANDLE;
+    if (!view) return VK_NULL_HANDLE;
+    for (const auto& [cached_view, cached_set] : ao_occ_cached_)
+        if (cached_view == view) return cached_set;
+    if (ao_occ_set_next_ >= ao_occ_sets_.size()) return VK_NULL_HANDLE;
     VkDescriptorSet set = ao_occ_sets_[ao_occ_set_next_++];
+    auto& slot = ao_occ_cached_[0].first ? ao_occ_cached_[1] : ao_occ_cached_[0];
+    slot = {view, set};
     VkDescriptorImageInfo image{};
     image.imageView = view;
     image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -3751,7 +3756,7 @@ void VulkanBackend::FlushDeferredScene() {
                 // GTAO from the distance target, sample 0 of the MSAA image.
                 if (!ao_half_fb_) ao_half_fb_ = AoFramebuffer(AoColorPass(), &ao_half_, nullptr);
                 VkDescriptorSet gtao_set = ao_half_fb_ && ao_gtao_pipe_
-                                               ? AcquireAoSet(ao_dist_.view, VK_NULL_HANDLE, VK_NULL_HANDLE, false)
+                                               ? AcquireAoSet(ao_dist_.view, VK_NULL_HANDLE, false)
                                                : VK_NULL_HANDLE;
                 bool gtao_ok = false;
                 if (gtao_set) {
@@ -3793,7 +3798,7 @@ void VulkanBackend::FlushDeferredScene() {
                 if (!ao_occ_fb_) ao_occ_fb_ = AoFramebuffer(AoColorPass(), &ao_occ_, nullptr);
                 VkDescriptorSet occ_pass_set =
                     ao_occ_fb_ && ao_occ_pipe_
-                        ? AcquireAoSet(ao_half_.view, ao_dist_.view, VK_NULL_HANDLE, true)
+                        ? AcquireAoSet(ao_half_.view, ao_dist_.view, true)
                         : VK_NULL_HANDLE;
                 if (gtao_ok && occ_pass_set) {
                     Transition(ao_occ_.image, ao_occ_.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3838,8 +3843,17 @@ void VulkanBackend::FlushDeferredScene() {
             zero_ok = EnsureAoZero(rt->w, rt->h);
         if (zero_ok && ao_zero_.image)
             occlusion = AcquireAoOcclusionSet(ao_zero_.view);
-        else
-            LOG_FIRST(4, "vulkan: AO zero occlusion target unavailable; receiver set 1 is unbound");
+        // the occlusion target from an earlier flush is a full-size image too: stale AO for one
+        // replay is better than an unbound set 1
+        if (!occlusion && ao_occ_.image && ao_occ_.w == rt->w && ao_occ_.h == rt->h &&
+            ao_occ_.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            occlusion = AcquireAoOcclusionSet(ao_occ_.view);
+        if (!occlusion && !ao_failed_) {
+            // the receivers were recorded with the AO shader variant, which needs set 1; turn AO
+            // off from the next frame so they are recorded with the game's own shaders again
+            ao_failed_ = true;
+            LOGE("vulkan: no AO occlusion image could be bound; ambient occlusion is off for this run");
+        }
     }
 
     BeginScenePass(rt, ds);
@@ -3873,7 +3887,8 @@ void VulkanBackend::ResetDeferred() {
     ao_depth_clear_ = true;
     ao_set_next_ = 0;
     ao_occ_set_next_ = 0;
-    ao_mode_ = app::Snapshot().ao;
+    for (auto& cached : ao_occ_cached_) cached = {};
+    ao_mode_ = ao_failed_ ? 0 : app::Snapshot().ao;
     defer_scene_ = defer_forced_ || ao_mode_ != 0;
     msaa_store_ = defer_scene_;
     for (VkPipeline p : retired_ao_pipelines_)

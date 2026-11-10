@@ -83,83 +83,22 @@ float RawDepth(float2 uv) {
     return depthTex.SampleLevel(ps, saturate(uv), 0);
 }
 #endif
-// The title tests GREATEREQUAL and the host mirrors it to LESSEQUAL: host depth is 0 near, 1 far,
-// and the AO depth prepass is cleared to 1.
-// raw is the prepass's view distance (clip w): already linear, no near/far needed
+// The AO kernel reads the prepass's distance target: each pixel holds the view distance (clip w),
+// already linear, so no near/far is needed. Empty pixels hold kAoDistClear.
 float LinearDepth(float raw) { return raw; }
 // view-space position: the screen offset scales with depth (the projection's x / z, y / z)
 float3 ViewAt(float2 uv, float z) {
     float2 n = uv * 2.0 - 1.0;
     return float3(n.x * ao.w * ao.z * z, -n.y * ao.z * z, z);
 }
-float SafeDepth(float2 uv, float z) {
-    const float d = LinearDepth(RawDepth(uv));
-    return abs(d - z) < 0.05 * z ? d : z;
-}
 // Each 4x4 block of AO pixels covers 16 evenly spread kernel rotations (an ordered 4x4 pattern);
 // the occlusion pass averages exactly one block, so the pattern cancels instead of reading as noise.
 static const float kRot4x4[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
-float AoFactor(float2 uv_in, uint2 pix) {
-    // Work at the centre of the depth texel actually read. At half resolution an AO pixel's
-    // centre falls between two depth texels; placing one texel's depth at that in-between spot
-    // put the point off its own surface by half a texel of depth, worst on grazing floors.
-    const float2 uv = (floor(uv_in / src.xy) + 0.5) * src.xy;
-    float z = LinearDepth(RawDepth(uv));
-    if (z >= src.w * 0.999) return 1.0;
-    float3 p = ViewAt(uv, z);
-    // Surface direction from the neighbour on the same surface: of each pair, the one with the
-    // smaller depth step. Central differences bend the normal across creases and curb edges,
-    // which sent samples into the surface and drew dark lines along every edge.
-    const float2 ox = float2(src.x, 0), oy = float2(0, src.y);
-    const float zr = LinearDepth(RawDepth(uv + ox)), zl = LinearDepth(RawDepth(uv - ox));
-    const float zd = LinearDepth(RawDepth(uv + oy)), zu = LinearDepth(RawDepth(uv - oy));
-    const float3 dx = abs(zr - z) < abs(z - zl) ? ViewAt(uv + ox, zr) - p : p - ViewAt(uv - ox, zl);
-    const float3 dy = abs(zd - z) < abs(z - zu) ? ViewAt(uv + oy, zd) - p : p - ViewAt(uv - oy, zu);
-    float3 n = normalize(cross(dx, dy));
-    if (dot(n, p) > 0.0) n = -n;
-    float3 t = normalize(cross(abs(n.z) < 0.99 ? float3(0, 0, 1) : float3(1, 0, 0), n));
-    float3 b = cross(n, t);
-    const float ang = (kRot4x4[(pix.y & 3) * 4 + (pix.x & 3)] + 0.5) / 16.0 * 6.2831853;
-    float cs = cos(ang), sn = sin(ang);
-    // 12 hemisphere directions on a spiral: three rings of four, short and steep to long and flat
-    static const float3 kernel[12] = {
-        float3(0.25, 0.0, 0.35), float3(0.0, 0.25, 0.35), float3(-0.25, 0.0, 0.35), float3(0.0, -0.25, 0.35),
-        float3(0.42, 0.42, 0.45), float3(-0.42, 0.42, 0.45), float3(-0.42, -0.42, 0.45), float3(0.42, -0.42, 0.45),
-        float3(0.0, 0.9, 0.3), float3(-0.9, 0.0, 0.3), float3(0.0, -0.9, 0.3), float3(0.9, 0.0, 0.3)
-    };
-    // The depth units are the title's w-buffer scale, not metres, so the radius is a fraction of
-    // the distance (ao.y scales it): about the same screen area near and far.
-    const float rad = ao.y * 0.05 * z;
-    float occlusion = 0.0;
-    float count = 0.0;
-    [unroll] for (int i = 0; i < 12; i++) {
-        float3 d = kernel[i];
-        d.xy = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
-        float3 sp = p + (t * d.x + b * d.y + n * d.z) * rad;
-        if (sp.z <= 0.001) continue;
-        float2 suv = float2(sp.x / (sp.z * ao.w * ao.z), -sp.y / (sp.z * ao.z)) * 0.5 + 0.5;
-        if (suv.x < 0 || suv.x > 1 || suv.y < 0 || suv.y > 1) continue;
-        // Test the pixel actually read, at its own 3D position: it occludes only if it rises above
-        // this surface's plane within the radius. Comparing the sample point's depth with the
-        // depth of the nearest pixel instead counted that pixel's grid offset on grazing floors
-        // as occlusion, which beat against the pixel grid as regular stripes.
-        const float2 cuv = (floor(suv / src.xy) + 0.5) * src.xy;
-        const float3 v = ViewAt(cuv, LinearDepth(RawDepth(cuv))) - p;
-        const float dist = length(v);
-        count += 1.0;
-        if (dist > 1e-6 && dist < rad) {
-            const float h = dot(v, n) / dist;  // sine of the occluder's elevation above the plane
-            if (h > 0.15) occlusion += (h - 0.15) / 0.85 * (1.0 - dist / rad);
-        }
-    }
-    return saturate(1.0 - (occlusion / max(count, 1.0)) * ao.x);
-}
-
 // GTAO (Jimenez et al. 2016, after Intel's XeGTAO): per slice through the pixel, find the highest
 // occluder on each side (the horizons) and integrate the cosine-weighted visible arc between
-// them. GTAO_SLICES and GTAO_STEPS come from the pass (2 x 6 at Half, 3 x 8 at Full).
+// them. GTAO_SLICES and GTAO_STEPS come from the pass (3 x 6 at Half, 3 x 8 at Full).
 #ifndef GTAO_SLICES
-#define GTAO_SLICES 2
+#define GTAO_SLICES 3
 #define GTAO_STEPS 6
 #endif
 float FastAcos(float x) {
@@ -168,7 +107,9 @@ float FastAcos(float x) {
     return x >= 0 ? r : 3.141593 - r;
 }
 float AoGtao(float2 uv_in, uint2 pix) {
-    // the depth texel actually read, as in AoFactor
+    // Work at the centre of the depth texel actually read. At half resolution an AO pixel's
+    // centre falls between two depth texels; placing one texel's depth at that in-between spot
+    // put the point off its own surface by half a texel of depth, worst on grazing floors.
     const float2 uv = (floor(uv_in / src.xy) + 0.5) * src.xy;
     const float z = LinearDepth(RawDepth(uv));
     if (z >= src.w * 0.999) return 1.0;
@@ -266,11 +207,7 @@ O vs(uint id : SV_VertexID) {
     return o;
 }
 float4 psmain(O i) : SV_Target {
-#ifdef AO_SSAO
-    float f = AoFactor(i.uv, uint2(i.p.xy));  // TCNYC_AO_METHOD=ssao: the earlier kernel
-#else
     float f = AoGtao(i.uv, uint2(i.p.xy));
-#endif
     return float4(f, f, f, 1.0);
 }
 )";

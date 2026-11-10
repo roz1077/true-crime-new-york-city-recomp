@@ -76,8 +76,7 @@ with a GTAO kernel (see `gtao-plan.md`). Checked in game on Windows at Half and 
 
 - F10 Off / Half / Full. Half is GTAO 3 slices × 6 steps at half resolution; Full is 3 × 8.
 - Defaults: radius 0.75 (× 5% of distance), strength 1 (a power on visibility).
-- Overrides: `TCNYC_AO_RADIUS`, `TCNYC_AO_STRENGTH`, and `TCNYC_AO_METHOD=ssao` (the earlier
-  hemisphere kernel, for comparison only).
+- Overrides: `TCNYC_AO_RADIUS` and `TCNYC_AO_STRENGTH`.
 
 ### Remaining caveats
 
