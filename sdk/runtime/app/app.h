@@ -24,7 +24,7 @@ struct Settings {
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
-    uint32_t msaa = 2;               // 0, 2, 4 or 8 samples
+    uint32_t msaa = 0;               // 0, 2, 4 or 8 samples; off by default, it is the costliest option
     bool smaa = true;                // SMAA 1x on the finished frame
     bool bloom = true;                // bright-pass bloom on the finished frame
     bool dof = true;                  // distance blur on the finished frame

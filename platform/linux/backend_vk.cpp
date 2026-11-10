@@ -6460,8 +6460,8 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
 
     if (rt && !a.pretransformed) rt->scene_frame = frames_ + 1;
     Target* dof_ds = ds ? ds : pass_ds_;
-    // Distance blur only uses the main target's full-size, multisampled scene depth (as d3d12.cpp).
-    if (scene_dof_ && dof_ds && dof_ds->samples > 1 && rt && !a.pretransformed &&
+    // Distance blur uses the main target's full-size scene depth, multisampled or not (as d3d12.cpp).
+    if (scene_dof_ && dof_ds && rt && !a.pretransformed &&
         s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable) && rt->gw == width_ && rt->gh == height_ &&
         dof_ds->w == rt->w && dof_ds->h == rt->h && s.viewport.w == width_ && s.viewport.h == height_) {
         const WRange r = DrawWRange(s, prog);
@@ -7518,19 +7518,22 @@ void VulkanBackend::Present(const Surface& front) {
         source_view = smaa_output_.view;
     }
 
-    // PC distance blur: the main target's resolved depth, only available with MSAA (as d3d12.cpp)
+    // PC distance blur: the main target's depth, resolved with MSAA or the image itself without (as d3d12.cpp)
     const SceneDepth* dof = nullptr;
-    if (snapshot.dof && direct && ft && msaa_ > 1) {
+    if (snapshot.dof && direct && ft) {
         auto it = scene_depth_.find(ft);
-        if (it != scene_depth_.end() && it->second.depth && it->second.depth->samples > 1 &&
-            it->second.depth->resolved_image)
+        const Target* d = it != scene_depth_.end() ? it->second.depth : nullptr;
+        if (d && d->sample_view && (d->samples > 1 ? d->resolved_image != VK_NULL_HANDLE : d->image != VK_NULL_HANDLE))
             dof = &it->second;
     }
     VkImageView depth_view = white_view_;
     if (dof) {
-        depth_view = dof->depth->sample_view;
-        Transition(dof->depth->resolved_image, dof->depth->resolved_layout,
-                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, dof->depth->format);
+        Target* d = dof->depth;
+        depth_view = d->sample_view;
+        if (d->samples > 1)
+            Transition(d->resolved_image, d->resolved_layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, d->format);
+        else
+            Transition(d->image, d->layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, d->format);
     }
     if ((dof != nullptr) != dof_active_) {
         dof_active_ = dof != nullptr;

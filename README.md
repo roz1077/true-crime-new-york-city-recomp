@@ -79,10 +79,10 @@ The game receives no controller input while the menu is open, so pause the game 
 | Render scale | 25% to 200% of the output height. |
 | Field of view | 80% to 150% of the game's view, gameplay camera only; aiming still zooms. |
 | Anisotropic filtering | Game default, 2x, 4x, 8x or 16x. |
-| MSAA | Off, 2x, 4x or 8x. 2x by default. |
+| MSAA | Off, 2x, 4x or 8x. Off by default: it is the most demanding option. |
 | SMAA | SMAA 1x anti-aliasing on the finished frame. On by default. |
 | Bloom | Optional bright-pass bloom over the game's lighting. On by default. |
-| Depth of field | Distance blur for 3D scenes. Requires MSAA. On by default. |
+| Depth of field | Distance blur for 3D scenes. On by default. |
 | Ambient occlusion | GTAO contact shadows in corners and under objects, applied to world geometry only so lights, fog and effects keep their brightness. Off, Half or Full resolution. Off by default. Windows (D3D12) and Linux (Vulkan). |
 | Building seam fix | Experimental: gives detailed buildings priority over simplified city meshes. On by default. |
 | PC contrast | Softer shadow roll-off inspired by the PC version. On by default. |

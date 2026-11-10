@@ -39,6 +39,9 @@
   configured heavy-attack key.
 
 ### Graphics
+- MSAA is off by default (it is the most demanding option); existing settings files keep
+  their choice. Depth of field no longer needs MSAA: distance blur reads the scene depth
+  with MSAA off too, on Windows and Linux.
 - The intro movies (Activision, Luxoflux, Exakt) fill wide screens: their 4:3
   picture is stretched across the whole frame at every aspect setting instead of
   sitting squeezed in the middle. The legal page keeps its 4:3 shape, centred. On

@@ -149,7 +149,16 @@ const char* kBlitHlsl = R"(
 cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; float4 hdr; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
+// the scene depth for distance blur: multisampled with MSAA, a plain texture without (DEPTH_SINGLE)
+#ifdef DEPTH_SINGLE
+Texture2D<float> depthTex : register(t3);
+#define DEPTH_DIMS(w, h) { uint levels_; depthTex.GetDimensions(0, w, h, levels_); }
+#define DEPTH_LOAD(p) depthTex.Load(int3(p, 0))
+#else
 Texture2DMS<float> depthTex : register(t3);
+#define DEPTH_DIMS(w, h) { uint samples_; depthTex.GetDimensions(w, h, samples_); }
+#define DEPTH_LOAD(p) depthTex.Load(p, 0)
+#endif
 SamplerState ls : register(s0);
 SamplerState ps : register(s1);
 struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
@@ -225,7 +234,7 @@ float3 Bloom(float2 uv) {
 }
 
 // PC distance blur: 13-tap hex blur weighted by the linearised scene depth. The scene depth is
-// multisampled; sample 0 and undo the reversed depth before the PC linearisation.
+// multisampled with MSAA (sample 0) or single-sample without; undo the reversed depth before the PC linearisation.
 float3 DistanceBlur(float2 uv, float3 color) {
     static const float2 hex[13] = {
         float2(0, 0), float2(0.5, 0.8660), float2(-0.5, 0.8660), float2(-1, 0),
@@ -233,10 +242,10 @@ float3 DistanceBlur(float2 uv, float3 color) {
         float2(1, 1.7320), float2(-1, 1.7320), float2(-2, 0),
         float2(-1, -1.7320), float2(1, -1.7320), float2(2, 0)
     };
-    uint w, h, samples;
-    depthTex.GetDimensions(w, h, samples);
+    uint w, h;
+    DEPTH_DIMS(w, h);
     uint2 p = uint2(saturate(uv) * float2(max(w, 1) - 1, max(h, 1) - 1));
-    float raw = 1.0 - depthTex.Load(p, 0);
+    float raw = 1.0 - DEPTH_LOAD(p);
     float world = src.z * src.w / max(src.w - raw * (src.w - src.z), 1e-4);
     float coef = saturate((world - 40.0) / (65.0 - 40.0));
     if (coef <= 0.0) return color;
@@ -926,7 +935,7 @@ private:
     // shaders by source hash: Compile returns the bytecode and sets hash
     ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
     // Blit's pipeline
-    ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples);
+    ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples, bool depth_single = false);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv) const;
     // Init, in order, each callee right after its caller
     bool CreateDevice();
@@ -2185,8 +2194,10 @@ void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_AD
 }
 
 void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o) {
-    // a single sampled resource cannot back a Texture2DMS view
-    ID3D12Resource* depth = o.depth && o.depth->GetDesc().SampleDesc.Count > 1 ? o.depth : nullptr;
+    // a multisampled depth is read through a Texture2DMS view, a single-sample one (MSAA off) through the
+    // DEPTH_SINGLE variant's Texture2D view
+    ID3D12Resource* depth = o.depth;
+    const bool depth_single = depth && depth->GetDesc().SampleDesc.Count == 1;
     uint32_t slot = AllocSrvSlots(4);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fmt;
@@ -2199,7 +2210,8 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot + 2, srv_inc_));
     sv = {};
     sv.Format = kDepthRead;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    sv.ViewDimension = depth_single ? D3D12_SRV_DIMENSION_TEXTURE2D : D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    if (depth_single) sv.Texture2D.MipLevels = 1;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     dev_->CreateShaderResourceView(depth, &sv, Cpu(srv_heap_.Get(), slot + 3, srv_inc_));
     uint32_t si = EnsureBlitSamplers();
@@ -2211,7 +2223,7 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
                    o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z,
                    o.hdr_mode, o.paper_white, o.peak, o.highlights};
     std::memcpy(cb.cpu, c, sizeof(c));
-    DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples), cb.gpu, slot, si);
+    DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples, depth_single), cb.gpu, slot, si);
 }
 
 // Portable DXBC only: pipeline caches would additionally need adapter/driver keys.
@@ -2374,12 +2386,13 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC D3D12Backend::FullScreenPipelineDesc(ID3DBlob
     return d;
 }
 
-ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples) {
-    auto& pso = blit_psos_[uint64_t(rtv) | uint64_t(over) << 32 | uint64_t(samples) << 33];
+ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples, bool depth_single) {
+    auto& pso = blit_psos_[uint64_t(rtv) | uint64_t(over) << 32 | uint64_t(samples) << 33 | uint64_t(depth_single) << 48];
     if (pso) return pso.Get();
     uint64_t h;
-    ID3DBlob* vs = Compile(kBlitHlsl, "vs", "vs_5_0", h);
-    ID3DBlob* ps = Compile(kBlitHlsl, "psmain", "ps_5_0", h);
+    const std::string text = depth_single ? std::string("#define DEPTH_SINGLE 1\n") + kBlitHlsl : std::string(kBlitHlsl);
+    ID3DBlob* vs = Compile(text, "vs", "vs_5_0", h);
+    ID3DBlob* ps = Compile(text, "psmain", "ps_5_0", h);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
     d.SampleDesc.Count = samples;
     if (over) {
@@ -4212,9 +4225,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     const bool frame = bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_;
     RegionClip(a, stages, frame ? guest_w_ : 0, frame ? guest_h_ : 0, c);
     if (bound_rt_ && !a.pretransformed) bound_rt_->scene_frame = frame_;
-    // Distance blur only uses this frame's full-size, multisampled scene depth. The allocation can
-    // fall back to one sample, so check the resource, not the configured mode. Scene-time AO
-    // supports both sample counts.
+    // Distance blur uses this frame's full-size scene depth, multisampled or not; Blit picks the
+    // view from the resource. Scene-time AO supports both sample counts.
     const bool depth_available = bound_ds_ && bound_ds_->res;
     // scene_view: a widescreen game view is full width but shorter than the 640x480 surface
     // (letterboxed by the title); a shadow or mirror pass is much smaller.
@@ -5676,7 +5688,7 @@ void D3D12Backend::Present(const Surface& front) {
     const auto depth = scene_depth_.find(t);
     if (t && render_.dof && depth != scene_depth_.end()) {
         Target& ds = *depth->second.target;
-        if (ds.res && ds.res->GetDesc().SampleDesc.Count > 1 && ds.w == t->w && ds.h == t->h) {
+        if (ds.res && ds.w == t->w && ds.h == t->h) {  // multisampled or not (Blit picks the view)
             dof_depth_ = ds.res.Get();
             Transition(dof_depth_, ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             dof_near_ = depth->second.near_z;
