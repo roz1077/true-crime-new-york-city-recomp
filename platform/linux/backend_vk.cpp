@@ -1187,9 +1187,9 @@ bool WriteSwapTga(const char* path, const uint8_t* px, uint32_t w, uint32_t h, V
                 row[size_t(x) * 3 + 1] = SrgbByte(out[1]);
                 row[size_t(x) * 3 + 2] = SrgbByte(out[0]);
             } else {
-                row[size_t(x) * 3 + 0] = bgr ? p[2] : p[0];
+                row[size_t(x) * 3 + 0] = bgr ? p[0] : p[2];
                 row[size_t(x) * 3 + 1] = p[1];
-                row[size_t(x) * 3 + 2] = bgr ? p[0] : p[2];
+                row[size_t(x) * 3 + 2] = bgr ? p[2] : p[0];
             }
         }
         std::fwrite(row.data(), 1, row.size(), f);
@@ -3222,18 +3222,17 @@ void VulkanBackend::BindTargets(const State& s, Target*& rt, Target*& ds) {
     if (perf_) perf_bind_++;
     rt = nullptr;
     ds = nullptr;
-    const bool want_rt = s.rt.header && s.rt.size;
-    const bool want_ds = s.zs.header && s.zs.size;
     TextureDesc rd, dd;
-    const uint32_t rt_data = want_rt ? (DescribeSurface(s.rt, rd) ? rd.data : s.rt.data) : 0;
-    const uint32_t ds_data = want_ds ? (DescribeSurface(s.zs, dd) ? dd.data : s.zs.data) : 0;
-    const auto same_target = [](Target* old, uint32_t data, const TextureDesc& desc, bool depth) {
-        return old && old->data == data && old->depth == depth && old->gw == desc.width && old->gh == desc.height &&
-               old->guest_format == desc.format;
+    // Swizzled surfaces encode their dimensions in Format and have no Size field value.
+    const bool want_rt = DescribeSurface(s.rt, rd);
+    const bool want_ds = DescribeSurface(s.zs, dd);
+    const auto same_target = [](Target* old, const TextureDesc& desc, bool depth) {
+        return old && old->data == desc.data && old->depth == depth && old->gw == desc.width && old->gh == desc.height &&
+               old->guest_format == desc.format && old->pitch == desc.pitch && old->linear == desc.linear;
     };
     if (pass_ != VK_NULL_HANDLE &&
-        ((want_rt && same_target(pass_rt_, rt_data, rd, false)) || (!want_rt && !pass_rt_)) &&
-        ((want_ds && same_target(pass_ds_, ds_data, dd, true)) || (!want_ds && !pass_ds_))) {
+        ((want_rt && same_target(pass_rt_, rd, false)) || (!want_rt && !pass_rt_)) &&
+        ((want_ds && same_target(pass_ds_, dd, true)) || (!want_ds && !pass_ds_))) {
         rt = pass_rt_;
         ds = pass_ds_;
         if (DeferredPending() &&
@@ -5894,8 +5893,14 @@ void VulkanBackend::FillConstants(const State& s, const PixelKey& pk, const std:
     if (c.zparams[3] != 1.0f) LOG_FIRST(4, "vulkan: depth scale %.3f for the distant city pass", c.zparams[3]);
     for (int i = 0; i < 4; i++) {
         c.tscale[i] = 1.0f;
-        if (info[size_t(i)].flags & kTexTarget)
+        if (info[size_t(i)].flags & kTexTarget) {
             c.rtshift[i] = (!prog || ReadsViewportOffset(s.vs->program)) ? -0.5f : 0.0f;
+            // TexUv clamps target reads. Leave the region open so the sampler
+            // handles addressing instead of pinning every sample to (0, 0).
+            constexpr float kOpen = 1e9f;
+            c.rtclip[i][0] = c.rtclip[i][1] = -kOpen;
+            c.rtclip[i][2] = c.rtclip[i][3] = kOpen;
+        }
     }
     (void)pk;
 }
