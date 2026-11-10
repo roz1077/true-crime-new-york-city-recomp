@@ -18,6 +18,7 @@
 
 #include "core/log.h"
 #include "kernel/kernel.h"
+#include "level_generation.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
 
@@ -45,10 +46,15 @@ void DetachChildren(uint8_t *base) {
 
 } // namespace
 
+namespace game {
+std::atomic<uint32_t> g_level_generation{0};
+}
+
 // world reset: clears [record+0xA8] for every record
 X86_EXTERN_FUNC(__imp__sub_00068300);
 X86_FUNC(sub_00068300) {
     DetachChildren(base);
+    game::g_level_generation.fetch_add(1, std::memory_order_relaxed);
     __imp__sub_00068300(ctx, base);
 }
 
@@ -56,5 +62,6 @@ X86_FUNC(sub_00068300) {
 X86_EXTERN_FUNC(__imp__sub_000703D0);
 X86_FUNC(sub_000703D0) {
     DetachChildren(base);
+    game::g_level_generation.fetch_add(1, std::memory_order_relaxed);
     __imp__sub_000703D0(ctx, base);
 }
