@@ -63,6 +63,7 @@
 #include <cstring>
 
 #include "core/input.h"
+#include "level_generation.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
@@ -167,6 +168,7 @@ struct AimHold {
     uint8_t mode = 0;
     float pitch = 0;
     bool held = false;
+    uint32_t generation = 0;  // game::LevelGeneration() when the hold started
 };
 thread_local AimHold g_aim_hold;
 
@@ -181,16 +183,21 @@ float ApplyAim(uint8_t *base, uint32_t camera, uint32_t controller, uint8_t mode
     input::UseDirectMouseAim();
     float dx = 0, dy = 0;
     const bool sampled = input::ConsumeMouseAim(dx, dy);
-    mouse_aim = input::KeyboardMouseActive() || input::DirectAimRecent();
+    // a level load or world reset ends the hold: the camera and its controller are new objects
+    const uint32_t generation = game::LevelGeneration();
+    if (g_aim_hold.generation != generation) g_aim_hold.held = false;
+    // The hold starts when the mouse moves and lasts while keyboard/mouse stays the active device. A
+    // keyboard-only player never starts it, so the game's own pitch and auto-centre stay in charge.
+    mouse_aim = input::DirectAimRecent() || (input::KeyboardMouseActive() && g_aim_hold.held);
     if (!mouse_aim) {
         g_aim_hold.held = false;
         return RdF(base, kPitch);
     }
     if (!g_aim_hold.held || g_aim_hold.camera != camera || g_aim_hold.controller != controller ||
-        g_aim_hold.mode != mode) {
+        g_aim_hold.mode != mode || g_aim_hold.generation != generation) {
         // Start from the game's current angle, then keep the mouse's own so the
         // controller's per-frame rest-pitch reset cannot undo the accumulation.
-        g_aim_hold = {camera, controller, mode, RdF(base, kPitch), true};
+        g_aim_hold = {camera, controller, mode, RdF(base, kPitch), true, generation};
     }
 
     const float percent = float(std::clamp(input::g_mouse_sensitivity_percent, 10u, 400u)) * 0.01f;

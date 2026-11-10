@@ -31,6 +31,7 @@ struct X86Context { uint32_t ecx = 0; };
 #define X86_MEM32(a) (*reinterpret_cast<uint32_t*>(base + (a)))
 #define X86_MEM8(a) base[a]
 namespace mem { bool IsCommitted(uint32_t a) { return a && a < 0x500000; } }
+namespace game { uint32_t generation = 0; uint32_t LevelGeneration() { return generation; } }
 namespace input {
 bool g_direct_mouse_aim = true, recent = false, mouse_active = false;
 uint32_t g_mouse_sensitivity_percent = 100, g_mouse_vertical_sensitivity_percent = 100;
@@ -174,6 +175,24 @@ extern "C" __declspec(dllexport) int run() {
     Update(base, 9, 0);
     if (!Close(RdF(base, kPitch), 0.2f)) return 15;
     if (base[kTestAutoCenter] != 0) return 18;
+    // Keyboard-only play (keyboard/mouse active, the mouse never moved) leaves the
+    // game's auto-center alone: no hold has started.
+    base[kTestAutoCenter] = 1;
+    input::mouse_active = true; input::recent = false;
+    SetFloat(base, kPitch, 0.2f);
+    Update(base, 9, 0);
+    if (!Close(RdF(base, kPitch), 0.35f)) return 29;
+    // A hold started by the mouse ends on a level load, even with keyboard/mouse still active.
+    input::recent = true;
+    SetFloat(base, kPitch, 0.2f);
+    Update(base, 9, 0, 10);
+    input::recent = false;
+    Update(base, 9, 0);
+    if (!Close(RdF(base, kPitch), 0.24f)) return 30;
+    game::generation++;
+    SetFloat(base, kPitch, 0.2f);
+    Update(base, 9, 0);
+    if (!Close(RdF(base, kPitch), 0.35f)) return 31;
     return 0;
 }
 '''
