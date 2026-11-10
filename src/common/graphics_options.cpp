@@ -332,7 +332,7 @@ void RestoreDefaults() {
     s.dof = d.dof;
     s.ao = d.ao;
     s.building_seam_fix = d.building_seam_fix;
-    s.object_detail = d.object_detail;
+    std::atomic_ref(s.object_detail).store(d.object_detail, std::memory_order_relaxed);  // read by lod.cpp
     s.pc_contrast = d.pc_contrast;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
@@ -641,9 +641,10 @@ std::string Value(Row row) {
 bool Change(Row row, int direction) {
     app::SettingsLock lock;
     app::Settings &s = app::Get();
+    // atomic stores: some of these (object_detail) are read on the game thread through atomic_ref
     auto set = [](uint32_t &field, uint32_t value) {
         if (field == value) return false;
-        field = value;
+        std::atomic_ref(field).store(value, std::memory_order_relaxed);
         return true;
     };
     bool changed = false;
