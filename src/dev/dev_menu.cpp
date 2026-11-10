@@ -13,6 +13,7 @@
 #include "imgui.h"
 
 #include "app/app.h"
+#include "common/guest_values.h"
 #include "core/input.h"
 #include "core/log.h"
 #include "dev/dev.h"
@@ -125,14 +126,7 @@ void StagesTab() {
     const std::vector<Script> scripts = LiveScripts();
     // fast-forward: every running script with a "Die" stage goes to it, except bosses
     if (ImGui::Button("Defeat all enemies")) {
-        static const uint32_t die = [] {
-            uint32_t crc = 0xFFFFFFFFu;
-            for (const char *p = "Die"; *p; ++p) {
-                crc ^= uint8_t(*p);
-                for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-            }
-            return ~crc;
-        }();
+        constexpr uint32_t die = guest::Crc32("Die");
         auto bossy = [](const std::string &name) {
             std::string lower = name;
             for (char &ch : lower) ch = char(std::tolower(uint8_t(ch)));

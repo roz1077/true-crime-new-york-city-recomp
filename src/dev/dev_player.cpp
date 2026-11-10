@@ -23,6 +23,7 @@
 #include <mutex>
 #include <vector>
 
+#include "common/guest_values.h"
 #include "core/log.h"
 #include "dev/dev.h"
 #include "kernel/kernel.h"
@@ -66,13 +67,6 @@ bool Readable(uint32_t va, uint32_t size = 4) {
     return va >= 0x10000 && mem::IsCommitted(va) && mem::IsCommitted(va + size - 1);
 }
 
-float F32(uint32_t va) {
-    const uint32_t bits = kernel::R32(va);
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
-
 uint32_t Player() {
     if (!Readable(kPlayer)) return 0;
     const uint32_t player = kernel::R32(kPlayer);
@@ -99,8 +93,8 @@ namespace dev {
 bool PlayerStatus(float &health, float &max_health) {
     const uint32_t h = HealthComponent(Player());
     if (!h) return false;
-    health = F32(h + kHealthNow);
-    max_health = F32(h + kHealthMax);
+    health = guest::ReadF32(h + kHealthNow);
+    max_health = guest::ReadF32(h + kHealthMax);
     return true;
 }
 
@@ -117,13 +111,8 @@ void RequestBadCopPoints(int points) { g_bad += points; }
 void RequestCareerPoints(int points) { g_career += points; }
 
 void RequestItem(const char *item_name, bool left_hand) {
-    uint32_t crc = 0xFFFFFFFFu;
-    for (const char *p = item_name; *p; ++p) {
-        crc ^= uint8_t(*p);
-        for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-    }
     std::lock_guard guard(g_items_lock);
-    g_items.push_back({~crc, left_hand ? 0u : 1u});
+    g_items.push_back({guest::Crc32(item_name), left_hand ? 0u : 1u});
 }
 
 bool CopPoints(int &good, int &bad) {
@@ -173,7 +162,7 @@ void PlayerFrame(X86Context &ctx) {
     }
     if (g_heal.exchange(false)) {
         kernel::W32(health + kHealthNow, kernel::R32(health + kHealthMax));
-        LOGR("dev: healed player to %.0f", F32(health + kHealthMax));
+        LOGR("dev: healed player to %.0f", guest::ReadF32(health + kHealthMax));
     }
     static int frames = 0;
     if (g_ammo && ++frames % 30 == 0) kernel::CallGuest(ctx, kSetAmmo, {999});

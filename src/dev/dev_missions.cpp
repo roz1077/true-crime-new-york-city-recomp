@@ -23,6 +23,7 @@
 #include <unordered_map>
 
 #include "common/graphics_menu.h"
+#include "common/guest_values.h"
 #include "core/log.h"
 #include "dev/level_names.h"
 #include "kernel/kernel.h"
@@ -54,15 +55,6 @@ std::atomic<int> g_request_case{-1}, g_request_mission{-1}, g_request_clock{-1};
 const char *Env(const char *name) {
     const char *v = std::getenv(name);
     return v && *v ? v : nullptr;
-}
-
-uint32_t Crc32(const char *s) {
-    uint32_t crc = 0xFFFFFFFFu;
-    for (; *s; ++s) {
-        crc ^= uint8_t(*s);
-        for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-    }
-    return ~crc;
 }
 
 uint32_t GameObject() {
@@ -132,7 +124,7 @@ void EnvironmentActions(X86Context &ctx, uint32_t game) {
         int c = -1, m = -1;
         if (!dev::InGameplay())
             LOGR("dev: mission jump ignored, not in gameplay yet");
-        else if (FindMission(Crc32(mission), c, m))
+        else if (FindMission(guest::Crc32(mission), c, m))
             ApplyMission(ctx, game, c, m);
         else
             LOGR("dev: mission %s is not in the story table", mission);
@@ -147,7 +139,7 @@ namespace {
 const LevelName *Find(uint32_t hash) {
     static const std::unordered_map<uint32_t, const LevelName *> names = [] {
         std::unordered_map<uint32_t, const LevelName *> map;
-        for (const LevelName &name : kLevelInfoNames) map.emplace(Crc32(name.name), &name);
+        for (const LevelName &name : kLevelInfoNames) map.emplace(guest::Crc32(name.name), &name);
         return map;
     }();
     auto it = names.find(hash);

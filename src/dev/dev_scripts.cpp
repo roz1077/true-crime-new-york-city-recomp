@@ -24,6 +24,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "common/guest_values.h"
 #include "core/log.h"
 #include "dev/dev.h"
 #include "dev/script_names.h"
@@ -50,15 +51,6 @@ std::unordered_map<uint32_t, Live> g_live;            // instance -> owner, last
 std::unordered_map<uint32_t, uint32_t> g_requests;    // instance -> state hash
 uint64_t g_frame = 0;
 
-uint32_t Crc32(const char *s) {
-    uint32_t crc = 0xFFFFFFFFu;
-    for (; *s; ++s) {
-        crc ^= uint8_t(*s);
-        for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-    }
-    return ~crc;
-}
-
 bool Readable(uint32_t va, uint32_t size = 4) {
     return va && mem::IsCommitted(va) && mem::IsCommitted(va + size - 1);
 }
@@ -70,7 +62,7 @@ namespace dev {
 std::string ScriptName(uint32_t hash) {
     static const std::unordered_map<uint32_t, const char *> names = [] {
         std::unordered_map<uint32_t, const char *> map;
-        for (const char *name : kScriptNames) map.emplace(Crc32(name), name);
+        for (const char *name : kScriptNames) map.emplace(guest::Crc32(name), name);
         return map;
     }();
     if (auto it = names.find(hash); it != names.end()) return it->second;
@@ -178,12 +170,6 @@ std::string Running() {
     return text;
 }
 
-float StackFloat(uint32_t va) {
-    const uint32_t bits = kernel::R32(va);
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
 } // namespace
 
 // SetGrabbable(bool) 0x17FA70: character +0xA8 -> +0x24 bit 0x200 = not grabbable
@@ -203,7 +189,7 @@ X86_FUNC(sub_001828C0) {
     if (dev::TraceScripts()) {
         const uint32_t vm = kernel::R32(ctx.esp + 4);
         LOGR("dev trace: frame %llu SetTimer(%.2f s, %s) from %s", static_cast<unsigned long long>(g_frame),
-             StackFloat(vm - 8), dev::ScriptName(kernel::R32(vm - 4)).c_str(), Running().c_str());
+             guest::ReadF32(vm - 8), dev::ScriptName(kernel::R32(vm - 4)).c_str(), Running().c_str());
     }
     __imp__sub_001828C0(ctx, base);
 }
@@ -236,20 +222,20 @@ namespace dev {
 
 void SumoBefore(uint32_t grapple) {
     g_sumo_state = kernel::G<uint8_t>(grapple + 0x0C);
-    g_sumo_timer = StackFloat(grapple + 0x30);
+    g_sumo_timer = guest::ReadF32(grapple + 0x30);
 }
 
 void SumoAfter(uint32_t grapple, bool push_window) {
     if (!TraceScripts() || !Readable(grapple + 0x44)) return;
     const uint8_t state = kernel::G<uint8_t>(grapple + 0x0C);
-    const float timer = StackFloat(grapple + 0x30);
+    const float timer = guest::ReadF32(grapple + 0x30);
     if (state == g_sumo_state && (g_sumo_timer > 0) == (timer > 0)) return;
     static const auto start = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     LOGR("dev sumo: %.1f ms frame %llu grapple %08X state %u -> %u, timer %.3f -> %.3f, balance %.3f, "
          "timer2 %.3f, dt %.4f%s",
          ms, static_cast<unsigned long long>(g_frame), grapple, g_sumo_state, state, g_sumo_timer, timer,
-         StackFloat(grapple + 0x40), StackFloat(grapple + 0x44), StackFloat(0x37F630),
+         guest::ReadF32(grapple + 0x40), guest::ReadF32(grapple + 0x44), guest::ReadF32(0x37F630),
          push_window ? " (push window, slowed)" : "");
 }
 

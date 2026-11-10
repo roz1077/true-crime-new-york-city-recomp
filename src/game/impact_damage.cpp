@@ -17,9 +17,9 @@
 // follows difficulty and mission changes.
 
 #include <algorithm>
-#include <cstring>
 
 #include "core/log.h"
+#include "common/guest_values.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
@@ -32,21 +32,8 @@ constexpr uint32_t kHealthOwner = 0x04;
 constexpr uint32_t kHealthMax = 0x08;
 constexpr uint32_t kSimTicks = 0x363D0C;    // simulation tick counter, 60 a second (timing.cpp)
 constexpr uint32_t kTicksPerWindow = 60;    // one second of game time
-constexpr uint32_t kDamageTypeImpact = 0x2B2D2DAF; // crc32("DAMAGETYPE_IMPACT")
+constexpr uint32_t kDamageTypeImpact = guest::Crc32("DAMAGETYPE_IMPACT"); // 0x2B2D2DAF
 constexpr float kMaxImpactPerWindow = 0.15f;       // of max health
-
-float F32(uint32_t va) {
-    const uint32_t bits = kernel::R32(va);
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
-
-void W32F(uint32_t va, float f) {
-    uint32_t bits;
-    std::memcpy(&bits, &f, 4);
-    kernel::W32(va, bits);
-}
 
 // impact damage already taken in the current window; game thread only
 uint32_t g_window_start = 0;
@@ -64,8 +51,8 @@ X86_FUNC(sub_0019D3B0) {
         const uint32_t player_health =
             player && mem::IsCommitted(player + kPlayerHealth + 3) ? kernel::R32(player + kPlayerHealth) : 0;
         const bool is_player = player && (kernel::R32(health + kHealthOwner) == player || health == player_health);
-        const float amount = F32(ctx.esp + 8);
-        const float max_health = F32(health + kHealthMax);
+        const float amount = guest::ReadF32(ctx.esp + 8);
+        const float max_health = guest::ReadF32(health + kHealthMax);
         // the first few player damage types, so a scrape with another hash can be found (docs/glitch-faq-triage.md)
         if (is_player) LOG_FIRST(16, "tcnyc: player damage type %08X amount %.1f", type, amount);
         if (is_player && type == kDamageTypeImpact && amount > 0.0f && max_health > 0.0f) {  // also false for NaN
@@ -81,7 +68,7 @@ X86_FUNC(sub_0019D3B0) {
             // every hit counts toward the window, so a stream of small hits is capped too
             g_window_damage += allowed;
             if (allowed < amount) {
-                W32F(ctx.esp + 8, allowed);
+                guest::WriteF32(ctx.esp + 8, allowed);
                 LOG_FIRST(8, "tcnyc: impact damage on player capped %.1f -> %.1f (max %.1f)", amount, allowed,
                           max_health);
             }

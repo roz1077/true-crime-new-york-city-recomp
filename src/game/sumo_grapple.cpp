@@ -11,8 +11,8 @@
 // frame on the Xbox. This side gets a slower clock during that window, so the
 // window lasts kWindowScale times longer; the rest of the game keeps its time.
 
-#include <cstring>
 
+#include "common/guest_values.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
@@ -27,18 +27,6 @@ constexpr uint8_t kRecovering = 1;
 constexpr float kAtEdge = 0.999f;
 constexpr float kWindowScale = 1.5f; // 166 ms -> about 250 ms
 
-float F32(uint32_t va) {
-    const uint32_t bits = kernel::R32(va);
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
-
-void W32F(uint32_t va, float f) {
-    uint32_t bits;
-    std::memcpy(&bits, &f, 4);
-    kernel::W32(va, bits);
-}
 } // namespace
 
 X86_EXTERN_FUNC(__imp__sub_00058D90);
@@ -49,11 +37,11 @@ X86_FUNC(sub_00058D90) {
     dev::SumoBefore(grapple);
 #endif
     const bool push_window =
-        kernel::G<uint8_t>(grapple + kState) == kRecovering && F32(grapple + kBalance) >= kAtEdge;
-    const float frame_time = F32(kFrameTime);
-    if (push_window) W32F(kFrameTime, frame_time / kWindowScale);
+        kernel::G<uint8_t>(grapple + kState) == kRecovering && guest::ReadF32(grapple + kBalance) >= kAtEdge;
+    const float frame_time = guest::ReadF32(kFrameTime);
+    if (push_window) guest::WriteF32(kFrameTime, frame_time / kWindowScale);
     __imp__sub_00058D90(ctx, base);
-    if (push_window) W32F(kFrameTime, frame_time);
+    if (push_window) guest::WriteF32(kFrameTime, frame_time);
 #if TCNYC_DEV_TOOLS
     dev::SumoAfter(grapple, push_window);
 #endif
