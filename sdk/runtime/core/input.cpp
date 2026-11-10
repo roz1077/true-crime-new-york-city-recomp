@@ -33,6 +33,10 @@ uint32_t g_prompt_override = 0;
 // A small right-stick sample used only while a lock-on target is active; the
 // game's aim assist reads the stick and snaps the crosshair onto the target.
 std::atomic<int16_t> g_lock_stick_x{0}, g_lock_stick_y{0};
+// when the camera hooks last set it: the in-car camera and cutscenes skip those hooks, so a
+// sample they stopped refreshing must not keep turning the view
+std::atomic<uint64_t> g_lock_stick_at{0};
+constexpr uint64_t kLockStickMs = 100;
 
 namespace {
 
@@ -339,8 +343,9 @@ bool ReadKeyboardMouse(Pad& pad) {
         if (ui) {
             pad.rx = pad.ry = 0;
         } else if (direct) {
-            pad.rx = g_lock_stick_x.load(std::memory_order_relaxed);
-            pad.ry = g_lock_stick_y.load(std::memory_order_relaxed);
+            const bool fresh = now - g_lock_stick_at.load(std::memory_order_relaxed) < kLockStickMs;
+            pad.rx = fresh ? g_lock_stick_x.load(std::memory_order_relaxed) : 0;
+            pad.ry = fresh ? g_lock_stick_y.load(std::memory_order_relaxed) : 0;
         } else {
             pad.rx = g_hold_rx;
             pad.ry = g_hold_ry;
@@ -448,6 +453,7 @@ bool KeyboardMouseActive() { return g_keyboard_mouse_active.load(std::memory_ord
 void SetLockOnStick(int16_t x, int16_t y) {
     g_lock_stick_x.store(x, std::memory_order_relaxed);
     g_lock_stick_y.store(y, std::memory_order_relaxed);
+    g_lock_stick_at.store(NowMs(), std::memory_order_relaxed);
 }
 
 // relative motion and wheel notches from the window thread; the Windows path
