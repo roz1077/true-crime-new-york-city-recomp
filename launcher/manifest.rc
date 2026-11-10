@@ -1,0 +1,3 @@
+// The long-path manifest as a resource, for MinGW-target builds (CMakeLists.txt): the MSVC-target
+// link embeds it with /MANIFESTINPUT, which under a MinGW driver needs mt.exe from the Windows SDK.
+1 24 "TrueCrimeNYC.manifest"
