@@ -65,6 +65,13 @@ if ((Test-Path -LiteralPath $cache -PathType Leaf) -and
     (Select-String -LiteralPath $cache -Pattern '^TCNYC_DEV_TOOLS:BOOL=(ON|TRUE|1|YES)$' -Quiet)) {
     throw "$BuildDir was configured with TCNYC_DEV_TOOLS=ON. Reconfigure it with -DTCNYC_DEV_TOOLS=OFF (or use the release preset in a clean directory) before packaging."
 }
+# Only an optimised build ships: Debug and RelWithDebInfo are slower and carry debug data.
+if (Test-Path -LiteralPath $cache -PathType Leaf) {
+    $type = Select-String -LiteralPath $cache -Pattern '^CMAKE_BUILD_TYPE:STRING=(.*)$' | Select-Object -First 1
+    if ($type -and $type.Matches[0].Groups[1].Value -ne 'Release') {
+        throw "$BuildDir is a $($type.Matches[0].Groups[1].Value) build. Package a Release build (the release preset)."
+    }
+}
 $marker = [Text.Encoding]::ASCII.GetBytes('TCNYC-DEV-TOOLS-BUILD')
 $exeBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $exe).Path)
 $exeText = [Text.Encoding]::GetEncoding(28591).GetString($exeBytes)
@@ -116,13 +123,19 @@ function Get-PeImports([string]$Path) {
 }
 $system32 = Join-Path $env:SystemRoot 'System32'
 $shipped = @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
+# The Windows DLLs the game and its bundled tools may import. Any other DLL, even one that happens
+# to be in this machine's System32 (a driver's or another program's), would be missing elsewhere.
+$windows = @('kernel32.dll', 'ntdll.dll', 'user32.dll', 'gdi32.dll', 'advapi32.dll', 'shell32.dll', 'ole32.dll',
+    'oleaut32.dll', 'comdlg32.dll', 'imm32.dll', 'setupapi.dll', 'version.dll', 'winmm.dll', 'ws2_32.dll',
+    'dwmapi.dll', 'dbghelp.dll', 'windowscodecs.dll', 'd3d12.dll', 'dxgi.dll', 'd3dcompiler_47.dll',
+    'shlwapi.dll', 'uxtheme.dll', 'hid.dll', 'cfgmgr32.dll', 'bcrypt.dll', 'crypt32.dll', 'psapi.dll',
+    'userenv.dll', 'rpcrt4.dll', 'xinput1_4.dll', 'iphlpapi.dll', 'secur32.dll', 'combase.dll')
 $executables = @($exe) + @('clang.exe', 'lld-link.exe', 'xbe_recomp.exe' | ForEach-Object { Join-Path $compiler $_ })
 foreach ($binary in $executables) {
     foreach ($dll in Get-PeImports $binary) {
         $name = $dll.ToLowerInvariant()
         if ($name -like 'api-ms-win-*' -or $name -like 'ext-ms-*' -or $shipped -contains $name) { continue }
-        if ($name -match '^(libc\+\+|libunwind|libllvm|libclang|libgcc|libstdc\+\+|libwinpthread)' -or
-            !(Test-Path -LiteralPath (Join-Path $system32 $dll) -PathType Leaf)) {
+        if ($windows -notcontains $name -or !(Test-Path -LiteralPath (Join-Path $system32 $dll) -PathType Leaf)) {
             throw "$binary needs $dll, which is neither a Windows DLL nor in the package. Build the release with the MSVC-target clang (build.bat puts Visual Studio's or C:\Program Files\LLVM's first on PATH), not a MinGW toolchain."
         }
     }
@@ -130,7 +143,7 @@ foreach ($binary in $executables) {
 $isolated = Join-Path ([IO.Path]::GetTempPath()) ('tcnyc-compiler-' + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $isolated | Out-Null
 try {
-    foreach ($name in 'clang.exe', 'lld-link.exe') { Copy-Item -LiteralPath (Join-Path $compiler $name) -Destination $isolated }
+    foreach ($name in 'clang.exe', 'lld-link.exe', 'xbe_recomp.exe') { Copy-Item -LiteralPath (Join-Path $compiler $name) -Destination $isolated }
     foreach ($name in $shipped) { Copy-Item -LiteralPath (Join-Path $RuntimeDir $name) -Destination $isolated }
     $savedPath = $env:PATH
     $env:PATH = "$isolated;$system32;$env:SystemRoot"
@@ -141,6 +154,12 @@ try {
             if ($LASTEXITCODE -ne 0 -or $out -notmatch 'LLVM|clang') {
                 throw "The bundled compiler/$name does not run on its own (exit $LASTEXITCODE): $($out.Trim()). Build the release with the MSVC-target clang, not a MinGW toolchain."
             }
+        }
+        # xbe_recomp has no --version: started with a missing input it reports that and exits. Only
+        # a loader failure (0xC0000135, a DLL not found) means it cannot run from the package.
+        $out = & (Join-Path $isolated 'xbe_recomp.exe') (Join-Path $isolated 'missing.xbe') 2>&1 | Out-String
+        if ($LASTEXITCODE -eq -1073741515 -or !$out.Trim()) {
+            throw "The bundled compiler/xbe_recomp.exe does not start on its own (exit $LASTEXITCODE). Rebuild it with the MSVC-target clang."
         }
     } finally {
         $env:PATH = $savedPath
