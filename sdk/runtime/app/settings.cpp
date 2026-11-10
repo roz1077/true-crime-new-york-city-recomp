@@ -300,12 +300,14 @@ Mode CachedOutput() {
     static Mode mode{};
     const Settings s = Snapshot();
     Key now{s.width, s.height, MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY)};
-    Mode out = s.width && s.height ? Mode{s.width, s.height} : Desktop();
-    std::lock_guard<std::mutex> guard(lock);
-    if (!(now == key) || !mode.height) {
-        key = now;
-        mode = out;
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        if (now == key && mode.height) return mode;
     }
+    const Mode out = s.width && s.height ? Mode{s.width, s.height} : Desktop();
+    std::lock_guard<std::mutex> guard(lock);
+    key = now;
+    mode = out;
     return mode;
 }
 
