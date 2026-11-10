@@ -491,7 +491,8 @@ const char *Help(Row row) {
     case Row::ObjectDetail:
         return "How far buildings and props keep their detailed models before switching to "
                "simpler ones. Original is the game's own; higher levels look better at a distance but cost "
-               "performance. Vehicles and distant pedestrians keep the game's own detail.";
+               "performance. Maximum draws every object at full detail at any distance and is much slower "
+               "in busy streets. Vehicles and distant pedestrians keep the game's own detail.";
     case Row::Anisotropic:
         return "Keeps textures sharp at glancing angles, such as roads into the distance. Game default uses "
                "the filtering the game asks for.";
