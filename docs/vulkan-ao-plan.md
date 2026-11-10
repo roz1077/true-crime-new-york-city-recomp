@@ -180,7 +180,9 @@ helper.
 - The scene MSAA colour and depth/stencil attachments use `STORE` only while the deferred path
   is active. A deferred flush closes and reopens the scene pass, so discarding the multisample
   attachments would lose the scene between the AO passes and the replay. With AO off (and no
-  forced deferral) the immediate path keeps the cheaper `DONT_CARE` resolve behavior.
+  forced deferral) the immediate path keeps the cheaper `DONT_CARE` resolve behavior. Only the
+  render passes are keyed by this: store ops do not affect render pass compatibility, so
+  pipelines and framebuffers are shared and toggling AO does not recompile them.
 - AO uses dedicated targets and passes: the prepass has R32F colour + scene-format depth and
   no resolve attachment; GTAO and the blur are R8 passes. The existing `RenderPassForMs`
   helper cannot express the two-attachment prepass because it always adds resolve
@@ -194,9 +196,13 @@ helper.
   LESS/LESS_OR_EQUAL, 0.0 for GREATER/GREATER_OR_EQUAL); the distance target clears to 1e30.
 - AO tracks its scene colour/depth pair from the bound targets directly, so it does not
   depend on the DOF-only `scene_depth_` map or on MSAA being enabled.
-- The deferred path flushes before clears, copies, resolves, readbacks, target uploads,
-  target release, texture/image replacement and any submission. Texture uploads for images no
-  pending draw samples are allowed to submit without a replay.
+- The deferred path flushes before work that touches the pending scene: clears of a target the
+  pending draws render into or sample, any full-size depth clear (a new scene view), sampling or
+  late-copying a target they render into, target release, texture/image replacement and any
+  submission. Clears of unrelated targets (HUD slots, shadow and reflection maps), sampling a
+  target the pending draws only read, and texture uploads for images no pending draw samples
+  leave the list in place, since every replay runs the whole AO pass again. `TCNYC_PERF=1`
+  logs deferred flushes and AO runs per frame.
 - AO is recomputed at each flush from the accumulated prepass depth, matching D3D12; a
   full-size depth clear (or a new frame) re-arms the prepass clear.
 - `TCNYC_AO_PROBE=1` writes the first distance and full-size occlusion images to

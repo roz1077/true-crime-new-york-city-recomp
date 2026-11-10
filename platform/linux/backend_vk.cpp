@@ -351,7 +351,6 @@ struct PsoKey {
     float zslope = 0.0f;  // solid polygon offset, as the D3D12 backend applies it
     uint32_t rtfmt = 0, dsfmt = 0;
     uint32_t samples = 1;
-    uint32_t msaa_store = 0;  // the deferred scene pass needs multisample STORE
     uint32_t sprite = 0;  // a program's point list drawn as point sprites
     bool operator==(const PsoKey&) const = default;
 };
@@ -660,6 +659,11 @@ private:
 
     // deferred scene display list and receiver AO
     bool DeferredPending() const { return !deferred_.empty(); }
+    // the pending scene draws render into t: work that reads or rewrites t must replay them first
+    bool DeferredWrites(const Target* t) const {
+        return t && DeferredPending() &&
+               (t == defer_rt_ || t == defer_ds_ || deferred_write_targets_.count(const_cast<Target*>(t)));
+    }
     void FlushDeferredScene();
     void ReplayDeferred(const std::vector<DeferredDraw>& draws, VkDescriptorSet occlusion);
     void ResetDeferred();
@@ -837,7 +841,11 @@ private:
     // deferred scene display list
     bool defer_forced_ = false;
     bool defer_scene_ = false;
-    bool msaa_store_ = false;  // STORE multisample attachments only while replaying
+    // STORE multisample attachments for the whole frame while the deferred display list is on (AO,
+    // TCNYC_DEFER_SCENE): its replay closes and reopens the scene pass. Only the render passes are
+    // keyed by it. Store ops do not affect render pass compatibility, so pipelines and framebuffers
+    // made for either variant work with both, and toggling AO does not rebuild them.
+    bool msaa_store_ = false;
     bool defer_abandoned_ = false;
     bool defer_ao_applied_ = false;
     bool flushing_deferred_ = false;
@@ -1029,6 +1037,7 @@ private:
     unsigned long long perf_direct_ = 0, perf_stale_ = 0, perf_readback_ = 0;
     unsigned long long perf_bind_ = 0, perf_pass_new_ = 0, perf_fb_new_ = 0, perf_target_new_ = 0;
     unsigned long long perf_target_upload_ = 0, perf_feedback_ = 0;
+    unsigned long long perf_defer_flushes_ = 0, perf_ao_runs_ = 0;  // deferred replays and AO passes
     // reused across draws: the assembled vertex/index buffers keep their capacity
     Assembled scratch_;
     std::chrono::steady_clock::time_point perf_log_at_{};
@@ -3038,7 +3047,6 @@ VkFramebuffer VulkanBackend::FramebufferFor(Target* rt, Target* ds) {
         if (ds->samples > 1) attach[n++] = ds->resolved_view;
     }
     uint64_t key = Hash(attach, sizeof(VkImageView) * n);
-    key = Hash(&msaa_store_, sizeof(msaa_store_), key);
     auto it = framebuffers_.find(key);
     if (it != framebuffers_.end()) return it->second;
     const uint32_t samples = rt ? rt->samples : ds ? ds->samples : 1;
@@ -3645,6 +3653,7 @@ void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, VkDes
 void VulkanBackend::FlushDeferredScene() {
     if (deferred_.empty() || flushing_deferred_) return;
     flushing_deferred_ = true;
+    if (perf_) perf_defer_flushes_++;
     struct Guard {
         bool& f;
         ~Guard() { f = false; }
@@ -3813,6 +3822,7 @@ void VulkanBackend::FlushDeferredScene() {
                                ao_occ_.format);
                     DumpAoProbe(ao_occ_);
                     ao_ran = true;
+                    if (perf_) perf_ao_runs_++;
                 } else {
                     LOG_FIRST(4, "vulkan: AO occlusion skipped: descriptor or framebuffer unavailable");
                 }
@@ -4941,7 +4951,9 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
                 borrowed_[bkey] = tx;
                 it = borrowed_.find(bkey);
             }
-            if (DeferredPending()) FlushDeferredScene();
+            // sampling a target the pending draws render into needs their output first; one they
+            // only read can be sampled now (it stays in a read layout)
+            if (DeferredWrites(target)) FlushDeferredScene();
             FlushPass();
             BeginRecord();
             VkImage target_image = target->samples > 1 ? target->resolved_image : target->image;
@@ -5686,7 +5698,7 @@ void VulkanBackend::FillConstants(const State& s, const PixelKey& pk, const std:
 
 VkPipeline VulkanBackend::ClearPipeline(VkFormat format, VkFormat depth, uint32_t mask, uint32_t samples) {
     const uint64_t key = uint64_t(format) | (uint64_t(depth) << 32) | (uint64_t(mask) << 40) |
-                         (uint64_t(samples) << 48) | (msaa_store_ ? (1ull << 56) : 0);
+                         (uint64_t(samples) << 48);
     if (auto it = clear_pipelines_.find(key); it != clear_pipelines_.end()) return it->second;
     if (!clear_vs_) {
         static const char* kClearHlsl = R"(
@@ -5760,14 +5772,23 @@ float4 psmain() : SV_Target { return colour; }
 void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                           uint32_t stencil) {
     ScopeTimer timer(perf_, &perf_clear_ms_);
-    // A clear is an immediate command: pending scene draws must run first.
-    if (DeferredPending()) FlushDeferredScene();
     Target* rt = nullptr;
     Target* ds = nullptr;
     BindTargets(s, rt, ds);
     if (!pass_) return;
+    // A clear is an immediate command. Pending scene draws must run first when it clears a target
+    // they render into or sample, and before a full-size depth clear, which starts a new scene view
+    // (below). Clears of other targets (HUD slots, shadow and reflection maps) leave the list
+    // alone: each replay runs the whole AO pass again.
+    const bool view_clear = ds && (flags & kClearZ) && ds->gw == width_ && ds->gh == height_;
+    if (DeferredPending() && (view_clear || DeferredWrites(rt) || DeferredWrites(ds) ||
+                              (rt && deferred_read_targets_.count(rt)) || (ds && deferred_read_targets_.count(ds)))) {
+        FlushDeferredScene();
+        BindTargets(s, rt, ds);
+        if (!pass_) return;
+    }
     // A full-size depth clear starts a new scene view; the AO prepass starts empty again.
-    if (ds && (flags & kClearZ) && ds->gw == width_ && ds->gh == height_) {
+    if (view_clear) {
         ao_depth_clear_ = true;
         defer_rt_ = defer_ds_ = nullptr;
     }
@@ -6050,7 +6071,6 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     k.rtfmt = rt ? uint32_t(rt->format) : 0;
     k.dsfmt = ds ? uint32_t(ds->format) : 0;
     k.samples = rt ? rt->samples : ds ? ds->samples : 1;
-    k.msaa_store = msaa_store_ ? 1 : 0;
     k.blend = SimpleState(s, kMBlendEnable) != 0;
     if (k.blend) {
         k.src = SimpleState(s, kMSrcBlend);
@@ -6427,7 +6447,7 @@ void VulkanBackend::RecordLate(uint32_t data) {
     Target* t = TargetAt(data, false, true);
     if (!t) return;
     if (!t || t->depth) return;
-    if (DeferredPending()) FlushDeferredScene();
+    if (DeferredWrites(t)) FlushDeferredScene();  // the copy must see the pending scene draws
     if (DirtyEpoch(t->data) != t->epoch) return;  // guest memory is newer than the image
     VkImage image = t->samples > 1 ? t->resolved_image : t->image;
     if (!image || !t->w || !t->h) return;
@@ -7393,14 +7413,15 @@ void VulkanBackend::Present(const Surface& front) {
             LOGI("renderer: frame %llu, %.2f ms (%.1f fps), draw %.2f [asm %.2f vert %.2f tex %.2f pix %.2f tgt "
                  "%.2f pipe %.2f const %.2f geo %.2f rec %.2f], ui %.2f, wait %.2f, sync %.2f, copy %.2f, clear "
                  "%.2f, present %.2f, %llu draws, %llu textures, %llu compiles, direct %llu stale %llu readback "
-                 "%llu, binds %llu, passes %llu, fbs %llu, new targets %llu, target uploads %llu (vulkan)",
+                 "%llu, binds %llu, passes %llu, fbs %llu, new targets %llu, target uploads %llu, deferred flushes %.1f, "
+                 "AO runs %.1f per frame (vulkan)",
                  frames_, ms, ms > 0 ? 1000.0 / ms : 0.0, perf_draw_ms_ / 60.0, perf_assemble_ms_ / 60.0,
                  perf_vertex_ms_ / 60.0, perf_tex_ms_ / 60.0, perf_pixel_ms_ / 60.0, perf_target_ms_ / 60.0,
                  perf_pipe_ms_ / 60.0, perf_const_ms_ / 60.0, perf_geom_ms_ / 60.0, perf_record_ms_ / 60.0,
                  perf_ui_ms_ / 60.0, perf_wait_ms_ / 60.0, perf_sync_ms_ / 60.0, perf_copy_ms_ / 60.0,
                  perf_clear_ms_ / 60.0, perf_present_ms_ / 60.0, draws_, tex_uploads_, shader_compiles_, perf_direct_,
                  perf_stale_, perf_readback_, perf_bind_, perf_pass_new_, perf_fb_new_, perf_target_new_,
-                 perf_target_upload_);
+                 perf_target_upload_, double(perf_defer_flushes_) / 60.0, double(perf_ao_runs_) / 60.0);
             perf_log_at_ = now;
             perf_draw_ms_ = perf_ui_ms_ = perf_wait_ms_ = 0.0;
             perf_assemble_ms_ = perf_vertex_ms_ = perf_tex_ms_ = perf_pixel_ms_ = 0.0;
@@ -7408,6 +7429,7 @@ void VulkanBackend::Present(const Surface& front) {
             perf_sync_ms_ = perf_copy_ms_ = perf_clear_ms_ = perf_present_ms_ = 0.0;
             perf_direct_ = perf_stale_ = perf_readback_ = 0;
             perf_bind_ = perf_pass_new_ = perf_fb_new_ = perf_target_new_ = perf_target_upload_ = 0;
+            perf_defer_flushes_ = perf_ao_runs_ = 0;
         } else {
             size_t late_count = 0;
             {
