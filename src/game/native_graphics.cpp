@@ -188,12 +188,14 @@ void Apply(const Values &v) {
 void ApplyDisplayChoice(uint32_t mode, uint64_t size) {
     PollDisplayApply();
     if (g_display_request) return;  // one change at a time; the choice stays pending for another A
-    g_pending = false;
     const uint32_t w = uint32_t(size >> 32), h = uint32_t(size);
     {
         app::SettingsLock lock;
         app::Settings &s = app::Get();
-        if (s.width == w && s.height == h && uint32_t(s.display_mode) == mode) return;
+        if (s.width == w && s.height == h && uint32_t(s.display_mode) == mode) {
+            g_pending = false;
+            return;
+        }
         g_display_old_mode = s.display_mode;
         g_display_old_w = s.width;
         g_display_old_h = s.height;
@@ -209,8 +211,9 @@ void ApplyDisplayChoice(uint32_t mode, uint64_t size) {
         s.width = g_display_old_w;
         s.height = g_display_old_h;
         LOGE("Display tab: could not request a display change to mode %u, %ux%u", mode, w, h);
-        return;
+        return;  // the choice stays pending, so another A retries it
     }
+    g_pending = false;
     g_display_request = request;
 }
 
@@ -234,10 +237,10 @@ void RestoreDisplayChoice(uint32_t mode, uint64_t size) {
     MarkSave();
 }
 
-// guest buffers for the row texts, one per option
+// guest buffers for the row texts, one per option; 0 if they could not be allocated
 uint32_t TextBuffer(uint32_t index) {
     static const uint32_t buffers = mem::AllocSystem(kOptionCount * kTextBytes, 16);
-    return buffers + index * uint32_t(kTextBytes);
+    return buffers ? buffers + index * uint32_t(kTextBytes) : 0;
 }
 
 // what the rows had when the Display tab was entered, for cancel; menu thread only
@@ -300,11 +303,13 @@ X86_FUNC(sub_000C7B80) {
             const Option option = OptionAt(g_page, row);
             char buffer_text[kTextBytes];
             Text(Current(), option, buffer_text);
-            const uint32_t buffer = TextBuffer(uint32_t(option));
-            std::memcpy(base + buffer, buffer_text, std::strlen(buffer_text) + 1);
-            X86_MEM32(out) = buffer;
-            ::kernel::Return(ctx, 0, 2);
-            return;
+            if (const uint32_t buffer = TextBuffer(uint32_t(option))) {
+                std::memcpy(base + buffer, buffer_text, std::strlen(buffer_text) + 1);
+                X86_MEM32(out) = buffer;
+                ::kernel::Return(ctx, 0, 2);
+                return;
+            }
+            LOG_FIRST(1, "Display tab: no guest memory for the row texts");
         }
         // SUBTITLES in the top slot: the game's own text for that port
     }
