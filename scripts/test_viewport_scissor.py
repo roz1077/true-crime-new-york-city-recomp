@@ -33,6 +33,9 @@ struct Commands {
 };
 struct D3D12Backend {
  Target* bound_rt_=nullptr; Target* bound_ds_=nullptr; Commands* cl_;
+ // a deferred scene bundle: viewport and scissor are kept for the direct list at replay
+ Commands* bundle_=nullptr;
+ struct { D3D12_VIEWPORT viewport{}; D3D12_RECT scissor{}; bool has_viewport=false, has_scissor=false; } bundle_desc_;
  struct { bool rasterizer=false; D3D12_VIEWPORT viewport{}; D3D12_RECT scissor{}; } binds_;
  void SetViewportScissor(const State&,uint32_t,uint32_t,float = 1.0f);
 };
@@ -68,9 +71,15 @@ extern "C" __declspec(dllexport) int run() {
  // Squeezed HUD preserves its guest clip, hiding sprites outside the 16:9 area.
  b.SetViewportScissor(s,640,480,0.75f);
  if(!equal(cmd.rect,{280,0,1957,958}))return 9;
+ // While a bundle records, the direct list is left alone and the clip waits in the bundle's state.
+ Commands bundle; b.bundle_=&bundle; calls=cmd.calls;
+ s.scissors[0]=10;s.scissors[1]=20;s.scissors[2]=110;s.scissors[3]=220;
+ b.SetViewportScissor(s,640,480);
+ if(cmd.calls!=calls||bundle.calls||!b.bundle_desc_.has_viewport||!b.bundle_desc_.has_scissor)return 10;
+ if(!equal(b.bundle_desc_.scissor,{35,40,385,440}))return 11;
  return 0;
 }
 '''
 rc = run_native(source, prefix="tcnyc-viewport_scissor-", needs_crt=True)
 assert rc == 0, f"Viewport/scissor regression {rc} (2 = locker clipped to viewport)"
-print('PASS: explicit scissor overrides viewport, default clip, upscaling, wide frames, target bounds and state cache')
+print('PASS: explicit scissor overrides viewport, default clip, upscaling, wide frames, target bounds, state cache and bundle recording')

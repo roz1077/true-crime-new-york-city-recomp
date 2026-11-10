@@ -219,6 +219,12 @@ UINT GetRawInputData(HRAWINPUT r, UINT, RAWINPUT* p, UINT*, UINT) { *p=*static_c
 struct SDL_Gamepad {};
 enum SDL_GamepadType { SDL_GAMEPAD_TYPE_UNKNOWN,SDL_GAMEPAD_TYPE_PS3,SDL_GAMEPAD_TYPE_PS4,SDL_GAMEPAD_TYPE_PS5,SDL_GAMEPAD_TYPE_XBOX360,SDL_GAMEPAD_TYPE_XBOXONE };
 SDL_GamepadType SDL_GetRealGamepadType(SDL_Gamepad*) { return SDL_GAMEPAD_TYPE_XBOXONE; }
+// the prompt-style detection (UpdatePromptType) also reads the mapped type and the pad's identity
+SDL_GamepadType SDL_GetGamepadType(SDL_Gamepad*) { return SDL_GAMEPAD_TYPE_XBOXONE; }
+const char* SDL_GetGamepadName(SDL_Gamepad*) { return "Xbox Controller"; }
+unsigned short SDL_GetGamepadVendor(SDL_Gamepad*) { return 0x045E; }
+unsigned short SDL_GetGamepadProduct(SDL_Gamepad*) { return 0x0B12; }
+unsigned long long SDL_GetGamepadSteamHandle(SDL_Gamepad*) { return 0; }
 namespace input {
 ''' + (root/'sdk/runtime/core/input.h').read_text().split('namespace input {',1)[1].rsplit('}',1)[0] + state + '\n} // anonymous namespace\n' + methods + r'''
 Pad device;
