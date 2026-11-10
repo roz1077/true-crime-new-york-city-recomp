@@ -81,6 +81,74 @@ if (!(Test-Path -LiteralPath $sdkLicence -PathType Leaf)) {
     throw "SDK licence not found: $sdkLicence"
 }
 
+# The package must run on a plain Windows install. A build made with a MinGW-target clang (for
+# example llvm-mingw from winget, when it is first on PATH) links the game against libc++.dll and
+# libunwind.dll, and bundles a clang.exe launcher that needs clang-<version>.exe and libLLVM beside
+# it. Refuse both: every DLL the executables import must be a Windows system DLL or one this
+# package ships, and the bundled compiler must start from a folder of its own.
+function Get-PeImports([string]$Path) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+    $sections = [BitConverter]::ToUInt16($bytes, $pe + 6)
+    $optional = $pe + 24
+    $optionalSize = [BitConverter]::ToUInt16($bytes, $pe + 20)
+    $dirs = if ([BitConverter]::ToUInt16($bytes, $optional) -eq 0x20B) { $optional + 112 } else { $optional + 96 }
+    $importRva = [BitConverter]::ToUInt32($bytes, $dirs + 8)
+    $table = $optional + $optionalSize
+    $toOffset = {
+        param([uint32]$rva)
+        for ($i = 0; $i -lt $sections; $i++) {
+            $s = $table + $i * 40
+            $va = [BitConverter]::ToUInt32($bytes, $s + 12)
+            $size = [Math]::Max([BitConverter]::ToUInt32($bytes, $s + 8), [BitConverter]::ToUInt32($bytes, $s + 16))
+            if ($rva -ge $va -and $rva -lt $va + $size) { return $rva - $va + [BitConverter]::ToUInt32($bytes, $s + 20) }
+        }
+        throw "${Path}: import RVA $rva is outside every section"
+    }
+    $names = @()
+    if (!$importRva) { return $names }
+    for ($d = & $toOffset $importRva; [BitConverter]::ToUInt32($bytes, $d + 12); $d += 20) {
+        $n = & $toOffset ([BitConverter]::ToUInt32($bytes, $d + 12))
+        $end = [Array]::IndexOf($bytes, [byte]0, [int]$n)
+        $names += [Text.Encoding]::ASCII.GetString($bytes, $n, $end - $n)
+    }
+    return $names
+}
+$system32 = Join-Path $env:SystemRoot 'System32'
+$shipped = @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
+$executables = @($exe) + @('clang.exe', 'lld-link.exe', 'xbe_recomp.exe' | ForEach-Object { Join-Path $compiler $_ })
+foreach ($binary in $executables) {
+    foreach ($dll in Get-PeImports $binary) {
+        $name = $dll.ToLowerInvariant()
+        if ($name -like 'api-ms-win-*' -or $name -like 'ext-ms-*' -or $shipped -contains $name) { continue }
+        if ($name -match '^(libc\+\+|libunwind|libllvm|libclang|libgcc|libstdc\+\+|libwinpthread)' -or
+            !(Test-Path -LiteralPath (Join-Path $system32 $dll) -PathType Leaf)) {
+            throw "$binary needs $dll, which is neither a Windows DLL nor in the package. Build the release with the MSVC-target clang (build.bat puts Visual Studio's or C:\Program Files\LLVM's first on PATH), not a MinGW toolchain."
+        }
+    }
+}
+$isolated = Join-Path ([IO.Path]::GetTempPath()) ('tcnyc-compiler-' + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $isolated | Out-Null
+try {
+    foreach ($name in 'clang.exe', 'lld-link.exe') { Copy-Item -LiteralPath (Join-Path $compiler $name) -Destination $isolated }
+    foreach ($name in $shipped) { Copy-Item -LiteralPath (Join-Path $RuntimeDir $name) -Destination $isolated }
+    $savedPath = $env:PATH
+    $env:PATH = "$isolated;$system32;$env:SystemRoot"
+    try {
+        foreach ($name in 'clang.exe', 'lld-link.exe') {
+            $tool = Join-Path $isolated $name
+            $out = & $tool --version 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0 -or $out -notmatch 'LLVM|clang') {
+                throw "The bundled compiler/$name does not run on its own (exit $LASTEXITCODE): $($out.Trim()). Build the release with the MSVC-target clang, not a MinGW toolchain."
+            }
+        }
+    } finally {
+        $env:PATH = $savedPath
+    }
+} finally {
+    Remove-Item -LiteralPath $isolated -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # Compute provenance before the temporary archive exists in the repository, so
 # packaging itself cannot make the tree look dirty.
 $version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion

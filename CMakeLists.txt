@@ -13,6 +13,13 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sdk/cmake/XbeRecomp.cmake)
     message(FATAL_ERROR "The vendored sdk/ tree is missing; restore it from the repository root.")
 endif()
 set(SDK ${CMAKE_CURRENT_SOURCE_DIR}/sdk)
+# A MinGW-target clang (e.g. llvm-mingw first on PATH) builds and runs here, but its executable needs
+# libc++.dll and libunwind.dll and its bundled clang.exe is a launcher: release packages must be
+# built with the MSVC-target clang that build.bat selects. scripts/package-release.ps1 refuses them.
+if(MINGW)
+    message(WARNING "Configured with a MinGW-target clang (${CMAKE_CXX_COMPILER}). Fine for local builds; "
+                    "release packages need the MSVC-target clang from Visual Studio or C:/Program Files/LLVM.")
+endif()
 include(${SDK}/cmake/XbeRecomp.cmake)
 
 file(GLOB XBE_HOST_SOURCES CONFIGURE_DEPENDS src/*/*.cpp)
