@@ -43,8 +43,11 @@ file(GLOB RT_SRC "${REPO}/sdk/runtime/*/*.cpp")
 list(FILTER RT_SRC EXCLUDE REGEX "/app/|/gpu/d3d12\\.cpp$|/gpu/texturedumper\\.cpp$|/audio/xaudio2\\.cpp$")
 list(APPEND RT_SRC "${REPO}/sdk/runtime/app/game_files.cpp")
 
-file(GLOB GAME_SRC "${REPO}/src/*/*.cpp")
+file(GLOB GAME_SRC CONFIGURE_DEPENDS "${REPO}/src/*/*.cpp")
 list(FILTER GAME_SRC EXCLUDE REGEX "/linux/app_stub\\.cpp$|/linux/input_stub\\.cpp$|/linux/graphics_menu_stub\\.cpp$")
+# The developer debug tools (src/dev/, docs/debug-menu-plan.md) are Windows-only: they use the
+# Win32 key and window APIs and are never part of a Linux build.
+list(FILTER GAME_SRC EXCLUDE REGEX "/src/dev/")
 
 set(HOST
     "${CMAKE_CURRENT_SOURCE_DIR}/app_sdl.cpp"
