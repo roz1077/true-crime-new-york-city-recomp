@@ -5000,7 +5000,16 @@ bool D3D12Backend::ResizeSwap() {
     if (chain_change) {
         // HDR was toggled or the window moved to another monitor: the swapchain format and
         // colour space are fixed at creation, so build a new chain rather than resizing it.
-        if (!CreateSwapChain(hwnd)) return false;
+        // DXGI allows one chain per window, so the old one is gone by now; a failure right after
+        // a display change can be transient, so try a few more times before giving up.
+        bool created = CreateSwapChain(hwnd);
+        for (int attempt = 1; !created && attempt <= 5; attempt++) {
+            LOGE("d3d12: swap chain rebuild failed, retrying (%d of 5)", attempt);
+            Sleep(100 * attempt);
+            RefreshFactory(true);
+            created = CreateSwapChain(hwnd);
+        }
+        if (!created) return false;
         if (!CreateBackBufferViews()) {
             LOGE("d3d12: back buffer views failed after rebuilding the swap chain");
             return false;
