@@ -273,6 +273,40 @@ the push-off was won. The other side's update sometimes runs nested inside
 this one and then also sees the slower clock for that frame, which is
 harmless.
 
+## Script native table and damage (2026-11-09)
+
+The script-native table starts at `0x2ECE10`. Entries are 12 bytes
+`{name CRC-32, function, next}`. Useful functions:
+
+| Native | Address |
+| --- | --- |
+| `TakeDamage` | `0x183020` |
+| `SetScriptedDeath` | `0x183060` |
+| `PlayPhoneVO` | `0x182620` |
+| `PlayVO` | `0x182660` |
+| `Shoot` | `0x181B80` |
+| `IsProne` | `0x17FFE0` |
+| `IsDazed` | `0x182FE0` |
+| `InVehicle` | `0x184F90` |
+| `StartEnterCarThread` | `0x1853E0` |
+| `StartExitCarThread` | `0x185430` |
+| `SetWeatherValue` | `0x17EB10` |
+| `SetRainType` | `0x17EC70` |
+
+`0x19D3B0` is the central health-damage routine: `ecx` is the health
+component (`+0x04` owner, `+0x08` max, `+0x10` current, `+0x18` flags), and
+the stack holds the damage type, amount (float) and source object.
+`health+0x18` bit `0x04` is `IgnoreDamage`. `DAMAGETYPE_IMPACT` is
+`0x2B2D2DAF`; `DAMAGETYPE_EXPLOSION` is `0xE78846D1`.
+
+Phone/mix-bin volume: `0x25DA90` starts a stream and fails when the mix-bin
+volume is not positive. `0x2291F0` reads that volume from the float table at
+`0x337640` (`index * 4`); an exact 0 there is the voice-volume-0 phone-call
+bug.
+
+See [glitch-faq-triage.md](glitch-faq-triage.md) for the Xbox glitch-list
+mapping and which entries still need a runtime trace.
+
 ## Still unknown
 
 1. **Mission jump during gameplay.** Load a save, then trigger

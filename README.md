@@ -49,6 +49,8 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 - **Controller and mouse** — Xbox, PlayStation and Switch controllers with hot-plug, rumble and adaptive glyphs; raw mouse aim with separate sensitivity.
 - **Texture tools** — dump textures and load PNG/DDS replacement packs shared between Windows and Linux.
 - **Copland traffic fix** — restores normal civilian traffic after scripted and random-crime vehicle passes, without reducing police or wanted-level spawns.
+- **Car-scrape damage cap** — a passing car can no longer deal thousands of impact damage per second (most noticeable while you enter or exit a vehicle); all impact damage to the player is limited to 15% of max health per second.
+- **Voice-volume 0 phone-call fix** — phone calls still start (silently) when voice volume is 0, so informant missions and precinct-cleanup messages are not lost.
 - **Quality of life** — 30/60 FPS limiter, Unicode and long-path support, durable saves and a keyboard/mouse/controller graphics menu.
 
 <details>

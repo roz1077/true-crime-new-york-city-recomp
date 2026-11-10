@@ -3,6 +3,14 @@
 ## Unreleased
 
 ### Gameplay
+- A voice volume of 0 no longer blocks gameplay phone calls: the mix-bin
+  volume getter raises an exact 0 to a tiny positive value, so calls still
+  start (silently) and their completion advances informant and precinct
+  missions.
+- Car-scrape damage is capped: impact (collision) damage to the player, most
+  visibly from a passing car while entering or exiting a vehicle, is limited
+  to 15% of max health per second of game time instead of the car's full
+  velocity-derived damage. Other damage types are unchanged.
 - Direct mouse pitch is held against the on-foot controller's rest-pitch reset and
   the profile's camera auto-center, so vertical aim accumulates instead of snapping
   back every frame. Both return to the game's control when a pad takes over.
