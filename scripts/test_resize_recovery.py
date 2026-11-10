@@ -20,6 +20,7 @@ void GetClientRect(HWND,RECT* r) { *r=client; }
 HMONITOR MonitorFromWindow(HWND,unsigned) { return nullptr; }
 uint64_t now_ms=0;
 uint64_t GetTickCount64() { return now_ms; }
+void Sleep(unsigned) {}
 #define MONITOR_DEFAULTTOPRIMARY 1
 #define FAILED(hr) ((hr)<0)
 #define LOGE(...) ((void)0)
