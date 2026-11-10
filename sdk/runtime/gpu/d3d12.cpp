@@ -4567,7 +4567,10 @@ bool D3D12Backend::RenderAoOcclusion(Target& rt, float near_z, float far_z) {
     dof_depth_ = nullptr;
     if (!ao_half_ready_ || !EnsureAoOcclusion(rt.w, rt.h)) return false;
     const bool depth_ms = ao_dist_->GetDesc().SampleDesc.Count > 1;
-    const std::string shader = std::string("#define DEPTH_MS ") + (depth_ms ? "1\n" : "0\n") + kAoOcclusionHlsl;
+    // built once per variant, not on every AO run
+    static const std::string kShaders[2] = {std::string("#define DEPTH_MS 0\n") + kAoOcclusionHlsl,
+                                            std::string("#define DEPTH_MS 1\n") + kAoOcclusionHlsl};
+    const std::string& shader = kShaders[depth_ms ? 1 : 0];
     if (!EnsurePassPipeline(shader.c_str(), "psmain", kAoFormat, -1)) return false;
     Transition(ao_occ_.Get(), ao_occ_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
     ID3D12Resource* src[3] = {ao_half_.Get(), ao_dist_.Get(), nullptr};
