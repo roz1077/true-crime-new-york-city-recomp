@@ -30,6 +30,13 @@
 #include "kernel/memory.h"
 #include "xdk/hle.h"
 
+namespace app {
+// the window thread applies a display change and reports whether it worked (main.cpp; the SDL
+// hosts answer at once, graphics_options.cpp)
+uint64_t RequestDisplayApply();
+bool DisplayApplyResult(uint64_t request, bool &ok);
+} // namespace app
+
 namespace {
 
 using namespace game::display_rows;
@@ -67,6 +74,13 @@ constexpr uint64_t kSaveIdleMs = 250;
 std::atomic<bool> g_save_dirty{false};
 std::atomic<uint64_t> g_save_due{0};
 
+// A display mode/resolution change the window thread has not answered yet: the requested values
+// are in the live settings (the window thread applies from them) but are written to the file only
+// once it confirms them. A refused change is put back. Menu thread only.
+uint64_t g_display_request = 0;
+app::DisplayMode g_display_old_mode{};
+uint32_t g_display_old_w = 0, g_display_old_h = 0;
+
 uint64_t NowMs() {
     return uint64_t(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -79,8 +93,31 @@ void MarkSave() {
 }
 
 void FlushSettings() {
+    if (g_display_request) return;  // saved once the display change is answered
     if (!g_save_dirty.exchange(false, std::memory_order_acq_rel)) return;
     app::Save();
+}
+
+// the window thread's answer to the display change in flight: keep and save it, or put the
+// previous mode back
+void PollDisplayApply() {
+    if (!g_display_request) return;
+    bool ok = false;
+    if (!app::DisplayApplyResult(g_display_request, ok)) return;
+    g_display_request = 0;
+    if (!ok) {
+        {
+            app::SettingsLock lock;
+            app::Settings &s = app::Get();
+            s.display_mode = g_display_old_mode;
+            s.width = g_display_old_w;
+            s.height = g_display_old_h;
+        }
+        app::ApplyDisplay();
+        LOGE("Display tab: the display change was refused; kept the previous mode");
+    }
+    g_save_dirty.store(true, std::memory_order_release);
+    FlushSettings();
 }
 
 void MaybeSave() {
@@ -132,7 +169,7 @@ void Apply(const Values &v) {
     s.vsync = v.vsync;
     app::SetMsaaSamples(v.msaa);
     s.smaa = v.smaa;
-    s.object_detail = v.object_detail;
+    std::atomic_ref(s.object_detail).store(v.object_detail, std::memory_order_relaxed);  // read by lod.cpp
     s.ao = v.ao;
     s.bloom = v.bloom;
     s.dof = v.dof;
@@ -146,18 +183,55 @@ void Apply(const Values &v) {
     MarkSave();
 }
 
-// sets the display mode and output resolution and has the window thread apply them, as the overlay's Apply does
+// sets the display mode and output resolution and has the window thread apply them, as the overlay's Apply does:
+// the file is written once the window thread confirms the change (PollDisplayApply)
 void ApplyDisplayChoice(uint32_t mode, uint64_t size) {
+    PollDisplayApply();
+    if (g_display_request) return;  // one change at a time; the choice stays pending for another A
     g_pending = false;
-    app::SettingsLock lock;
-    app::Settings &s = app::Get();
     const uint32_t w = uint32_t(size >> 32), h = uint32_t(size);
-    if (s.width == w && s.height == h && uint32_t(s.display_mode) == mode) return;
-    s.display_mode = app::DisplayMode(mode);
-    s.width = w;
-    s.height = h;
-    app::Save();
+    {
+        app::SettingsLock lock;
+        app::Settings &s = app::Get();
+        if (s.width == w && s.height == h && uint32_t(s.display_mode) == mode) return;
+        g_display_old_mode = s.display_mode;
+        g_display_old_w = s.width;
+        g_display_old_h = s.height;
+        s.display_mode = app::DisplayMode(mode);
+        s.width = w;
+        s.height = h;
+    }
+    const uint64_t request = app::RequestDisplayApply();
+    if (!request) {
+        app::SettingsLock lock;
+        app::Settings &s = app::Get();
+        s.display_mode = g_display_old_mode;
+        s.width = g_display_old_w;
+        s.height = g_display_old_h;
+        LOGE("Display tab: could not request a display change to mode %u, %ux%u", mode, w, h);
+        return;
+    }
+    g_display_request = request;
+}
+
+// Cancel: put back the mode the tab was entered with. It was in use before, so it is applied
+// without waiting; a change still in flight is superseded (the window thread applies in order).
+void RestoreDisplayChoice(uint32_t mode, uint64_t size) {
+    g_pending = false;
+    PollDisplayApply();
+    const bool superseded = g_display_request != 0;
+    g_display_request = 0;
+    const uint32_t w = uint32_t(size >> 32), h = uint32_t(size);
+    {
+        app::SettingsLock lock;
+        app::Settings &s = app::Get();
+        if (!superseded && s.width == w && s.height == h && uint32_t(s.display_mode) == mode) return;
+        s.display_mode = app::DisplayMode(mode);
+        s.width = w;
+        s.height = h;
+    }
     app::ApplyDisplay();
+    MarkSave();
 }
 
 // guest buffers for the row texts, one per option
@@ -199,7 +273,7 @@ X86_FUNC(sub_000B14F0) {
     __imp__sub_000B14F0(ctx, base);
     if (g_entered) {
         Apply(g_on_entry);
-        ApplyDisplayChoice(g_on_entry.applied_mode, g_on_entry.applied);
+        RestoreDisplayChoice(g_on_entry.applied_mode, g_on_entry.applied);
     }
     FlushSettings(); // Back restores and saves before the tab (or menu) closes
     g_first = 0;
@@ -208,6 +282,7 @@ X86_FUNC(sub_000B14F0) {
 
 X86_EXTERN_FUNC(__imp__sub_000C7B80);
 X86_FUNC(sub_000C7B80) {
+    PollDisplayApply();
     MaybeSave(); // the row getter runs every frame while the tab is open
     const uint32_t self = ctx.ecx, out = X86_MEM32(ctx.esp + 4), port = X86_MEM32(ctx.esp + 8);
     const bool text = port >= kDisplayText && port < kDisplayText + kShownRows;
@@ -251,6 +326,7 @@ X86_FUNC(sub_000C7B80) {
 // MenuPauseInterface event dispatcher (thiscall: event, two arguments).
 X86_EXTERN_FUNC(__imp__sub_000CB400);
 X86_FUNC(sub_000CB400) {
+    PollDisplayApply();
     MaybeSave();
     const uint32_t self = ctx.ecx, event = X86_MEM32(ctx.esp + 4), input = X86_MEM32(ctx.esp + 8);
     const uint32_t page = self ? X86_MEM32(self + kPage) : 0;
@@ -290,7 +366,7 @@ X86_FUNC(sub_000CB400) {
             if (step.apply) ApplyDisplayChoice(g_pending_mode, g_pending_size);
             // Navigation (no value change) means the arrow steps have settled;
             // leaving the row list/tab also has to save before the hooks stop.
-            // A display apply already wrote the file in ApplyDisplayChoice.
+            // A display apply writes the file once the window thread confirms it.
             if ((!step.change && !step.apply) || !OnDisplayRows(base, self)) FlushSettings();
             ::kernel::Return(ctx, 0, 3);
             return;
