@@ -3633,8 +3633,15 @@ VkDescriptorSet VulkanBackend::AcquireAoOcclusionSet(VkImageView view) {
 }
 
 void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, VkDescriptorSet occlusion) {
+    size_t skipped = 0;
     for (const DeferredDraw& d : draws) {
         if (!d.pipe) continue;
+        // A receiver's pipeline reads set 1. Without an occlusion set (no AO image could be made,
+        // FlushDeferredScene turned AO off from the next frame) it cannot be drawn safely.
+        if (d.receiver && !occlusion) {
+            ++skipped;
+            continue;
+        }
         if (d.pipe != bound_pipe_) {
             vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe);
             bound_pipe_ = d.pipe;
@@ -3657,6 +3664,7 @@ void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, VkDes
         if (d.rt) d.rt->drawn = true;
         if (d.ds) d.ds->drawn = true;
     }
+    if (skipped) LOGE("vulkan: %zu AO receiver draw(s) skipped this frame: no occlusion image", skipped);
     bound_pipe_ = VK_NULL_HANDLE;
     viewport_valid_ = false;
 }
