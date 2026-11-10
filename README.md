@@ -228,6 +228,9 @@ Ubuntu 24.04 has no `libsdl3-dev`; build SDL 3.4.16 (`release-3.4.16`) from sour
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) — overridable function layout and instruction hooks.
 - [Zydis](https://github.com/zyantific/zydis) — x86 instruction decoding.
 - [toml++](https://github.com/marzer/tomlplusplus), [Dear ImGui](https://github.com/ocornut/imgui), [SDL](https://github.com/libsdl-org/SDL) and [SMAA](https://github.com/iryoku/smaa) — configuration, overlay, window/input and anti-aliasing.
+- [LLVM / Clang](https://llvm.org/) — the compiler bundled with the Windows release to build the game code on first launch.
+- [shaderc](https://github.com/google/shaderc) / [glslang](https://github.com/KhronosGroup/glslang) and [stb](https://github.com/nothings/stb) — run-time shader compilation and texture image loading on Linux.
+- Ambient occlusion follows GTAO (Jimenez et al., "Practical Real-Time Strategies for Accurate Indirect Occlusion", 2016) and Intel's [XeGTAO](https://github.com/GameTechDev/XeGTAO).
 
 See `sdk/THIRD_PARTY.txt`, `sdk/LICENSE` and the `LICENSES/` folder in the release package for the full notices.
 
