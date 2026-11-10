@@ -50,6 +50,8 @@
   deliberately differs from the console, where the glow texture's black border shows there.
 - Fixed the FS placeholder replacing the top-right HUD slot icon after weapon swaps:
   small cached HUD render targets are kept across idle frames instead of being swept.
+- Vulkan now binds swizzled render targets and leaves target UV clamps open, so projected
+  light textures such as the garage floor pools are drawn on Linux.
 - HDR output on Windows (scRGB or HDR10) and Linux (HDR10 or extended sRGB) with paper
   white, peak brightness and highlight strength settings. Off by default; it follows a
   Windows HDR toggle without a restart.

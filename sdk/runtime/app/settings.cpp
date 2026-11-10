@@ -173,7 +173,7 @@ toml::table Table() {
                   {"dof", s.dof},
                   {"ao", int64_t(s.ao)},
                   {"building_seam_fix", s.building_seam_fix},
-                  {"object_detail", int64_t(s.object_detail)},
+                  {"object_detail", int64_t(std::atomic_ref(Get().object_detail).load(std::memory_order_relaxed))},
                   {"pc_contrast", s.pc_contrast},
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},

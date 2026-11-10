@@ -4877,7 +4877,9 @@ bool VulkanBackend::RebuildTargetSingleSample(Target* t) {
             }
         ok = found && vkAllocateMemory(device_, &alloc, nullptr, &t->memory) == VK_SUCCESS;
         if (ok) {
-            vkBindImageMemory(device_, t->image, t->memory, 0);
+            ok = vkBindImageMemory(device_, t->image, t->memory, 0) == VK_SUCCESS;
+        }
+        if (ok) {
             t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
             VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             view.image = t->image;
