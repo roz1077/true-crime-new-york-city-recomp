@@ -170,7 +170,13 @@ cmake -S platform/linux -B build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build/linux --parallel
 ```
 
-The full CI package list is in [`.github/workflows/linux-package.yml`](.github/workflows/linux-package.yml).
+On Ubuntu 24.04 the packages are:
+
+```sh
+sudo apt-get install build-essential cmake ninja-build pkg-config libvulkan-dev libshaderc-dev   libasound2-dev libpulse-dev libudev-dev libx11-dev libxext-dev libxrandr-dev libxi-dev   libxcursor-dev libxfixes-dev libxss-dev libxkbcommon-dev libdrm-dev libwayland-dev   wayland-protocols libdecor-0-dev libegl1-mesa-dev
+```
+
+Ubuntu 24.04 has no `libsdl3-dev`; build SDL 3.4.16 (`release-3.4.16`) from source with `-DSDL_SHARED=OFF -DSDL_STATIC=ON` and install it first. `scripts/package-linux.sh build/linux dist` then makes the release tarball.
 
 ## Beta notes
 

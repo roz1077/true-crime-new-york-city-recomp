@@ -36,7 +36,7 @@ include(${SDK}/cmake/XbeRecomp.cmake)
 
 file(GLOB XBE_HOST_SOURCES CONFIGURE_DEPENDS src/*/*.cpp)
 list(FILTER XBE_HOST_SOURCES EXCLUDE REGEX "/src/game/")
-# Developer debug tools (docs/debug-menu-plan.md): off unless a dev build asks;
+# Developer debug tools (src/dev/): off unless a dev build asks;
 # release builds do not compile src/dev/ at all
 option(TCNYC_DEV_TOOLS "Build the developer debug tools" OFF)
 if(NOT TCNYC_DEV_TOOLS)

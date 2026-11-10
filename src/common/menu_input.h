@@ -1,5 +1,5 @@
 // Controller handling for the in-game Graphics menu, kept apart from ImGui so
-// scripts/test_graphics_choices.py can compile it alone.
+// a test can compile it alone.
 #pragma once
 
 #include <cstdint>

@@ -1,6 +1,6 @@
 // Rules for the Graphics rows added to the native Options > Display tab
 // (native_graphics.cpp): cursor movement, value changes and row text. No
-// runtime dependencies, so scripts/test_display_rows.py can compile it.
+// runtime dependencies, so a test can compile it.
 //
 // The tab has two pages. Main follows the game's SUBTITLES row with the
 // Graphics menu's display and rendering options; its HDR SETTINGS row opens

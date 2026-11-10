@@ -2,7 +2,7 @@
 //
 // Player character: the global [0x37D284] (its wallet at +0xB4 is what the
 // script native AddMoney uses on a character). Found through the script
-// natives (see docs/reverse-engineering-notes.md):
+// natives:
 //   +0xB4  wallet; vtable +0x8C = AddMoney(amount), thiscall   (AddMoney, 0x184460)
 //   +0xBC  health component: max +0x08, health +0x10 (floats),
 //          flags +0x18, bit 0x04 = ignore damage            (Get/SetHealth, IgnoreDamage)

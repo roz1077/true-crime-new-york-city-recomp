@@ -45,7 +45,7 @@ list(APPEND RT_SRC "${REPO}/sdk/runtime/app/game_files.cpp")
 
 file(GLOB GAME_SRC CONFIGURE_DEPENDS "${REPO}/src/*/*.cpp")
 list(FILTER GAME_SRC EXCLUDE REGEX "/linux/app_stub\\.cpp$|/linux/input_stub\\.cpp$|/linux/graphics_menu_stub\\.cpp$")
-# The developer debug tools (src/dev/, docs/debug-menu-plan.md) are Windows-only: they use the
+# The developer debug tools (src/dev/) are Windows-only: they use the
 # Win32 key and window APIs and are never part of a Linux build.
 list(FILTER GAME_SRC EXCLUDE REGEX "/src/dev/")
 

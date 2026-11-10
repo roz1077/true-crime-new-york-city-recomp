@@ -7,7 +7,7 @@
 // debug menu can list them with their stages, and applies a requested stage
 // right before the game's own update.
 //
-// Instance layout (see docs/reverse-engineering-notes.md):
+// Instance layout:
 //   +0x424  current state (CRC-32 of the state name)
 //   +0x478  the script's state table: a tag node whose children are the states
 //   +0x490  requested state: the script native SetState (0x17D680 -> 0xFC090)

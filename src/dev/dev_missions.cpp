@@ -9,7 +9,7 @@
 //   XBE_DEV_CLOCK=<hh:mm>     set the time of day, the same way
 //   XBE_DEV_DELAY=<frames>    run them once by themselves, that many frames after
 //                             the game object exists
-// See docs/reverse-engineering-notes.md for the addresses.
+// Addresses are XBE virtual addresses, as in generated/game's sub_ names.
 
 #include "dev/dev.h"
 

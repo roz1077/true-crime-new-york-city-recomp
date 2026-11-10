@@ -1250,7 +1250,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     guest_h_ = height;
     if (const char* e = std::getenv("TCNYC_DEFER_SCENE")) defer_forced_ = *e && std::atoi(e) != 0;
     // Experimental: the deferred AO path has known bright-effect artifacts. It is
-    // opt-in until the clean-depth/effect-mask plan in docs/deferred-renderer.md is done.
+    // opt-in until scene depth and effect masks are separated for it.
     defer_scene_ = defer_forced_;
     if (defer_scene_) LOGR("d3d12: experimental deferred AO enabled (TCNYC_DEFER_SCENE=1)");
     HWND hwnd = static_cast<HWND>(app::Window());

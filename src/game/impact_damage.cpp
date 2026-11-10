@@ -63,7 +63,7 @@ X86_FUNC(sub_0019D3B0) {
         const bool is_player = player && (kernel::R32(health + kHealthOwner) == player || health == player_health);
         const float amount = guest::ReadF32(ctx.esp + 8);
         const float max_health = guest::ReadF32(health + kHealthMax);
-        // the first few player damage types, so a scrape with another hash can be found (docs/glitch-faq-triage.md)
+        // the first few player damage types, so a scrape with another hash can be found
         if (is_player) LOG_FIRST(16, "tcnyc: player damage type %08X amount %.1f", type, amount);
         if (is_player && type == kDamageTypeImpact && amount > 0.0f && max_health > 0.0f) {  // also false for NaN
             // game time, so pause and slow motion do not refill the allowance

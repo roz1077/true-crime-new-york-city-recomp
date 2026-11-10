@@ -383,7 +383,7 @@ void InfoTab() {
 
 } // namespace
 
-// Release packaging (scripts/package-release.ps1, scripts/test_no_dev_tools.py) refuses an
+// Release packaging (scripts/package-release.ps1) refuses an
 // executable that contains this string. It is logged once so it always stays in the binary.
 constexpr char kDevBuildMarker[] = "TCNYC-DEV-TOOLS-BUILD";
 

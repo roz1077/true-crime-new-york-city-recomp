@@ -58,7 +58,7 @@ $exe = Join-Path $BuildDir 'TrueCrimeNYC.exe'
 if (!(Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw "Release executable not found: $exe. Build the release target first."
 }
-# Developer debug tools must never ship (docs/debug-menu-plan.md): refuse a build directory
+# Developer debug tools (src/dev/) must never ship: refuse a build directory
 # configured with them, and an executable that contains the dev build marker.
 $cache = Join-Path $BuildDir 'CMakeCache.txt'
 if ((Test-Path -LiteralPath $cache -PathType Leaf) -and

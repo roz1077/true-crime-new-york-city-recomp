@@ -1,5 +1,5 @@
 // Value lists and stepping rules for the in-game Graphics menu. No runtime or
-// ImGui dependencies, so scripts/test_graphics_choices.py can compile it alone.
+// ImGui dependencies, so a test can compile it alone.
 #pragma once
 
 #include <cmath>
