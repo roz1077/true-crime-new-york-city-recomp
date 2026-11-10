@@ -192,12 +192,10 @@ float3 HdrHighlights(float3 lin, float paper_white, float peak, float strength) 
     const float3 luma = float3(0.2126, 0.7152, 0.0722);
     const float l = dot(lin, luma);
     const float P = lerp(1.0, max(peak, paper_white) / max(paper_white, 1.0), saturate(strength));
-    float l2 = l;
-    if (l > knee) {
-        const float t = (l - knee) / (1.0 - knee);
-        l2 = l + t * t * (P - 1.0);
-    }
-    return lin * (l2 / max(l, 1e-4));
+    if (l <= knee) return lin;  // exactly unchanged, down to black
+    const float t = (l - knee) / (1.0 - knee);
+    const float l2 = l + t * t * (P - 1.0);
+    return lin * (l2 / l);
 }
 
 // A single-pass approximation of the PC release's bright-pass bloom. Each tap first averages a
@@ -1721,6 +1719,19 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
     return {r.Get(), 0, p, r->GetGPUVirtualAddress()};
 }
 
+// Two guest formats store a texel the same way: equal, or differing only in tiling (LIN_) or in
+// an unused alpha (X8R8G8B8 against A8R8G8B8), as a target is often sampled through either.
+bool SameTexelLayout(uint32_t a, uint32_t b) {
+    if (a == b) return true;
+    auto layout = [](uint32_t f) {
+        std::string n = Format(f).name;
+        if (n.rfind("LIN_", 0) == 0) n.erase(0, 4);
+        if (!n.empty() && n[0] == 'X') n[0] = 'A';
+        return n;
+    };
+    return layout(a) == layout(b);
+}
+
 uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
     Frame& f = CurrentFrame();
     const uint32_t per = kSrvCount / kFrames;
@@ -1937,7 +1948,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     // an empty pool drops the new resource with t
     if (!CreateTargetView(t)) return nullptr;
     t.data = slot.data;
-    t.guest_bits = Format(s.format).bits;
+    t.guest_format = s.format;
     t.bytes = GuestPitch(slot.gw) * slot.gh;
     if (depth) {
         // D16/D24 depth surfaces are not four bytes per texel; the signature must not run past them
@@ -3007,9 +3018,9 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     if (ext_) ext_->Sample(d.data, fi.depth, stage, alt, stages.k[stage], box);
     auto tit = targets_.find(SizedTargetKey(d.data, fi.depth, d.width, d.height) | alt);
     // A small target kept while unused may have had its memory reused for an ordinary texture of
-    // the same size: one of another texel size is not the target any more.
-    const bool reused = tit != targets_.end() && tit->second.guest_bits && fi.bits != tit->second.guest_bits &&
-                        TargetStale(d.data);
+    // the same size: one of another texel layout is not the target any more.
+    const bool reused = tit != targets_.end() && tit->second.guest_format != ~0u &&
+                        !SameTexelLayout(d.format, tit->second.guest_format) && TargetStale(d.data);
     if (tit != targets_.end() && !reused && !d.cube && d.depth == 1 && !fi.compressed) {
         // A target sampled here but not drawn into this frame must stay live: the sweep only
         // retires targets unused for kStaleFrames, and the submitted frame may still read it.

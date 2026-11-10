@@ -2464,12 +2464,10 @@ float3 HdrHighlights(float3 lin, float paper_white, float peak, float strength) 
     const float3 luma = float3(0.2126, 0.7152, 0.0722);
     const float l = dot(lin, luma);
     const float P = lerp(1.0, max(peak, paper_white) / max(paper_white, 1.0), saturate(strength));
-    float l2 = l;
-    if (l > knee) {
-        const float t = (l - knee) / (1.0 - knee);
-        l2 = l + t * t * (P - 1.0);
-    }
-    return lin * (l2 / max(l, 1e-4));
+    if (l <= knee) return lin;  // exactly unchanged, down to black
+    const float t = (l - knee) / (1.0 - knee);
+    const float l2 = l + t * t * (P - 1.0);
+    return lin * (l2 / l);
 }
 // A single-pass approximation of the PC release's bright-pass bloom. Each tap first averages a
 // small box, so thin chrome/specular edges are diluted before the threshold while lamps and neon
