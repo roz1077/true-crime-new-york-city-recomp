@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.1.0 — Beta 2 (unreleased)
 
 ### Gameplay
 - A voice volume of 0 no longer blocks gameplay phone calls: the mix-bin

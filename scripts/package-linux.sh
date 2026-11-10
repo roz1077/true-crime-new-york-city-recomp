@@ -108,7 +108,7 @@ GLIBC=$(objdump -T "$PKG/TrueCrimeNYC" | grep -oE 'GLIBC_[0-9.]+' | sort -V | ta
 [ -n "$GLIBC" ] || GLIBC=unknown
 {
     echo "True Crime: New York City - native Linux build"
-    echo "Version: 0.9.0.0"
+    echo "Version: 0.9.1.0"
     echo "Built: $BUILD_TIME"
     echo "Git: $(git -C "$REPO" describe --always --dirty 2>/dev/null || echo unknown)"
     echo "GLIBC: $GLIBC"
