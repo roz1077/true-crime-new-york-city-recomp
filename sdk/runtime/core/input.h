@@ -33,6 +33,8 @@ extern uint32_t g_mouse_vertical_sensitivity_percent;
 // when set, mouse motion is not folded into the right stick: the gameplay
 // camera reads the same pixels as an angle, see src/game/mouse_aim.cpp
 extern bool g_direct_mouse_aim;
+// settings.toml prompt_style: 0 automatic, 1 original, 2 Xbox, 3 PlayStation, 4 Steam Deck
+extern uint32_t g_prompt_override;
 // pixels of mouse motion since the last call, false when nothing is pending;
 // the angle applies to the gameplay camera instead of the 8-bit stick
 bool ConsumeMouseAim(float& dx, float& dy);

@@ -127,6 +127,7 @@ const app::GameInfo app::kGame = {
                 {"mouse_sensitivity_percent", nullptr, &input::g_mouse_sensitivity_percent},
                 {"mouse_vertical_sensitivity_percent", nullptr, &input::g_mouse_vertical_sensitivity_percent},
                 {"direct_mouse_aim", &input::g_direct_mouse_aim, nullptr},
+                {"prompt_style", nullptr, &input::g_prompt_override},
                 {"reload_key", nullptr, &input::g_reload_key}, {"heavy_attack_key", nullptr, &input::g_heavy_attack_key},
                 {"use_key", nullptr, &input::g_use_key}, {"climb_key", nullptr, &input::g_climb_key}},
     .load = nullptr,                      // reads more from the settings file's toml::table

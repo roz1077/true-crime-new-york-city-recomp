@@ -29,6 +29,7 @@ uint32_t g_mouse_vertical_sensitivity_percent = 100;
 // configurable heavy key because Left Alt and mouse side button 2 are the defaults.
 uint32_t g_reload_key = 'R', g_heavy_attack_key = 0, g_use_key = 'E', g_climb_key = 'G';
 bool g_direct_mouse_aim = true;
+uint32_t g_prompt_override = 0;
 
 namespace {
 
@@ -94,13 +95,24 @@ void UpdatePromptType() {
     const bool deck_pad = g_pads[0] && ((SDL_GetGamepadVendor(g_pads[0]) == 0x28DE &&
                                          SDL_GetGamepadProduct(g_pads[0]) == 0x1205) ||
                                         (name && std::strstr(name, "Steam Deck")));
+    // a PlayStation pad behind Steam Input can report Xbox types; its name still says what it is
+    auto contains = [&](const char* text) { return name && std::strstr(name, text); };
+    const bool playstation_name = contains("PS3") || contains("PS4") || contains("PS5") || contains("DualSense") ||
+                                  contains("DualShock") || contains("Sony");
+    // On a Deck, Steam Input hands the built-in controller over as a virtual pad (a Steam handle, often
+    // typed Xbox). That is the Deck's own controller unless the pad says it is something else; an
+    // external Xbox pad there can be picked with prompt_style.
+    const bool deck_virtual = g_pads[0] && RunningOnSteamDeck() && SDL_GetGamepadSteamHandle(g_pads[0]) != 0;
     PromptStyle style = PromptStyle::Original;
-    if (playstation(real) || playstation(mapped))
+    if (playstation(real) || playstation(mapped) || playstation_name)
         style = PromptStyle::PlayStation;
-    else if (deck_pad || (g_pads[0] && RunningOnSteamDeck() && !xbox(mapped)))
+    else if (deck_pad || deck_virtual || (g_pads[0] && RunningOnSteamDeck() && !xbox(mapped)))
         style = PromptStyle::SteamDeck;
     else if (xbox(real) || xbox(mapped))
         style = PromptStyle::Xbox;
+    constexpr PromptStyle kOverrides[] = {PromptStyle::Original, PromptStyle::Original, PromptStyle::Xbox,
+                                          PromptStyle::PlayStation, PromptStyle::SteamDeck};
+    if (g_prompt_override > 0 && g_prompt_override < 5) style = kOverrides[g_prompt_override];
     g_prompt_style.store(style, std::memory_order_relaxed);
     if (g_pads[0])
         LOGR("input: controller 1 prompts: %s %04X:%04X, real type %d, mapped type %d, steam handle %llu, style %d",
