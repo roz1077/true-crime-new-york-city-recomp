@@ -10,6 +10,11 @@
 // 10 ticks (166 ms), which with the original's frame drops could be a single
 // frame on the Xbox. This side gets a slower clock during that window, so the
 // window lasts kWindowScale times longer; the rest of the game keeps its time.
+//
+// The frame time is a global, so it is lowered only for the duration of this
+// call and restored straight after; guest code runs on one thread, so nothing
+// else reads it meanwhile. The window is detected before the update, so the
+// frame that opens it runs at normal speed: one tick of about ten.
 
 
 #include "common/guest_values.h"

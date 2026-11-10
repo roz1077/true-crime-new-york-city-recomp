@@ -15,6 +15,12 @@
 // of game time. That keeps a car hit dangerous but stops a scrape from being
 // instant death. The cap is based on the game's own max-health value, so it
 // follows difficulty and mission changes.
+//
+// The cap applies to the amount passed in, before 0x19D3B0's own filters and
+// multipliers. A hit the routine then ignores (invulnerable, ignore-damage
+// flags) still uses up the allowance, and the routine may scale what is left,
+// so the 15% is approximate. Both only ever make the player take less damage.
+// The window is one second, so it needs no reset on a mission or level change.
 
 #include <algorithm>
 
