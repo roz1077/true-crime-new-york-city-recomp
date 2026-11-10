@@ -158,7 +158,6 @@ namespace {
 // Shared by this main-loop iteration's simulation and rendering calls.
 thread_local bool fast_gameplay = false;
 thread_local bool fast_cutscene = false;
-thread_local bool cutscene_tick_not_due = false;
 thread_local bool use_sampled_vblank = false;
 thread_local uint32_t sampled_vblank = 0;
 thread_local uint32_t frame_ticks = 0;
@@ -199,8 +198,8 @@ namespace game {
 uint32_t MainLoopSwapInterval(uint32_t interval) { return fast_present && interval == 2 ? 1 : interval; }
 } // namespace game
 
-// The main loop's simulation step (ticks argument): at 60 FPS, the vblanks
-// elapsed since the last frame; in a caught-up cutscene, none.
+// The main loop's simulation step uses elapsed vblanks in 60 FPS gameplay.
+// Cutscenes keep the title's audio-clock step.
 X86_EXTERN_FUNC(__imp__sub_000A5200);
 X86_FUNC(sub_000A5200) {
     if (X86_MEM32(ctx.esp) != kMainLoopSimulate) return __imp__sub_000A5200(ctx, base);
@@ -215,8 +214,6 @@ X86_FUNC(sub_000A5200) {
         const uint32_t elapsed = sampled_vblank - last;
         frame_ticks = std::clamp(elapsed, 1u, 4u);
         use_sampled_vblank = elapsed != 0;
-    } else if (fast_cutscene && cutscene_tick_not_due && original_ticks == 1) {
-        frame_ticks = 0;
     }
 #if TCNYC_DEV_TOOLS
     frame_ticks = dev::AdjustTicks(frame_ticks); // debug menu: pause, slow motion, fast forward
@@ -303,24 +300,38 @@ X86_FUNC(sub_00243000) {
 X86_FUNC(sub_002914D2) {
     using clock = std::chrono::steady_clock;
     static const auto start = clock::now();
-    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
     // Split whole seconds to keep the multiplication safe, including uint32_t wrap.
-    const uint64_t samples = uint64_t(ns / 1000000000) * 48000 + uint64_t(ns % 1000000000) * 48000 / 1000000000;
-    uint32_t value = uint32_t(samples);
+    const auto sample_time = [] {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
+        return uint32_t(uint64_t(ns / 1000000000) * 48000 + uint64_t(ns % 1000000000) * 48000 / 1000000000);
+    };
+    uint32_t value = sample_time();
     uint32_t ret;
     std::memcpy(&ret, base + ctx.esp, 4);
     if (ret == kMainLoopSampleTime) {
         fast_gameplay = false;
         fast_cutscene = X86_MEM8(kAudioClockMode) && AtGameFrameRate() && !timing::Enabled();
-        cutscene_tick_not_due = false;
-        // Only the steady audio-clock branch forces a tick when the scene is
-        // already caught up. Leave the entry and clock rebase paths alone.
+        // The title's render passes expect the simulation to update before each
+        // picture. Wait for the audio clock when we are early instead of
+        // rendering a zero-tick frame, which can flash. Entry and clock rebase
+        // use their own timing. Bound the wait to roughly one tick so an
+        // unexpected clock offset falls back to the title's own step.
         if (fast_cutscene && X86_MEM8(kPreviousAudioClockMode) && !X86_MEM8(ctx.esp + 0x1E)) {
             const uint32_t start_sample = X86_MEM32(kCutsceneClockStart);
-            const uint32_t elapsed = value - start_sample - uint32_t(value < start_sample);
-            const float due = float(int32_t(elapsed)) * -X86_MEMF32(kTicksPerSample);
             const uint32_t state = X86_MEM32(kCutsceneState);
-            cutscene_tick_not_due = state && int32_t(due) <= int32_t(X86_MEM32(state + 0x9C));
+            if (state) {
+                const int32_t tick = int32_t(X86_MEM32(state + 0x9C));
+                const float ticks_per_sample = -X86_MEMF32(kTicksPerSample);
+                const auto caught_up = [&] {
+                    const uint32_t elapsed = value - start_sample - uint32_t(value < start_sample);
+                    return int32_t(float(int32_t(elapsed)) * ticks_per_sample) <= tick;
+                };
+                const auto deadline = clock::now() + std::chrono::milliseconds(20);
+                while (caught_up() && clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    value = sample_time();
+                }
+            }
         }
     }
     if (timing::Enabled() && ret == kMainLoopSampleTime) {
