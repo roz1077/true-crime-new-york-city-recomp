@@ -10,10 +10,13 @@
 - Car-scrape damage is capped: impact (collision) damage to the player, most
   visibly from a passing car while entering or exiting a vehicle, is limited
   to 15% of max health per second of game time instead of the car's full
-  velocity-derived damage. Other damage types are unchanged.
+  velocity-derived damage. The cap counts the health actually lost, so hits the
+  game ignores do not use it up, and it restarts on a level load. Other damage
+  types are unchanged.
 - Direct mouse pitch is held against the on-foot controller's rest-pitch reset and
   the profile's camera auto-center, so vertical aim accumulates instead of snapping
-  back every frame. Both return to the game's control when a pad takes over.
+  back every frame. The hold starts when the mouse moves, so keyboard-only play keeps
+  the game's auto-center, and ends on a level load or when a pad takes over.
 - Mouse pitch now follows the stock (non-inverted) vertical direction; the game's
   invert-Y setting still flips it.
 - Human Cargo: the push-off window on the cargo container fight with Tommy lasts
@@ -24,7 +27,10 @@
 - Button prompts follow the active device on Linux as well as Windows, including
   PlayStation pads behind Steam Input.
 - The Steam Deck's built-in controller gets its own glyphs (lettered face buttons,
-  View and Menu); PlayStation prompts show Share and Options.
+  View and Menu), also when Steam Input presents it as an Xbox pad; PlayStation
+  prompts show Share and Options.
+- `prompt_style` in `settings.toml` overrides the automatic prompt choice: 0 automatic,
+  1 original, 2 Xbox, 3 PlayStation, 4 Steam Deck.
 - Keyboard prompts switch to the pedal keys (W, S, Space) in a vehicle and show the
   configured heavy-attack key.
 

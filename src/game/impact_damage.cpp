@@ -16,16 +16,17 @@
 // instant death. The cap is based on the game's own max-health value, so it
 // follows difficulty and mission changes.
 //
-// The cap applies to the amount passed in, before 0x19D3B0's own filters and
-// multipliers. A hit the routine then ignores (invulnerable, ignore-damage
-// flags) still uses up the allowance, and the routine may scale what is left,
-// so the 15% is approximate. Both only ever make the player take less damage.
-// The window is one second, so it needs no reset on a mission or level change.
+// The amount passed in is clipped to what is left of the window, and the window is then charged with the
+// health the player actually lost (read before and after 0x19D3B0). A hit the routine ignores
+// (invulnerable, ignore-damage flags) costs nothing, and its own multipliers are counted as applied. A
+// multiplier above 1 can still take a capped hit slightly past 15%; the next hit in the window gets nothing.
+// The window restarts on a level load or world reset and when the player object changes.
 
 #include <algorithm>
 
 #include "core/log.h"
 #include "common/guest_values.h"
+#include "level_generation.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
@@ -36,6 +37,7 @@ constexpr uint32_t kPlayer = 0x37D284;
 constexpr uint32_t kPlayerHealth = 0xBC;    // player + 0xBC: the player's health component
 constexpr uint32_t kHealthOwner = 0x04;
 constexpr uint32_t kHealthMax = 0x08;
+constexpr uint32_t kHealthCurrent = 0x10;
 constexpr uint32_t kSimTicks = 0x363D0C;    // simulation tick counter, 60 a second (timing.cpp)
 constexpr uint32_t kTicksPerWindow = 60;    // one second of game time
 constexpr uint32_t kDamageTypeImpact = guest::Crc32("DAMAGETYPE_IMPACT"); // 0x2B2D2DAF
@@ -45,6 +47,8 @@ constexpr float kMaxImpactPerWindow = 0.15f;       // of max health
 uint32_t g_window_start = 0;
 float g_window_damage = 0.0f;
 bool g_window_open = false;
+uint32_t g_window_player = 0;      // the player the window belongs to
+uint32_t g_window_generation = 0;  // game::LevelGeneration() when it opened
 
 } // namespace
 
@@ -64,20 +68,31 @@ X86_FUNC(sub_0019D3B0) {
         if (is_player && type == kDamageTypeImpact && amount > 0.0f && max_health > 0.0f) {  // also false for NaN
             // game time, so pause and slow motion do not refill the allowance
             const uint32_t now = kernel::R32(kSimTicks);
-            if (!g_window_open || now - g_window_start >= kTicksPerWindow) {
+            const uint32_t generation = game::LevelGeneration();
+            if (!g_window_open || now - g_window_start >= kTicksPerWindow || g_window_player != player ||
+                g_window_generation != generation) {
                 g_window_start = now;
                 g_window_damage = 0.0f;
                 g_window_open = true;
+                g_window_player = player;
+                g_window_generation = generation;
             }
             const float remaining = std::max(0.0f, max_health * kMaxImpactPerWindow - g_window_damage);
             const float allowed = std::min(amount, remaining);
-            // every hit counts toward the window, so a stream of small hits is capped too
-            g_window_damage += allowed;
             if (allowed < amount) {
                 guest::WriteF32(ctx.esp + 8, allowed);
                 LOG_FIRST(8, "tcnyc: impact damage on player capped %.1f -> %.1f (max %.1f)", amount, allowed,
                           max_health);
             }
+            // charge what the routine actually took, after its own filters and multipliers; every hit
+            // counts, so a stream of small hits is capped too
+            const bool readable = mem::IsCommitted(health + kHealthCurrent + 3);
+            const float before = readable ? guest::ReadF32(health + kHealthCurrent) : 0.0f;
+            __imp__sub_0019D3B0(ctx, base);
+            const float after = readable ? guest::ReadF32(health + kHealthCurrent) : before;
+            const float taken = before - after;
+            if (taken > 0.0f) g_window_damage += taken;  // also false for NaN
+            return;
         }
     }
     __imp__sub_0019D3B0(ctx, base);
