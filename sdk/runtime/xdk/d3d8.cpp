@@ -753,6 +753,7 @@ HLE_STDCALL(D3DDevice_GetDepthStencilSurface2, 0) {
 namespace {
 std::atomic<uint32_t> g_presents{0};
 uint32_t g_frame_draws = 0;  // draws since the last Swap: a frame with none presents a CPU-written buffer
+bool g_picture_shown = false;  // the last Swap presented a CPU-written buffer (movie, legal page)
 }  // namespace
 
 uint32_t d3d::PresentCount() { return g_presents.load(); }
@@ -842,6 +843,7 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         // wait for the renderer to finish reading it before the title writes the next one
         if (!g_frame_draws) g_backend->WaitPresent();
     }
+    g_picture_shown = !g_frame_draws;
     g_frame_draws = 0;
     uint32_t interval = R32(kRenderState + gpu::kRsPresentationInterval * 4);
     if (app::kGame.swap_interval) interval = app::kGame.swap_interval(interval);
@@ -871,6 +873,24 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     const uint8_t* rects = a[0] && a[1] ? static_cast<const uint8_t*>(HostPtr(a[1])) : nullptr;
     if (g_backend) g_backend->Clear(g_state, a[0], rects, a[2], a[3], ArgF(a, 4), a[5]);
+#ifndef _WIN32
+    // Between CPU-written pictures the title clears each front buffer, then writes the next page over only part of
+    // it (the legal page leaves the bottom rows to the clear). The console's clear writes the buffer's memory; the
+    // Vulkan clear only reaches the GPU image, and a buffer the title never locks keeps the last movie frame in
+    // those rows. Write a full clear of a 32-bit front buffer to memory too while pictures are being shown.
+    constexpr uint32_t kClearTarget = 0xF0;
+    if (g_picture_shown && !g_frame_draws && !a[0] && (a[2] & kClearTarget) == kClearTarget) {
+        gpu::TextureDesc d;
+        const uint32_t rt = g_state.rt.header;
+        bool front = false;
+        for (uint32_t b : g_buffers) front |= b && rt && R32(b + 4) == R32(rt + 4);
+        if (front && gpu::DescribeSurface(g_state.rt, d) && d.linear && gpu::Format(d.format).bits == 32 &&
+            d.pitch >= d.width * 4 && mem::IsCommitted(d.data) && mem::IsCommitted(d.data + d.pitch * d.height - 1)) {
+            uint32_t* p = static_cast<uint32_t*>(HostPtr(d.data));
+            std::fill(p, p + size_t(d.pitch / 4) * d.height, a[3]);
+        }
+    }
+#endif
     return 0;
 }
 
