@@ -57,8 +57,9 @@ gamescope's output.
 See `README.md`. **F10**, or **Back + Start** on controller 1, opens the Graphics
 menu. The menu works with keyboard, mouse and controller.
 
-Button prompts follow controller 1: Steam Deck prompts for the Deck's own controller, PlayStation
-prompts for a PlayStation pad (also behind Steam Input), Xbox prompts for an Xbox pad. If the guess is
+Button prompts follow the controller in use: Steam Deck prompts for the Deck's own controller,
+PlayStation prompts for a PlayStation pad (also behind Steam Input), and Xbox prompts for an Xbox pad
+or another handheld's built-in controller (ROG Ally, Legion Go). If the guess is
 wrong, for example an Xbox pad used through Steam Input on a Deck, set `prompt_style` in
 `settings.toml`: 0 automatic, 1 original, 2 Xbox, 3 PlayStation, 4 Steam Deck.
 
