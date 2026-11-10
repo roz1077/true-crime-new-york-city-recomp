@@ -394,8 +394,11 @@ uint64_t RequestDisplayApply() {
     return request;
 }
 
+// Both the F10 menu and the native Display tab request applies, and the window thread answers them
+// in posting order. A later request finishing means an earlier one is finished as well: its values
+// were applied again by the later one, whose result it reports.
 bool DisplayApplyResult(uint64_t request, bool &ok) {
-    if (!request || g_apply_finished.load(std::memory_order_acquire) != request) return false;
+    if (!request || g_apply_finished.load(std::memory_order_acquire) < request) return false;
     ok = g_apply_ok.load(std::memory_order_relaxed);
     return true;
 }
