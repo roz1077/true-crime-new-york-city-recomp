@@ -386,7 +386,16 @@ void InfoTab() {
 
 } // namespace
 
+// Release packaging (scripts/package-release.ps1, scripts/test_no_dev_tools.py) refuses an
+// executable that contains this string. It is logged once so it always stays in the binary.
+constexpr char kDevBuildMarker[] = "TCNYC-DEV-TOOLS-BUILD";
+
 void DrawMenu() {
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        LOGR("dev: %s, debug menu on F9", kDevBuildMarker);
+    }
     if (ImGui::IsKeyPressed(ImGuiKey_F9, false)) {
         if (g_open) Close();
         else Open();

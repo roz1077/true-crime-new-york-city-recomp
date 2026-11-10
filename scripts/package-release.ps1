@@ -58,6 +58,20 @@ $exe = Join-Path $BuildDir 'TrueCrimeNYC.exe'
 if (!(Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw "Release executable not found: $exe. Build the release target first."
 }
+# Developer debug tools must never ship (docs/debug-menu-plan.md): refuse a build directory
+# configured with them, and an executable that contains the dev build marker.
+$cache = Join-Path $BuildDir 'CMakeCache.txt'
+if ((Test-Path -LiteralPath $cache -PathType Leaf) -and
+    (Select-String -LiteralPath $cache -Pattern '^TCNYC_DEV_TOOLS:BOOL=(ON|TRUE|1|YES)$' -Quiet)) {
+    throw "$BuildDir was configured with TCNYC_DEV_TOOLS=ON. Reconfigure it with -DTCNYC_DEV_TOOLS=OFF (or use the release preset in a clean directory) before packaging."
+}
+$marker = [Text.Encoding]::ASCII.GetBytes('TCNYC-DEV-TOOLS-BUILD')
+$exeBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $exe).Path)
+$exeText = [Text.Encoding]::GetEncoding(28591).GetString($exeBytes)
+if ($exeText.Contains([Text.Encoding]::GetEncoding(28591).GetString($marker))) {
+    throw "$exe contains the developer debug tools (TCNYC-DEV-TOOLS-BUILD). Rebuild with TCNYC_DEV_TOOLS=OFF before packaging."
+}
+
 $compiler = Join-Path $BuildDir 'compiler'
 if (!(Test-Path -LiteralPath $compiler -PathType Container)) {
     throw "Compiler directory not found: $compiler. Build the release target first."
