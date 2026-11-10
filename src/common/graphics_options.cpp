@@ -382,6 +382,7 @@ Kind KindOf(Row row) {
 }
 
 bool Enabled(Row row) {
+    app::SettingsLock lock;  // the native Display tab can write these from the game thread
     if (row == Row::ApplyDisplay) return !g_menu.apply_pending && DisplayPending();
     if (row == Row::DumpFormat) return app::Get().dump_textures;
     // The HDR toggle stays reachable on an SDR display so a failed detection can be retried and
@@ -560,7 +561,8 @@ std::string Value(Row row) {
         return text;
     case Row::AspectRatio:
         if (!s.aspect) {
-            const app::Mode o = app::Output();
+            // the desktop mode was read when the menu opened; Output() would query Windows every frame
+            const app::Mode o = s.width && s.height ? app::Mode{s.width, s.height} : g_menu.desktop;
             std::snprintf(text, sizeof(text), "Auto (%.2f:1)", o.height ? float(o.width) / float(o.height) : 0.0f);
         } else if (*choices::AspectName(s.aspect)) {
             std::snprintf(text, sizeof(text), "%s", choices::AspectName(s.aspect));

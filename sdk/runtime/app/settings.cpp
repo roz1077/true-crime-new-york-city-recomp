@@ -67,7 +67,7 @@ Settings Snapshot() {
     s.dof = g.dof;
     s.ao = g.ao;
     s.building_seam_fix = g.building_seam_fix;
-    s.object_detail = g.object_detail;
+    s.object_detail = std::atomic_ref(g.object_detail).load(std::memory_order_relaxed);  // stored atomically
     s.pc_contrast = g.pc_contrast;
     s.custom_textures = g.custom_textures;
     s.dump_textures = g.dump_textures;
