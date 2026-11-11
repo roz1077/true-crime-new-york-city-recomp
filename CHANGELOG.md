@@ -20,9 +20,6 @@
   edges. Both off by default.
 - With MSAA on, alpha-tested cut-outs (fences, leaves, wires) get alpha to coverage, so their edges
   are smoothed like geometry edges. This applies only to the main picture.
-- Fixed: road markings and puddles on the streets are shown, as on the console. The game draws
-  them into a small top-down image that it projects onto the road; with MSAA on, edge smoothing
-  applied to that image broke the thin markings into a faint speckle that all but vanished.
 - Texture packs: generated mipmaps average in linear light (distant bright detail no longer
   darkens) and keep the coverage of cut-out textures, so fences and leaves do not thin out.
 - Colour grading: a `lut.cube` table beside the executable grades the 3D frame; its strength is in
