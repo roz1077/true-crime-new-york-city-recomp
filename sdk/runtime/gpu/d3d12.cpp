@@ -715,11 +715,17 @@ public:
     void RecordLate(uint32_t data) override;
     void Flush() override;
     void SetGamma(const uint8_t* ramp) override;
-    void ClearReport() override { counted_.clear(); }
+    void ClearReport() override {
+        counted_.clear();
+        if (cap_) fprintf(cap_, "%04u visibility clear\n", cap_i_);
+    }
     // Delivered by the next Submit, as before the Linux-port integration: the title presents
     // every frame, so the report still arrives in time. Flushing here adds a mid-frame GPU wait
     // that this backend does not need.
-    void GetReport(uint32_t report) override { reports_.push_back({report, counted_, fence_value_ + 1}); }
+    void GetReport(uint32_t report) override {
+        if (cap_) fprintf(cap_, "%04u visibility report %08X from %zu counted draws\n", cap_i_, report, counted_.size());
+        reports_.push_back({report, counted_, fence_value_ + 1});
+    }
 
     ID3D12Device* Device() override { return dev_.Get(); }
     ID3D12GraphicsCommandList* List() override { return cl_; }
@@ -1127,6 +1133,7 @@ private:
     Extension* ext_ = nullptr;
     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
     FILE* cap_ = nullptr;
+    uint32_t cap_reports_left_ = 0;  // visibility results logged after a capture
     std::filesystem::path cap_dir_;
     uint32_t cap_i_ = 0;
     uint32_t cap_rt_ = 0;
@@ -3638,6 +3645,7 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
                 s.scissor_count, s.scissors[0], s.scissors[1], s.scissors[2], s.scissors[3]);
     fprintf(cap_, " v3 %.3f %.3f %.3f %.3f zclip %g %g %u bcol %08X", s.vdef[3][0], s.vdef[3][1], s.vdef[3][2], s.vdef[3][3], s.zclip[0], s.zclip[1], s.zclip_on, SimpleState(s, kMBlendColor));
     if (c.zparams[3] > 0 && c.zparams[3] != 1.0f) fprintf(cap_, " depthscale %g", c.zparams[3]);
+    if (s.simple[kMCountEnable >> 2]) fprintf(cap_, " counted");
     // the lighting constants the vertex programs read; a camera-dependent flip here explains walls that change brightness
     fprintf(cap_, " amb %.4f %.4f %.4f L0 %.4f %.4f %.4f i0 %.4f i1 %.4f i2 %.4f L1 %.4f %.4f %.4f L2 %.4f %.4f %.4f"
                    " mat %.4f %.4f %.4f spec %.4f %.4f %.4f pow %.4f",
@@ -3652,8 +3660,8 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
     if (SimpleState(s, kMAlphaTestEnable))
         fprintf(cap_, " atest func %.0f ref %.0f", c.misc[1], c.misc[0]);
     if (s.rs[kRsFogEnable])
-        fprintf(cap_, " fog %08X mode %u %.3f %.3f %.4f", s.rs[kRsFogColor], s.rs[kRsFogTableMode], c.fog[0], c.fog[1],
-                c.fog[2]);
+        fprintf(cap_, " fog %08X mode %u %.3f %.3f %.4f set %g %g %g", s.rs[kRsFogColor], s.rs[kRsFogTableMode], c.fog[0],
+                c.fog[1], c.fog[2], Bits(s.rs[kRsFogStart]), Bits(s.rs[kRsFogEnd]), Bits(s.rs[kRsFogDensity]));
     CaptureTextures(s, stages);
 }
 
@@ -4017,11 +4025,13 @@ void D3D12Backend::DeliverReports() {
         kernel::W32(r.va + kTime, uint32_t(presents_));
         kernel::W32(r.va + kTimeHigh, 0);
         kernel::W32(r.va + kCount, uint32_t(std::lround(pixels)));
+        if (cap_reports_left_) LOGI("capture: visibility report %08X: %.0f pixels", r.va, pixels);
         std::atomic_thread_fence(std::memory_order_release);
         kernel::W32(r.va + kStatus, 0);
         reports_.pop_front();
     }
     if (reports_.empty()) query_next_ = 0;  // no pending report references the query ring now
+    if (cap_reports_left_) cap_reports_left_--;
 }
 
 constexpr uint32_t kPointList = 1;   // D3DPT_POINTLIST
@@ -5073,6 +5083,7 @@ void D3D12Backend::FinishCapture(const Surface& front) {
     }
     fclose(cap_);
     cap_ = nullptr;
+    cap_reports_left_ = 8;  // the reports of the captured frame arrive over the next few submits
     cap_tex_.clear();
     LOGI("d3d12: frame captured to %s", cap_dir_.string().c_str());
 }
