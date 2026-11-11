@@ -18,6 +18,8 @@ enum class PromptStyle { Original, PlayStation, Xbox, KeyboardMouse, KeyboardDri
 PromptStyle ControllerPromptStyle();
 // true while keyboard/mouse is the input the game is following; a pad takes
 // over as soon as it is used
+// port 0 holds the left trigger (aim / lock-on)
+bool LockOnHeld();
 bool KeyboardMouseActive();
 // While a lock-on target is active, the game's own aim assist needs a small
 // right-stick deflection to run. Direct mouse aim otherwise leaves the stick

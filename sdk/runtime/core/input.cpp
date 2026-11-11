@@ -55,6 +55,8 @@ std::atomic<uint64_t> g_direct_at{0};      // last frame the direct controller r
 std::atomic<uint64_t> g_direct_used_at{0}; // last time the camera took a sample
 // the Graphics menu (or another overlay) is using the pointer
 std::atomic<bool> g_ui_active{false};
+// port 0 is holding the left trigger (aim / lock-on): the right or middle mouse button, or a pad's trigger
+std::atomic<bool> g_lock_held{false};
 
 // direct aim is live only while its controller is actually updating; a
 // different camera mode falls back to the right stick instead of losing the
@@ -448,6 +450,8 @@ PromptStyle ControllerPromptStyle() {
     return g_prompt_style.load(std::memory_order_relaxed);
 }
 
+bool LockOnHeld() { return g_lock_held.load(std::memory_order_relaxed); }
+
 bool KeyboardMouseActive() { return g_keyboard_mouse_active.load(std::memory_order_relaxed); }
 
 void SetLockOnStick(int16_t x, int16_t y) {
@@ -654,6 +658,8 @@ Pad Poll(int port) {
             p.connected = true;
         }
     }
+    // the left trigger aims and locks on; the mouse aim leaves the heading to the game only while it is held
+    if (port == 0) g_lock_held.store(p.analog[6] > 32, std::memory_order_relaxed);
     // A background window keeps receiving controller state through SDL, but it
     // must not steer, attack or open the menu. Scripted and replayed input is
     // applied by GameInfo::pad just below, after this gate.

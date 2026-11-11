@@ -256,8 +256,11 @@ bool AimRequested(uint32_t controller) {
 
 // True while the game has a lock-on target. Its own camera pass then owns the
 // heading: restoring the mouse here would leave the crosshair beside the target
-// instead of snapping onto it.
+// instead of snapping onto it. Locking on needs the left trigger held; the
+// player's target field alone is set outside lock-on too (after a level load it
+// is never clear), which kept the mouse from turning the camera's intro.
 bool LockTargetActive(uint8_t *base) {
+    if (!input::LockOnHeld()) return false;
     const uint32_t player = Rd(base, kPlayer);
     if (!player || !mem::IsCommitted(player + kLockTarget)) return false;
     return Rd(base, player + kLockTarget) != 0;
