@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Graphics
+- Pipelines are kept between runs: the driver's compiled pipelines are saved beside the
+  shader cache (`shader-cache/.../pipelines.bin` on Windows, `~/.cache/TrueCrimeNYC/pipelines.bin`
+  on Linux) a few seconds after the last new one, so effects and areas seen before no longer
+  stall a frame the first time they appear in a later run. A cache from another GPU or driver
+  is discarded. `TCNYC_PIPELINE_CACHE=0` turns it off.
+- Low latency (F10 and the Display tab, Windows): one frame waits for the display instead of
+  three, so the controls respond sooner. Off by default.
+- Bloom is built from a chain of half- to 1/16-size images instead of 36 full-size reads per
+  pixel: cheaper at high resolutions and smoother, without the faint eight-way star. Same
+  threshold and overall brightness; the glow spreads somewhat wider than before. A new Bloom
+  strength setting (50% to 400%, F10 and the Display tab) makes it brighter; 100% is the original look.
+- AMD FSR 1 upscaling (Upscaler: Bilinear or AMD FSR 1) when Render scale is below 100%, and
+  RCAS sharpening (Sharpening: Off to 100%) of the 3D frame at any render scale. The HUD,
+  movies and still pictures are not sharpened. Windows and Linux.
+- F10: the Depth of field help no longer says it needs MSAA.
+
 ## 0.9.1.0 — Beta 2 (2026-11-11)
 
 ### Gameplay

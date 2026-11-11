@@ -75,12 +75,15 @@ enum class Row {
     ApplyDisplay,
     AspectRatio,
     RenderScale,
+    Upscaler,
+    Sharpening,
     FieldOfView,
     ObjectDetail,
     Anisotropic,
     Msaa,
     Smaa,
     Bloom,
+    BloomStrength,
     DepthOfField,
     AmbientOcclusion,
     BuildingSeamFix,
@@ -90,6 +93,7 @@ enum class Row {
     HdrPeak,
     HdrHighlights,
     VSync,
+    LowLatency,
     FrameCap,
     ShowFps,
     TextureReplacement,
@@ -103,12 +107,15 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::ApplyDisplay,
                          Row::AspectRatio,
                          Row::RenderScale,
+                         Row::Upscaler,
+                         Row::Sharpening,
                          Row::FieldOfView,
                          Row::ObjectDetail,
                          Row::Anisotropic,
                          Row::Msaa,
                          Row::Smaa,
                          Row::Bloom,
+                         Row::BloomStrength,
                          Row::DepthOfField,
                          Row::AmbientOcclusion,
                          Row::BuildingSeamFix,
@@ -118,6 +125,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::HdrPeak,
                          Row::HdrHighlights,
                          Row::VSync,
+                         Row::LowLatency,
                          Row::FrameCap,
                          Row::ShowFps,
                          Row::TextureReplacement,
@@ -273,10 +281,14 @@ void RestoreDefaults() {
     s.aspect = d.aspect;
     app::SetFrameCap(d.fps_cap);
     s.vsync = d.vsync;
+    s.low_latency = d.low_latency;
+    s.upscaler = d.upscaler;
+    s.sharpening = d.sharpening;
     s.aniso = d.aniso;
     app::SetMsaaSamples(d.msaa);
     s.smaa = d.smaa;
     s.bloom = d.bloom;
+    s.bloom_strength = d.bloom_strength;
     s.dof = d.dof;
     s.ao = d.ao;
     s.building_seam_fix = d.building_seam_fix;
@@ -302,6 +314,9 @@ Kind KindOf(Row row) {
     case Row::Resolution:
     case Row::AspectRatio:
     case Row::RenderScale:
+    case Row::BloomStrength:
+    case Row::Upscaler:
+    case Row::Sharpening:
     case Row::FieldOfView:
     case Row::ObjectDetail:
     case Row::Anisotropic:
@@ -320,6 +335,7 @@ Kind KindOf(Row row) {
     case Row::PcContrast:
     case Row::Hdr:
     case Row::VSync:
+    case Row::LowLatency:
     case Row::ShowFps:
     case Row::TextureReplacement:
     case Row::TextureDumping:
@@ -333,6 +349,12 @@ bool Enabled(Row row) {
     app::SettingsLock lock;  // the native Display tab can write these from the game thread
     if (row == Row::ApplyDisplay) return !g_menu.apply_pending && DisplayPending();
     if (row == Row::DumpFormat) return app::Get().dump_textures;
+    // FSR 1 only upscales; at 100% and above there is nothing for it to do (Sharpening still works)
+    if (row == Row::Upscaler) return app::Get().render_percent < 100;
+    if (row == Row::BloomStrength) return app::Get().bloom;
+#ifndef _WIN32
+    if (row == Row::LowLatency) return false;  // Direct3D 12 only
+#endif
     // The HDR toggle stays reachable on an SDR display so a failed detection can be retried and
     // the fallback is visible; its sliders only matter once HDR is actually active.
     if (row == Row::HdrPaperWhite || row == Row::HdrPeak || row == Row::HdrHighlights)
@@ -380,6 +402,14 @@ const char *Label(Row row) {
         return "HDR peak brightness";
     case Row::HdrHighlights:
         return "HDR highlights";
+    case Row::BloomStrength:
+        return "Bloom strength";
+    case Row::Upscaler:
+        return "Upscaler";
+    case Row::Sharpening:
+        return "Sharpening";
+    case Row::LowLatency:
+        return "Low latency";
     case Row::VSync:
         return "V-Sync";
     case Row::FrameCap:
@@ -452,7 +482,7 @@ const char *Help(Row row) {
     case Row::Bloom:
         return "Adds extra bright-pass bloom over the game's own lighting.";
     case Row::DepthOfField:
-        return "Adds distance blur to the finished 3D frame when MSAA is enabled.";
+        return "Adds distance blur to the finished 3D frame.";
     case Row::AmbientOcclusion:
         return "Off, half or full resolution depth-based ambient occlusion. Half is cheaper and softer.";
     case Row::BuildingSeamFix:
@@ -469,6 +499,21 @@ const char *Help(Row row) {
         return "Peak highlight brightness. Display uses the panel's reported peak; otherwise 1000 nits.";
     case Row::HdrHighlights:
         return "How far bright neon, lamps and headlights are pushed above paper white.";
+    case Row::BloomStrength:
+        return "How bright the bloom glow is. 100% is the original, very subtle look.";
+    case Row::Upscaler:
+        return "How the picture is scaled up when Render scale is below 100%. AMD FSR 1 keeps edges sharper than "
+               "Bilinear and sharpens lightly; Sharpening sets how much.";
+    case Row::Sharpening:
+        return "Sharpens the finished 3D frame (AMD FidelityFX RCAS). Offsets the softness of SMAA and of render "
+               "scales below 100%. The HUD is not sharpened.";
+    case Row::LowLatency:
+#ifdef _WIN32
+        return "Lets only one frame wait for the display instead of three, so the controls respond sooner. "
+               "Can lower the frame rate on a slow GPU.";
+#else
+        return "Windows only.";
+#endif
     case Row::VSync:
         return "Waits for the monitor's refresh before showing a frame, which prevents tearing.";
     case Row::FrameCap:
@@ -574,6 +619,18 @@ std::string Value(Row row) {
     case Row::HdrHighlights:
         std::snprintf(text, sizeof(text), "%u%%", s.hdr_highlights);
         return text;
+    case Row::BloomStrength:
+        std::snprintf(text, sizeof(text), "%u%%", s.bloom_strength);
+        return text;
+    case Row::Upscaler:
+        if (s.render_percent >= 100) return "Not needed at 100%";
+        return s.upscaler == 1 ? "AMD FSR 1" : "Bilinear";
+    case Row::Sharpening:
+        if (!s.sharpening) return "Off";
+        std::snprintf(text, sizeof(text), "%u%%", s.sharpening);
+        return text;
+    case Row::LowLatency:
+        return s.low_latency ? "On" : "Off";
     case Row::VSync:
         return s.vsync ? "On" : "Off";
     case Row::ShowFps:
@@ -631,6 +688,15 @@ bool Change(Row row, int direction) {
     case Row::ObjectDetail:
         // read by the LOD hooks on the game thread: a single aligned 32-bit store
         changed = set(s.object_detail, choices::Step(choices::kObjectDetails, s.object_detail, direction));
+        break;
+    case Row::BloomStrength:
+        changed = set(s.bloom_strength, choices::Step(choices::kBloomStrengths, s.bloom_strength, direction));
+        break;
+    case Row::Upscaler:
+        changed = set(s.upscaler, choices::Step(choices::kUpscalers, s.upscaler, direction));
+        break;
+    case Row::Sharpening:
+        changed = set(s.sharpening, choices::Step(choices::kSharpenPercents, s.sharpening, direction));
         break;
     case Row::Anisotropic:
         changed = set(s.aniso, choices::Step(choices::kAnisoLevels, s.aniso, direction));
@@ -701,6 +767,9 @@ void Activate(Row row) {
             break;
         case Row::Hdr:
             s.hdr = !s.hdr;
+            break;
+        case Row::LowLatency:
+            s.low_latency = !s.low_latency;
             break;
         case Row::VSync:
             s.vsync = !s.vsync;

@@ -29,17 +29,21 @@ enum class Option {
     Resolution,
     Aspect,
     RenderScale,
+    Upscaler,
+    Sharpening,
     FieldOfView,
     ObjectDetail,
     Anisotropic,
     Msaa,
     Smaa,
     Bloom,
+    BloomStrength,
     DepthOfField,
     AmbientOcclusion,
     BuildingSeamFix,
     PcContrast,
     VSync,
+    LowLatency, // Windows only
     FrameCap,
     ShowFps,
     HdrPage, // opens the HDR page
@@ -54,9 +58,15 @@ inline constexpr uint32_t kOptionCount = uint32_t(Option::Count);
 
 inline constexpr Option kMainOptions[] = {
     Option::DisplayMode, Option::Resolution,       Option::Aspect,          Option::RenderScale,
+    Option::Upscaler,    Option::Sharpening,
     Option::FieldOfView, Option::ObjectDetail,     Option::Anisotropic,     Option::Msaa,
-    Option::Smaa,        Option::Bloom,            Option::DepthOfField,    Option::AmbientOcclusion,
-    Option::BuildingSeamFix, Option::PcContrast,   Option::VSync,           Option::FrameCap,
+    Option::Smaa,        Option::Bloom,            Option::BloomStrength,
+    Option::DepthOfField,    Option::AmbientOcclusion,
+    Option::BuildingSeamFix, Option::PcContrast,   Option::VSync,
+#ifdef _WIN32
+    Option::LowLatency,
+#endif
+    Option::FrameCap,
     Option::ShowFps,     Option::HdrPage};
 inline constexpr Option kHdrOptions[] = {Option::Hdr, Option::HdrPaperWhite, Option::HdrPeak, Option::HdrHighlights,
                                          Option::HdrBack};
@@ -93,6 +103,8 @@ struct Values {
     bool bloom = true, dof = true, building_seam_fix = true, pc_contrast = true, hdr = false;
     uint32_t hdr_paper_white = 200, hdr_peak = 0, hdr_highlights = 40;  // app::Settings defaults
     uint32_t display_peak = 0; // the HDR display's reported peak in nits, 0 when unknown (read only)
+    uint32_t upscaler = 0, sharpening = 0, bloom_strength = 100;  // app::Settings defaults
+    bool low_latency = false;
 };
 
 inline bool DisplayPending(const Values &v) { return v.size != v.applied || v.mode != v.applied_mode; }
@@ -190,6 +202,18 @@ inline void Change(Values &v, Option option, int direction, std::span<const uint
         v.render_percent =
             choices::ClampRenderPercent(choices::Step(choices::kRenderPercents, v.render_percent, direction));
         break;
+    case Option::BloomStrength:
+        v.bloom_strength = choices::Step(choices::kBloomStrengths, v.bloom_strength, direction);
+        break;
+    case Option::Upscaler:
+        v.upscaler = choices::Step(choices::kUpscalers, v.upscaler, direction);
+        break;
+    case Option::Sharpening:
+        v.sharpening = choices::Step(choices::kSharpenPercents, v.sharpening, direction);
+        break;
+    case Option::LowLatency:
+        v.low_latency = !v.low_latency;
+        break;
     case Option::FieldOfView:
         v.fov_percent = choices::ClampFovPercent(choices::Step(choices::kFovPercents, v.fov_percent, direction));
         break;
@@ -277,6 +301,21 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
         break;
     case Option::RenderScale:
         std::snprintf(text, kTextBytes, "RENDER SCALE %u.%02uX", v.render_percent / 100, v.render_percent % 100);
+        break;
+    case Option::BloomStrength:
+        std::snprintf(text, kTextBytes, "BLOOM LEVEL %u", v.bloom_strength);
+        break;
+    case Option::Upscaler:
+        std::snprintf(text, kTextBytes, "UPSCALER %s", v.upscaler == 1 ? "FSR 1" : "BILINEAR");
+        break;
+    case Option::Sharpening:
+        if (v.sharpening)
+            std::snprintf(text, kTextBytes, "SHARPENING %u", v.sharpening);
+        else
+            std::snprintf(text, kTextBytes, "SHARPENING OFF");
+        break;
+    case Option::LowLatency:
+        std::snprintf(text, kTextBytes, "LOW LATENCY %s", OnOff(v.low_latency));
         break;
     case Option::FieldOfView:
         std::snprintf(text, kTextBytes, "FOV %u.%02uX", v.fov_percent / 100, v.fov_percent % 100);

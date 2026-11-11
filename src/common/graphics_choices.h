@@ -14,6 +14,9 @@ inline constexpr uint32_t kMinRenderPercent = 20, kMaxRenderPercent = 200;
 inline constexpr uint32_t kAnisoLevels[] = {0, 2, 4, 8, 16}; // 0: as the game asks
 inline constexpr uint32_t kMsaaSamples[] = {0, 2, 4, 8};     // 0: off
 inline constexpr uint32_t kAoModes[] = {0, 1, 2};            // off, half resolution, full resolution
+inline constexpr uint32_t kUpscalers[] = {0, 1};              // bilinear, AMD FSR 1
+inline constexpr uint32_t kBloomStrengths[] = {50, 100, 150, 200, 300, 400};  // percent of the original
+inline constexpr uint32_t kSharpenPercents[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
 // The game's Swap limits pacing to 60 / presentation interval (d3d8.cpp), so
 // higher caps have no effect and are not offered.
 inline constexpr uint32_t kFrameCaps[] = {30, 60};

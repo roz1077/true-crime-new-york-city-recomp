@@ -170,6 +170,10 @@ Values Current() {
     v.hdr_paper_white = s.hdr_paper_white;
     v.hdr_peak = s.hdr_peak;
     v.hdr_highlights = s.hdr_highlights;
+    v.upscaler = s.upscaler;
+    v.bloom_strength = s.bloom_strength;
+    v.sharpening = s.sharpening;
+    v.low_latency = s.low_latency;
     v.display_peak = gpu::g_hdr_display_peak_nits.load(std::memory_order_relaxed);
     return v;
 }
@@ -197,6 +201,10 @@ void Apply(const Values &v) {
     s.hdr_paper_white = v.hdr_paper_white;
     s.hdr_peak = v.hdr_peak;
     s.hdr_highlights = v.hdr_highlights;
+    s.upscaler = v.upscaler;
+    s.bloom_strength = v.bloom_strength;
+    s.sharpening = v.sharpening;
+    s.low_latency = v.low_latency;
     game::SetShowFps(v.show_fps);
     MarkSave();
 }

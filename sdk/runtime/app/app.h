@@ -23,10 +23,14 @@ struct Settings {
     uint32_t aspect = 0;             // the frame's shape, width / height x 1000; 0 the output's
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;
-    uint32_t aniso = 0;              // 0 as the game asks
+    bool low_latency = false;        // one frame queued ahead of the display instead of three (Windows)
+    uint32_t aniso = 0;             // 0 as the game asks
     uint32_t msaa = 0;               // 0, 2, 4 or 8 samples; off by default, it is the costliest option
     bool smaa = true;                // SMAA 1x on the finished frame
+    uint32_t upscaler = 0;           // below 100% render scale: 0 bilinear, 1 AMD FSR 1
+    uint32_t sharpening = 0;         // RCAS sharpening on the finished frame, percent (0 off)
     bool bloom = true;                // bright-pass bloom on the finished frame
+    uint32_t bloom_strength = 100;    // bloom brightness, percent of the original
     bool dof = true;                  // distance blur on the finished frame
     uint32_t ao = 0;                  // ambient occlusion: 0 off, 1 half resolution, 2 full resolution
     bool building_seam_fix = true;   // experimental priority for detailed city geometry

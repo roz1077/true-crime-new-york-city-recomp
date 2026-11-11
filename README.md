@@ -45,7 +45,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 ## Highlights
 
 - **Native renderers** — Direct3D 12 on Windows, Vulkan on Linux; no emulator and no Proton.
-- **Modern graphics** — render scale, aspect ratio, field of view, object detail, MSAA, SMAA, bloom, depth of field and GTAO ambient occlusion on both platforms.
+- **Modern graphics** — render scale with AMD FSR 1 upscaling and sharpening, aspect ratio, field of view, object detail, MSAA, SMAA, bloom, depth of field and GTAO ambient occlusion on both platforms.
 - **HDR output** — optional HDR on Windows (scRGB or HDR10) and Linux (HDR10 or extended sRGB), with paper white, peak brightness and highlight strength settings.
 - **Widescreen** — up to 32:9 for the 3D view, with the HUD and menus kept in the middle and the intro movies stretched to fill the screen.
 - **Controller and mouse** — Xbox, PlayStation and Switch controllers with hot-plug, rumble and matching button prompts, including Steam Deck glyphs and Xbox prompts for the ROG Ally and Legion Go under Steam Input. Raw mouse aim works in precision aim and snaps onto a lock-on target; keyboard prompts switch to the pedal keys in a car.
@@ -86,12 +86,15 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Apply display changes | Applies the display mode and resolution. A change that fails puts the previous mode back. |
 | Aspect ratio | Auto, 4:3, 16:10, 16:9, 21:9 or 32:9. The 3D view widens; HUD and menus stay 16:9 in the middle, and the intro movies stretch to fill the screen. 4:3 and the wide shapes take effect after a restart. |
 | Render scale | 25% to 200% of the output height. |
+| Upscaler | Bilinear or AMD FSR 1, used when Render scale is below 100%. FSR 1 keeps edges sharper and sharpens lightly. |
+| Sharpening | Off to 100%: AMD FidelityFX RCAS sharpening of the 3D frame, at any render scale. The HUD is not sharpened. Off by default. |
 | Field of view | 80% to 150% of the game's view, gameplay camera only; aiming still zooms. |
 | Object detail | Original, High, Very high or Maximum: how far buildings and props keep their detailed models. Vehicles keep the game's own detail level. Maximum is much slower. |
 | Anisotropic filtering | Game default, 2x, 4x, 8x or 16x. |
 | MSAA | Off, 2x, 4x or 8x. Off by default: it is the most demanding option. |
 | SMAA | SMAA 1x anti-aliasing on the finished frame. On by default. |
 | Bloom | Optional bright-pass bloom over the game's lighting. On by default. |
+| Bloom strength | 50% to 400% of the original bloom, which is very subtle at 100% (the default). |
 | Depth of field | Distance blur for 3D scenes. On by default. |
 | Ambient occlusion | GTAO contact shadows in corners and under objects, applied to world geometry only so lights, fog and effects keep their brightness. Off, Half or Full resolution. Off by default. Windows (D3D12) and Linux (Vulkan). |
 | Building seam fix | Experimental: gives detailed buildings priority over simplified city meshes. On by default. |
@@ -99,6 +102,7 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | HDR | Expands the finished frame's highlights for an HDR display. Off by default, and identical to normal output when off. On Windows it follows the system HDR switch without a restart. |
 | HDR paper white / peak / highlights | Brightness of normal white (nits), the brightest highlights (the display's reported peak, or 1000 nits), and how far lamps, neon and headlights are pushed above white. |
 | V-Sync / Frame limit | V-Sync on/off; 30 or 60 FPS. The game's timing is built for at most 60. |
+| Low latency | Windows: one frame waits for the display instead of three, so the controls respond sooner. Can lower the frame rate on a slow GPU. Off by default. |
 | FPS counter | On or off. |
 | Texture replacement / dumping | Enable replacement packs; dump to PNG or DDS. |
 | Defaults / Close | Defaults resets every option (display changes still need Apply); Close saves and closes the menu. |
@@ -228,6 +232,7 @@ Ubuntu 24.04 has no `libsdl3-dev`; build SDL 3.4.16 (`release-3.4.16`) from sour
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) — overridable function layout and instruction hooks.
 - [Zydis](https://github.com/zyantific/zydis) — x86 instruction decoding.
 - [toml++](https://github.com/marzer/tomlplusplus), [Dear ImGui](https://github.com/ocornut/imgui), [SDL](https://github.com/libsdl-org/SDL) and [SMAA](https://github.com/iryoku/smaa) — configuration, overlay, window/input and anti-aliasing.
+- [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT) — upscaling and sharpening.
 - [LLVM / Clang](https://llvm.org/) — the compiler bundled with the Windows release to build the game code on first launch.
 - [shaderc](https://github.com/google/shaderc) / [glslang](https://github.com/KhronosGroup/glslang) and [stb](https://github.com/nothings/stb) — run-time shader compilation and texture image loading on Linux.
 - Ambient occlusion follows GTAO (Jimenez et al., "Practical Real-Time Strategies for Accurate Indirect Occlusion", 2016) and Intel's [XeGTAO](https://github.com/GameTechDev/XeGTAO).

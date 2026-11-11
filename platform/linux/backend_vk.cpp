@@ -45,6 +45,7 @@
 #include "core/log.h"
 #include "gpu/ao.h"
 #include "gpu/backend.h"
+#include "gpu/post_fx.h"
 #include "gpu/shaders.h"
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
@@ -787,6 +788,15 @@ private:
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
+    // Pipelines kept on disk between runs ($XDG_CACHE_HOME/TrueCrimeNYC/pipelines.bin), so a pipeline the game
+    // needed before does not stall a frame the first time again. Every pipeline is made through it.
+    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+    uint32_t pipeline_cache_new_ = 0;          // pipelines made since the last save
+    uint64_t pipeline_cache_quiet_since_ = 0;  // frames_ at the last one
+    void OpenPipelineCache();
+    void SavePipelineCache(bool force);
+    VkResult CreatePipelines(uint32_t count, const VkGraphicsPipelineCreateInfo* info,
+                             const VkAllocationCallbacks* alloc, VkPipeline* out);
     VkQueue queue_ = VK_NULL_HANDLE, present_queue_ = VK_NULL_HANDLE;
     uint32_t graphics_family_ = ~0u, present_family_ = ~0u;
     std::string device_name_;
@@ -972,6 +982,45 @@ private:
     VkBuffer smaa_area_buffer_ = VK_NULL_HANDLE, smaa_search_buffer_ = VK_NULL_HANDLE;
     bool smaa_lookups_pending_ = false;
     bool smaa_failed_ = false;
+    // the shared layout of the full-screen passes on the finished frame (SMAA, bloom; smaa_set_layout_ and
+    // smaa_pipeline_layout_ are it)
+    bool EnsurePostLayout();
+    VkDescriptorPool CreatePostPool(uint32_t count);
+    bool AllocatePostSets(VkDescriptorPool pool, uint32_t count, VkDescriptorSet* out);
+    void WritePostSet(VkDescriptorSet set, VkImageView t0, VkImageView t1, VkImageView t2);
+    VkPipeline MakePostPipeline(VkShaderModule vs, VkShaderModule ps, const char* entry, VkFormat format);
+    void DrawPostPass(VkPipeline pipeline, VkDescriptorSet set, SmaaImage& dst, const float p[8]);
+    // the bloom chain (post_fx.h): down[0] is half the source size, each next level half again; up[i] is level i
+    // finished, with every smaller level folded in
+    static constexpr VkFormat kBloomFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    static constexpr uint32_t kBloomSets = 2 * kBloomLevels - 1;
+    struct BloomChain {
+        SmaaImage down[kBloomLevels], up[kBloomLevels - 1];
+        uint32_t src_w = 0, src_h = 0;
+        VkShaderModule vs = VK_NULL_HANDLE, ps[3] = {};
+        VkPipeline pipelines[3] = {};  // bright, down, up
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet sets[kBloomSets] = {};
+        bool failed = false;
+    } bloom_;
+    bool EnsureBloom(uint32_t src_w, uint32_t src_h);
+    void DestroyBloomTargets();
+    VkImageView BuildBloom(VkImageView src, uint32_t w, uint32_t h);
+    // FSR 1 (post_fx.h): easu is output sized, rcas whichever size it sharpened; both in the scene's format
+    struct FsrState {
+        SmaaImage easu, rcas;
+        VkShaderModule vs = VK_NULL_HANDLE, ps[2] = {};
+        VkPipeline pipelines[2] = {};  // easu, rcas
+        VkFormat pipeline_format = VK_FORMAT_UNDEFINED;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet sets[2] = {};
+        bool failed = false;
+    } fsr_;
+    void DestroyFsrImage(SmaaImage& image);
+    // EASU to out_w x out_h when the scene is smaller and the Upscaler setting is FSR, then RCAS; the view to
+    // present, src when neither applies
+    VkImageView UpscaleAndSharpen(VkImageView src, VkFormat format, uint32_t w, uint32_t h, uint32_t out_w,
+                                  uint32_t out_h, const app::Settings& s);
     bool dof_active_ = false;
     bool bloom_active_ = false;
 
@@ -1213,6 +1262,117 @@ bool WriteRgbaTga(const char* path, const uint8_t* px, uint32_t w, uint32_t h, u
 }
 } // namespace
 
+namespace {
+// $XDG_CACHE_HOME/TrueCrimeNYC, or ~/.cache/TrueCrimeNYC; empty when neither is set
+std::filesystem::path CacheRoot() {
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+        return std::filesystem::path(xdg) / "TrueCrimeNYC";
+    if (const char* home = std::getenv("HOME"); home && *home)
+        return std::filesystem::path(home) / ".cache" / "TrueCrimeNYC";
+    return {};
+}
+
+constexpr uint64_t kPipelineCacheMagic = 0x3142494C4F535058ull;  // "XPSOLIB1"
+constexpr uint64_t kPipelineCacheMaxBytes = 512ull << 20;
+struct PipelineFileHeader {
+    uint64_t magic, size, checksum;
+};
+}  // namespace
+
+VkResult VulkanBackend::CreatePipelines(uint32_t count, const VkGraphicsPipelineCreateInfo* info,
+                                        const VkAllocationCallbacks* alloc, VkPipeline* out) {
+    const VkResult r = vkCreateGraphicsPipelines(device_, pipeline_cache_, count, info, alloc, out);
+    if (r == VK_SUCCESS && pipeline_cache_) {
+        // Vulkan does not say whether the cache already had it; a save with nothing new is only a rewrite
+        ++pipeline_cache_new_;
+        pipeline_cache_quiet_since_ = frames_;
+    }
+    return r;
+}
+
+// The cache from the last run, or an empty one. Its own header names the GPU and driver build; data from
+// another is not handed to the driver (some drivers do not reject it safely), so that starts an empty cache.
+void VulkanBackend::OpenPipelineCache() {
+    if (const char* e = std::getenv("TCNYC_PIPELINE_CACHE"); e && std::strcmp(e, "0") == 0) return;
+    std::vector<uint8_t> data;
+    const std::filesystem::path root = CacheRoot();
+    if (!root.empty()) {
+        std::ifstream in(root / "pipelines.bin", std::ios::binary | std::ios::ate);
+        const std::streamoff length = in ? std::streamoff(in.tellg()) : std::streamoff(-1);
+        PipelineFileHeader header{};
+        if (length > std::streamoff(sizeof(header)) &&
+            length <= std::streamoff(sizeof(header) + kPipelineCacheMaxBytes)) {
+            in.seekg(0);
+            if (in.read(reinterpret_cast<char*>(&header), sizeof(header)) && header.magic == kPipelineCacheMagic &&
+                header.size == uint64_t(length) - sizeof(header)) {
+                data.resize(size_t(header.size));
+                if (!in.read(reinterpret_cast<char*>(data.data()), std::streamsize(data.size())) ||
+                    Hash(data.data(), data.size()) != header.checksum)
+                    data.clear();
+            }
+        }
+    }
+    // VkPipelineCacheHeaderVersionOne: length, version, vendor, device, UUID
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(physical_, &props);
+    if (data.size() >= 32) {
+        uint32_t words[4];
+        std::memcpy(words, data.data(), 16);
+        if (words[1] != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || words[2] != props.vendorID ||
+            words[3] != props.deviceID || std::memcmp(data.data() + 16, props.pipelineCacheUUID, VK_UUID_SIZE)) {
+            LOGR("vulkan: saved pipelines are from another GPU or driver, starting again");
+            data.clear();
+            pipeline_cache_new_ = 1;  // replace the stale file at the next save
+        }
+    } else {
+        data.clear();
+    }
+    VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    info.initialDataSize = data.size();
+    info.pInitialData = data.empty() ? nullptr : data.data();
+    if (vkCreatePipelineCache(device_, &info, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+        info.initialDataSize = 0;
+        info.pInitialData = nullptr;
+        if (vkCreatePipelineCache(device_, &info, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+            pipeline_cache_ = VK_NULL_HANDLE;
+            LOGR("vulkan: pipeline cache unavailable, pipelines are not kept between runs");
+            return;
+        }
+    }
+    LOGR("vulkan: pipeline cache opened, %zu KB saved", data.size() / 1024);
+}
+
+// Writes the cache once a few seconds pass with no new pipeline (they come in bursts, at level loads and new
+// effects), so the copy does not land in the middle of one. force writes any change (at shutdown).
+void VulkanBackend::SavePipelineCache(bool force) {
+    if (!pipeline_cache_ || !pipeline_cache_new_) return;
+    if (!force && frames_ - pipeline_cache_quiet_since_ < 300) return;  // 5 s at 60 FPS
+    const std::filesystem::path root = CacheRoot();
+    if (root.empty()) return;
+    size_t size = 0;
+    if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size ||
+        size > kPipelineCacheMaxBytes)
+        return;
+    std::vector<uint8_t> bytes(size);
+    if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, bytes.data()) != VK_SUCCESS) return;
+    bytes.resize(size);
+    pipeline_cache_new_ = 0;
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    const std::string file = (root / "pipelines.bin").string();
+    const std::string temp = file + ".tmp." + std::to_string(::getpid());
+    const PipelineFileHeader header{kPipelineCacheMagic, bytes.size(), Hash(bytes.data(), bytes.size())};
+    FILE* f = std::fopen(temp.c_str(), "wb");
+    if (!f) return;
+    const bool ok = std::fwrite(&header, sizeof(header), 1, f) == 1 &&
+                    std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    if (std::fclose(f) == 0 && ok && std::rename(temp.c_str(), file.c_str()) == 0) {
+        LOGI("vulkan: saved %zu KB of pipelines", bytes.size() / 1024);
+        return;
+    }
+    std::remove(temp.c_str());
+}
+
 bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     width_ = width;
     height_ = height;
@@ -1249,6 +1409,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     }
     perf_log_at_ = std::chrono::steady_clock::now();
     if (!CreateInstance() || !CreateSurface() || !PickDevice() || !CreateDevice()) return false;
+    OpenPipelineCache();
     {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(physical_, &props);
@@ -2296,7 +2457,7 @@ bool VulkanBackend::CreateUiComposite() {
     info.pDynamicState = &dynamic;
     info.layout = ui_pipeline_layout_;
     info.renderPass = swap_pass_;
-    if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &ui_pipeline_) != VK_SUCCESS)
+    if (CreatePipelines(1, &info, nullptr, &ui_pipeline_) != VK_SUCCESS)
         return false;
     ui_pipeline_format_ = swapchain_format_;
     return true;
@@ -2398,7 +2559,8 @@ bool VulkanBackend::CreatePresent() {
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
     if (vkCreateSampler(device_, &si, nullptr, &present_point_sampler_) != VK_SUCCESS) return false;
 
-    VkDescriptorSetLayoutBinding bind[5]{};
+    // 0 frame, 1 gamma ramp, 2 depth, 3 and 4 samplers, 5 the bloom chain
+    VkDescriptorSetLayoutBinding bind[6]{};
     for (int i = 0; i < 3; i++) {
         bind[i].binding = uint32_t(i);
         bind[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -2411,12 +2573,16 @@ bool VulkanBackend::CreatePresent() {
         bind[3 + i].descriptorCount = 1;
         bind[3 + i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
+    bind[5].binding = 5;
+    bind[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bind[5].descriptorCount = 1;
+    bind[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 5;
+    li.bindingCount = 6;
     li.pBindings = bind;
     if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &present_set_layout_) != VK_SUCCESS) return false;
 
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3},
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4},
                                      {VK_DESCRIPTOR_TYPE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 1;
@@ -2443,7 +2609,9 @@ bool VulkanBackend::CreatePresent() {
 [[vk::binding(2, 0)]] Texture2D<float4> depthTex;
 [[vk::binding(3, 0)]] SamplerState frameSampler;
 [[vk::binding(4, 0)]] SamplerState depthSampler;
-struct PC { float pc; float bloom; float dof; float pad; float2 src; float2 zrange; float4 hdr; float4 rect; };
+[[vk::binding(5, 0)]] Texture2D<float4> bloomTex;
+// chain: the bloom chain is bound (bloomTex); without it BloomAt taps the frame
+struct PC { float pc; float bloom; float dof; float chain; float2 src; float2 zrange; float4 hdr; float4 rect; };
 [[vk::push_constant]] ConstantBuffer<PC> pc;
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
@@ -2504,6 +2672,7 @@ float3 BrightAt(float2 uv) {
     return max(c - 0.94, 0.0);
 }
 float3 BloomAt(float2 uv) {
+    if (pc.chain > 0.0) return bloomTex.SampleLevel(frameSampler, uv, 0).rgb;
     static const float2 dirs[8] = {
         float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
         float2(0.7071, 0.7071), float2(-0.7071, 0.7071),
@@ -2568,7 +2737,7 @@ float4 psmain(O i) : SV_Target {
         // Match the SDR order through PC contrast: gamma, then bloom, then contrast. The part of
         // the bloom above white is carried separately so it can exceed white, scaled by highlights.
         float3 g = c.rgb;
-        float3 b = pc.bloom > 0.0 ? BloomAt(i.uv) * 1.2 : 0;
+        float3 b = pc.bloom > 0.0 ? BloomAt(i.uv) * (1.2 * pc.bloom) : 0;
         g += b;
         if (pc.pc > 0.0) g = lerp(g, PcContrast(g), pc.pc);
         float3 over = max(c.rgb + b - 1.0, 0.0);
@@ -2579,7 +2748,7 @@ float4 psmain(O i) : SV_Target {
         float3 nits = clamp(rgb2020 * pc.hdr.y, 0.0, 10000.0);
         return float4(PqEncode(nits), c.a);
     }
-    if (pc.bloom > 0.0) c.rgb += BloomAt(i.uv) * 1.2;
+    if (pc.bloom > 0.0) c.rgb += BloomAt(i.uv) * (1.2 * pc.bloom);
     if (pc.pc > 0.0) {
         c.rgb = PcContrast(c.rgb);
         static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
@@ -2645,6 +2814,8 @@ void VulkanBackend::Shutdown() {
         if (ao_occ_pool_) vkDestroyDescriptorPool(device_, ao_occ_pool_, nullptr);
         if (ao_pipeline_layout_) vkDestroyPipelineLayout(device_, ao_pipeline_layout_, nullptr);
         if (ao_set_layout_) vkDestroyDescriptorSetLayout(device_, ao_set_layout_, nullptr);
+        SavePipelineCache(true);
+        if (pipeline_cache_) vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
         vkDestroyDevice(device_, nullptr);
     }
     if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
@@ -3568,7 +3739,7 @@ VkPipeline VulkanBackend::CreateAoPipeline(VkShaderModule vs, VkShaderModule ps,
     info.layout = ao_pipeline_layout_;
     info.renderPass = pass;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) != VK_SUCCESS)
+    if (CreatePipelines(1, &info, nullptr, &pipeline) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     return pipeline;
 }
@@ -4386,7 +4557,7 @@ bool VulkanBackend::CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderM
                           : k.samples > 1 ? RenderPassForMs(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.samples)
                                           : RenderPassFor(VkFormat(k.rtfmt), VkFormat(k.dsfmt));
     if (info.renderPass == VK_NULL_HANDLE) return false;
-    VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &out);
+    VkResult r = CreatePipelines(1, &info, nullptr, &out);
     if (r != VK_SUCCESS) {
         LOGE("vulkan: pipeline failed: %s", r == VK_ERROR_OUT_OF_DEVICE_MEMORY ? "out of memory" : "error");
         return false;
@@ -6067,7 +6238,7 @@ float4 psmain() : SV_Target { return colour; }
     info.renderPass = samples > 1 ? RenderPassForMs(format, depth, samples) : RenderPassFor(format, depth);
     if (info.renderPass == VK_NULL_HANDLE) return VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) != VK_SUCCESS)
+    if (CreatePipelines(1, &info, nullptr, &pipeline) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     clear_pipelines_[key] = pipeline;
     return pipeline;
@@ -6986,12 +7157,11 @@ V vs(uint id : SV_VertexID) {
 float4 blend(V v) : SV_Target { return SMAANeighborhoodBlendingPS(v.uv, v.o, colorTex, blendTex); }
 )";
 
-bool VulkanBackend::EnsureSmaa(uint32_t w, uint32_t h, VkFormat format) {
-    if (smaa_failed_) return false;
-    if (smaa_output_.image && smaa_w_ == w && smaa_h_ == h && smaa_format_ == format) return true;
-    vkDeviceWaitIdle(device_);
-    DestroySmaaTargets();
-
+// The descriptor and pipeline layout of the full-screen passes on the finished frame (SMAA, bloom): images at
+// bindings 2 to 4 and the linear and point samplers at 6 and 7, as InjectBindings places t0-t2 and s0-s1, and 8
+// floats of push constants.
+bool VulkanBackend::EnsurePostLayout() {
+    if (smaa_pipeline_layout_) return true;
     auto make_sampler = [&](VkFilter filter, VkSampler* out) {
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = si.minFilter = filter;
@@ -7000,6 +7170,319 @@ bool VulkanBackend::EnsureSmaa(uint32_t w, uint32_t h, VkFormat format) {
     };
     if (!smaa_linear_ && !make_sampler(VK_FILTER_LINEAR, &smaa_linear_)) return false;
     if (!smaa_point_ && !make_sampler(VK_FILTER_NEAREST, &smaa_point_)) return false;
+    if (!smaa_set_layout_) {
+        VkDescriptorSetLayoutBinding bind[5]{};
+        for (int i = 0; i < 3; i++) {
+            bind[i].binding = uint32_t(2 + i);
+            bind[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            bind[i].descriptorCount = 1;
+            bind[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        for (int i = 0; i < 2; i++) {
+            bind[3 + i].binding = uint32_t(6 + i);
+            bind[3 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            bind[3 + i].descriptorCount = 1;
+            bind[3 + i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = 5;
+        li.pBindings = bind;
+        if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &smaa_set_layout_) != VK_SUCCESS) return false;
+    }
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &smaa_set_layout_;
+    VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 8};
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(device_, &pl, nullptr, &smaa_pipeline_layout_) != VK_SUCCESS) {
+        smaa_pipeline_layout_ = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+// a pool for count sets of the post layout
+VkDescriptorPool VulkanBackend::CreatePostPool(uint32_t count) {
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * count},
+                                     {VK_DESCRIPTOR_TYPE_SAMPLER, 2 * count}};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = count;
+    pi.poolSizeCount = 2;
+    pi.pPoolSizes = sizes;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    if (vkCreateDescriptorPool(device_, &pi, nullptr, &pool) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return pool;
+}
+
+bool VulkanBackend::AllocatePostSets(VkDescriptorPool pool, uint32_t count, VkDescriptorSet* out) {
+    std::vector<VkDescriptorSetLayout> layouts(count, smaa_set_layout_);
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = pool;
+    ai.descriptorSetCount = count;
+    ai.pSetLayouts = layouts.data();
+    return vkAllocateDescriptorSets(device_, &ai, out) == VK_SUCCESS;
+}
+
+// t0 to t2 of a post set (white where null) and its two samplers
+void VulkanBackend::WritePostSet(VkDescriptorSet set, VkImageView t0, VkImageView t1, VkImageView t2) {
+    VkDescriptorImageInfo images[3]{};
+    const VkImageView views[3] = {t0, t1, t2};
+    for (int i = 0; i < 3; i++) {
+        images[i].imageView = views[i] ? views[i] : white_view_;
+        images[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    VkDescriptorImageInfo samplers[2]{};
+    samplers[0].sampler = smaa_linear_;
+    samplers[1].sampler = smaa_point_;
+    VkWriteDescriptorSet writes[5]{};
+    for (int i = 0; i < 3; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = uint32_t(2 + i);
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[i].pImageInfo = &images[i];
+    }
+    for (int i = 0; i < 2; i++) {
+        writes[3 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3 + i].dstSet = set;
+        writes[3 + i].dstBinding = uint32_t(6 + i);
+        writes[3 + i].descriptorCount = 1;
+        writes[3 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[3 + i].pImageInfo = &samplers[i];
+    }
+    vkUpdateDescriptorSets(device_, 5, writes, 0, nullptr);
+}
+
+// a full-screen pass pipeline of the post layout, writing all of one colour attachment of this format
+VkPipeline VulkanBackend::MakePostPipeline(VkShaderModule vs, VkShaderModule ps, const char* entry, VkFormat format) {
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cb{};
+    cb.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = 1;
+    blend.pAttachments = &cb;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dyn;
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "vs";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = ps;
+    stages[1].pName = entry;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &vi;
+    info.pInputAssemblyState = &ia;
+    info.pViewportState = &vp;
+    info.pRasterizationState = &rs;
+    info.pMultisampleState = &ms;
+    info.pDepthStencilState = &dss;
+    info.pColorBlendState = &blend;
+    info.pDynamicState = &dynamic;
+    info.layout = smaa_pipeline_layout_;
+    info.renderPass = RenderPassFor(format, VK_FORMAT_UNDEFINED);
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (CreatePipelines(1, &info, nullptr, &pipeline) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return pipeline;
+}
+
+// one full-screen post pass into dst, which is then left readable
+void VulkanBackend::DrawPostPass(VkPipeline pipeline, VkDescriptorSet set, SmaaImage& dst, const float p[8]) {
+    vkCmdPushConstants(cmd_, smaa_pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(float) * 8, p);
+    Transition(dst.image, dst.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, dst.format);
+    VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rp.renderPass = RenderPassFor(dst.format, VK_FORMAT_UNDEFINED);
+    rp.framebuffer = dst.framebuffer;
+    rp.renderArea = {{0, 0}, {dst.w, dst.h}};
+    vkCmdBeginRenderPass(cmd_, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    VkViewport viewport{0, 0, float(dst.w), float(dst.h), 0, 1};
+    VkRect2D scissor{{0, 0}, {dst.w, dst.h}};
+    vkCmdSetViewport(cmd_, 0, 1, &viewport);
+    vkCmdSetScissor(cmd_, 0, 1, &scissor);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, smaa_pipeline_layout_, 0, 1, &set, 0, nullptr);
+    vkCmdDraw(cmd_, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cmd_);
+    Transition(dst.image, dst.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dst.format);
+    bound_pipe_ = VK_NULL_HANDLE;
+    viewport_valid_ = false;
+}
+
+void VulkanBackend::DestroyBloomTargets() {
+    for (SmaaImage* image : {&bloom_.down[0], &bloom_.down[1], &bloom_.down[2], &bloom_.down[3], &bloom_.up[0],
+                             &bloom_.up[1], &bloom_.up[2]}) {
+        if (image->framebuffer) vkDestroyFramebuffer(device_, image->framebuffer, nullptr);
+        if (image->view) vkDestroyImageView(device_, image->view, nullptr);
+        if (image->image) vkDestroyImage(device_, image->image, nullptr);
+        if (image->memory) vkFreeMemory(device_, image->memory, nullptr);
+        *image = SmaaImage();
+    }
+    bloom_.src_w = bloom_.src_h = 0;
+}
+
+// The chain's images and pipelines for a source of this size (the shared post_fx.h shader). The sets of every pass
+// but the first read fixed images, so they are written here; the bright pass's source changes per frame.
+bool VulkanBackend::EnsureBloom(uint32_t src_w, uint32_t src_h) {
+    static_assert(kBloomLevels == 4, "DestroyBloomTargets lists the levels");
+    if (bloom_.failed) return false;
+    if (bloom_.down[0].image && bloom_.src_w == src_w && bloom_.src_h == src_h) return true;
+    if (!EnsurePostLayout()) return false;
+    if (!bloom_.pipelines[0]) {
+        bloom_.vs = CompileShader(kBloomHlsl, shaderc_vertex_shader, "vs");
+        const char* entries[3] = {"bright", "down", "up"};
+        for (int i = 0; i < 3; i++) {
+            bloom_.ps[i] = CompileShader(kBloomHlsl, shaderc_fragment_shader, entries[i]);
+            if (!bloom_.vs || !bloom_.ps[i]) return false;
+            bloom_.pipelines[i] = MakePostPipeline(bloom_.vs, bloom_.ps[i], entries[i], kBloomFormat);
+            if (!bloom_.pipelines[i]) return false;
+        }
+        if (!(bloom_.pool = CreatePostPool(kBloomSets))) return false;
+        if (!AllocatePostSets(bloom_.pool, kBloomSets, bloom_.sets)) return false;
+    }
+    vkDeviceWaitIdle(device_);
+    DestroyBloomTargets();
+    uint32_t w = src_w, h = src_h;
+    for (uint32_t i = 0; i < kBloomLevels; i++) {
+        w = std::max(1u, (w + 1) / 2);
+        h = std::max(1u, (h + 1) / 2);
+        if (!CreateSmaaImage(bloom_.down[i], w, h, kBloomFormat, true)) return false;
+        if (i + 1 < kBloomLevels && !CreateSmaaImage(bloom_.up[i], w, h, kBloomFormat, true)) return false;
+    }
+    // sets: 0 bright (written per frame), 1-3 down, 4-6 up (largest first)
+    for (uint32_t i = 1; i < kBloomLevels; i++) WritePostSet(bloom_.sets[i], bloom_.down[i - 1].view, nullptr, nullptr);
+    for (uint32_t i = 0; i + 1 < kBloomLevels; i++) {
+        const bool smallest = i + 2 == kBloomLevels;
+        WritePostSet(bloom_.sets[kBloomLevels + i], bloom_.down[i].view,
+                     smallest ? bloom_.down[i + 1].view : bloom_.up[i + 1].view, nullptr);
+    }
+    bloom_.src_w = src_w;
+    bloom_.src_h = src_h;
+    LOGR("vulkan: bloom chain %ux%u to %ux%u", bloom_.down[0].w, bloom_.down[0].h, w, h);
+    return true;
+}
+
+// the finished half-size bloom, readable; null when the chain is unavailable (the present pass then taps the source)
+VkImageView VulkanBackend::BuildBloom(VkImageView src, uint32_t w, uint32_t h) {
+    if (!EnsureBloom(w, h)) {
+        if (!bloom_.failed) LOGE("vulkan: bloom chain could not be created, using the single-pass bloom");
+        bloom_.failed = true;
+        DestroyBloomTargets();
+        return VK_NULL_HANDLE;
+    }
+    WritePostSet(bloom_.sets[0], src, gamma_view_, nullptr);
+    {
+        const float p[8] = {1.0f / float(w), 1.0f / float(h), 1.0f, 0};
+        DrawPostPass(bloom_.pipelines[0], bloom_.sets[0], bloom_.down[0], p);
+    }
+    for (uint32_t i = 1; i < kBloomLevels; i++) {
+        const float p[8] = {1.0f / float(bloom_.down[i - 1].w), 1.0f / float(bloom_.down[i - 1].h), 0, 0};
+        DrawPostPass(bloom_.pipelines[1], bloom_.sets[i], bloom_.down[i], p);
+    }
+    for (uint32_t i = kBloomLevels - 1; i-- > 0;) {
+        const bool smallest = i + 2 == kBloomLevels;
+        const float p[8] = {1.0f / float(bloom_.down[i + 1].w), 1.0f / float(bloom_.down[i + 1].h), kBloomWeights[i],
+                            smallest ? kBloomWeights[i + 1] : 1.0f};
+        DrawPostPass(bloom_.pipelines[2], bloom_.sets[kBloomLevels + i], bloom_.up[i], p);
+    }
+    return bloom_.up[0].view;
+}
+
+void VulkanBackend::DestroyFsrImage(SmaaImage& image) {
+    if (image.framebuffer) vkDestroyFramebuffer(device_, image.framebuffer, nullptr);
+    if (image.view) vkDestroyImageView(device_, image.view, nullptr);
+    if (image.image) vkDestroyImage(device_, image.image, nullptr);
+    if (image.memory) vkFreeMemory(device_, image.memory, nullptr);
+    image = SmaaImage();
+}
+
+VkImageView VulkanBackend::UpscaleAndSharpen(VkImageView src, VkFormat format, uint32_t w, uint32_t h,
+                                             uint32_t out_w, uint32_t out_h, const app::Settings& s) {
+    if (fsr_.failed || !w || !h) return src;
+    const bool upscale = s.upscaler == 1 && out_w && out_h && h < out_h;
+    if (!upscale && !s.sharpening) return src;
+    const uint32_t sw = upscale ? out_w : w, sh = upscale ? out_h : h;
+    auto fail = [&](const char* why) {
+        fsr_.failed = true;
+        LOGE("vulkan: FSR 1 %s, upscaling and sharpening are off", why);
+        return src;
+    };
+    if (!EnsurePostLayout()) return fail("has no pass layout");
+    if (!fsr_.pipelines[0] || fsr_.pipeline_format != format) {
+        vkDeviceWaitIdle(device_);
+        for (VkPipeline& p : fsr_.pipelines)
+            if (p) vkDestroyPipeline(device_, std::exchange(p, VK_NULL_HANDLE), nullptr);
+        if (!fsr_.vs) {
+            fsr_.vs = CompileShader(FsrHlsl(), shaderc_vertex_shader, "vs");
+            fsr_.ps[0] = CompileShader(FsrHlsl(), shaderc_fragment_shader, "easu");
+            fsr_.ps[1] = CompileShader(FsrHlsl(), shaderc_fragment_shader, "rcas");
+            if (!fsr_.vs || !fsr_.ps[0] || !fsr_.ps[1]) return fail("shaders did not compile");
+        }
+        const char* entries[2] = {"easu", "rcas"};
+        for (int i = 0; i < 2; i++)
+            if (!(fsr_.pipelines[i] = MakePostPipeline(fsr_.vs, fsr_.ps[i], entries[i], format)))
+                return fail("pipelines could not be created");
+        fsr_.pipeline_format = format;
+        if (!fsr_.pool) {
+            if (!(fsr_.pool = CreatePostPool(2))) return fail("descriptor pool could not be created");
+            if (!AllocatePostSets(fsr_.pool, 2, fsr_.sets)) return fail("descriptor sets could not be allocated");
+        }
+    }
+    auto ready = [&](const SmaaImage& image) {
+        return image.image && image.w == sw && image.h == sh && image.format == format;
+    };
+    if ((upscale && !ready(fsr_.easu)) || !ready(fsr_.rcas)) {
+        vkDeviceWaitIdle(device_);
+        if (upscale && !ready(fsr_.easu)) {
+            DestroyFsrImage(fsr_.easu);
+            if (!CreateSmaaImage(fsr_.easu, sw, sh, format, true)) return fail("images could not be created");
+        }
+        if (!ready(fsr_.rcas)) {
+            DestroyFsrImage(fsr_.rcas);
+            if (!CreateSmaaImage(fsr_.rcas, sw, sh, format, true)) return fail("images could not be created");
+        }
+        LOGR("vulkan: FSR 1 %s %ux%u to %ux%u", upscale ? "upscaling" : "sharpening", w, h, sw, sh);
+    }
+    // the previous frame is finished (Present waited for its fence), so its sets can be rewritten
+    const float p[8] = {float(w), float(h), float(sw), float(sh), RcasStops(s.sharpening), 0, 0, 0};
+    VkImageView rcas_src = src;
+    if (upscale) {
+        WritePostSet(fsr_.sets[0], src, nullptr, nullptr);
+        DrawPostPass(fsr_.pipelines[0], fsr_.sets[0], fsr_.easu, p);
+        rcas_src = fsr_.easu.view;
+    }
+    WritePostSet(fsr_.sets[1], rcas_src, nullptr, nullptr);
+    DrawPostPass(fsr_.pipelines[1], fsr_.sets[1], fsr_.rcas, p);
+    return fsr_.rcas.view;
+}
+
+bool VulkanBackend::EnsureSmaa(uint32_t w, uint32_t h, VkFormat format) {
+    if (smaa_failed_) return false;
+    if (smaa_output_.image && smaa_w_ == w && smaa_h_ == h && smaa_format_ == format) return true;
+    vkDeviceWaitIdle(device_);
+    DestroySmaaTargets();
+    if (!EnsurePostLayout()) return false;
 
     auto upload = [&](SmaaImage& image, uint32_t iw, uint32_t ih, VkFormat fmt) {
         return CreateSmaaImage(image, iw, ih, fmt, false);
@@ -7023,44 +7506,9 @@ bool VulkanBackend::EnsureSmaa(uint32_t w, uint32_t h, VkFormat format) {
         smaa_lookups_pending_ = true;
     }
 
-    if (!smaa_set_layout_) {
-        VkDescriptorSetLayoutBinding bind[5]{};
-        for (int i = 0; i < 3; i++) {
-            bind[i].binding = uint32_t(2 + i);
-            bind[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            bind[i].descriptorCount = 1;
-            bind[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        }
-        for (int i = 0; i < 2; i++) {
-            bind[3 + i].binding = uint32_t(6 + i);
-            bind[3 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-            bind[3 + i].descriptorCount = 1;
-            bind[3 + i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        }
-        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        li.bindingCount = 5;
-        li.pBindings = bind;
-        if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &smaa_set_layout_) != VK_SUCCESS) return false;
-        VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 9},
-                                         {VK_DESCRIPTOR_TYPE_SAMPLER, 6}};
-        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pi.maxSets = 3;
-        pi.poolSizeCount = 2;
-        pi.pPoolSizes = sizes;
-        if (vkCreateDescriptorPool(device_, &pi, nullptr, &smaa_pool_) != VK_SUCCESS) return false;
-        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool = smaa_pool_;
-        ai.descriptorSetCount = 3;
-        VkDescriptorSetLayout layouts[3] = {smaa_set_layout_, smaa_set_layout_, smaa_set_layout_};
-        ai.pSetLayouts = layouts;
-        if (vkAllocateDescriptorSets(device_, &ai, smaa_sets_) != VK_SUCCESS) return false;
-        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        pl.setLayoutCount = 1;
-        pl.pSetLayouts = &smaa_set_layout_;
-        VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 8};
-        pl.pushConstantRangeCount = 1;
-        pl.pPushConstantRanges = &push;
-        if (vkCreatePipelineLayout(device_, &pl, nullptr, &smaa_pipeline_layout_) != VK_SUCCESS) return false;
+    if (!smaa_pool_) {
+        if (!(smaa_pool_ = CreatePostPool(3))) return false;
+        if (!AllocatePostSets(smaa_pool_, 3, smaa_sets_)) return false;
     }
 
     if (!smaa_pipelines_[0] || smaa_pipeline_format_ != format) {
@@ -7135,7 +7583,7 @@ bool VulkanBackend::EnsureSmaa(uint32_t w, uint32_t h, VkFormat format) {
             info.pDynamicState = &dynamic;
             info.layout = smaa_pipeline_layout_;
             info.renderPass = RenderPassFor(passes[i].format, VK_FORMAT_UNDEFINED);
-            if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &smaa_pipelines_[i]) !=
+            if (CreatePipelines(1, &info, nullptr, &smaa_pipelines_[i]) !=
                 VK_SUCCESS) {
                 smaa_failed_ = true;
                 LOGE("vulkan: SMAA pipelines could not be created, SMAA is off");
@@ -7387,7 +7835,7 @@ void VulkanBackend::Present(const Surface& front) {
         info.pDynamicState = &dynamic;
         info.layout = present_pipeline_layout_;
         info.renderPass = swap_pass_;
-        if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &present_pipeline_) != VK_SUCCESS)
+        if (CreatePipelines(1, &info, nullptr, &present_pipeline_) != VK_SUCCESS)
             return;
         present_format_ = swapchain_format_;
     }
@@ -7522,6 +7970,14 @@ void VulkanBackend::Present(const Surface& front) {
         source_view = smaa_output_.view;
     }
 
+    // the bloom chain from the image the present pass reads; without it the pass taps that image itself
+    VkImageView bloom_view = VK_NULL_HANDLE;
+    if (snapshot.bloom && direct && ft && !ft->depth && ft->w && ft->h)
+        bloom_view = BuildBloom(source_view, ft->w, ft->h);
+    // FSR 1 upscaling and sharpening of the 3D scene (not of movies and still pictures)
+    if (direct && ft && !ft->depth && front.picture == gpu::Picture::Unknown)
+        source_view = UpscaleAndSharpen(source_view, ft->format, ft->w, ft->h, extent_.width, extent_.height, snapshot);
+
     // PC distance blur: the main target's depth, resolved with MSAA or the image itself without (as d3d12.cpp)
     const SceneDepth* dof = nullptr;
     if (snapshot.dof && direct && ft) {
@@ -7555,7 +8011,16 @@ void VulkanBackend::Present(const Surface& front) {
     VkDescriptorImageInfo samplers[2]{};
     samplers[0].sampler = present_sampler_;
     samplers[1].sampler = present_point_sampler_;
-    VkWriteDescriptorSet writes[5]{};
+    VkDescriptorImageInfo bloom_info{};
+    bloom_info.imageView = bloom_view ? bloom_view : white_view_;
+    bloom_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet writes[6]{};
+    writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[5].dstSet = present_set_;
+    writes[5].dstBinding = 5;
+    writes[5].descriptorCount = 1;
+    writes[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[5].pImageInfo = &bloom_info;
     for (int i = 0; i < 3; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = present_set_;
@@ -7572,7 +8037,7 @@ void VulkanBackend::Present(const Surface& front) {
         writes[3 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         writes[3 + i].pImageInfo = &samplers[i];
     }
-    vkUpdateDescriptorSets(device_, 5, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device_, 6, writes, 0, nullptr);
 
     const bool hdr = hdr_output_ != HdrOutput::Off;
     const uint32_t reported_peak = display_peak_nits_ ? display_peak_nits_ : 1000;
@@ -7661,8 +8126,8 @@ void VulkanBackend::Present(const Surface& front) {
     }
     vkCmdSetViewport(cmd_, 0, 1, &frame_viewport);
     const bool picture = front.picture != gpu::Picture::Unknown;
-    float present_pc[16] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? 1.0f : 0.0f,
-                            dof_on ? 1.0f : 0.0f, 0.0f,
+    float present_pc[16] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? float(snapshot.bloom_strength) / 100.0f : 0.0f,
+                            dof_on ? 1.0f : 0.0f, bloom_view ? 1.0f : 0.0f,
                             bloom_w ? 1.0f / float(bloom_w) : 0.0f,
                             bloom_h ? 1.0f / float(bloom_h) : 0.0f,
                             dof ? dof->near_w : 0.1f, dof ? dof->far_w : 1000.0f,
@@ -7755,6 +8220,7 @@ void VulkanBackend::Present(const Surface& front) {
     ResetFrame();
     ++frames_;
     presents_seen_.store(frames_);
+    SavePipelineCache(false);
     if (frames_ % 60 == 0) {
         if (perf_) {
             const auto now = std::chrono::steady_clock::now();

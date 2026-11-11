@@ -76,6 +76,9 @@ void Load() {
 
     SetFrameCap(t["fps_cap"].value_or(FrameCap()));
     s.vsync = t["vsync"].value_or(s.vsync);
+    s.low_latency = t["low_latency"].value_or(s.low_latency);
+    s.upscaler = uint32_t(std::clamp<int64_t>(t["upscaler"].value_or(int64_t(s.upscaler)), 0, 1));
+    s.sharpening = uint32_t(std::clamp<int64_t>(t["sharpening"].value_or(int64_t(s.sharpening)), 0, 100));
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     // as settings.cpp: a file without the key keeps the built-in default (Settings::msaa); older
     // files stored msaa = true for 4x
@@ -88,6 +91,7 @@ void Load() {
     }
     s.smaa = t["smaa"].value_or(s.smaa);
     s.bloom = t["bloom"].value_or(s.bloom);
+    s.bloom_strength = uint32_t(std::clamp<int64_t>(t["bloom_strength"].value_or(int64_t(s.bloom_strength)), 50, 400));
     s.dof = t["dof"].value_or(s.dof);
     if (t["ao"].is_boolean()) {
         s.ao = t["ao"].value_or(false) ? 2u : 0u;  // older settings stored a boolean
@@ -131,10 +135,14 @@ toml::table Table() {
                   {"aspect_ratio", int64_t(s.aspect)},
                   {"fps_cap", int64_t(FrameCap())},
                   {"vsync", s.vsync},
+                  {"low_latency", s.low_latency},
+                  {"upscaler", int64_t(s.upscaler)},
+                  {"sharpening", int64_t(s.sharpening)},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"msaa", MsaaSamples()},
                   {"smaa", s.smaa},
                   {"bloom", s.bloom},
+                  {"bloom_strength", int64_t(s.bloom_strength)},
                   {"dof", s.dof},
                   {"ao", int64_t(s.ao)},
                   {"building_seam_fix", s.building_seam_fix},

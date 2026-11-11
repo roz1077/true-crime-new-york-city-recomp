@@ -25,6 +25,7 @@
 #include <fstream>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -45,6 +46,7 @@
 #include "core/log.h"
 #include "gpu/ao.h"
 #include "gpu/backend.h"
+#include "gpu/post_fx.h"
 #include "gpu/ext.h"
 #include "gpu/shaders.h"
 #include "gpu/texture.h"
@@ -80,6 +82,13 @@ constexpr uint32_t kAoRtvs = 3;    // after SMAA: raw AO, full-size occlusion, p
 constexpr uint32_t kAoRtv = kRtvCount + kFrames + kSmaaRtvs;
 constexpr uint32_t kAoOccRtv = kAoRtv + 1;
 constexpr uint32_t kAoDistRtv = kAoRtv + 2;
+// after AO: the bloom chain's four down levels (half to 1/16 size), then its three up levels (half to 1/8)
+constexpr uint32_t kBloomRtvs = 2 * kBloomLevels - 1;
+constexpr uint32_t kBloomRtv = kAoRtv + kAoRtvs;
+constexpr DXGI_FORMAT kBloomFormat = DXGI_FORMAT_R11G11B10_FLOAT;
+// after bloom: FSR 1's upscaled image (EASU) and its sharpened one (RCAS)
+constexpr uint32_t kFsrRtvs = 2;
+constexpr uint32_t kFsrRtv = kBloomRtv + kBloomRtvs;
 // The AO prepass writes each pixel's view distance (clip w) here, so AO never has to turn
 // hyperbolic depth back into distance with a guessed near/far: most draws are vertex programs
 // whose projection the port cannot see, and a wrong guess bent flat surfaces into stripes.
@@ -124,6 +133,8 @@ struct Perf {
     uint64_t shrinks = 0;
     uint64_t syncs = 0;
     uint64_t psos = 0;
+    uint64_t pso_loads = 0;   // pipelines read from the saved library
+    uint64_t pso_misses = 0;  // looked up there and not found
     uint64_t shaders = 0;
     uint64_t shader_hits = 0;
     uint64_t raw = 0;
@@ -139,6 +150,12 @@ struct PerfScope {
     }
 };
 
+// TCNYC_BLOOM_VIEW=1 shows only the bloom chain's output, ten times brighter (a tuning aid)
+bool BloomView() {
+    static const bool on = std::getenv("TCNYC_BLOOM_VIEW") != nullptr;
+    return on;
+}
+
 // F3 captures only with diag::CaptureDir set
 bool CaptureOn() {
     if (diag::CaptureDir().empty()) LOG_FIRST(1, "capture: set XBE_CAPTURE_DIR");
@@ -149,6 +166,7 @@ const char* kBlitHlsl = R"(
 cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; float4 hdr; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
+Texture2D bloomTex : register(t2);
 // the scene depth for distance blur: multisampled with MSAA, a plain texture without (DEPTH_SINGLE)
 #ifdef DEPTH_SINGLE
 Texture2D<float> depthTex : register(t3);
@@ -220,7 +238,9 @@ float3 BrightAt(float2 uv) {
     return max(c - 0.94, 0.0);
 }
 
-float3 Bloom(float2 uv) {
+// Bloom: the bloom chain (post_fx.h) when post.w is set, one bilinear read of its finished level. BloomTaps,
+// the old 36-tap version, is the fallback when the chain's targets could not be made.
+float3 BloomTaps(float2 uv) {
     static const float2 dirs[8] = {
         float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
         float2(0.7071, 0.7071), float2(-0.7071, 0.7071),
@@ -231,6 +251,12 @@ float3 Bloom(float2 uv) {
     [unroll] for (int k = 0; k < 8; k++) b += BrightAt(uv + dirs[k] * t);
     b += BrightAt(uv);
     return b * (1.0 / 9.0);
+}
+float3 Bloom(float2 uv) {
+    float3 b;
+    [branch] if (post.w > 0) b = bloomTex.SampleLevel(ls, uv, 0).rgb;
+    else b = BloomTaps(uv);
+    return b;
 }
 
 // PC distance blur: 13-tap hex blur weighted by the linearised scene depth. The scene depth is
@@ -297,12 +323,14 @@ float4 psmain(O i) : SV_Target {
     c.rgb *= opts.w;
     if (post.z > 0) c.rgb = DistanceBlur(i.uv, c.rgb);
     c.rgb = ToGamma(c.rgb);
+    // TCNYC_BLOOM_VIEW=1: the bloom alone, ten times brighter, to see what it adds
+    if (post.w > 1.5) return float4(saturate(Bloom(i.uv) * 10.0), 1);
     if (hdr.x > 0.5) {
         // Match the SDR order through PC contrast: gamma, then bloom, then contrast. The part of
         // the bloom that lands above white is carried separately and added in linear light, so it
         // can exceed white instead of being clipped. No dither: the HDR target has more precision.
         float3 g = c.rgb;
-        float3 b = post.y > 0 ? Bloom(i.uv) * 1.2 : 0;
+        float3 b = post.y > 0 ? Bloom(i.uv) * (1.2 * post.y) : 0;
         g += b;
         if (post.x > 0) g = lerp(g, PcContrast(g), post.x);
         float3 over = max(c.rgb + b - 1.0, 0.0);
@@ -313,7 +341,7 @@ float4 psmain(O i) : SV_Target {
         float3 nits = clamp(rgb2020 * hdr.y, 0.0, 10000.0);
         return float4(PqEncode(nits), opts.y > 0 ? c.a : 1);
     }
-    if (post.y > 0) c.rgb += Bloom(i.uv) * 1.2;
+    if (post.y > 0) c.rgb += Bloom(i.uv) * (1.2 * post.y);
     if (post.x > 0) {
         c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
         // The contrast curve stretches the darkest 8-bit steps; an ordered dither breaks them up
@@ -626,6 +654,7 @@ struct BlitOptions {
     uint32_t samples = 1;     // destination sample count
     float post = 0;           // PC contrast strength, 0 off
     float bloom = 0;          // bright-pass bloom strength, 0 off
+    ID3D12Resource* bloom_tex = nullptr;  // the finished bloom chain (BuildBloom), null taps the source instead
     float src_w = 0, src_h = 0;  // source size in texels, for the bloom radius
     ID3D12Resource* depth = nullptr;  // scene depth for the distance blur
     float dof = 0;            // distance blur strength, 0 off
@@ -1100,6 +1129,15 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> blobs_;
     std::unordered_map<uint64_t, uint64_t> shader_src_;  // vertex and pixel program keys to source hash
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
+    // Pipelines kept on disk between runs (shader-cache/.../pipelines.bin): the driver's compiled
+    // pipelines, so a pipeline the game needed before does not stall a frame the first time again.
+    // The library reads from pso_lib_blob_ for as long as it exists.
+    ComPtr<ID3D12PipelineLibrary> pso_lib_;
+    std::vector<uint8_t> pso_lib_blob_;
+    uint32_t pso_lib_new_ = 0;           // pipelines stored since the last save
+    uint64_t pso_lib_quiet_since_ = 0;   // present count of the last store
+    void OpenPipelineLibrary();
+    void SavePipelineLibrary(bool force);
     // sampler descriptors are rewritten per frame like the SRV ring; a descriptor set from an
     // earlier frame may still be referenced by in-flight GPU work until its fence completes.
     static constexpr uint32_t kSamplersPerFrame = (kSamplerCount / kFrames) & ~3u;
@@ -1152,6 +1190,28 @@ private:
         ComPtr<ID3D12Resource> res;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
     };
+    // the bloom chain (kBloomHlsl): down[0] is half the source size, each next level half again; up[i] is level i
+    // finished, with every smaller level folded in
+    struct Bloom {
+        SmaaTexture down[kBloomLevels], up[kBloomLevels - 1];
+        uint32_t w[kBloomLevels] = {}, h[kBloomLevels] = {};
+        uint32_t src_w = 0, src_h = 0;
+        bool failed = false;
+    } bloom_;
+    bool EnsureBloom(uint32_t src_w, uint32_t src_h);
+    // the finished half-size bloom, readable; null when the chain is unavailable (the blit then taps the source)
+    ID3D12Resource* BuildBloom(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h);
+    // FSR 1 (EASU, then RCAS): easu is output sized, rcas whichever size it sharpened
+    struct Fsr {
+        SmaaTexture easu, rcas;
+        uint32_t easu_w = 0, easu_h = 0, rcas_w = 0, rcas_h = 0;
+        DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+        bool failed = false;
+    } fsr_;
+    D3D12_CPU_DESCRIPTOR_HANDLE frame_rtv_{};  // the back buffer view DrawFrame draws into
+    // FSR 1 upscaling to out_w x out_h when the scene is smaller, and RCAS sharpening; repoints color at the result
+    void UpscaleAndSharpen(ID3D12Resource*& color, DXGI_FORMAT& fmt, uint32_t w, uint32_t h, uint32_t out_w,
+                           uint32_t out_h);
     struct Smaa {
         SmaaTexture area, search;           // the reference lookups, uploaded once
         SmaaTexture edges, weights, output; // frame sized render targets
@@ -1244,6 +1304,15 @@ private:
     std::vector<Query> counted_;  // since the last ClearReport
     std::deque<Report> reports_;
     bool tearing_ = false;
+    // Frames the CPU may queue ahead of the display: 3 as DXGI's default, 1 with the low latency setting. The
+    // render thread waits on latency_wait_ before it starts a frame.
+    HANDLE latency_wait_ = nullptr;
+    uint32_t max_latency_ = 0;
+    UINT SwapFlags() const {
+        return (tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
+    void SetFrameLatency(bool low);
+    void WaitFrameLatency();
     uint64_t presents_ = 0;
     double fps_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
@@ -1262,6 +1331,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     if (defer_scene_) LOGR("d3d12: experimental deferred AO enabled (TCNYC_DEFER_SCENE=1)");
     HWND hwnd = static_cast<HWND>(app::Window());
     if (!CreateDevice()) return false;
+    OpenPipelineLibrary();
     if (!CreateSwapChain(hwnd)) return false;
     if (!CreateHeaps()) return false;
     if (!CreateBackBufferViews()) return false;
@@ -1406,7 +1476,7 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         sd.BufferCount = kFrames;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+        sd.Flags = SwapFlags();
         ComPtr<IDXGISwapChain1> sc1;
         HRESULT hr = factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1);
         if (FAILED(hr)) {
@@ -1440,6 +1510,10 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
         swap_ = sc3;
         hdr_output_ = mode;
         factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+        if (latency_wait_) CloseHandle(latency_wait_);
+        latency_wait_ = swap_->GetFrameLatencyWaitableObject();
+        max_latency_ = 0;  // a new chain starts at its own default
+        SetFrameLatency(settings.low_latency);
         if (mode == HdrOutput::ScRgb)
             LOGR("d3d12: HDR scRGB output, %ux%u FP16, peak %u nits", bb_w_, bb_h_, display_peak_nits_);
         else if (mode == HdrOutput::Hdr10)
@@ -1484,7 +1558,7 @@ bool D3D12Backend::CreateBackBufferViews() {
 bool D3D12Backend::CreateHeaps() {
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
-    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kSmaaRtvs + kAoRtvs, false,
+    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kSmaaRtvs + kAoRtvs + kBloomRtvs + kFsrRtvs, false,
                           rtv_heap_);
     dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
     CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
@@ -2214,7 +2288,8 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     dev_->CreateShaderResourceView(src, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
     sv.Format = kBgra;
     dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
-    dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot + 2, srv_inc_));
+    sv.Format = o.bloom_tex ? kBloomFormat : kBgra;
+    dev_->CreateShaderResourceView(o.bloom_tex, &sv, Cpu(srv_heap_.Get(), slot + 2, srv_inc_));
     sv = {};
     sv.Format = kDepthRead;
     sv.ViewDimension = depth_single ? D3D12_SRV_DIMENSION_TEXTURE2D : D3D12_SRV_DIMENSION_TEXTURE2DMS;
@@ -2226,7 +2301,7 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     if (!cb.res) return;
     float c[20] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                    o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
-                   o.post, o.bloom, depth ? o.dof : 0.0f, 0.0f,
+                   o.post, o.bloom, depth ? o.dof : 0.0f, o.bloom_tex ? (BloomView() ? 2.0f : 1.0f) : 0.0f,
                    o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z,
                    o.hdr_mode, o.paper_white, o.peak, o.highlights};
     std::memcpy(cb.cpu, c, sizeof(c));
@@ -2687,11 +2762,159 @@ float D3D12Backend::RenderTargetShift(const State& s, const DrawShaders& sh) con
     return offset ? -0.5f : 0.0f;
 }
 
+// The pipeline library's name for a description: every field the driver sees, read one by one (never the struct's
+// bytes, whose padding is not initialised), with shader and input layout contents in place of their pointers.
+// There is one root signature, so it is left out.
+std::wstring PipelineName(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) {
+    uint64_t h = 0x5049504C49423031ull;
+    auto mix = [&](const void* p, size_t n) { h = Hash(p, n, h); };
+    auto val = [&](auto v) { mix(&v, sizeof(v)); };
+    for (const D3D12_SHADER_BYTECODE* b : {&d.VS, &d.PS, &d.DS, &d.HS, &d.GS}) {
+        val(uint64_t(b->BytecodeLength));
+        if (b->BytecodeLength) mix(b->pShaderBytecode, b->BytecodeLength);
+    }
+    val(d.StreamOutput.NumEntries);
+    val(d.BlendState.AlphaToCoverageEnable);
+    val(d.BlendState.IndependentBlendEnable);
+    for (const auto& r : d.BlendState.RenderTarget) {
+        val(r.BlendEnable); val(r.LogicOpEnable); val(r.SrcBlend); val(r.DestBlend); val(r.BlendOp);
+        val(r.SrcBlendAlpha); val(r.DestBlendAlpha); val(r.BlendOpAlpha); val(r.LogicOp); val(r.RenderTargetWriteMask);
+    }
+    val(d.SampleMask);
+    const auto& r = d.RasterizerState;
+    val(r.FillMode); val(r.CullMode); val(r.FrontCounterClockwise); val(r.DepthBias); val(r.DepthBiasClamp);
+    val(r.SlopeScaledDepthBias); val(r.DepthClipEnable); val(r.MultisampleEnable); val(r.AntialiasedLineEnable);
+    val(r.ForcedSampleCount); val(r.ConservativeRaster);
+    const auto& z = d.DepthStencilState;
+    val(z.DepthEnable); val(z.DepthWriteMask); val(z.DepthFunc); val(z.StencilEnable); val(z.StencilReadMask);
+    val(z.StencilWriteMask);
+    for (const auto* f : {&z.FrontFace, &z.BackFace}) {
+        val(f->StencilFailOp); val(f->StencilDepthFailOp); val(f->StencilPassOp); val(f->StencilFunc);
+    }
+    for (UINT i = 0; i < d.InputLayout.NumElements; i++) {
+        const auto& e = d.InputLayout.pInputElementDescs[i];
+        mix(e.SemanticName, std::strlen(e.SemanticName));
+        val(e.SemanticIndex); val(e.Format); val(e.InputSlot); val(e.AlignedByteOffset); val(e.InputSlotClass);
+        val(e.InstanceDataStepRate);
+    }
+    val(d.IBStripCutValue);
+    val(d.PrimitiveTopologyType);
+    val(d.NumRenderTargets);
+    for (DXGI_FORMAT f : d.RTVFormats) val(f);
+    val(d.DSVFormat);
+    val(d.SampleDesc.Count);
+    val(d.SampleDesc.Quality);
+    val(d.Flags);
+    wchar_t name[20];
+    std::swprintf(name, 20, L"%016llX", static_cast<unsigned long long>(h));
+    return name;
+}
+
 HRESULT D3D12Backend::CreatePipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
                                      ComPtr<ID3D12PipelineState>& pso) {
     PerfScope perf_pipeline{g_perf.pipeline};
+    std::wstring name;
+    if (pso_lib_) {
+        name = PipelineName(desc);
+        if (SUCCEEDED(pso_lib_->LoadGraphicsPipeline(name.c_str(), &desc, IID_PPV_ARGS(&pso)))) {
+            ++g_perf.pso_loads;
+            return S_OK;
+        }
+        ++g_perf.pso_misses;
+    }
     ++g_perf.psos;
-    return dev_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+    const HRESULT hr = dev_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+    // E_INVALIDARG from StorePipeline: the name is already there (a different description under the same
+    // name, which a 64 bit hash makes very unlikely); the pipeline is still used, just not kept
+    if (SUCCEEDED(hr) && pso_lib_ && SUCCEEDED(pso_lib_->StorePipeline(name.c_str(), pso.Get()))) {
+        ++pso_lib_new_;
+        pso_lib_quiet_since_ = presents_;
+    }
+    return hr;
+}
+
+namespace {
+constexpr uint64_t kPipelineCacheMagic = 0x3142494C4F535058ull;  // "XPSOLIB1"
+constexpr uint64_t kPipelineCacheMaxBytes = 512ull << 20;
+}  // namespace
+
+// The library from the last run, or an empty one. The driver refuses a library from another driver or GPU
+// (D3D12_ERROR_DRIVER_VERSION_MISMATCH, D3D12_ERROR_ADAPTER_NOT_FOUND); that starts an empty one, which the
+// next save replaces the file with.
+void D3D12Backend::OpenPipelineLibrary() {
+    if (ShaderCacheDirectory().empty()) return;
+    if (const char* e = std::getenv("TCNYC_PIPELINE_CACHE"); e && std::strcmp(e, "0") == 0) return;
+    ComPtr<ID3D12Device1> dev1;
+    if (FAILED(dev_.As(&dev1))) {
+        LOGR("d3d12: no pipeline library support (ID3D12Device1), pipelines are not kept between runs");
+        return;
+    }
+    const auto file = ShaderCacheDirectory() / "pipelines.bin";
+    {
+        std::ifstream in(file, std::ios::binary | std::ios::ate);
+        const std::streamoff length = in ? std::streamoff(in.tellg()) : std::streamoff(-1);
+        ShaderCacheHeader header{};
+        if (length > std::streamoff(sizeof(header)) &&
+            length <= std::streamoff(sizeof(header) + kPipelineCacheMaxBytes)) {
+            in.seekg(0);
+            if (in.read(reinterpret_cast<char*>(&header), sizeof(header)) && header.magic == kPipelineCacheMagic &&
+                header.size == uint64_t(length) - sizeof(header)) {
+                pso_lib_blob_.resize(size_t(header.size));
+                if (!in.read(reinterpret_cast<char*>(pso_lib_blob_.data()), std::streamsize(pso_lib_blob_.size())) ||
+                    Hash(pso_lib_blob_.data(), pso_lib_blob_.size()) != header.checksum)
+                    pso_lib_blob_.clear();
+            }
+        }
+    }
+    HRESULT hr = E_FAIL;
+    if (!pso_lib_blob_.empty()) {
+        hr = dev1->CreatePipelineLibrary(pso_lib_blob_.data(), pso_lib_blob_.size(), IID_PPV_ARGS(&pso_lib_));
+        if (FAILED(hr)) {
+            LOGR("d3d12: saved pipelines not usable with this driver (0x%08lX), starting again", hr);
+            pso_lib_blob_.clear();
+            pso_lib_new_ = 1;  // replace the stale file at the next save
+        }
+    }
+    if (FAILED(hr)) hr = dev1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&pso_lib_));
+    if (FAILED(hr)) {
+        pso_lib_.Reset();
+        LOGR("d3d12: pipeline library unavailable (0x%08lX), pipelines are not kept between runs", hr);
+        return;
+    }
+    LOGR("d3d12: pipeline library opened, %zu KB saved", pso_lib_blob_.size() / 1024);
+}
+
+// Writes the library once a few seconds pass with no new pipeline (new ones come in bursts, at level loads
+// and new effects), so the copy and the write do not land in the middle of a burst. force writes any change.
+void D3D12Backend::SavePipelineLibrary(bool force) {
+    if (!pso_lib_ || !pso_lib_new_) return;
+    if (!force && presents_ - pso_lib_quiet_since_ < 300) return;  // 5 s at 60 FPS
+    const size_t size = pso_lib_->GetSerializedSize();
+    if (!size || size > kPipelineCacheMaxBytes) return;
+    std::vector<uint8_t> bytes(size);
+    if (FAILED(pso_lib_->Serialize(bytes.data(), size))) return;
+    const uint32_t added = std::exchange(pso_lib_new_, 0);
+    const auto file = ShaderCacheDirectory() / "pipelines.bin";
+    // the write is off the render thread; the bytes are a copy, independent of the library
+    std::thread([file, bytes = std::move(bytes), added] {
+        std::error_code ec;
+        std::filesystem::create_directories(file.parent_path(), ec);
+        auto temporary = file;
+        temporary += "." + std::to_string(GetCurrentProcessId()) + ".tmp";
+        ShaderCacheHeader header{kPipelineCacheMagic, 0, bytes.size(), Hash(bytes.data(), bytes.size())};
+        {
+            std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+            if (!out) return;
+            out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+            out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+            out.close();
+            if (out && MoveFileExW(temporary.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                LOGI("d3d12: saved %zu KB of pipelines (%u new)", bytes.size() / 1024, added);
+                return;
+            }
+        }
+        std::filesystem::remove(temporary, ec);
+    }).detach();
 }
 
 ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps) {
@@ -5053,7 +5276,7 @@ bool D3D12Backend::ResizeSwap() {
         return true;
     }
     const HRESULT hr =
-        swap_->ResizeBuffers(kFrames, w, h, SwapFormat(), tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+        swap_->ResizeBuffers(kFrames, w, h, SwapFormat(), SwapFlags());
     if (FAILED(hr)) {
         // ResizeBuffers leaves the swap chain as it was when it fails; rebuild the views so the
         // frame can continue at the previous size, and report device loss explicitly.
@@ -5162,16 +5385,31 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     float h = float(bb_h_);
     float vw = std::min(w, h * aspect);
     float vh = vw / aspect;
+    const float post = !t.picture && render_.pc_contrast ? 1.0f : 0.0f;
+    const float bloom = scene && render_.bloom ? float(render_.bloom_strength) / 100.0f : 0.0f;
+    const float dof = scene && render_.dof && dof_depth_ ? 1.0f : 0.0f;
+    BlitOptions o{.gamma = gamma_, .rtv = SwapFormat(), .post = post, .bloom = bloom, .src_w = float(t.w),
+                  .src_h = float(t.h), .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_};
+
+    // the image the blit reads: SMAA's output, else the target (resolved with MSAA)
+    ID3D12Resource* color = aa;
+    if (!color) {
+        color = ResolveColor(t);
+        if (!color) return;
+        auto& state = color == t.res.Get() ? t.state : t.resolved_state;
+        Transition(color, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    DXGI_FORMAT color_fmt = t.fmt;
+    // passes before the blit draw to their own targets; the back buffer and its viewport are set after them
+    if (bloom > 0) o.bloom_tex = BuildBloom(color, t.fmt, t.w, t.h);
+    if (scene) UpscaleAndSharpen(color, color_fmt, t.w, t.h, uint32_t(std::lround(vw)), uint32_t(std::lround(vh)));
+
+    cl_->OMSetRenderTargets(1, &frame_rtv_, FALSE, nullptr);
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
     binds_ = {};
-    const float post = !t.picture && render_.pc_contrast ? 1.0f : 0.0f;
-    const float bloom = scene && render_.bloom ? 1.0f : 0.0f;
-    const float dof = scene && render_.dof && dof_depth_ ? 1.0f : 0.0f;
-    BlitOptions o{.gamma = gamma_, .rtv = SwapFormat(), .post = post, .bloom = bloom, .src_w = float(t.w),
-                  .src_h = float(t.h), .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_};
     if (hdr_output_ != HdrOutput::Off) {
         const uint32_t reported = display_peak_nits_ ? display_peak_nits_ : 1000;
         o.hdr_mode = hdr_output_ == HdrOutput::ScRgb ? 1.0f : 2.0f;
@@ -5179,15 +5417,7 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
         o.peak = float(render_.hdr_peak ? render_.hdr_peak : reported);
         o.highlights = float(render_.hdr_highlights) / 100.0f;
     }
-    if (aa) {  // ApplySmaa left it readable
-        Blit(aa, t.fmt, uv, o);
-        return;
-    }
-    ID3D12Resource* color = ResolveColor(t);
-    if (!color) return;
-    auto& state = color == t.res.Get() ? t.state : t.resolved_state;
-    Transition(color, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Blit(color, t.fmt, uv, o);
+    Blit(color, color_fmt, uv, o);
 }
 
 bool D3D12Backend::EnsureHdrUiTarget() {
@@ -5486,6 +5716,142 @@ ID3D12Resource* D3D12Backend::ApplySmaa(Target& t) {
     return smaa_.output.res.Get();
 }
 
+// The chain's targets for a source of this size. Their views are fixed slots, so nothing in flight may still
+// reference them when they are remade: this only runs on a render scale change.
+bool D3D12Backend::EnsureBloom(uint32_t src_w, uint32_t src_h) {
+    if (bloom_.failed) return false;
+    if (bloom_.down[0].res && bloom_.src_w == src_w && bloom_.src_h == src_h) return true;
+    Flush();
+    for (auto& f : frames_)
+        if (f.fence && !WaitFence(f.fence)) return false;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    auto target = [&](SmaaTexture& tex, uint32_t w, uint32_t h, uint32_t rtv) {
+        if (tex.res) Release(std::move(tex.res));
+        D3D12_RESOURCE_DESC td = Texture2DDesc(kBloomFormat, w, h);
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        tex.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, tex.state, nullptr,
+                                                 IID_PPV_ARGS(&tex.res))))
+            return false;
+        dev_->CreateRenderTargetView(tex.res.Get(), nullptr, Cpu(rtv_heap_.Get(), rtv, rtv_inc_));
+        return true;
+    };
+    bloom_.src_w = bloom_.src_h = 0;
+    uint32_t w = src_w, h = src_h;
+    for (uint32_t i = 0; i < kBloomLevels; i++) {
+        w = std::max(1u, (w + 1) / 2);
+        h = std::max(1u, (h + 1) / 2);
+        bloom_.w[i] = w;
+        bloom_.h[i] = h;
+        if (!target(bloom_.down[i], w, h, kBloomRtv + i)) return false;
+        if (i + 1 < kBloomLevels && !target(bloom_.up[i], w, h, kBloomRtv + kBloomLevels + i)) return false;
+    }
+    bloom_.src_w = src_w;
+    bloom_.src_h = src_h;
+    LOGI("d3d12: bloom chain %ux%u to %ux%u", bloom_.w[0], bloom_.h[0], w, h);
+    return true;
+}
+
+ID3D12Resource* D3D12Backend::BuildBloom(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
+    if (!EnsureBloom(w, h)) {
+        if (!bloom_.failed) LOGE("d3d12: bloom chain targets could not be created, using the single-pass bloom");
+        bloom_.failed = true;
+        return nullptr;
+    }
+    auto rtv = [&](uint32_t index) { return Cpu(rtv_heap_.Get(), kBloomRtv + index, rtv_inc_); };
+    auto draw = [&](const char* entry, SmaaTexture& dst, uint32_t dst_rtv, uint32_t dw, uint32_t dh,
+                    ID3D12Resource* a, DXGI_FORMAT af, ID3D12Resource* b, DXGI_FORMAT bf, const float p[8]) {
+        Transition(dst.res.Get(), dst.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        ID3D12Resource* srcs[3] = {a, b, nullptr};
+        DXGI_FORMAT fmts[3] = {af, bf, kBgra};
+        Pass(kBloomHlsl, entry, kBloomFormat, rtv(dst_rtv), dw, dh, srcs, fmts, p, -1);
+        Transition(dst.res.Get(), dst.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    };
+    {
+        const float p[8] = {1.0f / float(w), 1.0f / float(h), gamma_ ? 1.0f : 0.0f, 0};
+        draw("bright", bloom_.down[0], 0, bloom_.w[0], bloom_.h[0], src, fmt, lut_.Get(), kBgra, p);
+    }
+    for (uint32_t i = 1; i < kBloomLevels; i++) {
+        const float p[8] = {1.0f / float(bloom_.w[i - 1]), 1.0f / float(bloom_.h[i - 1]), 0, 0};
+        draw("down", bloom_.down[i], i, bloom_.w[i], bloom_.h[i], bloom_.down[i - 1].res.Get(), kBloomFormat,
+             nullptr, kBgra, p);
+    }
+    // up[i] = down[i] * weight[i] + tent(the finished level i + 1); the smallest level is weighted on the way in
+    for (uint32_t i = kBloomLevels - 1; i-- > 0;) {
+        const bool smallest = i + 2 == kBloomLevels;
+        ID3D12Resource* coarse = smallest ? bloom_.down[i + 1].res.Get() : bloom_.up[i + 1].res.Get();
+        const float p[8] = {1.0f / float(bloom_.w[i + 1]), 1.0f / float(bloom_.h[i + 1]), kBloomWeights[i],
+                            smallest ? kBloomWeights[i + 1] : 1.0f};
+        draw("up", bloom_.up[i], kBloomLevels + i, bloom_.w[i], bloom_.h[i], bloom_.down[i].res.Get(), kBloomFormat,
+             coarse, kBloomFormat, p);
+    }
+    return bloom_.up[0].res.Get();
+}
+
+// FSR 1 on the finished scene (after SMAA, which works best at the render size): EASU to the output size when the
+// scene is smaller and the Upscaler setting is FSR, then RCAS. RCAS alone sharpens at the render size when only
+// Sharpening is set. The two targets' views are fixed slots, so they are remade only after the GPU is idle.
+void D3D12Backend::UpscaleAndSharpen(ID3D12Resource*& color, DXGI_FORMAT& fmt, uint32_t w, uint32_t h,
+                                     uint32_t out_w, uint32_t out_h) {
+    if (fsr_.failed || !w || !h) return;
+    const bool upscale = render_.upscaler == 1 && out_w && out_h && h < out_h;
+    if (!upscale && !render_.sharpening) return;
+    const uint32_t sw = upscale ? out_w : w, sh = upscale ? out_h : h;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    auto target = [&](SmaaTexture& tex, uint32_t tw, uint32_t th, uint32_t rtv) {
+        if (tex.res) Release(std::move(tex.res));
+        D3D12_RESOURCE_DESC td = Texture2DDesc(fmt, tw, th);
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        tex.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, tex.state, nullptr,
+                                                 IID_PPV_ARGS(&tex.res))))
+            return false;
+        dev_->CreateRenderTargetView(tex.res.Get(), nullptr, Cpu(rtv_heap_.Get(), rtv, rtv_inc_));
+        return true;
+    };
+    if (fsr_.fmt != fmt) {  // a new format makes both targets stale
+        fsr_.easu_w = fsr_.easu_h = fsr_.rcas_w = fsr_.rcas_h = 0;
+        fsr_.fmt = fmt;
+    }
+    const bool easu_ok = !upscale || (fsr_.easu.res && fsr_.easu_w == sw && fsr_.easu_h == sh);
+    const bool rcas_ok = fsr_.rcas.res && fsr_.rcas_w == sw && fsr_.rcas_h == sh;
+    if (!easu_ok || !rcas_ok) {
+        Flush();
+        for (auto& f : frames_)
+            if (f.fence && !WaitFence(f.fence)) return;
+        if (!easu_ok && !target(fsr_.easu, sw, sh, kFsrRtv)) fsr_.failed = true;
+        if (!rcas_ok && !fsr_.failed && !target(fsr_.rcas, sw, sh, kFsrRtv + 1)) fsr_.failed = true;
+        if (fsr_.failed) {
+            LOGE("d3d12: FSR 1 targets could not be created, upscaling and sharpening are off");
+            return;
+        }
+        if (!easu_ok) {
+            fsr_.easu_w = sw;
+            fsr_.easu_h = sh;
+        }
+        fsr_.rcas_w = sw;
+        fsr_.rcas_h = sh;
+        LOGI("d3d12: FSR 1 %s %ux%u to %ux%u", upscale ? "upscaling" : "sharpening", w, h, sw, sh);
+    }
+    auto rtv = [&](uint32_t index) { return Cpu(rtv_heap_.Get(), kFsrRtv + index, rtv_inc_); };
+    const float p[8] = {float(w), float(h), float(sw), float(sh), RcasStops(render_.sharpening), 0, 0, 0};
+    ID3D12Resource* src = color;
+    if (upscale) {
+        Transition(fsr_.easu.res.Get(), fsr_.easu.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        ID3D12Resource* srcs[3] = {color, nullptr, nullptr};
+        DXGI_FORMAT fmts[3] = {fmt, kBgra, kBgra};
+        Pass(FsrHlsl().c_str(), "easu", fmt, rtv(0), sw, sh, srcs, fmts, p, -1);
+        Transition(fsr_.easu.res.Get(), fsr_.easu.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        src = fsr_.easu.res.Get();
+    }
+    Transition(fsr_.rcas.res.Get(), fsr_.rcas.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12Resource* srcs[3] = {src, nullptr, nullptr};
+    DXGI_FORMAT fmts[3] = {fmt, kBgra, kBgra};
+    Pass(FsrHlsl().c_str(), "rcas", fmt, rtv(1), sw, sh, srcs, fmts, p, -1);
+    Transition(fsr_.rcas.res.Get(), fsr_.rcas.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    color = fsr_.rcas.res.Get();
+}
+
 bool D3D12Backend::EnsureAoHalf(uint32_t w, uint32_t h) {
     const uint32_t aw = render_.ao == 1 ? std::max(1u, w / 2) : std::max(1u, w);
     const uint32_t ah = render_.ao == 1 ? std::max(1u, h / 2) : std::max(1u, h);
@@ -5562,6 +5928,7 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi, ID3D12Resource* aa) {
     D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
+    frame_rtv_ = rh;
     float black[4] = {0, 0, 0, 1};
     cl_->ClearRenderTargetView(rh, black, 0, nullptr);
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
@@ -5670,7 +6037,9 @@ void LogPerf() {
              p.sig_bytes / n / 1048576.0, p.texups / n, p.texup_bytes / n / 1048576.0, p.newtex / n,
              p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
              (unsigned long long)p.shaders, (unsigned long long)p.psos, (unsigned long long)p.shader_hits);
-        LOGI("perf: pipeline creation %.3f ms/frame", p.pipeline / n);
+        LOGI("perf: pipeline creation %.3f ms/frame, %llu built, %llu from the saved library (%llu not in it)",
+             p.pipeline / n, (unsigned long long)p.psos, (unsigned long long)p.pso_loads,
+             (unsigned long long)p.pso_misses);
         g_perf = Perf{};
         perf_start = PerfClock::now();
         perf_frames = 0;
@@ -5741,11 +6110,29 @@ void D3D12Backend::Present(const Surface& front) {
     frame_++;
     ReleaseOldTextures();
     if (frame_ % 60 == 0) SweepTargets();
+    SavePipelineLibrary(false);
+    WaitFrameLatency();
     ResetFrame();
     CountFps();
     if (diag::Perf()) LogPerf();
     render_ = app::Snapshot();
     ApplySettings();  // reads render_
+}
+
+void D3D12Backend::SetFrameLatency(bool low) {
+    const uint32_t want = low ? 1 : 3;
+    if (!swap_ || want == max_latency_) return;
+    if (FAILED(swap_->SetMaximumFrameLatency(want))) return;
+    if (max_latency_) LOGR("d3d12: low latency %s (%u queued frame%s)", low ? "on" : "off", want, want == 1 ? "" : "s");
+    max_latency_ = want;
+}
+
+// Waits until the display has taken a queued frame, so the next one starts with at most max_latency_ ahead of it.
+// Bounded: a frame that never comes (a hidden window) must not stop the render thread.
+void D3D12Backend::WaitFrameLatency() {
+    if (!latency_wait_) return;
+    PerfScope perf_wait{g_perf.wait};
+    WaitForSingleObjectEx(latency_wait_, 1000, TRUE);
 }
 
 // the slot is not reused before the caller's wait: the title runs at most one present ahead
@@ -5772,6 +6159,7 @@ uint32_t D3D12Backend::SupportedMsaa(uint32_t samples) {
 
 void D3D12Backend::ApplySettings() {
     if (texturedumper::Update()) ReleasePackTextures();
+    SetFrameLatency(render_.low_latency);
     // Ambient occlusion requires the deferred scene list. Toggle it live so the F10 row
     // works without a restart.
     const bool want_defer = defer_forced_ || render_.ao != 0;
