@@ -130,6 +130,35 @@ X86_FUNC(sub_002453C0) {
     __imp__sub_002453C0(ctx, base);
 }
 
+// The sun: two additive quads about 745 units out, drawn through 0x21C800 from 0x144755 and 0x15002F with
+// no depth write, so whatever is drawn nearer hides them. The seam fix above pushes the distant city 32 times
+// further back in depth, which put it behind the sun, and the sun showed through the far buildings. With the
+// fix on, the sun gets the same scale, so the two keep the console's order.
+X86_EXTERN_FUNC(__imp__sub_0021C800);
+X86_FUNC(sub_0021C800) {
+    constexpr uint32_t kSunReturns[] = {0x0014475A, 0x00150034};
+    const uint32_t caller = X86_MEM32(ctx.esp);
+    if (std::ranges::find(kSunReturns, caller) == std::end(kSunReturns)) {
+        __imp__sub_0021C800(ctx, base);
+        return;
+    }
+    const bool enabled = [] {
+        app::SettingsLock settings_lock;
+        return app::Get().building_seam_fix;
+    }();
+    float previous = 1.0f;
+    if (enabled) {
+        std::lock_guard lock(d3d::Lock());
+        previous = d3d::State().program_depth_scale;
+        d3d::State().program_depth_scale = 1.0f / 32.0f;
+    }
+    __imp__sub_0021C800(ctx, base);
+    if (enabled) {
+        std::lock_guard lock(d3d::Lock());
+        d3d::State().program_depth_scale = previous;
+    }
+}
+
 // Comparison mode for the scene submission's distant-city pass.
 X86_EXTERN_FUNC(__imp__sub_0013F090);
 X86_FUNC(sub_0013F090) {
