@@ -357,6 +357,7 @@ struct PsoKey {
     uint32_t rtfmt = 0, dsfmt = 0;
     uint32_t samples = 1;
     uint32_t sprite = 0;  // a program's point list drawn as point sprites
+    uint32_t a2c = 0;     // alpha-tested opaque draw into a multisampled target: alpha to coverage
     bool operator==(const PsoKey&) const = default;
 };
 
@@ -775,6 +776,32 @@ private:
 
     uint32_t width_ = 0, height_ = 0;
     float scale_ = 1.0f, stretch_ = 1.0f;
+    // Depth targets the title samples as shadow maps (smaller than the frame, so never the scene's depth), by
+    // guest address: Shadow quality makes them a fixed size, one sample (as d3d12.cpp WantScale).
+    std::unordered_set<uint32_t> shadow_maps_;
+    uint32_t shadow_px_ = 0;  // Shadow quality: the shadow image's side in pixels, 0 the game's (render scale)
+    bool ShadowSized(uint32_t data) const { return shadow_px_ && shadow_maps_.count(data); }
+    uint32_t WantSamples(uint32_t data) const { return ShadowSized(data) ? 1u : msaa_; }
+    // a target's host size for its guest size: the render scale and stretch, or a shadow image's fixed size
+    void SizeTarget(Target* t, uint32_t gw, uint32_t gh) const {
+        if (ShadowSized(t->data)) {
+            const double side = double(std::max(gw, gh));
+            t->w = std::max(1u, uint32_t(std::lround(gw * shadow_px_ / side)));
+            t->h = std::max(1u, uint32_t(std::lround(gh * shadow_px_ / side)));
+            return;
+        }
+        t->w = std::max(1u, uint32_t(std::lround(double(gw) * t->scale * t->stretch)));
+        t->h = std::max(1u, uint32_t(std::lround(double(gh) * t->scale)));
+    }
+    float shadow_soft_ = 0.0f;  // console texels between the shadow image's softening taps, 0 off
+    // colour targets ever drawn with a depth buffer (reflections and the frame), which are never shadow images
+    std::unordered_set<uint32_t> depth_drawn_;
+    std::unordered_set<uint32_t> blurred_;  // offscreen images the game blurs into each other (the shadows)
+    bool NoteShadowImage(const State& s, int stage, const Target& t);
+    float WantScale(uint32_t data, bool depth) const {
+        (void)depth;
+        return ShadowSized(data) ? float(shadow_px_) : scale_;
+    }
     uint32_t max_image_side_ = 16384;
     uint32_t msaa_ = 1;
     uint32_t color_samples_ = 1, depth_samples_ = 1;
@@ -1006,6 +1033,15 @@ private:
     bool EnsureBloom(uint32_t src_w, uint32_t src_h);
     void DestroyBloomTargets();
     VkImageView BuildBloom(VkImageView src, uint32_t w, uint32_t h);
+    // the colour grading table (post_fx.h): lut.cube beside the executable, else a 2x2x2 identity
+    struct GradeLut {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        uint32_t size = 2;
+        bool loaded = false, tried = false;
+    } grade_;
+    void EnsureGradeLut();
     // FSR 1 (post_fx.h): easu is output sized, rcas whichever size it sharpened; both in the scene's format
     struct FsrState {
         SmaaImage easu, rcas;
@@ -1023,6 +1059,7 @@ private:
                                   uint32_t out_h, const app::Settings& s);
     bool dof_active_ = false;
     bool bloom_active_ = false;
+    float shadow_spacing_ = 0;  // ShadowSpacing of the setting, read once a frame
 
     // the open pass
     Target* pass_rt_ = nullptr;
@@ -2559,8 +2596,8 @@ bool VulkanBackend::CreatePresent() {
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
     if (vkCreateSampler(device_, &si, nullptr, &present_point_sampler_) != VK_SUCCESS) return false;
 
-    // 0 frame, 1 gamma ramp, 2 depth, 3 and 4 samplers, 5 the bloom chain
-    VkDescriptorSetLayoutBinding bind[6]{};
+    // 0 frame, 1 gamma ramp, 2 depth, 3 and 4 samplers, 5 the bloom chain, 6 the colour grading table
+    VkDescriptorSetLayoutBinding bind[7]{};
     for (int i = 0; i < 3; i++) {
         bind[i].binding = uint32_t(i);
         bind[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -2577,12 +2614,14 @@ bool VulkanBackend::CreatePresent() {
     bind[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     bind[5].descriptorCount = 1;
     bind[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bind[6] = bind[5];
+    bind[6].binding = 6;
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 6;
+    li.bindingCount = 7;
     li.pBindings = bind;
     if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &present_set_layout_) != VK_SUCCESS) return false;
 
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4},
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 5},
                                      {VK_DESCRIPTOR_TYPE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 1;
@@ -2598,7 +2637,7 @@ bool VulkanBackend::CreatePresent() {
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &present_set_layout_;
-    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 16};  // contrast, bloom, dof, source size, near/far, HDR, source rect
+    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 20};  // contrast, bloom, dof, source size, near/far, HDR, source rect, grading
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &push;
     if (vkCreatePipelineLayout(device_, &pl, nullptr, &present_pipeline_layout_) != VK_SUCCESS) return false;
@@ -2610,8 +2649,10 @@ bool VulkanBackend::CreatePresent() {
 [[vk::binding(3, 0)]] SamplerState frameSampler;
 [[vk::binding(4, 0)]] SamplerState depthSampler;
 [[vk::binding(5, 0)]] Texture2D<float4> bloomTex;
+[[vk::binding(6, 0)]] Texture3D<float4> gradeTex;
 // chain: the bloom chain is bound (bloomTex); without it BloomAt taps the frame
-struct PC { float pc; float bloom; float dof; float chain; float2 src; float2 zrange; float4 hdr; float4 rect; };
+// grade: x the grading table's entries a side, y its strength (0 off)
+struct PC { float pc; float bloom; float dof; float chain; float2 src; float2 zrange; float4 hdr; float4 rect; float4 grade; };
 [[vk::push_constant]] ConstantBuffer<PC> pc;
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
@@ -2684,6 +2725,12 @@ float3 BloomAt(float2 uv) {
     b += BrightAt(uv);
     return b * (1.0 / 9.0);
 }
+// how blurred a pixel is: 0 nearer than 40 units, 1 past 65
+float BlurCoef(float2 uv) {
+    float raw = saturate(depthTex.SampleLevel(depthSampler, saturate(uv), 0).r);
+    float world = pc.zrange.x * pc.zrange.y / max(pc.zrange.y - raw * (pc.zrange.y - pc.zrange.x), 1e-4);
+    return saturate((world - 40.0) / (65.0 - 40.0));
+}
 // PC distance blur: 13-tap hex blur weighted by the linearised scene depth, matching the D3D12
 // present shader. The Vulkan depth buffer keeps the guest's 0..1 convention (near 0), so no
 // reversed-Z undo is needed here.
@@ -2694,19 +2741,25 @@ float3 DistanceBlur(float2 uv, float3 color) {
         float2(1, 1.7320), float2(-1, 1.7320), float2(-2, 0),
         float2(-1, -1.7320), float2(1, -1.7320), float2(2, 0)
     };
-    float raw = saturate(depthTex.SampleLevel(depthSampler, saturate(uv), 0).r);
-    float world = pc.zrange.x * pc.zrange.y /
-                  max(pc.zrange.y - raw * (pc.zrange.y - pc.zrange.x), 1e-4);
-    float coef = saturate((world - 40.0) / (65.0 - 40.0));
+    float coef = BlurCoef(uv);
     if (coef <= 0.0) return color;
     float3 sum = 0;
     float count = 0;
     [unroll] for (int i = 0; i < 13; i++) {
-        float wgt = exp(-dot(hex[i], hex[i]) * 0.5);
-        sum += frameTex.SampleLevel(frameSampler, uv + hex[i] * pc.src * coef, 0).rgb * wgt;
+        float2 tuv = uv + hex[i] * pc.src * coef;
+        // a nearer, sharper surface counts only as far as it is blurred itself (no halo around it)
+        float tap = i == 0 ? coef : BlurCoef(tuv);
+        float wgt = exp(-dot(hex[i], hex[i]) * 0.5) * saturate(tap / coef * 2.0);
+        sum += frameTex.SampleLevel(frameSampler, tuv, 0).rgb * wgt;
         count += wgt;
     }
-    return sum / count;
+    return count > 0 ? sum / count : color;
+}
+
+float3 Grade(float3 c) {
+    if (pc.grade.y <= 0.0) return c;
+    float3 uvw = saturate(c) * ((pc.grade.x - 1) / pc.grade.x) + 0.5 / pc.grade.x;
+    return lerp(c, gradeTex.SampleLevel(frameSampler, uvw, 0).rgb, pc.grade.y);
 }
 
 // Match the PC release's tone on the finished frame (same curve as the D3D12 backend).
@@ -2740,6 +2793,7 @@ float4 psmain(O i) : SV_Target {
         float3 b = pc.bloom > 0.0 ? BloomAt(i.uv) * (1.2 * pc.bloom) : 0;
         g += b;
         if (pc.pc > 0.0) g = lerp(g, PcContrast(g), pc.pc);
+        g = Grade(g);
         float3 over = max(c.rgb + b - 1.0, 0.0);
         float3 lin = SrgbToLinear(saturate(g));
         lin = HdrHighlights(lin, pc.hdr.y, pc.hdr.z, pc.hdr.w) + over * (2.4 * pc.hdr.w);
@@ -2749,8 +2803,9 @@ float4 psmain(O i) : SV_Target {
         return float4(PqEncode(nits), c.a);
     }
     if (pc.bloom > 0.0) c.rgb += BloomAt(i.uv) * (1.2 * pc.bloom);
-    if (pc.pc > 0.0) {
-        c.rgb = PcContrast(c.rgb);
+    if (pc.pc > 0.0) c.rgb = PcContrast(c.rgb);
+    c.rgb = Grade(c.rgb);
+    if (pc.pc > 0.0 || pc.grade.y > 0.0) {
         static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
         int2 dp = int2(i.pos.xy) % 4;
         float d = (kDither[dp.y * 4 + dp.x] + 0.5) / 16.0 - 0.5;
@@ -4485,6 +4540,7 @@ bool VulkanBackend::CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderM
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VkSampleCountFlagBits(std::max(1u, k.samples));
+    ms.alphaToCoverageEnable = k.a2c ? VK_TRUE : VK_FALSE;
 
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = k.zen && k.dsfmt != 0;
@@ -4909,22 +4965,21 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
         const bool needs_upload = !depth && (DirtyEpoch(t->data) != t->epoch || t->upload_pending);
         // a target that fell back to one sample after a failed allocation waits for an MSAA
         // setting change (or a resize, below) instead of retrying on every bind
-        const bool restores_samples = t->samples != msaa_ && t->fallback_samples != msaa_;
-        const bool resized = t->scale != scale_ || t->stretch != stretch_;
+        const bool restores_samples = t->samples != WantSamples(d.data) && t->fallback_samples != WantSamples(d.data);
+        const bool resized = t->scale != WantScale(d.data, depth) || t->stretch != stretch_;
         if (resized || (restores_samples && !needs_upload)) {
             EndRecord(true);
             RetireTargetResources(t);
             if (resized) {
-                t->scale = scale_;
+                t->scale = WantScale(d.data, depth);
                 t->stretch = stretch_;
-                t->w = std::max(1u, uint32_t(std::lround(double(d.width) * t->scale * t->stretch)));
-                t->h = std::max(1u, uint32_t(std::lround(double(d.height) * t->scale)));
+                SizeTarget(t, d.width, d.height);
                 if (max_image_side_ && (t->w > max_image_side_ || t->h > max_image_side_)) {
                     t->w = std::min(t->w, max_image_side_);
                     t->h = std::min(t->h, max_image_side_);
                 }
             }
-            t->samples = msaa_;
+            t->samples = WantSamples(d.data);
             t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
             t->resolved_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             t->fb_layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -4963,10 +5018,9 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     t->guest_format = d.format;
     t->gw = d.width;
     t->gh = d.height;
-    t->scale = scale_;
+    t->scale = WantScale(d.data, depth);
     t->stretch = stretch_;
-    t->w = std::max(1u, uint32_t(std::lround(double(d.width) * t->scale * t->stretch)));
-    t->h = std::max(1u, uint32_t(std::lround(double(d.height) * t->scale)));
+    SizeTarget(t, d.width, d.height);
     if (max_image_side_ && (t->w > max_image_side_ || t->h > max_image_side_)) {
         LOGR("vulkan: host target %ux%u exceeds the device limit %u, clamping", t->w, t->h, max_image_side_);
         t->w = std::min(t->w, max_image_side_);
@@ -4979,7 +5033,7 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     t->bytes = uint8_t(std::max<uint32_t>(1u, Format(d.format).bits / 8));
     t->format = depth ? depth_format_ : VK_FORMAT_B8G8R8A8_UNORM;
 
-    t->samples = msaa_;
+    t->samples = WantSamples(d.data);
     if (!CreateTargetImages(*t)) {
         delete t;
         return nullptr;
@@ -6386,6 +6440,15 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         tex_targets[size_t(i)] = is_target ? sampled_target_ : nullptr;
         tex_reasons[size_t(i)] = tex_reason_;
         if (is_target) info[size_t(i)].flags |= kTexTarget;
+        // a depth target smaller than the frame read as a texture: a shadow map, made larger from its next use
+        if (Target* st = is_target ? sampled_target_ : nullptr; st && st->depth && (st->gw < width_ || st->gh < height_))
+            if (shadow_maps_.insert(st->data).second) LOGR("vulkan: shadow map %ux%u at %08X", st->gw, st->gh, st->data);
+        // the game's colour shadow image (d3d12.cpp NoteShadowImage): softened through spreadtap, wide < 0
+        if (Target* st = is_target ? sampled_target_ : nullptr; st && NoteShadowImage(s, i, *st) && shadow_soft_ > 0) {
+            info[size_t(i)].flags |= kTexWide;
+            wide[size_t(i)] = -shadow_soft_;
+            continue;
+        }
         // D3D12 BindTargetTexture: spread taps only when an upscaled target is shrunk into a smaller
         // one. A target read through a smaller texture view at 100% scale is not upscaled.
         if (Target* t = is_target ? sampled_target_ : nullptr; t && !t->depth && t->gw) {
@@ -6405,6 +6468,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     Target* rt = nullptr;
     Target* ds = nullptr;
     BindTargets(s, rt, ds);
+    if (rt && ds) depth_drawn_.insert(rt->data);
     if (!pass_) return;
 
     // Deferred scene display list: world draws into the full-size game view are recorded and
@@ -6555,6 +6619,14 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     k.dsfmt = ds ? uint32_t(ds->format) : 0;
     k.samples = rt ? rt->samples : ds ? ds->samples : 1;
     k.blend = SimpleState(s, kMBlendEnable) != 0;
+    // as d3d12.cpp: alpha-tested cut-outs get coverage from their alpha under MSAA, the test moves to half its
+    // reference
+    {
+        const uint32_t func = SimpleState(s, kMAlphaFunc);
+        // only into the frame: an offscreen image (road markings, shadows) is read back, where the dither shows
+        k.a2c = k.samples > 1 && rt && rt->gw >= width_ && !k.blend && SimpleState(s, kMAlphaTestEnable) &&
+                (func == 0x204 || func == 0x206);
+    }
     if (k.blend) {
         k.src = SimpleState(s, kMSrcBlend);
         k.dst = SimpleState(s, kMDestBlend);
@@ -6625,10 +6697,12 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     size.h = rt ? rt->gh : ds->gh;
     DrawConstants c;
     FillConstants(s, pk, info, prog, fixed_transform, size, c);
+    if (k.a2c) c.misc[0] *= 0.5f;  // coverage fades the edge out; the test only drops what is nearly clear
     const uint32_t host_w = rt ? rt->w : ds->w, host_h = rt ? rt->h : ds->h;
     c.tscale[0] = float(host_w) / float(std::max(1u, size.w));
     c.tscale[1] = float(host_h) / float(std::max(1u, size.h));
     c.tscale[2] = UiSqueeze(s, a, info, tex, rt);
+    c.tscale[3] = shadow_spacing_;
     // the frame's size when the draw targets the frame, for RegionClip's full-frame composites
     const bool frame = rt && rt->gw == width_ && rt->gh == height_;
     RegionClip(a, info, descs, frame ? width_ : 0, frame ? height_ : 0, c);
@@ -6642,9 +6716,14 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         const WRange r = DrawWRange(s, prog);
         if (r.near_w > 0 && r.far_w > r.near_w) scene_depth_[rt] = {dof_ds, r.near_w, r.far_w};
     }
-    c.tscale[3] = 1.0f;
     for (int i = 0; i < 4; i++)
         if ((info[size_t(i)].flags & kTexWide) && descs[size_t(i)].width && descs[size_t(i)].height) {
+            if (wide[size_t(i)] < 0) {  // a shadow image: 4x4 taps -wide console texels apart
+                c.spread[i][0] = -wide[size_t(i)] / float(descs[size_t(i)].width);
+                c.spread[i][1] = -wide[size_t(i)] / float(descs[size_t(i)].height);
+                c.spread[i][2] = 4;
+                continue;
+            }
             // D3D12 FillTexelConstants: a 3 console texel box per tap, n taps from the upscale
             const float n = std::ceil(3.0f * wide[size_t(i)] * 0.5f);
             c.spread[i][0] = 3.0f / (n * float(descs[size_t(i)].width));
@@ -7409,6 +7488,107 @@ VkImageView VulkanBackend::BuildBloom(VkImageView src, uint32_t w, uint32_t h) {
     return bloom_.up[0].view;
 }
 
+// The grading table as a 3D image, made and uploaded once on the frame's command buffer (as SMAA's lookups are).
+void VulkanBackend::EnsureGradeLut() {
+    if (grade_.tried) return;
+    grade_.tried = true;
+    const ColourLut table = LoadCubeLut(app::ExeDir() / "lut.cube");
+    const uint32_t n = table.size;
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_3D;
+    info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    info.extent = {n, n, n};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    auto fail = [&](const char* what) {
+        LOGE("vulkan: the colour grading table %s", what);
+        g_lut_loaded.store(false, std::memory_order_relaxed);
+    };
+    if (vkCreateImage(device_, &info, nullptr, &grade_.image) != VK_SUCCESS) return fail("image could not be made");
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(device_, grade_.image, &req);
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = req.size;
+    bool found = false;
+    for (uint32_t i = 0; i < mem_props_.memoryTypeCount && !found; i++)
+        if ((req.memoryTypeBits & (1u << i)) &&
+            (mem_props_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            alloc.memoryTypeIndex = i;
+            found = true;
+        }
+    if (!found || vkAllocateMemory(device_, &alloc, nullptr, &grade_.memory) != VK_SUCCESS)
+        return fail("has no memory");
+    vkBindImageMemory(device_, grade_.image, grade_.memory, 0);
+    void* cpu = nullptr;
+    const uint64_t bytes = uint64_t(n) * n * n * 16;
+    const UploadAlloc up = AllocUpload(bytes, 16, &cpu);
+    if (!cpu) return fail("could not be uploaded");
+    std::memcpy(cpu, table.rgba.data(), bytes);
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = grade_.image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = up.offset;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {n, n, n};
+    vkCmdCopyBufferToImage(cmd_, up.buffer, grade_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = grade_.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    view.format = info.format;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(device_, &view, nullptr, &grade_.view) != VK_SUCCESS) {
+        grade_.view = VK_NULL_HANDLE;
+        return fail("view could not be made");
+    }
+    grade_.size = n;
+    grade_.loaded = table.loaded;
+    g_lut_loaded.store(table.loaded, std::memory_order_relaxed);
+    if (table.loaded) LOGR("vulkan: colour grading table lut.cube, %u entries a side", n);
+}
+
+// The game's colour shadow image, as d3d12.cpp NoteShadowImage finds it: a small colour target never drawn with a
+// depth buffer, read by a depth-tested draw into the frame; a same-sized target the blur draws into from one joins
+// it. True when this read is the scene's (the one Shadow softness applies to). The draw's targets are not bound
+// yet, so they are looked up.
+bool VulkanBackend::NoteShadowImage(const State& s, int stage, const Target& t) {
+    // square and read with a projected lookup, as d3d12.cpp: not a HUD icon or the flat-read glow image
+    if (t.depth || t.gw != t.gh || t.gw < 64 || t.gw >= height_ || depth_drawn_.count(t.data)) return false;
+    const uint32_t mode = (s.rs[kRsPsTextureModes] >> (stage * 5)) & 0x1F;
+    const bool projected = s.ps ? (mode == 1 || mode == 2) : (s.tss[size_t(stage)][kTssTextureTransformFlags] & 0x100) != 0;
+    const Target* rt = s.rt.data ? TargetAt(s.rt.data, false, true) : nullptr;
+    const Target* ds = s.rs[kRsZEnable] && s.zs.data ? TargetAt(s.zs.data, true, true) : nullptr;
+    if (rt && ds && projected && rt->gw >= width_ && rt->gh >= height_) {
+        if (shadow_maps_.insert(t.data).second) LOGR("vulkan: shadow image %ux%u at %08X", t.gw, t.gh, t.data);
+        // softness only on images the game blurs (the shadows), not the road markings it projects the same way
+        return blurred_.count(t.data) != 0;
+    }
+    // a pass from one same-sized offscreen image into another: the shadow blur
+    const bool blur = rt && !ds && !rt->depth && rt != &t && rt->gw == t.gw && rt->gh == t.gh;
+    if (blur) {
+        blurred_.insert(t.data);
+        blurred_.insert(rt->data);
+    }
+    if (blur && shadow_maps_.count(t.data) && shadow_maps_.insert(rt->data).second)
+        LOGR("vulkan: shadow blur image %ux%u at %08X", rt->gw, rt->gh, rt->data);
+    return false;
+}
+
 void VulkanBackend::DestroyFsrImage(SmaaImage& image) {
     if (image.framebuffer) vkDestroyFramebuffer(device_, image.framebuffer, nullptr);
     if (image.view) vkDestroyImageView(device_, image.view, nullptr);
@@ -7646,6 +7826,9 @@ void VulkanBackend::Present(const Surface& front) {
         LOGR("linux: MSAA %ux", msaa_);
     }
     const app::Settings snapshot = app::Snapshot();
+    shadow_spacing_ = ShadowSpacing(snapshot.shadow_softness);
+    shadow_px_ = snapshot.shadow_resolution >= 2 ? 2048u : snapshot.shadow_resolution == 1 ? 1024u : 0u;
+    shadow_soft_ = snapshot.shadow_softness >= 2 ? 1.5f : snapshot.shadow_softness == 1 ? 0.75f : 0.0f;
     if (snapshot.vsync != vsync_ || snapshot.hdr != hdr_setting_) {
         vkDeviceWaitIdle(device_);
         if (!CreateSwapchain()) return;
@@ -7910,6 +8093,8 @@ void VulkanBackend::Present(const Surface& front) {
         gamma_dirty_ = false;
     }
 
+    EnsureGradeLut();  // the colour grading table, uploaded on this command buffer the first time
+
     // SMAA 1x on the finished scene, before the post chain samples it
     const bool smaa_on = snapshot.smaa && direct && ft && !ft->depth && ft->w && ft->h;
     if (smaa_on && EnsureSmaa(ft->w, ft->h, ft->format)) {
@@ -8014,13 +8199,22 @@ void VulkanBackend::Present(const Surface& front) {
     VkDescriptorImageInfo bloom_info{};
     bloom_info.imageView = bloom_view ? bloom_view : white_view_;
     bloom_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet writes[6]{};
+    VkWriteDescriptorSet writes[7]{};
     writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[5].dstSet = present_set_;
     writes[5].dstBinding = 5;
     writes[5].descriptorCount = 1;
     writes[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     writes[5].pImageInfo = &bloom_info;
+    VkDescriptorImageInfo grade_info{};
+    grade_info.imageView = grade_.view;
+    grade_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[6].dstSet = present_set_;
+    writes[6].dstBinding = 6;
+    writes[6].descriptorCount = 1;
+    writes[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[6].pImageInfo = &grade_info;
     for (int i = 0; i < 3; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = present_set_;
@@ -8037,7 +8231,7 @@ void VulkanBackend::Present(const Surface& front) {
         writes[3 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         writes[3 + i].pImageInfo = &samplers[i];
     }
-    vkUpdateDescriptorSets(device_, 6, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device_, grade_.view ? 7 : 6, writes, 0, nullptr);
 
     const bool hdr = hdr_output_ != HdrOutput::Off;
     const uint32_t reported_peak = display_peak_nits_ ? display_peak_nits_ : 1000;
@@ -8126,14 +8320,16 @@ void VulkanBackend::Present(const Surface& front) {
     }
     vkCmdSetViewport(cmd_, 0, 1, &frame_viewport);
     const bool picture = front.picture != gpu::Picture::Unknown;
-    float present_pc[16] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? float(snapshot.bloom_strength) / 100.0f : 0.0f,
+    float present_pc[20] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? float(snapshot.bloom_strength) / 100.0f : 0.0f,
                             dof_on ? 1.0f : 0.0f, bloom_view ? 1.0f : 0.0f,
                             bloom_w ? 1.0f / float(bloom_w) : 0.0f,
                             bloom_h ? 1.0f / float(bloom_h) : 0.0f,
                             dof ? dof->near_w : 0.1f, dof ? dof->far_w : 1000.0f,
                             hdr_mode, hdr_paper, hdr_peak, hdr_strength,
                             picture ? layout.uv[0] : 0.0f, picture ? layout.uv[1] : 0.0f,
-                            picture ? layout.uv[2] : 1.0f, picture ? layout.uv[3] : 1.0f};
+                            picture ? layout.uv[2] : 1.0f, picture ? layout.uv[3] : 1.0f,
+                            float(grade_.size),
+                            !picture && grade_.loaded ? float(snapshot.lut_strength) / 100.0f : 0.0f, 0.0f, 0.0f};
     vkCmdPushConstants(cmd_, present_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(present_pc),
                        present_pc);
     vkCmdDraw(cmd_, 3, 1, 0, 0);

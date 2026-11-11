@@ -92,6 +92,9 @@ void Load() {
     s.smaa = t["smaa"].value_or(s.smaa);
     s.bloom = t["bloom"].value_or(s.bloom);
     s.bloom_strength = uint32_t(std::clamp<int64_t>(t["bloom_strength"].value_or(int64_t(s.bloom_strength)), 50, 400));
+    s.shadow_resolution = uint32_t(std::clamp<int64_t>(t["shadow_resolution"].value_or(int64_t(s.shadow_resolution)), 0, 2));
+    s.shadow_softness = uint32_t(std::clamp<int64_t>(t["shadow_softness"].value_or(int64_t(s.shadow_softness)), 0, 2));
+    s.lut_strength = uint32_t(std::clamp<int64_t>(t["lut_strength"].value_or(int64_t(s.lut_strength)), 0, 100));
     s.dof = t["dof"].value_or(s.dof);
     if (t["ao"].is_boolean()) {
         s.ao = t["ao"].value_or(false) ? 2u : 0u;  // older settings stored a boolean
@@ -143,6 +146,9 @@ toml::table Table() {
                   {"smaa", s.smaa},
                   {"bloom", s.bloom},
                   {"bloom_strength", int64_t(s.bloom_strength)},
+                  {"shadow_resolution", int64_t(s.shadow_resolution)},
+                  {"shadow_softness", int64_t(s.shadow_softness)},
+                  {"lut_strength", int64_t(s.lut_strength)},
                   {"dof", s.dof},
                   {"ao", int64_t(s.ao)},
                   {"building_seam_fix", s.building_seam_fix},

@@ -40,6 +40,8 @@ enum class Option {
     BloomStrength,
     DepthOfField,
     AmbientOcclusion,
+    ShadowQuality,
+    ShadowSoftness,
     BuildingSeamFix,
     PcContrast,
     VSync,
@@ -61,7 +63,7 @@ inline constexpr Option kMainOptions[] = {
     Option::Upscaler,    Option::Sharpening,
     Option::FieldOfView, Option::ObjectDetail,     Option::Anisotropic,     Option::Msaa,
     Option::Smaa,        Option::Bloom,            Option::BloomStrength,
-    Option::DepthOfField,    Option::AmbientOcclusion,
+    Option::DepthOfField,    Option::AmbientOcclusion, Option::ShadowQuality, Option::ShadowSoftness,
     Option::BuildingSeamFix, Option::PcContrast,   Option::VSync,
 #ifdef _WIN32
     Option::LowLatency,
@@ -103,7 +105,7 @@ struct Values {
     bool bloom = true, dof = true, building_seam_fix = true, pc_contrast = true, hdr = false;
     uint32_t hdr_paper_white = 200, hdr_peak = 0, hdr_highlights = 40;  // app::Settings defaults
     uint32_t display_peak = 0; // the HDR display's reported peak in nits, 0 when unknown (read only)
-    uint32_t upscaler = 0, sharpening = 0, bloom_strength = 100;  // app::Settings defaults
+    uint32_t upscaler = 0, sharpening = 0, bloom_strength = 100, shadow_resolution = 0, shadow_softness = 0;  // app::Settings defaults
     bool low_latency = false;
 };
 
@@ -201,6 +203,12 @@ inline void Change(Values &v, Option option, int direction, std::span<const uint
     case Option::RenderScale:
         v.render_percent =
             choices::ClampRenderPercent(choices::Step(choices::kRenderPercents, v.render_percent, direction));
+        break;
+    case Option::ShadowQuality:
+        v.shadow_resolution = choices::Step(choices::kShadowLevels, v.shadow_resolution, direction);
+        break;
+    case Option::ShadowSoftness:
+        v.shadow_softness = choices::Step(choices::kShadowLevels, v.shadow_softness, direction);
         break;
     case Option::BloomStrength:
         v.bloom_strength = choices::Step(choices::kBloomStrengths, v.bloom_strength, direction);
@@ -302,6 +310,16 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
     case Option::RenderScale:
         std::snprintf(text, kTextBytes, "RENDER SCALE %u.%02uX", v.render_percent / 100, v.render_percent % 100);
         break;
+    case Option::ShadowQuality: {
+        constexpr const char *kNames[] = {"ORIGINAL", "HIGH", "ULTRA"};
+        std::snprintf(text, kTextBytes, "SHADOWS %s", kNames[v.shadow_resolution < 3 ? v.shadow_resolution : 0]);
+        break;
+    }
+    case Option::ShadowSoftness: {
+        constexpr const char *kNames[] = {"OFF", "SOFT", "SOFTER"};
+        std::snprintf(text, kTextBytes, "SOFT SHADOWS %s", kNames[v.shadow_softness < 3 ? v.shadow_softness : 0]);
+        break;
+    }
     case Option::BloomStrength:
         std::snprintf(text, kTextBytes, "BLOOM LEVEL %u", v.bloom_strength);
         break;

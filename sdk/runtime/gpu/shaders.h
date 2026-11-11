@@ -84,6 +84,9 @@ struct ShaderHooks {
 inline const ShaderHooks* g_shader_hooks = nullptr;
 inline bool g_reversed_depth = false;  // the renderer stores depth reversed: shadow compares turn r with it
 
+// the Shadow softness setting (0 off, 1 soft, 2 softer) as DrawConstants::tscale[3]
+inline float ShadowSpacing(uint32_t softness) { return softness == 1 ? 1.0f : softness >= 2 ? 1.75f : 0.0f; }
+
 // the constant buffer layout both stages share, register b1
 struct DrawConstants {
     float surf[4];      // target width, height, 1 / depth scale, 0
@@ -110,7 +113,8 @@ struct DrawConstants {
     float zclips[4];     // depth clip planes: near, far in screen z, 1 when on
     float vdef[16][4];   // vertex program inputs no stream feeds: State::vdef
     float tscale[4];     // host pixels per console pixel of the bound target along x and y; z scales screen x
-                         // about the centre (2D drawn for 16:9 on a wider frame); w unused
+                         // about the centre (2D drawn for 16:9 on a wider frame); w the shadow filter's tap
+                         // spacing in shadow map texels, 0 for the console's single compare
     float rtclip[4][4];  // per kTexTarget stage: uv min xy, max zw its reads are held to (RegionClip)
 };
 

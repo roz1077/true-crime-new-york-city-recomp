@@ -33,6 +33,9 @@ struct Settings {
     uint32_t bloom_strength = 100;    // bloom brightness, percent of the original
     bool dof = true;                  // distance blur on the finished frame
     uint32_t ao = 0;                  // ambient occlusion: 0 off, 1 half resolution, 2 full resolution
+    uint32_t shadow_resolution = 0;   // shadow maps: 0 the game's, 1 twice, 2 four times as sharp
+    uint32_t shadow_softness = 0;     // shadow edges: 0 the game's single compare, 1 soft, 2 softer
+    uint32_t lut_strength = 100;      // lut.cube colour grading strength, percent (no effect without the file)
     bool building_seam_fix = true;   // experimental priority for detailed city geometry
     uint32_t object_detail = 0;      // mesh LOD distance: 0 original, 1 high (2x), 2 very high (4x), 3 maximum
     bool pc_contrast = true;         // PC contrast curve on the finished frame

@@ -172,6 +172,8 @@ Values Current() {
     v.hdr_highlights = s.hdr_highlights;
     v.upscaler = s.upscaler;
     v.bloom_strength = s.bloom_strength;
+    v.shadow_resolution = s.shadow_resolution;
+    v.shadow_softness = s.shadow_softness;
     v.sharpening = s.sharpening;
     v.low_latency = s.low_latency;
     v.display_peak = gpu::g_hdr_display_peak_nits.load(std::memory_order_relaxed);
@@ -203,6 +205,8 @@ void Apply(const Values &v) {
     s.hdr_highlights = v.hdr_highlights;
     s.upscaler = v.upscaler;
     s.bloom_strength = v.bloom_strength;
+    s.shadow_resolution = v.shadow_resolution;
+    s.shadow_softness = v.shadow_softness;
     s.sharpening = v.sharpening;
     s.low_latency = v.low_latency;
     game::SetShowFps(v.show_fps);

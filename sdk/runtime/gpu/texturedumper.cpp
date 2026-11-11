@@ -34,6 +34,7 @@
 
 #include "app/app.h"
 #include "core/log.h"
+#include "gpu/mip_filter.h"
 #include "gpu/shaders.h"
 
 using Microsoft::WRL::ComPtr;
@@ -489,35 +490,10 @@ bool ReadPng(const fs::path& path, Image& img) {
 
 // Mipmaps
 
-// one 2x2 box of src, its far row and column clamped to the level's edge
-void AverageBox(const Level& src, uint32_t w, uint32_t h, uint32_t x, uint32_t y, uint8_t* out) {
-    const uint8_t* row0 = &src.px[size_t(y * 2) * src.pitch];
-    const uint8_t* row1 = &src.px[size_t(std::min(y * 2 + 1, h - 1)) * src.pitch];
-    uint32_t x0 = x * 2 * 4;
-    uint32_t x1 = std::min(x * 2 + 1, w - 1) * 4;
-    for (uint32_t c = 0; c < 4; c++) {
-        uint32_t sum = row0[x0 + c] + row0[x1 + c] + row1[x0 + c] + row1[x1 + c];
-        out[c] = uint8_t((sum + 2) / 4);
-    }
-}
-
-// a level with only level 0 gets a box filtered chain, so a bigger image does not shimmer at a distance
+// a level with only level 0 gets a chain (mip_filter.h), so a bigger image does not shimmer at a distance
 void AddMipmaps(Image& img) {
     if (img.levels.size() > 1 || !Uncompressed(img.format)) return;
-    uint32_t w = img.width;
-    uint32_t h = img.height;
-    while (w > 1 || h > 1) {
-        uint32_t half_w = std::max(w / 2, 1u);
-        uint32_t half_h = std::max(h / 2, 1u);
-        Level next{std::vector<uint8_t>(size_t(half_w) * half_h * 4), half_w * 4};
-        for (uint32_t y = 0; y < half_h; y++) {
-            uint8_t* row = &next.px[size_t(y) * next.pitch];
-            for (uint32_t x = 0; x < half_w; x++) AverageBox(img.levels.back(), w, h, x, y, row + x * 4);
-        }
-        img.levels.push_back(std::move(next));
-        w = half_w;
-        h = half_h;
-    }
+    mips::BuildChain(img.levels, img.width, img.height);
 }
 
 // Loading

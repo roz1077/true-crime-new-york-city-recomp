@@ -556,10 +556,26 @@ std::string ShaderHooks::Constants() const { return "    float4 ext;\n"; }
 
 std::string ShaderHooks::Shadow() const {
     std::string r = g_reversed_depth ? "1 - clamp(z, 0, mx) / mx" : "clamp(z, 0, mx) / mx";
+    // tscale.w is the shadow softness setting as a tap spacing in shadow map texels: 0 one compare (the console's),
+    // else a 3x3 grid of compares with 1-2-1 tent weights, a smooth filter about four texels wide
     return R"(// the sampler compares, a linear filter blends the four results like the console does
 float4 shadow(Texture2D<float> t, SamplerComparisonState s, float2 uv, float z, int fmt, float2 px, float2 size) {
     float mx = fmt == 2 ? 65535.0 : 16777215.0;
-    return t.SampleCmpLevelZero(s, uv, )" + r + R"().xxxx;
+    float r = )" + r + R"(;
+    float lit;
+    [branch] if (tscale.w <= 0) {
+        lit = t.SampleCmpLevelZero(s, uv, r);
+    } else {
+        uint w, h;
+        t.GetDimensions(w, h);
+        float2 d = tscale.w / float2(max(w, 1u), max(h, 1u));
+        lit = 0;
+        [unroll] for (int y = -1; y <= 1; y++)
+            [unroll] for (int x = -1; x <= 1; x++)
+                lit += t.SampleCmpLevelZero(s, uv + float2(x, y) * d, r) * ((2 - abs(x)) * (2 - abs(y)));
+        lit *= 1.0 / 16.0;
+    }
+    return lit.xxxx;
 }
 )";
 }

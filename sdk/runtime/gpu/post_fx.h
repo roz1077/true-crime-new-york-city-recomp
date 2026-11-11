@@ -4,7 +4,14 @@
 // full-screen triangle's NDC direction are the only splits. Textures t0 and t1 are bindings 2 and 3 on Vulkan,
 // samplers s0 (linear, clamped) and s1 (point) bindings 6 and 7.
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #include "../../third_party/fsr1/FsrShader.h"
 
@@ -134,6 +141,56 @@ float4 rcas(O i) : SV_Target {
 }
 )";
     return source;
+}
+
+// A colour grading look-up table: lut.cube beside the executable (the Adobe/Resolve .cube text format, a 3D table
+// of 2 to 64 entries a side, red changing fastest), applied to the finished frame in display gamma. Without the
+// file, or with one that does not parse, it is a 2x2x2 identity table and the blit leaves the colour as it is.
+struct ColourLut {
+    uint32_t size = 2;
+    std::vector<float> rgba;  // size^3 entries of 4 floats, red fastest
+    bool loaded = false;      // from a file
+};
+
+inline ColourLut IdentityLut() {
+    ColourLut l;
+    for (uint32_t b = 0; b < 2; b++)
+        for (uint32_t g = 0; g < 2; g++)
+            for (uint32_t r = 0; r < 2; r++) l.rgba.insert(l.rgba.end(), {float(r), float(g), float(b), 1.0f});
+    return l;
+}
+
+inline ColourLut LoadCubeLut(const std::filesystem::path& file) {
+    std::ifstream in(file);
+    if (!in) return IdentityLut();
+    ColourLut l;
+    l.size = 0;
+    float lo[3] = {0, 0, 0}, hi[3] = {1, 1, 1};
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream words(line);
+        std::string first;
+        words >> first;
+        if (first == "LUT_3D_SIZE") {
+            words >> l.size;
+        } else if (first == "DOMAIN_MIN") {
+            words >> lo[0] >> lo[1] >> lo[2];
+        } else if (first == "DOMAIN_MAX") {
+            words >> hi[0] >> hi[1] >> hi[2];
+        } else if (first == "TITLE" || first == "LUT_1D_SIZE" || std::isalpha(static_cast<unsigned char>(first[0]))) {
+            if (first == "LUT_1D_SIZE") return IdentityLut();  // 1D tables are not supported
+        } else {
+            std::istringstream values(line);
+            float rgb[3];
+            if (!(values >> rgb[0] >> rgb[1] >> rgb[2])) return IdentityLut();
+            for (int i = 0; i < 3; i++) l.rgba.push_back((rgb[i] - lo[i]) / std::max(hi[i] - lo[i], 1e-6f));
+            l.rgba.push_back(1.0f);
+        }
+    }
+    if (l.size < 2 || l.size > 64 || l.rgba.size() != size_t(l.size) * l.size * l.size * 4) return IdentityLut();
+    l.loaded = true;
+    return l;
 }
 
 // The Sharpening setting (percent, 1 to 100) as RCAS stops: 100% is RCAS at full strength (0 stops), each 50% less

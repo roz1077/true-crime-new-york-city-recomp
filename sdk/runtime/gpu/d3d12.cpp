@@ -163,10 +163,12 @@ bool CaptureOn() {
 }
 
 const char* kBlitHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; float4 hdr; };
+cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; float4 hdr; float4 grade; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
 Texture2D bloomTex : register(t2);
+// colour grading (post_fx.h ColourLut): grade.x entries a side, grade.y strength, 0 off
+Texture3D gradeTex : register(t4);
 // the scene depth for distance blur: multisampled with MSAA, a plain texture without (DEPTH_SINGLE)
 #ifdef DEPTH_SINGLE
 Texture2D<float> depthTex : register(t3);
@@ -259,6 +261,13 @@ float3 Bloom(float2 uv) {
     return b;
 }
 
+// how blurred a pixel is: 0 nearer than 40 units, 1 past 65
+float BlurCoef(uint2 p) {
+    float raw = 1.0 - DEPTH_LOAD(p);
+    float world = src.z * src.w / max(src.w - raw * (src.w - src.z), 1e-4);
+    return saturate((world - 40.0) / (65.0 - 40.0));
+}
+
 // PC distance blur: 13-tap hex blur weighted by the linearised scene depth. The scene depth is
 // multisampled with MSAA (sample 0) or single-sample without; undo the reversed depth before the PC linearisation.
 float3 DistanceBlur(float2 uv, float3 color) {
@@ -271,18 +280,27 @@ float3 DistanceBlur(float2 uv, float3 color) {
     uint w, h;
     DEPTH_DIMS(w, h);
     uint2 p = uint2(saturate(uv) * float2(max(w, 1) - 1, max(h, 1) - 1));
-    float raw = 1.0 - DEPTH_LOAD(p);
-    float world = src.z * src.w / max(src.w - raw * (src.w - src.z), 1e-4);
-    float coef = saturate((world - 40.0) / (65.0 - 40.0));
+    float coef = BlurCoef(p);
     if (coef <= 0.0) return color;
     float3 sum = 0;
     float count = 0;
+    float2 size = float2(max(w, 1) - 1, max(h, 1) - 1);
     [unroll] for (int i = 0; i < 13; i++) {
-        float wgt = exp(-dot(hex[i], hex[i]) * 0.5);
-        sum += img.SampleLevel(ls, uv + hex[i] * src.xy * coef, 0).rgb * wgt;
+        float2 tuv = uv + hex[i] * src.xy * coef;
+        // a tap on a nearer, sharper surface would smear it into the blurred background behind it (a halo around
+        // people and cars): it counts only as far as it is blurred itself
+        float tap = i == 0 ? coef : BlurCoef(uint2(saturate(tuv) * size));
+        float wgt = exp(-dot(hex[i], hex[i]) * 0.5) * saturate(tap / coef * 2.0);
+        sum += img.SampleLevel(ls, tuv, 0).rgb * wgt;
         count += wgt;
     }
-    return sum / count;
+    return count > 0 ? sum / count : color;
+}
+
+float3 Grade(float3 c) {
+    if (grade.y <= 0) return c;
+    float3 uvw = saturate(c) * ((grade.x - 1) / grade.x) + 0.5 / grade.x;
+    return lerp(c, gradeTex.SampleLevel(ls, uvw, 0).rgb, grade.y);
 }
 
 // Match the PC release's tone on the finished frame.
@@ -333,6 +351,7 @@ float4 psmain(O i) : SV_Target {
         float3 b = post.y > 0 ? Bloom(i.uv) * (1.2 * post.y) : 0;
         g += b;
         if (post.x > 0) g = lerp(g, PcContrast(g), post.x);
+        g = Grade(g);
         float3 over = max(c.rgb + b - 1.0, 0.0);
         float3 lin = SrgbToLinear(saturate(g));
         lin = HdrHighlights(lin, hdr.y, hdr.z, hdr.w) + over * (2.4 * hdr.w);
@@ -342,8 +361,9 @@ float4 psmain(O i) : SV_Target {
         return float4(PqEncode(nits), opts.y > 0 ? c.a : 1);
     }
     if (post.y > 0) c.rgb += Bloom(i.uv) * (1.2 * post.y);
-    if (post.x > 0) {
-        c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
+    if (post.x > 0) c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
+    c.rgb = Grade(c.rgb);
+    if (post.x > 0 || grade.y > 0) {
         // The contrast curve stretches the darkest 8-bit steps; an ordered dither breaks them up
         // before the back buffer quantises the result again.
         static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
@@ -641,6 +661,7 @@ struct PsoKey {
     float zslope;
     uint32_t rtfmt;
     uint32_t sprite;  // DrawShaders::sprite
+    uint32_t a2c;     // alpha-tested opaque draw into a multisampled target: alpha to coverage
 };
 
 // Blit's settings past the source and its rectangle
@@ -663,6 +684,7 @@ struct BlitOptions {
     float paper_white = 200;  // SDR white in nits
     float peak = 1000;        // highlight peak in nits
     float highlights = 0.4f;  // inverse tone map strength, 0..1 (app::Settings::hdr_highlights / 100)
+    float grade = 0;          // colour grading strength, 0..1, 0 off
 };
 
 // Shrink's settings past the source and the size
@@ -683,6 +705,7 @@ struct DrawTextures {
     bool rt[4] = {};            // stage samples a render target
     float k[4] = {1, 1, 1, 1};  // Extension::Sample's k
     float wide[4] = {};         // host texels per console texel of a target read into a smaller one, 0 otherwise
+    float soft[4] = {};         // a shadow image read by the scene: console texels between softening taps, 0 none
 };
 
 // what the last draw set on the command list, so the next one sets only what differs; anything else that sets them
@@ -1037,6 +1060,22 @@ private:
     Target* EnsureTarget(const Surface& s, bool depth);
     // EnsureTarget's steps, in call order
     TargetSlot FindTargetSlot(const Surface& s, bool depth, uint64_t alt);
+    // Depth targets the title samples as shadow maps (smaller than the frame, so never the scene's depth), by
+    // guest address: Shadow quality makes them a fixed size (shadow_px_), see WantScale.
+    std::unordered_set<uint32_t> shadow_maps_;
+    // colour targets ever drawn with a depth buffer (reflections and the frame), which are never shadow images
+    std::unordered_set<uint32_t> depth_drawn_;
+    std::unordered_set<uint32_t> blurred_;  // offscreen images the game blurs into each other (the shadows)
+    float shadow_soft_ = 0;  // console texels between the softening taps, 0 off
+    void NoteShadowImage(const State& s, int stage, const Target& t, DrawTextures& stages);
+    uint32_t shadow_px_ = 0;  // Shadow quality: the shadow image's side in pixels, 0 the game's (render scale)
+    // A target's size key: the render scale, or for a shadow image with Shadow quality on its fixed size in pixels
+    // (1024 or more, so never a scale), which it is made at whatever the render scale, stretch or MSAA.
+    bool ShadowSized(uint32_t data) const { return shadow_px_ && shadow_maps_.count(data); }
+    float WantScale(uint32_t data, bool depth) const {
+        (void)depth;
+        return ShadowSized(data) ? float(shadow_px_) : scale_;
+    }
     uint64_t SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const;
     bool TargetStale(uint32_t data) const;
     void ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it);
@@ -1186,6 +1225,11 @@ private:
     };
     std::vector<CapTex> cap_tex_;
     ComPtr<ID3D12Resource> lut_;
+    // the colour grading table (post_fx.h): lut.cube beside the executable, else a 2x2x2 identity
+    ComPtr<ID3D12Resource> grade_lut_;
+    uint32_t grade_size_ = 2;
+    bool grade_loaded_ = false;
+    void CreateGradeLut();
     struct SmaaTexture {
         ComPtr<ID3D12Resource> res;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -1342,6 +1386,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
                         ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
     LoadSettings();
     Begin();
+    CreateGradeLut();
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
 }
@@ -1653,6 +1698,45 @@ void D3D12Backend::CreateGammaLut() {
                                   IID_PPV_ARGS(&lut_));
 }
 
+// The grading table as a 3D texture, uploaded on the open command list at init.
+void D3D12Backend::CreateGradeLut() {
+    const ColourLut table = LoadCubeLut(app::ExeDir() / "lut.cube");
+    grade_size_ = table.size;
+    grade_loaded_ = table.loaded;
+    g_lut_loaded.store(table.loaded, std::memory_order_relaxed);
+    if (table.loaded) LOGR("d3d12: colour grading table lut.cube, %u entries a side", table.size);
+    const uint32_t n = table.size;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    td.Width = n;
+    td.Height = n;
+    td.DepthOrArraySize = UINT16(n);
+    td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.SampleDesc.Count = 1;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&grade_lut_)))) {
+        LOGE("d3d12: the colour grading table could not be created");
+        grade_loaded_ = false;
+        g_lut_loaded.store(false, std::memory_order_relaxed);
+        return;
+    }
+    const uint32_t row = n * 16, pitch = UploadPitch(row);
+    Alloc a = Upload(uint64_t(pitch) * n * n, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    if (!a.res) return;
+    for (uint32_t z = 0; z < n; z++)
+        for (uint32_t y = 0; y < n; y++)
+            std::memcpy(a.cpu + (size_t(z) * n + y) * pitch, &table.rgba[(size_t(z) * n + y) * n * 4], row);
+    D3D12_TEXTURE_COPY_LOCATION dl{grade_lut_.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION sl{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    sl.PlacedFootprint.Offset = a.off;
+    sl.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, n, n, n, pitch};
+    cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+    Transition(grade_lut_.Get(), state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
 void D3D12Backend::LoadSettings() {
     requested_msaa_ = app::MsaaSamples();
     msaa_ = SupportedMsaa(requested_msaa_);
@@ -1884,13 +1968,22 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator 
 
 // the host texture of a new target, at render scale or the extension's
 bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
-    float sc = scale_;
+    float sc = WantScale(t.data, t.depth);
     t.want_samples = msaa_;
-    t.want_scale = scale_;
+    t.want_scale = sc;
     t.want_stretch = stretch_;
     if (ext_) ext_->MakeTarget(s, t.depth, t.gw, t.gh, sc, t.fmt);
-    t.w = std::max(1u, uint32_t(std::lround(t.gw * sc * stretch_)));
-    t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
+    // a shadow image at Shadow quality: square pixels at a fixed size, one sample (the game blurs it anyway)
+    const bool shadow = ShadowSized(t.data);
+    const uint32_t samples = shadow ? 0 : msaa_;
+    if (shadow) {
+        const float side = float(std::max(t.gw, t.gh));
+        t.w = std::max(1u, uint32_t(std::lround(t.gw * float(shadow_px_) / side)));
+        t.h = std::max(1u, uint32_t(std::lround(t.gh * float(shadow_px_) / side)));
+    } else {
+        t.w = std::max(1u, uint32_t(std::lround(t.gw * sc * stretch_)));
+        t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
+    }
     if (t.w > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || t.h > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
         LOGE("d3d12: requested render target is too large: %ux%u", t.w, t.h);
         return false;
@@ -1911,12 +2004,12 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
         cv.Format = td.Format;
         t.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
-    if (msaa_) {
-        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{cv.Format, msaa_};
+    if (samples) {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{cv.Format, samples};
         HRESULT msaa_hr = E_FAIL;
         if (SUCCEEDED(dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
                                                sizeof(levels))) && levels.NumQualityLevels) {
-            td.SampleDesc.Count = msaa_;
+            td.SampleDesc.Count = samples;
             msaa_hr = dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.state, &cv,
                                                     IID_PPV_ARGS(&t.res));
             if (SUCCEEDED(msaa_hr)) {
@@ -2010,7 +2103,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
         Target& t = slot.it->second;
         // Targets that are only sampled keep their contents across a settings change; one that is
         // drawn into again is rebuilt when its MSAA/scale no longer match.
-        if (t.want_samples == msaa_ && t.want_scale == scale_ && t.want_stretch == stretch_)
+        if (t.want_samples == msaa_ && t.want_scale == WantScale(slot.data, depth) && t.want_stretch == stretch_)
             return &t;
         ReleaseTarget(slot.it);
     } else if (slot.it != targets_.end()) {
@@ -2020,6 +2113,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     t.depth = depth;
     t.gw = slot.gw;
     t.gh = slot.gh;
+    t.data = slot.data;  // CreateTargetResource picks a shadow map's scale by it
     if (!CreateTargetResource(t, s)) return nullptr;
     g_perf.targets++;
     // an empty pool drops the new resource with t
@@ -2053,6 +2147,7 @@ bool D3D12Backend::BindTargets(const State& s) {
                      rt->res->GetDesc().SampleDesc.Count != ds->res->GetDesc().SampleDesc.Count))
         ds = nullptr;
     if (!rt && !ds) return false;
+    if (rt && ds) depth_drawn_.insert(rt->data);
     if (rt) {
         if (LatchCpuWrite(*rt)) UploadTarget(*rt, s.rt);
         Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -2279,7 +2374,7 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     // DEPTH_SINGLE variant's Texture2D view
     ID3D12Resource* depth = o.depth;
     const bool depth_single = depth && depth->GetDesc().SampleDesc.Count == 1;
-    uint32_t slot = AllocSrvSlots(4);
+    uint32_t slot = AllocSrvSlots(5);  // t0-t3, then the grading table
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -2296,14 +2391,24 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     if (depth_single) sv.Texture2D.MipLevels = 1;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     dev_->CreateShaderResourceView(depth, &sv, Cpu(srv_heap_.Get(), slot + 3, srv_inc_));
+    // the grading table at t4, the root slot AO's occlusion uses during the scene (the deferred flush sets it again)
+    const uint32_t grade_slot = slot + 4;
+    sv = {};
+    sv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    sv.Texture3D.MipLevels = 1;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    dev_->CreateShaderResourceView(grade_lut_.Get(), &sv, Cpu(srv_heap_.Get(), grade_slot, srv_inc_));
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
     if (!cb.res) return;
-    float c[20] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
+    Cmd()->SetGraphicsRootDescriptorTable(4, Gpu(srv_heap_.Get(), grade_slot, srv_inc_));
+    float c[24] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                    o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
                    o.post, o.bloom, depth ? o.dof : 0.0f, o.bloom_tex ? (BloomView() ? 2.0f : 1.0f) : 0.0f,
                    o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z,
-                   o.hdr_mode, o.paper_white, o.peak, o.highlights};
+                   o.hdr_mode, o.paper_white, o.peak, o.highlights,
+                   float(grade_size_), o.grade, 0.0f, 0.0f};
     std::memcpy(cb.cpu, c, sizeof(c));
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples, depth_single), cb.gpu, slot, si);
 }
@@ -2639,6 +2744,7 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     b.BlendOpAlpha = BlendOp(k.op);
     b.RenderTargetWriteMask = UINT8(k.wmask);
     d.SampleMask = UINT_MAX;
+    d.BlendState.AlphaToCoverageEnable = k.a2c ? TRUE : FALSE;
     d.RasterizerState.FillMode = k.fill == kFillWireframe ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
     d.RasterizerState.CullMode = k.cull ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
     d.RasterizerState.FrontCounterClockwise = k.ccw;
@@ -2955,6 +3061,45 @@ TexKind TextureKind(const TextureDesc& d) {
 
 constexpr float kUpscaledMin = 1.01f;  // host texels per console texel past rounding: the target is upscaled
 
+// the stage reads its texture with a projected lookup: a pixel shader stage mode project2d or project3d, or
+// fixed-function D3DTTFF_PROJECTED
+bool ProjectedLookup(const State& s, int stage) {
+    if (s.ps) {
+        const uint32_t m = (s.rs[kRsPsTextureModes] >> (stage * 5)) & 0x1F;
+        return m == 1 || m == 2;
+    }
+    return (s.tss[size_t(stage)][kTssTextureTransformFlags] & 0x100) != 0;
+}
+
+// The game's shadows are a small colour image (256x256): silhouettes drawn in grey without a depth buffer, blurred
+// back and forth with a second image of its size, then projected onto the world by the 3D scene draws, which test
+// depth. A colour target smaller than the frame, never drawn with a depth buffer (unlike the reflection image),
+// read by a depth-tested draw into the frame (unlike the glow composite, which tests no depth) is one; so is a small
+// target the blur draws into from one. Shadow quality makes them larger (WantScale) from their next use; Shadow
+// softness has the scene read them through a grid of taps (spreadtap).
+void D3D12Backend::NoteShadowImage(const State& s, int stage, const Target& t, DrawTextures& stages) {
+    // square (the shadow image is 256x256; HUD icons and other small targets are not), and read in the scene with a
+    // projected lookup (the glow image, also 256x256, is read flat)
+    if (t.depth || t.gw != t.gh || t.gw < 64 || t.gw >= guest_h_ || depth_drawn_.count(t.data)) return;
+    const bool scene_read = draw_rt_ && draw_ds_ && s.rs[kRsZEnable] && draw_rt_->gw >= guest_w_ &&
+                            draw_rt_->gh >= guest_h_ && ProjectedLookup(s, stage);
+    if (scene_read) {
+        if (shadow_maps_.insert(t.data).second) LOGR("d3d12: shadow image %ux%u at %08X", t.gw, t.gh, t.data);
+        // softness only on images the game blurs (the shadows), not the road markings it projects the same way
+        if (shadow_soft_ > 0 && t.gw && blurred_.count(t.data)) stages.soft[stage] = shadow_soft_;
+        return;
+    }
+    // a pass from one same-sized offscreen image into another: the shadow blur
+    const bool blur = draw_rt_ && !draw_ds_ && !draw_rt_->depth && draw_rt_ != &t && draw_rt_->gw == t.gw &&
+                      draw_rt_->gh == t.gh;
+    if (blur) {
+        blurred_.insert(t.data);
+        blurred_.insert(draw_rt_->data);
+    }
+    if (blur && shadow_maps_.count(t.data) && shadow_maps_.insert(draw_rt_->data).second)
+        LOGR("d3d12: shadow blur image %ux%u at %08X", draw_rt_->gw, draw_rt_->gh, draw_rt_->data);
+}
+
 ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const TextureDesc& d, Target& t, bool box,
                                                 DrawTextures& stages) {
     TexInfo& info = stages.info[stage];
@@ -2970,6 +3115,7 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
             DeferredFallback("scene target sampled after a deferred draw");
         }
     }
+    NoteShadowImage(s, stage, t, stages);
     bool feedback = &t == draw_rt_;
     stages.rt[stage] = true;
     info.flags |= kTexTarget;
@@ -2982,13 +3128,19 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     // a pass shrinking it averages each tap over a console texel, else upscaled taps skip texels and ghost
     Target* rt = FindTarget(s.rt, false);
     float k = float(t.w) / (t.gw * stages.k[stage]);
-    if (!t.depth && box && k > kUpscaledMin && rt && rt != &t && (t.gw > rt->gw || t.gh > rt->gh)) {
+    if (stages.soft[stage] > 0) info.flags |= kTexWide;  // the shadow image through spreadtap
+    else if (!t.depth && box && k > kUpscaledMin && rt && rt != &t && (t.gw > rt->gw || t.gh > rt->gh)) {
         stages.wide[stage] = k;
         info.flags |= kTexWide;
     }
     if (ext_) ext_->Sampled(d, &t, 0, info);
     sv.Format = t.depth ? kDepthRead : t.fmt;
-    if (t.depth) info.shadow = ShadowDepthKind(d.format);
+    if (t.depth) {
+        info.shadow = ShadowDepthKind(d.format);
+        // a depth target smaller than the frame read as a texture: a shadow map, made larger from its next use
+        if ((t.gw < guest_w_ || t.gh < guest_h_) && shadow_maps_.insert(t.data).second)
+            LOGR("d3d12: shadow map %ux%u at %08X", t.gw, t.gh, t.data);
+    }
     if (t.res->GetDesc().SampleDesc.Count > 1) {
         ID3D12Resource* resolved = t.depth ? ResolveDepth(t) : ResolveColor(t);
         if (t.depth) sv.Format = DXGI_FORMAT_R32_FLOAT;
@@ -3499,6 +3651,11 @@ void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
     k.samples = target ? target->res->GetDesc().SampleDesc.Count : 1;
     k.rtfmt = bound_rt_ ? bound_rt_->fmt : 0;
     KeyBlend(s, k);
+    // alpha-tested cut-outs (fences, leaves, wires) get coverage from their alpha under MSAA, so their edges are
+    // smoothed like geometry edges; the test itself moves to half its reference (UploadConstants)
+    k.a2c = k.samples > 1 && k.has_rt && !k.blend && SimpleState(s, kMAlphaTestEnable) && bound_rt_->gw >= guest_w_ &&
+            (Cmp(SimpleState(s, kMAlphaFunc)) == D3D12_COMPARISON_FUNC_GREATER ||
+             Cmp(SimpleState(s, kMAlphaFunc)) == D3D12_COMPARISON_FUNC_GREATER_EQUAL);
     if (k.has_ds) KeyDepthStencil(s, a, k);
     KeyRasterizer(s, a, k);
 }
@@ -3560,6 +3717,12 @@ void D3D12Backend::FillTexelConstants(int i, const TextureDesc& d, const DrawTex
     c.texsize[i][0] = float(d.width);
     c.texsize[i][1] = float(d.height);
     if (!stages.rt[i]) return;
+    if (stages.soft[i] > 0) {  // 4x4 taps soft_ console texels apart
+        c.spread[i][0] = stages.soft[i] / float(d.width);
+        c.spread[i][1] = stages.soft[i] / float(d.height);
+        c.spread[i][2] = 4;
+        return;
+    }
     float k = stages.k[i];
     // a 3 console texel box per tap keeps the console chain's glow width and brightness
     if (stages.wide[i] > 0) {
@@ -3771,6 +3934,7 @@ bool D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     uint8_t* vsc = same ? nullptr : UploadVertexConstants(s);
     if (!same && !vsc) return false;
     FillSurfaceConstants(s, size, c);
+    if (k.a2c) c.misc[0] *= 0.5f;  // coverage fades the edge out; the test only drops what is nearly clear
     // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
     if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
     // lines: negative, half a pixel onto the host's pixel centers (the vertex epilogue), widened by LineHlsl
@@ -4461,6 +4625,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     c.tscale[0] = TargetScale();
     c.tscale[1] = TargetScaleY();
     c.tscale[2] = UiSqueeze(s, a, stages);
+    c.tscale[3] = ShadowSpacing(render_.shadow_softness);
     // the frame's size when the draw targets the frame, for RegionClip's full-frame composites
     const bool frame = bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_;
     RegionClip(a, stages, frame ? guest_w_ : 0, frame ? guest_h_ : 0, c);
@@ -5388,8 +5553,10 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     const float post = !t.picture && render_.pc_contrast ? 1.0f : 0.0f;
     const float bloom = scene && render_.bloom ? float(render_.bloom_strength) / 100.0f : 0.0f;
     const float dof = scene && render_.dof && dof_depth_ ? 1.0f : 0.0f;
+    const float grade = !t.picture && grade_loaded_ ? float(render_.lut_strength) / 100.0f : 0.0f;
     BlitOptions o{.gamma = gamma_, .rtv = SwapFormat(), .post = post, .bloom = bloom, .src_w = float(t.w),
-                  .src_h = float(t.h), .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_};
+                  .src_h = float(t.h), .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_,
+                  .grade = grade};
 
     // the image the blit reads: SMAA's output, else the target (resolved with MSAA)
     ID3D12Resource* color = aa;
@@ -6160,6 +6327,8 @@ uint32_t D3D12Backend::SupportedMsaa(uint32_t samples) {
 void D3D12Backend::ApplySettings() {
     if (texturedumper::Update()) ReleasePackTextures();
     SetFrameLatency(render_.low_latency);
+    shadow_px_ = render_.shadow_resolution >= 2 ? 2048u : render_.shadow_resolution == 1 ? 1024u : 0u;
+    shadow_soft_ = render_.shadow_softness >= 2 ? 1.5f : render_.shadow_softness == 1 ? 0.75f : 0.0f;
     // Ambient occlusion requires the deferred scene list. Toggle it live so the F10 row
     // works without a restart.
     const bool want_defer = defer_forced_ || render_.ao != 0;

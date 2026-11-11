@@ -86,8 +86,11 @@ enum class Row {
     BloomStrength,
     DepthOfField,
     AmbientOcclusion,
+    ShadowQuality,
+    ShadowSoftness,
     BuildingSeamFix,
     PcContrast,
+    ColourGrading,
     Hdr,
     HdrPaperWhite,
     HdrPeak,
@@ -118,8 +121,11 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::BloomStrength,
                          Row::DepthOfField,
                          Row::AmbientOcclusion,
+                         Row::ShadowQuality,
+                         Row::ShadowSoftness,
                          Row::BuildingSeamFix,
                          Row::PcContrast,
+                         Row::ColourGrading,
                          Row::Hdr,
                          Row::HdrPaperWhite,
                          Row::HdrPeak,
@@ -289,6 +295,9 @@ void RestoreDefaults() {
     s.smaa = d.smaa;
     s.bloom = d.bloom;
     s.bloom_strength = d.bloom_strength;
+    s.shadow_resolution = d.shadow_resolution;
+    s.shadow_softness = d.shadow_softness;
+    s.lut_strength = d.lut_strength;
     s.dof = d.dof;
     s.ao = d.ao;
     s.building_seam_fix = d.building_seam_fix;
@@ -314,6 +323,9 @@ Kind KindOf(Row row) {
     case Row::Resolution:
     case Row::AspectRatio:
     case Row::RenderScale:
+    case Row::ShadowQuality:
+    case Row::ShadowSoftness:
+    case Row::ColourGrading:
     case Row::BloomStrength:
     case Row::Upscaler:
     case Row::Sharpening:
@@ -352,6 +364,7 @@ bool Enabled(Row row) {
     // FSR 1 only upscales; at 100% and above there is nothing for it to do (Sharpening still works)
     if (row == Row::Upscaler) return app::Get().render_percent < 100;
     if (row == Row::BloomStrength) return app::Get().bloom;
+    if (row == Row::ColourGrading) return gpu::g_lut_loaded.load(std::memory_order_relaxed);
 #ifndef _WIN32
     if (row == Row::LowLatency) return false;  // Direct3D 12 only
 #endif
@@ -402,6 +415,12 @@ const char *Label(Row row) {
         return "HDR peak brightness";
     case Row::HdrHighlights:
         return "HDR highlights";
+    case Row::ShadowQuality:
+        return "Shadow quality";
+    case Row::ShadowSoftness:
+        return "Shadow softness";
+    case Row::ColourGrading:
+        return "Colour grading";
     case Row::BloomStrength:
         return "Bloom strength";
     case Row::Upscaler:
@@ -499,6 +518,15 @@ const char *Help(Row row) {
         return "Peak highlight brightness. Display uses the panel's reported peak; otherwise 1000 nits.";
     case Row::HdrHighlights:
         return "How far bright neon, lamps and headlights are pushed above paper white.";
+    case Row::ShadowQuality:
+        return "Resolution of the shadow image. Original follows Render scale; High and Ultra draw it at 1024 and 2048 "
+               "pixels a side.";
+    case Row::ShadowSoftness:
+        return "Filters shadow edges. Off is the game's hard edge; Soft and Softer blur it over more of the shadow map.";
+    case Row::ColourGrading:
+        return gpu::g_lut_loaded.load(std::memory_order_relaxed)
+                   ? "Strength of the colour grading table lut.cube beside the executable."
+                   : "Put a colour grading table named lut.cube beside the executable and restart to use it.";
     case Row::BloomStrength:
         return "How bright the bloom glow is. 100% is the original, very subtle look.";
     case Row::Upscaler:
@@ -619,6 +647,18 @@ std::string Value(Row row) {
     case Row::HdrHighlights:
         std::snprintf(text, sizeof(text), "%u%%", s.hdr_highlights);
         return text;
+    case Row::ShadowQuality: {
+        constexpr const char *kNames[] = {"Original", "High (1024)", "Ultra (2048)"};
+        return kNames[std::min<uint32_t>(s.shadow_resolution, 2)];
+    }
+    case Row::ShadowSoftness: {
+        constexpr const char *kNames[] = {"Off", "Soft", "Softer"};
+        return kNames[std::min<uint32_t>(s.shadow_softness, 2)];
+    }
+    case Row::ColourGrading:
+        if (!gpu::g_lut_loaded.load(std::memory_order_relaxed)) return "No lut.cube";
+        std::snprintf(text, sizeof(text), "%u%%", s.lut_strength);
+        return text;
     case Row::BloomStrength:
         std::snprintf(text, sizeof(text), "%u%%", s.bloom_strength);
         return text;
@@ -688,6 +728,15 @@ bool Change(Row row, int direction) {
     case Row::ObjectDetail:
         // read by the LOD hooks on the game thread: a single aligned 32-bit store
         changed = set(s.object_detail, choices::Step(choices::kObjectDetails, s.object_detail, direction));
+        break;
+    case Row::ShadowQuality:
+        changed = set(s.shadow_resolution, choices::Step(choices::kShadowLevels, s.shadow_resolution, direction));
+        break;
+    case Row::ShadowSoftness:
+        changed = set(s.shadow_softness, choices::Step(choices::kShadowLevels, s.shadow_softness, direction));
+        break;
+    case Row::ColourGrading:
+        changed = set(s.lut_strength, choices::Step(choices::kLutStrengths, s.lut_strength, direction));
         break;
     case Row::BloomStrength:
         changed = set(s.bloom_strength, choices::Step(choices::kBloomStrengths, s.bloom_strength, direction));

@@ -14,6 +14,17 @@
   pixel: cheaper at high resolutions and smoother, without the faint eight-way star. Same
   threshold and overall brightness; the glow spreads somewhat wider than before. A new Bloom
   strength setting (50% to 400%, F10 and the Display tab) makes it brighter; 100% is the original look.
+- Shadow quality (Original, High 2x, Ultra 4x): the game's 256x256 shadow image (silhouettes the
+  game blurs and projects onto the world) is drawn at a fixed 1024 or 2048 pixels a side, without
+  MSAA, instead of at the render scale. Shadow softness (Off, Soft, Softer) reads it through a 4x4 grid of taps for wider, smoother
+  edges. Both off by default.
+- With MSAA on, alpha-tested cut-outs (fences, leaves, wires) get alpha to coverage, so their edges
+  are smoothed like geometry edges.
+- Texture packs: generated mipmaps average in linear light (distant bright detail no longer
+  darkens) and keep the coverage of cut-out textures, so fences and leaves do not thin out.
+- Colour grading: a `lut.cube` table beside the executable grades the 3D frame; its strength is in
+  F10 (Colour grading).
+- Depth of field no longer smears sharp nearer objects into the blurred background behind them.
 - AMD FSR 1 upscaling (Upscaler: Bilinear or AMD FSR 1) when Render scale is below 100%, and
   RCAS sharpening (Sharpening: Off to 100%) of the 3D frame at any render scale. The HUD,
   movies and still pictures are not sharpened. Windows and Linux.

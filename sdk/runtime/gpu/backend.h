@@ -79,5 +79,7 @@ inline std::atomic<uint32_t> g_hdr_display_peak_nits{0};
 // Set by the window thread on WM_DISPLAYCHANGE (an HDR toggle in Windows, a display added or
 // removed); the renderer re-reads the display's HDR capability once and clears it.
 inline std::atomic<bool> g_display_changed{false};
+// lut.cube (a colour grading table) was found and loaded; the Graphics menu shows its strength row
+inline std::atomic<bool> g_lut_loaded{false};
 
 }  // namespace gpu
