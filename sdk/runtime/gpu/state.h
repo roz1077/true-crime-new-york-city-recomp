@@ -213,6 +213,7 @@ struct State {
     float zclip[2] = {0, 0};
     uint32_t zclip_on = 0;
     float program_depth_scale = 1; // host Z-buffer scale after guest vertex-program clipping
+    bool fog_full = false;         // a title hook's request: fogged draws come out entirely in the fog colour
     // the current vertex attribute when no stream feeds it, including SetVertexData inside begin/end
     // (vertex colour starts white, the rest 0 0 0 1)
     float vdef[16][4] = {{0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {1, 1, 1, 1}, {0, 0, 0, 1}, {0, 0, 0, 1},

@@ -3290,6 +3290,13 @@ constexpr float kFogTableLinear = 3.0f;
 // table mode none under a vertex program: oFog is the blend factor, passed on as linear fog from 1 to 0
 void FillFogConstants(const State& s, bool vertex_program, DrawConstants& c) {
     if (!s.rs[kRsFogEnable]) return;
+    if (s.fog_full) {  // linear fog whose range lies far below any fog value: the factor saturates to 0
+        c.fog[0] = -2e9f;
+        c.fog[1] = -1e9f;
+        c.fog[2] = 0.0f;
+        c.fog[3] = kFogTableLinear;
+        return;
+    }
     if (vertex_program && s.rs[kRsFogTableMode] == kFogTableNone) {
         c.fog[0] = 1.0f;
         c.fog[1] = 0.0f;

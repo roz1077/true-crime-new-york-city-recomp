@@ -159,6 +159,26 @@ X86_FUNC(sub_0021C800) {
     }
 }
 
+// The distant city's skyline: a strip of building cut-outs drawn by 0x13C390 from 0x13F2BB, inside the
+// distant-city pass. Its texture is plain white and the game's fog leaves it nearly unfogged, so on the console
+// too it stands out as a white silhouette between the buildings. Drawn entirely in the fog colour, it reads as
+// far-off city in the haze; its cut-out alpha is kept. (Left out, the sky's bare horizon band shows instead.)
+X86_EXTERN_FUNC(__imp__sub_0013C390);
+X86_FUNC(sub_0013C390) {
+    constexpr uint32_t kSkylineReturn = 0x0013F2BB;
+    if (X86_MEM32(ctx.esp) != kSkylineReturn) {
+        __imp__sub_0013C390(ctx, base);
+        return;
+    }
+    {
+        std::lock_guard lock(d3d::Lock());
+        d3d::State().fog_full = true;
+    }
+    __imp__sub_0013C390(ctx, base);
+    std::lock_guard lock(d3d::Lock());
+    d3d::State().fog_full = false;
+}
+
 // Comparison mode for the scene submission's distant-city pass.
 X86_EXTERN_FUNC(__imp__sub_0013F090);
 X86_FUNC(sub_0013F090) {

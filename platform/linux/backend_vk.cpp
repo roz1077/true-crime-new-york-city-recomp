@@ -5893,7 +5893,11 @@ void VulkanBackend::FillConstants(const State& s, const PixelKey& pk, const std:
     c.surf[1] = float(size.h);
     c.surf[2] = 1.0f / s.zscale;
     if (s.rs[kRsFogEnable]) {
-        if (prog && s.rs[kRsFogTableMode] == kFogTableNone) {
+        if (s.fog_full) {  // linear fog whose range lies far below any fog value: the factor saturates to 0
+            c.fog[0] = -2e9f;
+            c.fog[1] = -1e9f;
+            c.fog[3] = kFogTableLinear;
+        } else if (prog && s.rs[kRsFogTableMode] == kFogTableNone) {
             c.fog[0] = 1.0f;
             c.fog[3] = kFogTableLinear;
         } else {
