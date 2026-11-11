@@ -35,6 +35,7 @@ struct PixelKey {
     uint32_t quad = 0;       // a screen quad: QuadHlsl
     uint32_t alphatest = 0;  // alpha test on: only then may the shader discard, which turns off early depth tests
     uint32_t ao = 0;         // scene AO: 1 scale by 1 - the occlusion at t4, 3 write view distance (prepass)
+    uint32_t motion = 0;     // TAA: also write the pixel's motion to SV_Target1 (uv to the previous frame)
     bool operator==(const PixelKey& o) const;
 };
 
@@ -44,7 +45,8 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]);
 
 // vertex program microcode to HLSL, regs is the bit mask of v registers the draw supplies
 // decode: VertexDecode per register, 4 bits each, for elements the input assembler hands over raw
-std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t regs, uint64_t decode = 0);
+// prev: also run the program on the previous frame's constants (cp, register b2) for TAA's motion (HAS_PREV)
+std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t regs, uint64_t decode = 0, bool prev = false);
 // the program reads c-37, the viewport offset that carries the XDK's half pixel screen space offset
 bool ReadsViewportOffset(const std::vector<uint32_t>& program);
 // fixed function vertex state a shader is built for

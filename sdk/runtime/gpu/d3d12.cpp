@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <map>
 #include <optional>
 #include <thread>
 #include <unordered_map>
@@ -89,6 +90,12 @@ constexpr DXGI_FORMAT kBloomFormat = DXGI_FORMAT_R11G11B10_FLOAT;
 // after bloom: FSR 1's upscaled image (EASU) and its sharpened one (RCAS)
 constexpr uint32_t kFsrRtvs = 2;
 constexpr uint32_t kFsrRtv = kBloomRtv + kBloomRtvs;
+// after FSR: the TAA history pair (one read, one written each frame)
+constexpr uint32_t kTaaRtvs = 2;
+constexpr uint32_t kTaaRtv = kFsrRtv + kFsrRtvs;
+// after TAA: the motion target drawn beside the scene (uv to the previous frame; 60000: none)
+constexpr uint32_t kMotionRtv = kTaaRtv + kTaaRtvs;
+constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16_FLOAT;
 // The AO prepass writes each pixel's view distance (clip w) here, so AO never has to turn
 // hyperbolic depth back into distance with a guessed near/far: most draws are vertex programs
 // whose projection the port cannot see, and a wrong guess bent flat surfaces into stripes.
@@ -149,6 +156,15 @@ struct PerfScope {
         if (on) acc += PerfMs(t);
     }
 };
+
+// TCNYC_TAA_VIEW=1 or 2 shows TAA's motion instead of the picture (a tuning aid; kTaaHlsl)
+int TaaView() {
+    static const int view = [] {
+        const char* e = std::getenv("TCNYC_TAA_VIEW");
+        return e ? std::atoi(e) : 0;
+    }();
+    return view;
+}
 
 // TCNYC_BLOOM_VIEW=1 shows only the bloom chain's output, ten times brighter (a tuning aid)
 bool BloomView() {
@@ -662,6 +678,7 @@ struct PsoKey {
     uint32_t rtfmt;
     uint32_t sprite;  // DrawShaders::sprite
     uint32_t a2c;     // alpha-tested opaque draw into a multisampled target: alpha to coverage
+    uint32_t motion;  // TAA: the motion target is bound beside the colour: 1 masked off, 2 written (R16G16F)
 };
 
 // Blit's settings past the source and its rectangle
@@ -737,6 +754,7 @@ struct DrawShaders {
     bool quad = false;
     bool fixed_transform = false;  // fixed function on untransformed vertices: the shader reads matrices and lights
     bool sprite = false;           // a program's points drawn as point sprites (SpriteHlsl)
+    bool motion = false;           // TAA: the program also runs on the matched previous constants (HAS_PREV)
     FixedKey fk;
     uint64_t vkey = 0;
     uint64_t vh = 0;
@@ -910,6 +928,10 @@ private:
     void Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh, uint32_t w,
               uint32_t h, ID3D12Resource* const src[3], const DXGI_FORMAT fmt[3], const float p[8],
               float blend) override;
+    // Pass with count floats of constants (up to 64) instead of 8
+    void PassN(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh, uint32_t w,
+               uint32_t h, ID3D12Resource* const src[3], const DXGI_FORMAT fmt[3], const float* p, uint32_t count,
+               float blend, ID3D12Resource* src4 = nullptr, DXGI_FORMAT fmt4 = DXGI_FORMAT_UNKNOWN);
     ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* entry, DXGI_FORMAT rtv, float blend);
     // Draw, in call order, each callee right after its caller
     bool DepthCopy(const State& s);
@@ -1253,6 +1275,34 @@ private:
         bool failed = false;
     } fsr_;
     D3D12_CPU_DESCRIPTOR_HANDLE frame_rtv_{};  // the back buffer view DrawFrame draws into
+    // TAA (experimental): this frame's jitter in host pixels, the history pair, and the camera it was drawn with
+    float taa_jitter_[2] = {};
+    struct Taa {
+        SmaaTexture history[2];
+        uint32_t w = 0, h = 0, next = 0;  // history[next] is written this frame
+        DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+        CameraFrame camera;               // the previous frame's
+        bool valid = false;               // the history holds a frame
+        bool failed = false;
+    } taa_;
+    ID3D12Resource* ApplyTaa(Target& t);
+    // TAA object motion: a motion target beside the frame's scene target, written by program draws matched to the
+    // same draw in the previous frame, whose vertex constants they run again (VertexProgramHlsl prev)
+    using VertexConstants = std::array<std::array<float, 4>, 192>;
+    Target* motion_rt_ = nullptr;  // this frame's scene target the motion target is bound beside
+    ComPtr<ID3D12Resource> motion_;
+    D3D12_RESOURCE_STATES motion_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    uint32_t motion_w_ = 0, motion_h_ = 0, motion_samples_ = 0;
+    uint64_t motion_cleared_ = ~0ull;  // frame the motion target was last cleared
+    bool motion_failed_ = false;
+    bool bound_motion_ = false;  // the bound targets include the motion target
+    // this frame's scene program draws by identity (geometry and program), and last frame's, with their constants
+    std::unordered_map<uint64_t, std::vector<VertexConstants>> motion_now_, motion_was_;
+    VertexConstants motion_match_{};
+    std::map<std::string, uint32_t> motion_trace_;  // TCNYC_TRACE_MOTION counts
+    bool EnsureMotion(Target& rt);
+    // the constants of the previous frame's draw like this one, closest to its own (several cars share a model)
+    const VertexConstants* MatchPrevious(uint64_t id, const State& s);
     // FSR 1 upscaling to out_w x out_h when the scene is smaller, and RCAS sharpening; repoints color at the result
     void UpscaleAndSharpen(ID3D12Resource*& color, DXGI_FORMAT& fmt, uint32_t w, uint32_t h, uint32_t out_w,
                            uint32_t out_h);
@@ -1275,6 +1325,7 @@ private:
     struct SceneDepth {
         Target* target;
         float near_z, far_z;
+        float w_scale = 1;  // the true view distance per unit of the normalised one (far planes past 1000)
     };
     std::unordered_map<Target*, SceneDepth> scene_depth_;  // per colour target, cleared at present
     ID3D12Resource* dof_depth_ = nullptr;  // this frame's readable depth, set at present
@@ -1603,7 +1654,7 @@ bool D3D12Backend::CreateBackBufferViews() {
 bool D3D12Backend::CreateHeaps() {
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
-    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kSmaaRtvs + kAoRtvs + kBloomRtvs + kFsrRtvs, false,
+    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kSmaaRtvs + kAoRtvs + kBloomRtvs + kFsrRtvs + kTaaRtvs + 1, false,
                           rtv_heap_);
     dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
     CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
@@ -1634,7 +1685,11 @@ bool D3D12Backend::CreateRootSignature() {
     ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[2].NumDescriptors = 1;
     ranges[2].BaseShaderRegister = 4;
-    D3D12_ROOT_PARAMETER params[5] = {};
+    // params[5]: the matched draw's previous vertex constants (b2), for TAA's motion variant of a program
+    D3D12_ROOT_PARAMETER params[6] = {};
+    params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[5].Descriptor.ShaderRegister = 2;
+    params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[4].DescriptorTable.NumDescriptorRanges = 1;
     params[4].DescriptorTable.pDescriptorRanges = &ranges[2];
@@ -1650,7 +1705,7 @@ bool D3D12Backend::CreateRootSignature() {
         params[2 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
     D3D12_ROOT_SIGNATURE_DESC rsd{};
-    rsd.NumParameters = 5;
+    rsd.NumParameters = 6;
     rsd.pParameters = params;
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> rs;
@@ -1756,6 +1811,7 @@ void D3D12Backend::Begin() {
     cl_->SetDescriptorHeaps(2, heaps);
     cl_->SetGraphicsRootSignature(root_.Get());
     bound_rt_ = bound_ds_ = nullptr;
+    bound_motion_ = false;
     binds_ = {};
 }
 
@@ -2157,12 +2213,19 @@ bool D3D12Backend::BindTargets(const State& s) {
         Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         ds->drawn = true;
     }
-    if (rt != bound_rt_ || ds != bound_ds_) {
-        D3D12_CPU_DESCRIPTOR_HANDLE rh = rt ? Cpu(rtv_heap_.Get(), rt->view, rtv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    // TAA: the frame's 3D scene target gets the motion target beside it, from its first depth-tested use in a frame
+    if (render_.taa && rt && ds && !rt->depth && rt->gw == guest_w_ && rt->gh == guest_h_ && rt != motion_rt_)
+        EnsureMotion(*rt);
+    const bool with_motion = rt && rt == motion_rt_ && motion_ && render_.taa;
+    if (with_motion) Transition(motion_.Get(), motion_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (rt != bound_rt_ || ds != bound_ds_ || with_motion != bound_motion_) {
+        D3D12_CPU_DESCRIPTOR_HANDLE rh[2] = {rt ? Cpu(rtv_heap_.Get(), rt->view, rtv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{},
+                                             Cpu(rtv_heap_.Get(), kMotionRtv, rtv_inc_)};
         D3D12_CPU_DESCRIPTOR_HANDLE dh = ds ? Cpu(dsv_heap_.Get(), ds->view, dsv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
-        cl_->OMSetRenderTargets(rt ? 1 : 0, rt ? &rh : nullptr, FALSE, ds ? &dh : nullptr);
+        cl_->OMSetRenderTargets(rt ? (with_motion ? 2 : 1) : 0, rt ? rh : nullptr, FALSE, ds ? &dh : nullptr);
         bound_rt_ = rt;
         bound_ds_ = ds;
+        bound_motion_ = with_motion;
     }
     return true;
 }
@@ -2642,21 +2705,28 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
 void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh,
                         uint32_t w, uint32_t h, ID3D12Resource* const src[3], const DXGI_FORMAT fmt[3],
                         const float p[8], float blend) {
+    PassN(hlsl, entry, rtv, rh, w, h, src, fmt, p, 8, blend);
+}
+
+void D3D12Backend::PassN(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh,
+                         uint32_t w, uint32_t h, ID3D12Resource* const src[3], const DXGI_FORMAT fmt[3],
+                         const float* p, uint32_t count, float blend, ID3D12Resource* src4, DXGI_FORMAT fmt4) {
     ID3D12PipelineState* pso = EnsurePassPipeline(hlsl, entry, rtv, blend);
     if (!pso) return;
     uint32_t slot = AllocSrvSlots(4);
     for (int i = 0; i < 4; i++) {
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-        sv.Format = i < 3 && src[i] ? fmt[i] : kBgra;
-        sv.ViewDimension = i < 3 && src[i] && src[i]->GetDesc().SampleDesc.Count > 1
-                               ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
+        ID3D12Resource* r = i < 3 ? src[i] : src4;
+        sv.Format = r ? (i < 3 ? fmt[i] : fmt4) : kBgra;
+        sv.ViewDimension = r && r->GetDesc().SampleDesc.Count > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS
+                                                                   : D3D12_SRV_DIMENSION_TEXTURE2D;
         sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         if (sv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) sv.Texture2D.MipLevels = 1;
-        dev_->CreateShaderResourceView(i < 3 ? src[i] : nullptr, &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+        dev_->CreateShaderResourceView(r, &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
     }
     Alloc cb = Upload(256, 256);
     if (!cb.res) return;
-    std::memcpy(cb.cpu, p, 8 * sizeof(float));
+    std::memcpy(cb.cpu, p, std::min(count, 64u) * sizeof(float));
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     SetFullViewport(w, h);
     if (blend >= 0) {
@@ -2745,6 +2815,10 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     b.RenderTargetWriteMask = UINT8(k.wmask);
     d.SampleMask = UINT_MAX;
     d.BlendState.AlphaToCoverageEnable = k.a2c ? TRUE : FALSE;
+    if (k.motion) {  // the motion target beside the colour: unblended, written only by draws that compute motion
+        d.BlendState.IndependentBlendEnable = TRUE;
+        d.BlendState.RenderTarget[1].RenderTargetWriteMask = k.motion == 2 ? UINT8(D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN) : UINT8(0);
+    }
     d.RasterizerState.FillMode = k.fill == kFillWireframe ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
     d.RasterizerState.CullMode = k.cull ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
     d.RasterizerState.FrontCounterClockwise = k.ccw;
@@ -2755,8 +2829,9 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     d.RasterizerState.DepthClipEnable = k.has_ds ? TRUE : FALSE;
     FillDepthStencilDesc(k, d.DepthStencilState);
     d.PrimitiveTopologyType = TopologyType(k.topo);
-    d.NumRenderTargets = k.has_rt ? 1 : 0;
+    d.NumRenderTargets = k.has_rt ? (k.motion ? 2 : 1) : 0;
     d.RTVFormats[0] = k.has_rt ? DXGI_FORMAT(k.rtfmt) : DXGI_FORMAT_UNKNOWN;
+    if (k.has_rt && k.motion) d.RTVFormats[1] = kMotionFormat;
     d.DSVFormat = k.has_ds ? kDepthFormat : DXGI_FORMAT_UNKNOWN;
     d.SampleDesc.Count = k.samples;
 }
@@ -3516,6 +3591,7 @@ uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     if (!sh.prog && a.pretransformed) vkey ^= kPretransformedSalt;
     if (sh.quad) vkey ^= kQuadSalt;
     if (sh.sprite) vkey ^= kSpriteSalt;
+    if (sh.motion) vkey ^= 0x6D6F74696F6E3031ull;  // "motion01"
     if (!sh.prog) vkey = Hash(&sh.fk, sizeof(sh.fk), vkey);
     return vkey;
 }
@@ -3536,7 +3612,7 @@ std::string SpriteSizeHlsl(std::string s) {
 
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
     if (sh.prog) {
-        std::string src = VertexProgramHlsl(s.vs->program, a.regs, a.decode);
+        std::string src = VertexProgramHlsl(s.vs->program, a.regs, a.decode, sh.motion);
         return sh.sprite ? SpriteSizeHlsl(std::move(src)) : src;
     }
     return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
@@ -3651,6 +3727,7 @@ void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
     k.samples = target ? target->res->GetDesc().SampleDesc.Count : 1;
     k.rtfmt = bound_rt_ ? bound_rt_->fmt : 0;
     KeyBlend(s, k);
+    k.motion = bound_rt_ && bound_motion_ ? 1 : 0;
     // alpha-tested cut-outs (fences, leaves, wires) get coverage from their alpha under MSAA, so their edges are
     // smoothed like geometry edges; the test itself moves to half its reference (UploadConstants)
     k.a2c = k.samples > 1 && k.has_rt && !k.blend && SimpleState(s, kMAlphaTestEnable) && bound_rt_->gw >= guest_w_ &&
@@ -4571,9 +4648,50 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         }
     }
     bool ao_receiver = defer_now && (ao_roles & kAoColour);
+    // TAA object motion: an opaque, depth-writing program draw into the scene, matched to the same draw last frame
+    // (its geometry and program); it runs its program again on that draw's constants for where it was
+    const VertexConstants* prev_consts = nullptr;
+    // "Opaque" as the AO roles count it: most of the world draws with blending on but ONE/ZERO (no blend in effect)
+    // or as alpha surfaces (SRCALPHA/INVSRCALPHA) that still write depth
+    const bool blend_on = SimpleState(s, kMBlendEnable) != 0;
+    const uint32_t bsrc = SimpleState(s, kMSrcBlend), bdst = SimpleState(s, kMDestBlend);
+    const bool solid = !blend_on || (bsrc == 1 && bdst == 0) || (bsrc == 0x302 && bdst == 0x303);
+    // TCNYC_TRACE_MOTION=1: why the 3D scene's draws do or do not write motion, every 120 frames
+    static const bool trace_motion = std::getenv("TCNYC_TRACE_MOTION") != nullptr;
+    if (trace_motion && bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ && bound_ds_ &&
+        !a.pretransformed) {
+        const char* why = !bound_motion_ ? "no motion target" : !sh.prog ? "fixed function" : !s.rs[kRsZEnable] ? "no depth test"
+                        : !SimpleState(s, kMZWriteEnable) ? "no depth write" : !solid ? "blend" : "eligible";
+        char key[64];
+        if (!solid && std::strcmp(why, "blend") == 0) std::snprintf(key, sizeof(key), "blend %X %X", bsrc, bdst);
+        else std::snprintf(key, sizeof(key), "%s", why);
+        motion_trace_[key]++;
+    }
+    if (bound_motion_ && sh.prog && !a.pretransformed && bound_ds_ && s.rs[kRsZEnable] &&
+        SimpleState(s, kMZWriteEnable) && solid) {
+        uint32_t ident[22] = {prim, start, count, s.index_data, s.base_vertex, s.vs_handle};
+        for (int i = 0; i < 16; i++) ident[6 + i] = s.streams[size_t(i)].vb;
+        const uint64_t id = Hash(ident, sizeof(ident), s.vs->hash);
+        motion_now_[id].push_back(s.vsc);
+        prev_consts = MatchPrevious(id, s);
+        if (trace_motion) motion_trace_[prev_consts ? "matched" : "unmatched"]++;
+        if (prev_consts) {
+            sh.motion = true;
+            sh.vkey = VertexKey(s, a, sh);
+            EnsureVertexShader(s, a, sh);
+            if (!sh.vs_code) {  // the variant failed: the draw keeps its plain program
+                LOG_FIRST(4, "d3d12: TAA motion vertex shader failed, drawing without motion");
+                sh.motion = false;
+                sh.vkey = VertexKey(s, a, sh);
+                EnsureVertexShader(s, a, sh);
+                prev_consts = nullptr;
+            }
+        }
+    }
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
     pk.ao = ao_receiver ? 1 : 0;
+    pk.motion = prev_consts ? 1 : 0;
     sh.pkey = Hash(&pk, sizeof(pk));
     EnsurePixelShader(pk, sh);
     if (ao_receiver && !sh.ps_code) {
@@ -4584,12 +4702,23 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         sh.pkey = Hash(&pk, sizeof(pk));
         EnsurePixelShader(pk, sh);
     }
+    if (pk.motion && !sh.ps_code) {  // the motion variant failed to compile: draw it without motion
+        LOG_FIRST(4, "d3d12: TAA motion pixel shader failed, drawing without motion");
+        pk.motion = 0;
+        sh.pkey = Hash(&pk, sizeof(pk));
+        EnsurePixelShader(pk, sh);
+        sh.motion = false;
+        sh.vkey = VertexKey(s, a, sh);
+        EnsureVertexShader(s, a, sh);
+        prev_consts = nullptr;
+    }
     if (!sh.vs_code || !sh.ps_code) return;
 
     // pipeline
     PsoKey k;
     BuildPipelineKey(s, a, sh.vh, sh.ph, k);
     k.sprite = sh.sprite;
+    if (prev_consts) k.motion = 2;
     ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
     if (!pso) return;
     depth_replay_ = {};
@@ -4601,6 +4730,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         DrawShaders dsh = sh;
         PixelKey dpk = pk;
         dpk.ao = 3;
+        dpk.motion = 0;
         dsh.pkey = Hash(&dpk, sizeof(dpk));
         EnsurePixelShader(dpk, dsh);
         if (dsh.ps_code) {
@@ -4610,6 +4740,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             dk.rtfmt = kAoDistFormat;
             dk.blend = dk.src = dk.dst = dk.op = 0;
             dk.wmask = 1;  // red
+            dk.motion = 0;
             dk.sten = dk.sfunc = dk.smask = dk.swmask = dk.sfail = dk.szfail = dk.spass = 0;
             depth_replay_.pso = EnsurePipeline(dk, dsh.vs_code, dsh.ps_code);
         }
@@ -4635,7 +4766,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     const bool depth_available = bound_ds_ && bound_ds_->res;
     // scene_view: a widescreen game view is full width but shorter than the 640x480 surface
     // (letterboxed by the title); a shadow or mirror pass is much smaller.
-    if ((render_.dof || render_.ao != 0) && depth_available && bound_rt_ && !a.pretransformed && k.zwrite &&
+    if ((render_.dof || render_.ao != 0 || render_.taa) && depth_available && bound_rt_ && !a.pretransformed && k.zwrite &&
         bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ &&
         bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h && scene_view) {
         const WRange r = DrawWRange(s, sh.prog);
@@ -4648,7 +4779,14 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             range.far_w = 1000.0f;
         }
         if (range.near_w > 0 && range.far_w > range.near_w)
-            scene_depth_.insert_or_assign(bound_rt_, SceneDepth{bound_ds_, range.near_w, range.far_w});
+            scene_depth_.insert_or_assign(bound_rt_, SceneDepth{bound_ds_, range.near_w, range.far_w,
+                                                                range.far_w > 0 ? r.far_w / range.far_w : 1.0f});
+    }
+    // TAA: the frame's sub-pixel jitter on the 3D scene's program draws (the vertex epilogue adds ext.xy)
+    if (render_.taa && sh.prog && depth_available && bound_rt_ && !a.pretransformed && bound_rt_->gw == guest_w_ &&
+        bound_rt_->gh == guest_h_) {
+        c.ext[0] = 2.0f * taa_jitter_[0] / float(bound_rt_->w);
+        c.ext[1] = -2.0f * taa_jitter_[1] / float(bound_rt_->h);
     }
     if (!UploadConstants(s, sh, k, stages, size, c)) return;
     if (ext_) binds_ = {};
@@ -4665,6 +4803,13 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     SetBlendFactorStencilRef(s);
 
     // geometry, counted while the title runs a visibility test
+    if (prev_consts) {  // the matched draw's previous constants at b2 for the motion variant
+        Alloc pc = Upload(sizeof(VertexConstants), 256);
+        if (pc.res) {
+            std::memcpy(pc.cpu, prev_consts->data(), sizeof(VertexConstants));
+            Cmd()->SetGraphicsRootConstantBufferView(5, pc.gpu);
+        }
+    }
     uint32_t query = BeginCountedDraw(s);
     if (defer_now) bundle_desc_.drew = true;
     DrawGeometry(a);
@@ -4811,11 +4956,16 @@ void D3D12Backend::FlushDeferredScene() {
         const SIZE_T want_rtv = b.has_rt ? b.rtv.ptr : 0;
         const SIZE_T want_dsv = b.has_ds ? b.dsv.ptr : 0;
         if (want_rtv != rtv || want_dsv != dsv) {
-            D3D12_CPU_DESCRIPTOR_HANDLE rh{};
+            D3D12_CPU_DESCRIPTOR_HANDLE rh[2] = {{}, Cpu(rtv_heap_.Get(), kMotionRtv, rtv_inc_)};
             D3D12_CPU_DESCRIPTOR_HANDLE dh{};
-            if (b.has_rt) rh = b.rtv;
+            if (b.has_rt) rh[0] = b.rtv;
             if (b.has_ds) dh = b.dsv;
-            cl_->OMSetRenderTargets(b.has_rt ? 1 : 0, b.has_rt ? &rh : nullptr, FALSE, b.has_ds ? &dh : nullptr);
+            // the scene target's bundles were recorded with TAA's motion target beside it (BindTargets)
+            const bool with_motion = b.has_rt && motion_rt_ && motion_ && render_.taa &&
+                                     b.rtv.ptr == Cpu(rtv_heap_.Get(), motion_rt_->view, rtv_inc_).ptr;
+            if (with_motion) Transition(motion_.Get(), motion_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            cl_->OMSetRenderTargets(b.has_rt ? (with_motion ? 2 : 1) : 0, b.has_rt ? rh : nullptr, FALSE,
+                                    b.has_ds ? &dh : nullptr);
             rtv = want_rtv;
             dsv = want_dsv;
         }
@@ -5955,6 +6105,323 @@ ID3D12Resource* D3D12Backend::BuildBloom(ID3D12Resource* src, DXGI_FORMAT fmt, u
     return bloom_.up[0].res.Get();
 }
 
+// TAA resolve (experimental, camera motion only): reprojects each pixel into the previous frame with the scene depth
+// and the two frames' cameras, clamps the history to the current 3x3 neighbourhood and blends 10% of the new frame
+// in. Moving cars and people have no motion of their own here, so they ghost; that is what this spike measures.
+// c: m0-m3 the current view to previous view matrix (D3D rows), proj xs ys (current) pxs pys (previous),
+// z near far (normalised depth range) w_scale reset, px the jitter in uv, xy then 1 / size zw
+const char* kTaaHlsl = R"(
+cbuffer B : register(b1) { float4 m0; float4 m1; float4 m2; float4 m3; float4 proj; float4 z; float4 px; float4 flags; };
+Texture2D cur : register(t0);
+Texture2D hist : register(t1);
+#if DEPTH_MS
+Texture2DMS<float> depthTex : register(t2);
+#define DEPTH_LOAD(p) depthTex.Load(p, 0)
+Texture2DMS<float2> motionTex : register(t3);
+#define MOTION_LOAD(p) motionTex.Load(p, 0)
+#else
+Texture2D<float> depthTex : register(t2);
+#define DEPTH_LOAD(p) depthTex.Load(int3(p, 0))
+Texture2D<float2> motionTex : register(t3);
+#define MOTION_LOAD(p) motionTex.Load(int3(p, 0))
+#endif
+SamplerState ls : register(s0);
+SamplerState ps : register(s1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float3 ToYCoCg(float3 c) {
+    return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25)));
+}
+float3 FromYCoCg(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+// the history through a 5-tap Catmull-Rom (bilinear taps): bilinear alone blurs a little more every frame in motion
+float3 HistoryAt(float2 uv) {
+    float2 size = 1.0 / px.zw;
+    float2 pos = uv * size;
+    float2 c1 = floor(pos - 0.5) + 0.5;
+    float2 f = pos - c1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 t0 = (c1 - 1) * px.zw, t3 = (c1 + 2) * px.zw, t12 = (c1 + w2 / w12) * px.zw;
+    float3 r = hist.SampleLevel(ls, float2(t12.x, t0.y), 0).rgb * (w12.x * w0.y) +
+               hist.SampleLevel(ls, float2(t0.x, t12.y), 0).rgb * (w0.x * w12.y) +
+               hist.SampleLevel(ls, t12, 0).rgb * (w12.x * w12.y) +
+               hist.SampleLevel(ls, float2(t3.x, t12.y), 0).rgb * (w3.x * w12.y) +
+               hist.SampleLevel(ls, float2(t12.x, t3.y), 0).rgb * (w12.x * w3.y);
+    float n = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max(r / n, 0.0);
+}
+float4 taa(O i) : SV_Target {
+    int2 ip = int2(i.p.xy);
+    // this frame shifted by its jitter: read it back where the pixel centre landed, so the blend does not wobble
+    float3 c = cur.SampleLevel(ls, i.uv + px.xy, 0).rgb;
+    // the neighbourhood's mean and spread in YCoCg, and the nearest depth around (edges move with the nearer surface)
+    float3 sum1 = 0, sum2 = 0;
+    float near_raw = 1;
+    int2 near_at = ip;
+    [unroll] for (int y = -1; y <= 1; y++)
+        [unroll] for (int x = -1; x <= 1; x++) {
+            float3 n = ToYCoCg(cur.Load(int3(ip + int2(x, y), 0)).rgb);
+            sum1 += n;
+            sum2 += n * n;
+            float r = 1.0 - DEPTH_LOAD(ip + int2(x, y));
+            if (r < near_raw) {
+                near_raw = r;
+                near_at = ip + int2(x, y);
+            }
+        }
+    if (z.w > 0) return float4(c, 1);
+    float3 mean = sum1 / 9;
+    float3 sigma = sqrt(max(sum2 / 9 - mean * mean, 0.0));
+    float raw = near_raw;
+    float w = z.x * z.y / max(z.y - raw * (z.y - z.x), 1e-4) * z.z;
+    float2 uv = i.uv - px.xy;  // without this frame's jitter
+    float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
+    float4 view = float4(ndc.x * w / proj.x, ndc.y * w / proj.y, w, 1);
+    float4 prev = view.x * m0 + view.y * m1 + view.z * m2 + view.w * m3;
+    float2 puv;
+    // the draw's own motion where it wrote one (cars, people, the world; flags.x set when the target is this frame's),
+    // else the camera's
+    float2 objmv = float2(60000, 60000);
+    [branch] if (flags.x > 0) objmv = MOTION_LOAD(near_at);
+    // where the camera alone would have moved this pixel
+    const bool cam_ok = prev.z > 1e-3;
+    float2 cam_puv = uv;
+    if (cam_ok) {
+        float2 pndc = prev.xy * proj.zw / prev.z;
+        cam_puv = float2(pndc.x * 0.5 + 0.5, 0.5 - pndc.y * 0.5);
+    }
+    if (objmv.x < 50000) {
+        puv = uv + objmv;
+    } else {
+        if (!cam_ok) return float4(c, 1);
+        puv = cam_puv;
+    }
+    if (any(puv < 0) || any(puv > 1)) return float4(c, 1);
+    // how far the pixel moved, in pixels: the clip is loose when still (stable) and tight in motion (no trails)
+    float moved = length((puv - uv) / px.zw);
+    float motion = saturate(moved / 2.0);
+    // an object moving by itself (its motion differs from the camera's by half a pixel or more): the strictest
+    // handling; the world, whose motion is the camera's, keeps the steadier one
+    const bool own = objmv.x < 50000 && (!cam_ok || length((puv - cam_puv) / px.zw) > 0.5);
+    // variance clip: the history pulled toward the mean until it lies within the neighbourhood's spread
+    float3 h = ToYCoCg(HistoryAt(puv));
+    // loose where nothing moves (steady fine detail), tight where anything does (no trails); per-object motion makes
+    // a car moving past a still view count as moving
+    float3 e = sigma * (own ? 0.9 : lerp(1.6, 1.0, motion)) + 1e-4;
+    float3 d = h - mean;
+    float3 u = abs(d / e);
+    float s = max(u.x, max(u.y, u.z));
+    if (s > 1) h = mean + d / s;
+    // more of the new frame the further the pixel moved, so fast motion does not trail; weighted by 1 / (1 + luma)
+    // so a single bright pixel (a window, a lamp) cannot flicker the result
+    float alpha = own ? max(0.25, lerp(0.08, 0.4, saturate(moved / 6.0))) : lerp(0.07, 0.3, saturate(moved / 8.0));
+    float3 hc = FromYCoCg(h);
+    // TCNYC_TAA_VIEW=1: the motion used, red and green its size across and down (16 pixels full), blue 1 where the
+    // draw's own motion was used, 0 the camera's; =2: red how far the draw's motion is from the camera's (4 pixels
+    // full), blue as in 1
+    if (flags.y > 1.5) return float4(saturate(length((puv - cam_puv) / px.zw) / 4), 0, objmv.x < 50000 ? 1 : 0, 1);
+    if (flags.y > 0.5) return float4(saturate(abs((puv - uv) / px.zw) / 16), objmv.x < 50000 ? 1 : 0, 1);
+    float wc = alpha / (1 + ToYCoCg(c).x), wh = (1 - alpha) / (1 + h.x);
+    return float4((c * wc + hc * wh) / (wc + wh), 1);
+}
+)";
+
+// The motion target for the scene target rt (its size and sample count), cleared to "no motion" (60000) the first
+// time it is bound in a frame; false when it cannot be made.
+bool D3D12Backend::EnsureMotion(Target& rt) {
+    if (motion_failed_) return false;
+    const uint32_t samples = rt.res->GetDesc().SampleDesc.Count;
+    if (!motion_ || motion_w_ != rt.w || motion_h_ != rt.h || motion_samples_ != samples) {
+        if (motion_) Release(std::move(motion_));
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC td = Texture2DDesc(kMotionFormat, rt.w, rt.h);
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        td.SampleDesc.Count = samples;
+        D3D12_CLEAR_VALUE cv{kMotionFormat, {60000.0f, 60000.0f, 0, 1}};
+        motion_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, motion_state_, &cv,
+                                                 IID_PPV_ARGS(&motion_)))) {
+            motion_failed_ = true;
+            LOGE("d3d12: TAA motion target could not be created, TAA uses camera motion only");
+            return false;
+        }
+        dev_->CreateRenderTargetView(motion_.Get(), nullptr, Cpu(rtv_heap_.Get(), kMotionRtv, rtv_inc_));
+        motion_w_ = rt.w;
+        motion_h_ = rt.h;
+        motion_samples_ = samples;
+        motion_cleared_ = ~0ull;
+        LOGR("d3d12: TAA motion target %ux%u, %u samples", rt.w, rt.h, samples);
+    }
+    Transition(motion_.Get(), motion_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (motion_cleared_ != frame_) {
+        const float none[4] = {60000.0f, 60000.0f, 0, 1};
+        cl_->ClearRenderTargetView(Cpu(rtv_heap_.Get(), kMotionRtv, rtv_inc_), none, 0, nullptr);
+        motion_cleared_ = frame_;
+    }
+    motion_rt_ = &rt;
+    return true;
+}
+
+const D3D12Backend::VertexConstants* D3D12Backend::MatchPrevious(uint64_t id, const State& s) {
+    auto it = motion_was_.find(id);
+    if (it == motion_was_.end() || it->second.empty()) return nullptr;
+    auto& list = it->second;
+    size_t best = 0;
+    float best_d = 3.4e38f;
+    for (size_t i = 0; i < list.size() && list.size() > 1; i++) {
+        float d = 0;
+        for (size_t r = 0; r < 192; r++)
+            for (size_t c = 0; c < 4; c++) d += std::fabs(list[i][r][c] - s.vsc[r][c]);
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    motion_match_ = list[best];
+    list[best] = list.back();
+    list.pop_back();
+    return &motion_match_;
+}
+
+// 4x4 inverse (general, Gauss-Jordan); false when singular
+bool Invert4(const float* m, float* out) {
+    float a[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 8; c++) a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r ? 1.0f : 0.0f);
+    for (int col = 0; col < 4; col++) {
+        int pivot = col;
+        for (int r = col + 1; r < 4; r++)
+            if (std::fabs(a[r][col]) > std::fabs(a[pivot][col])) pivot = r;
+        if (std::fabs(a[pivot][col]) < 1e-12f) return false;
+        if (pivot != col)
+            for (int c = 0; c < 8; c++) std::swap(a[col][c], a[pivot][c]);
+        const float d = a[col][col];
+        for (int c = 0; c < 8; c++) a[col][c] /= d;
+        for (int r = 0; r < 4; r++) {
+            if (r == col) continue;
+            const float f = a[r][col];
+            for (int c = 0; c < 8; c++) a[r][c] -= f * a[col][c];
+        }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) out[r * 4 + c] = a[r][c + 4];
+    return true;
+}
+
+ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
+    if (taa_.failed || t.depth || !t.w || !t.h) return nullptr;
+    const auto depth = scene_depth_.find(&t);
+    if (depth == scene_depth_.end() || !depth->second.target || !depth->second.target->res) {
+        taa_.valid = false;
+        return nullptr;
+    }
+    ID3D12Resource* color = ResolveColor(t);
+    if (!color) return nullptr;
+    auto& state = color == t.res.Get() ? t.state : t.resolved_state;
+    Transition(color, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (!taa_.history[0].res || taa_.w != t.w || taa_.h != t.h || taa_.fmt != t.fmt) {
+        Flush();
+        for (auto& f : frames_)
+            if (f.fence && !WaitFence(f.fence)) return nullptr;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        for (uint32_t i = 0; i < 2; i++) {
+            SmaaTexture& tex = taa_.history[i];
+            if (tex.res) Release(std::move(tex.res));
+            D3D12_RESOURCE_DESC td = Texture2DDesc(t.fmt, t.w, t.h);
+            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            tex.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, tex.state, nullptr,
+                                                     IID_PPV_ARGS(&tex.res)))) {
+                taa_.failed = true;
+                LOGE("d3d12: TAA history could not be created, TAA is off");
+                return nullptr;
+            }
+            dev_->CreateRenderTargetView(tex.res.Get(), nullptr, Cpu(rtv_heap_.Get(), kTaaRtv + i, rtv_inc_));
+        }
+        taa_.w = t.w;
+        taa_.h = t.h;
+        taa_.fmt = t.fmt;
+        taa_.valid = false;
+        LOGR("d3d12: TAA history %ux%u", t.w, t.h);
+    }
+    // the cameras: this frame's, and the one the history was made with
+    // The scene hook records the camera of the frame after the one drawn (tested: one frame earlier is steady), so the
+    // frame drawn uses the snapshot one present back. TCNYC_TAA_CAMERA_OFFSET overrides it for testing.
+    static const int64_t offset = [] {
+        const char* e = std::getenv("TCNYC_TAA_CAMERA_OFFSET");
+        return e ? int64_t(std::atoll(e)) : int64_t(-1);
+    }();
+    const CameraFrame cam = CameraOf(uint64_t(int64_t(presents_) + 8 + offset));
+    float inv[16], m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    // depth turns into view distance with the camera's own planes (the scene depth's range is normalised for the
+    // distance blur and is not in view units)
+    bool reset = !taa_.valid || !cam.serial || cam.xs <= 0 || cam.ys <= 0 || cam.near_z <= 0 ||
+                 !taa_.camera.serial || taa_.camera.xs <= 0;
+    if (!reset && Invert4(cam.view, inv)) {
+        // row vectors: view = world * V, so previous view = view * inverse(V) * V_previous
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) {
+                float sum = 0;
+                for (int k = 0; k < 4; k++) sum += inv[r * 4 + k] * taa_.camera.view[k * 4 + c];
+                m[r * 4 + c] = sum;
+            }
+    } else {
+        reset = true;
+    }
+    const SceneDepth& sd = depth->second;
+    // TCNYC_TRACE_TAA=1: the inputs, every 30th frame
+    static const bool trace = std::getenv("TCNYC_TRACE_TAA") != nullptr;
+    if (trace && presents_ % 30 == 0) {
+        const float* v = cam.view;
+        LOGR("taa: frame %llu serial %llu prev %llu reset %d xs %.4f ys %.4f pxs %.4f pys %.4f near %.3f far %.3f "
+             "wscale %.3f cam planes %.3f %.1f target %ux%u jitter %.2f %.2f",
+             (unsigned long long)presents_, (unsigned long long)cam.serial,
+             (unsigned long long)taa_.camera.serial, reset ? 1 : 0, cam.xs, cam.ys, taa_.camera.xs, taa_.camera.ys,
+             sd.near_z, sd.far_z, sd.w_scale, cam.near_z, cam.far_z, t.w, t.h, taa_jitter_[0], taa_jitter_[1]);
+        LOGR("taa:   view %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.2f %.2f %.2f %.3f", v[0],
+             v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+        LOGR("taa:   cur->prev %.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f | %.3f %.3f %.3f", m[0], m[1], m[2],
+             m[4], m[5], m[6], m[8], m[9], m[10], m[12], m[13], m[14]);
+    }
+    Target& ds = *sd.target;
+    Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    // the motion target, when this frame's draws into t wrote it (at t's size and sample count, as the depth)
+    const bool motion = motion_ && motion_cleared_ == frame_ && motion_w_ == t.w && motion_h_ == t.h &&
+                        motion_samples_ == ds.res->GetDesc().SampleDesc.Count;
+    if (motion) Transition(motion_.Get(), motion_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    const float p[32] = {m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
+                         m[12], m[13], m[14], m[15],
+                         cam.xs, cam.ys, taa_.camera.xs, taa_.camera.ys,
+                         cam.near_z, cam.far_z > 0 ? cam.far_z : 1e7f, 1.0f, reset ? 1.0f : 0.0f,
+                         taa_jitter_[0] / float(t.w), taa_jitter_[1] / float(t.h), 1.0f / float(t.w), 1.0f / float(t.h),
+                         motion ? 1.0f : 0.0f, float(TaaView()), 0, 0};
+    SmaaTexture& out = taa_.history[taa_.next];
+    SmaaTexture& in = taa_.history[taa_.next ^ 1];
+    Transition(in.res.Get(), in.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(out.res.Get(), out.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    static const std::string kMs = std::string("#define DEPTH_MS 1\n") + kTaaHlsl;
+    static const std::string kSingle = std::string("#define DEPTH_MS 0\n") + kTaaHlsl;
+    const bool ms = ds.res->GetDesc().SampleDesc.Count > 1;
+    ID3D12Resource* srcs[3] = {color, in.res.Get(), ds.res.Get()};
+    DXGI_FORMAT fmts[3] = {t.fmt, t.fmt, kDepthRead};
+    PassN((ms ? kMs : kSingle).c_str(), "taa", t.fmt, Cpu(rtv_heap_.Get(), kTaaRtv + taa_.next, rtv_inc_), t.w, t.h,
+          srcs, fmts, p, 32, -1, motion ? motion_.Get() : nullptr, kMotionFormat);
+    Transition(out.res.Get(), out.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    taa_.next ^= 1;
+    taa_.valid = true;
+    taa_.camera = cam;
+    return out.res.Get();
+}
+
 // FSR 1 on the finished scene (after SMAA, which works best at the render size): EASU to the output size when the
 // scene is smaller and the Upscaler setting is FSR, then RCAS. RCAS alone sharpens at the render size when only
 // Sharpening is set. The two targets' views are fixed slots, so they are remade only after the GPU is idle.
@@ -5962,7 +6429,8 @@ void D3D12Backend::UpscaleAndSharpen(ID3D12Resource*& color, DXGI_FORMAT& fmt, u
                                      uint32_t out_w, uint32_t out_h) {
     if (fsr_.failed || !w || !h) return;
     const bool upscale = render_.upscaler == 1 && out_w && out_h && h < out_h;
-    if (!upscale && !render_.sharpening) return;
+    // TAA softens the frame, so it brings RCAS at its default strength along (as FSR upscaling does)
+    if (!upscale && !render_.sharpening && !(render_.taa && taa_.valid)) return;
     const uint32_t sw = upscale ? out_w : w, sh = upscale ? out_h : h;
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     auto target = [&](SmaaTexture& tex, uint32_t tw, uint32_t th, uint32_t rtv) {
@@ -6250,9 +6718,21 @@ void D3D12Backend::Present(const Surface& front) {
         }
     }
 
-    ID3D12Resource* aa = t && render_.smaa ? ApplySmaa(*t) : nullptr;
+    // TAA replaces SMAA on the 3D scene when it is on; movies and pictures keep SMAA
+    ID3D12Resource* aa = t && render_.taa && t->scene_frame == frame_ ? ApplyTaa(*t) : nullptr;
+    if (!aa && t && render_.smaa) aa = ApplySmaa(*t);
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi, aa);
+    if (!motion_trace_.empty() && frame_ % 120 == 0) {
+        std::string line;
+        for (const auto& [k, v] : motion_trace_) line += " | " + k + " " + std::to_string(v / 120);
+        LOGR("motion: per frame%s", line.c_str());
+        motion_trace_.clear();
+    }
+    // TAA object motion: this frame's draws are the next frame's previous ones
+    motion_was_ = std::move(motion_now_);
+    motion_now_.clear();
+    motion_rt_ = nullptr;
     scene_depth_.clear();
     dof_depth_ = nullptr;
     Submit(false);
@@ -6278,6 +6758,20 @@ void D3D12Backend::Present(const Surface& front) {
     ReleaseOldTextures();
     if (frame_ % 60 == 0) SweepTargets();
     SavePipelineLibrary(false);
+    // the next frame's TAA jitter: an 8-step Halton (2, 3) pattern within the pixel
+    if (render_.taa) {
+        auto halton = [](uint32_t i, uint32_t b) {
+            float f = 1, r = 0;
+            for (; i; i /= b) r += (f /= float(b)) * float(i % b);
+            return r;
+        };
+        const uint32_t i = uint32_t(frame_ % 8) + 1;
+        taa_jitter_[0] = halton(i, 2) - 0.5f;
+        taa_jitter_[1] = halton(i, 3) - 0.5f;
+    } else {
+        taa_jitter_[0] = taa_jitter_[1] = 0;
+        taa_.valid = false;
+    }
     WaitFrameLatency();
     ResetFrame();
     CountFps();

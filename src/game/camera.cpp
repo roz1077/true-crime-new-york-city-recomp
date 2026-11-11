@@ -24,6 +24,7 @@
 #include "common/graphics_choices.h"
 #include "common/graphics_menu.h"
 #include "core/log.h"
+#include "gpu/backend.h"
 #include "kernel/kernel.h"
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
@@ -94,6 +95,15 @@ void RunProjection(X86Context &ctx, uint8_t *base, const char *which, void (*ori
         std::memcpy(base + kRenderer + kScaleX, &scale, sizeof(scale));
     }
     AdjustProjection(ctx, base, which, gameplay);
+    if (gameplay) {  // TAA's reprojection: the projection's scales as this call builds them
+        const float k = F32(base, ctx.esp + 4);
+        std::lock_guard lock(gpu::g_camera_mutex);
+        gpu::g_camera_now.xs = k * F32(base, kRenderer + kScaleX);
+        gpu::g_camera_now.ys = k * F32(base, kRenderer + kScaleY);
+        gpu::g_camera_now.near_z = F32(base, kRenderer + kNear);
+        // the infinite projection (0x245CE0) has no far plane
+        gpu::g_camera_now.far_z = std::strcmp(which, "infinite projection") == 0 ? 0.0f : F32(base, kRenderer + kFar);
+    }
     original(ctx, base);
     if (adjust) std::memcpy(base + kRenderer + kScaleX, &previous, sizeof(previous));
 }

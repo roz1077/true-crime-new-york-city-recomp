@@ -77,6 +77,7 @@ void Load() {
     SetFrameCap(t["fps_cap"].value_or(FrameCap()));
     s.vsync = t["vsync"].value_or(s.vsync);
     s.low_latency = t["low_latency"].value_or(s.low_latency);
+    s.taa = t["taa"].value_or(s.taa);
     s.upscaler = uint32_t(std::clamp<int64_t>(t["upscaler"].value_or(int64_t(s.upscaler)), 0, 1));
     s.sharpening = uint32_t(std::clamp<int64_t>(t["sharpening"].value_or(int64_t(s.sharpening)), 0, 100));
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
@@ -139,6 +140,7 @@ toml::table Table() {
                   {"fps_cap", int64_t(FrameCap())},
                   {"vsync", s.vsync},
                   {"low_latency", s.low_latency},
+                  {"taa", s.taa},
                   {"upscaler", int64_t(s.upscaler)},
                   {"sharpening", int64_t(s.sharpening)},
                   {"anisotropic_filtering", int64_t(s.aniso)},

@@ -16,6 +16,7 @@
 #include <cstring>
 
 #include "core/log.h"
+#include "gpu/backend.h"
 
 #include "kernel/kernel.h"
 #include "xdk/hle.h"
@@ -156,6 +157,11 @@ X86_FUNC(sub_00143650) {
     float w;
     std::memcpy(&w, now.vec + 12, 4);
     const float cam_distance = CameraDistance(base, X86_MEM32(ctx.esp + 4), lamp);
+    {  // TAA's reprojection: the frame's view matrix
+        std::lock_guard lock(gpu::g_camera_mutex);
+        std::memcpy(gpu::g_camera_now.view, base + X86_MEM32(ctx.esp + 4) + 0xD0, 64);
+        gpu::g_camera_now.serial++;
+    }
     Light pick = now;
     if (now.strength != 0.0f && w != 0.0f) {
         have_lamp = true;

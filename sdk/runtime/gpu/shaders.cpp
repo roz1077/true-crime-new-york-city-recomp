@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -32,6 +33,9 @@ struct VOut {
     float4 tc2 : TEXCOORD2;
     float4 tc3 : TEXCOORD3;
     float fogamt : TEXCOORD4;
+    // motion for TAA: this frame's clip position and the previous frame's (w < 0: none, the camera's is used)
+    float4 mc : TEXCOORD6;
+    float4 mp : TEXCOORD7;
     float2 zclip : SV_ClipDistance0;
 };
 cbuffer VC : register(b0) { float4 c[192]; };
@@ -241,6 +245,23 @@ const char* kVsEpilogue = R"(
     q.xyz *= p.w;
     q.w = p.w;
     o.pos = q;
+    o.mc = q;  // before the jitter: motion is between unjittered positions
+    // TAA: the frame's sub-pixel jitter in clip space (DrawConstants::ext.xy), zero outside the 3D scene and with TAA off
+    o.pos.xy += ext.xy * o.pos.w;
+#ifdef HAS_PREV
+    {  // the same program run with the matched draw's previous constants (cp)
+        float4 pp = prevPos;
+        pp.w = magclamp(pp.w);
+        float4 qp;
+        qp.x = (pp.x * 2 / surf.x - 1) * tscale.z;
+        qp.y = 1 - pp.y * 2 / surf.y;
+        qp.xy *= pp.w;
+        qp.zw = float2(0, pp.w);
+        o.mp = qp;
+    }
+#else
+    o.mp = float4(0, 0, 0, -1);
+#endif
     // D3DDevice_SetDepthClipPlanes: clip outside [near, far] of the console's screen z, linear in clip space
     o.zclip = zclips.z != 0 ? float2(p.z - zclips.x, zclips.y - p.z) * p.w : float2(1, 1);
     o.d0 = saturate(oD0);
@@ -716,11 +737,13 @@ bool ReadsViewportOffset(const std::vector<uint32_t>& prog) {
     return false;
 }
 
-std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs, uint64_t decode) {
+std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs, uint64_t decode, bool prev) {
     std::string s = Common();
+    if (prev) s += "#define HAS_PREV 1\ncbuffer VCP : register(b2) { float4 cp[192]; };\n";
     s += kVsHelpers;
     s += VsInputs(regs, decode);
     s += kVsPrologue;
+    const size_t body_start = s.size();
     for (size_t n = 0; n + 4 <= prog.size(); n += 4) {
         Tok k{&prog[n]};
         uint32_t mac = k.f(1, 21, 4), ilu = k.f(1, 25, 3);
@@ -753,6 +776,25 @@ std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs, 
             s += "    }\n";
         }
         if (k.f(3, 0, 1)) break;  // last instruction
+    }
+    if (prev) {
+        // TAA motion: the program again in a scope of its own, on the previous frame's constants, for its position
+        std::string body = s.substr(body_start);
+        std::string again;
+        again.reserve(body.size() + 64);
+        for (size_t i = 0; i < body.size(); i++) {
+            const bool word_start = i == 0 || !(std::isalnum(static_cast<unsigned char>(body[i - 1])) || body[i - 1] == '_');
+            if (word_start && body.compare(i, 2, "c[") == 0) {
+                again += "cp[";
+                i++;
+            } else {
+                again += body[i];
+            }
+        }
+        s += "    precise float4 prevPos;\n    {\n";
+        s += kVsPrologue;
+        s += again;
+        s += "        prevPos = oPos;\n    }\n";
     }
     s += kVsEpilogue;
     return s;
@@ -876,6 +918,8 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     if (surf.w == 0 && abs(sp.y - (surf.y - 0.5)) < 1e-3) cp.y = -cp.w;
     o.pos = cp;
     o.zclip = float2(1, 1);
+    o.mc = cp;
+    o.mp = float4(0, 0, 0, -1);
     o.d0 = saturate(oD0);
     o.d1 = saturate(oD1);
     o.b0 = o.d0;
@@ -902,7 +946,11 @@ std::string PixelHlsl(const PixelKey& k) {
     // occlusion, not brightness: an unset (null) view reads 0 and leaves the colour alone
     // t4: past the stages' t0-t3 (ps_5_0 has no register spaces)
     if (k.ao == 1) s += "Texture2D<float> aoOcc : register(t4);\n";
-    s += F("float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {\n");
+    if (k.motion)
+        s += "struct PsMotion { float4 c : SV_Target0; float4 m : SV_Target1; };\n"
+             "PsMotion main(VOut i, bool front : SV_IsFrontFace) {\n";
+    else
+        s += F("float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {\n");
     s += "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = i.tc3;\n";
     s += k.two_sided ? "    float4 v0 = front ? i.d0 : i.b0, v1 = front ? i.d1 : i.b1;\n" : "    float4 v0 = i.d0, v1 = i.d1;\n";
     s += "    if (misc.w == 0) v1 = float4(0, 0, 0, 1);\n";
@@ -992,7 +1040,19 @@ std::string PixelHlsl(const PixelKey& k) {
     // lerp(fog, surface * ao, f). Without fog (f = 1) this is a plain multiply.
     else if (k.ao) body += "{ float ao = 1.0 - aoOcc.Load(int3(i.pos.xy, 0));\n"
                            "  outc.rgb = outc.rgb * ao + (1.0 - fogin.a) * fogin.rgb * (1.0 - ao); }\n";
-    body += Hooks().Output() + "return outc;\n}\n";
+    body += Hooks().Output();
+    if (k.motion)
+        // the uv this pixel had in the previous frame minus its uv now; 60000 (no previous position) has the TAA
+        // resolve use the camera's motion there
+        body += "PsMotion r;\nr.c = outc;\n"
+                "if (i.mp.w > 0) {\n"
+                "    float2 now = i.mc.xy / i.mc.w, was = i.mp.xy / i.mp.w;\n"
+                "    r.m = float4((was - now) * float2(0.5, -0.5), 0, 1);\n"
+                "} else {\n"
+                "    r.m = float4(60000, 60000, 0, 1);\n"
+                "}\nreturn r;\n}\n";
+    else
+        body += "return outc;\n}\n";
     s += body;
     return k.quad ? QuadHlsl(std::move(s)) : s;
 }

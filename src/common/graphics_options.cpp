@@ -82,6 +82,7 @@ enum class Row {
     Anisotropic,
     Msaa,
     Smaa,
+    Taa,
     Bloom,
     BloomStrength,
     DepthOfField,
@@ -117,6 +118,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::Anisotropic,
                          Row::Msaa,
                          Row::Smaa,
+                         Row::Taa,
                          Row::Bloom,
                          Row::BloomStrength,
                          Row::DepthOfField,
@@ -288,6 +290,7 @@ void RestoreDefaults() {
     app::SetFrameCap(d.fps_cap);
     s.vsync = d.vsync;
     s.low_latency = d.low_latency;
+    s.taa = d.taa;
     s.upscaler = d.upscaler;
     s.sharpening = d.sharpening;
     s.aniso = d.aniso;
@@ -341,6 +344,7 @@ Kind KindOf(Row row) {
     case Row::HdrHighlights:
         return Kind::Choice;
     case Row::Smaa:
+    case Row::Taa:
     case Row::Bloom:
     case Row::DepthOfField:
     case Row::BuildingSeamFix:
@@ -367,6 +371,7 @@ bool Enabled(Row row) {
     if (row == Row::ColourGrading) return gpu::g_lut_loaded.load(std::memory_order_relaxed);
 #ifndef _WIN32
     if (row == Row::LowLatency) return false;  // Direct3D 12 only
+    if (row == Row::Taa) return false;         // Direct3D 12 only for now
 #endif
     // The HDR toggle stays reachable on an SDR display so a failed detection can be retried and
     // the fallback is visible; its sliders only matter once HDR is actually active.
@@ -395,6 +400,8 @@ const char *Label(Row row) {
         return "Anisotropic filtering";
     case Row::Msaa:
         return "MSAA";
+    case Row::Taa:
+        return "TAA (experimental)";
     case Row::Smaa:
         return "SMAA";
     case Row::Bloom:
@@ -496,6 +503,9 @@ const char *Help(Row row) {
                "the filtering the game asks for.";
     case Row::Msaa:
         return "Smooths geometry edges. Higher counts require more GPU memory.";
+    case Row::Taa:
+        return "Experimental temporal anti-aliasing in place of SMAA on the 3D scene. Smooths edges and shimmer over "
+               "several frames; moving cars and people can leave trails. A test of whether FSR 3 or DLSS could work.";
     case Row::Smaa:
         return "Smooths jagged edges on the finished frame (SMAA 1x). The HUD is smoothed with it.";
     case Row::Bloom:
@@ -619,6 +629,8 @@ std::string Value(Row row) {
         const auto samples = app::MsaaSamples();
         return samples ? std::to_string(samples) + "x" : "Off";
     }
+    case Row::Taa:
+        return s.taa ? "On" : "Off";
     case Row::Smaa:
         return s.smaa ? "On" : "Off";
     case Row::Bloom:
@@ -799,6 +811,9 @@ void Activate(Row row) {
         return;
     case Kind::Toggle:
         switch (row) {
+        case Row::Taa:
+            s.taa = !s.taa;
+            break;
         case Row::Smaa:
             s.smaa = !s.smaa;
             break;

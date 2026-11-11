@@ -234,6 +234,7 @@ public:
     void Present(const Surface& front) override {
         const bool perf = diag::Perf();
         const auto t = perf ? Clock::now() : Clock::time_point{};
+        SnapshotCamera(presents_);  // the camera this frame was drawn with, for TAA on the render thread
         Cmd c{Op::Present};
         c.s1 = front;
         c.s1.header = Header(front.header);

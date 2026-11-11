@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 #include "gpu/state.h"
 
@@ -79,6 +80,27 @@ inline std::atomic<uint32_t> g_hdr_display_peak_nits{0};
 // Set by the window thread on WM_DISPLAYCHANGE (an HDR toggle in Windows, a display added or
 // removed); the renderer re-reads the display's HDR capability once and clears it.
 inline std::atomic<bool> g_display_changed{false};
+// The gameplay camera, for TAA's reprojection: the view matrix (D3D rows, world to view) and the projection's x and
+// y scales, written by the game hooks (src/game/camera.cpp, night_shadows.cpp) on the title's thread. Each present
+// snapshots it into g_camera_frames[present % 8], so the renderer reads the camera of the frame it draws.
+struct CameraFrame {
+    float view[16] = {};
+    float xs = 0, ys = 0;  // clip x = view x * xs / view z, likewise y
+    float near_z = 0, far_z = 0;  // the projection's planes in view units (far 0: infinite)
+    uint64_t serial = 0;   // the game's frame it was written in, 0 before any
+};
+inline std::mutex g_camera_mutex;
+inline CameraFrame g_camera_now;            // under g_camera_mutex
+inline CameraFrame g_camera_frames[8];      // under g_camera_mutex
+inline void SnapshotCamera(uint64_t present) {
+    std::lock_guard lock(g_camera_mutex);
+    g_camera_frames[present % 8] = g_camera_now;
+}
+inline CameraFrame CameraOf(uint64_t present) {
+    std::lock_guard lock(g_camera_mutex);
+    return g_camera_frames[present % 8];
+}
+
 // lut.cube (a colour grading table) was found and loaded; the Graphics menu shows its strength row
 inline std::atomic<bool> g_lut_loaded{false};
 
