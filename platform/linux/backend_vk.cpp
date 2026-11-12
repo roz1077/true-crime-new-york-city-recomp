@@ -1125,7 +1125,29 @@ private:
     bool pass_motion_ = false;      // the open pass has the motion attachment
     bool EnsureMotion(Target& rt);
     void DestroyMotion();
-    std::unordered_map<uint64_t, std::vector<VertexConstants>> motion_now_, motion_was_;
+    // this frame's and last frame's scene program draws: their constants in a flat pool, chained per draw identity.
+    // Both keep their memory from frame to frame (no allocation per draw, which cost 2-3 ms a frame on the Deck).
+    struct MotionDraws {
+        struct Entry {
+            uint32_t next;  // next entry of the same identity, ~0u at the end
+            bool used;
+        };
+        std::vector<VertexConstants> constants;
+        std::vector<Entry> entries;
+        std::unordered_map<uint64_t, uint32_t> heads;  // identity -> first entry
+        void Clear() {
+            constants.clear();
+            entries.clear();
+            heads.clear();
+        }
+        void Add(uint64_t id, const VertexConstants& c) {
+            const uint32_t at = uint32_t(entries.size());
+            auto [it, fresh] = heads.try_emplace(id, at);
+            entries.push_back({fresh ? ~0u : it->second, false});
+            if (!fresh) it->second = at;
+            constants.push_back(c);
+        }
+    } motion_now_, motion_was_;
     VertexConstants motion_match_{};
     static constexpr size_t kRoadProjection = 188;  // guest constant 92: the road programs' projection rows
     struct RoadProjection {
@@ -3113,7 +3135,7 @@ void VulkanBackend::ResetFrame() {
     // TAA: this frame's matched draws are the next frame's previous ones; a frame without TAA drops the history
     if (!taa_applied_) {
         ResetTemporalHistory();
-        motion_now_.clear();
+        motion_now_.Clear();
         road_projection_now_ = {};
     }
     if (!splits_ms_.empty() && frames_ % 120 == 0) {
@@ -3172,8 +3194,8 @@ void VulkanBackend::ResetFrame() {
         LOGR("motion: per frame%s", line.c_str());
         motion_trace_.clear();
     }
-    motion_was_ = std::move(motion_now_);
-    motion_now_.clear();
+    std::swap(motion_was_, motion_now_);
+    motion_now_.Clear();
     road_projection_was_ = road_projection_now_;
     road_projection_now_ = {};
     motion_rt_ = nullptr;
@@ -3845,24 +3867,32 @@ const VulkanBackend::VertexConstants* VulkanBackend::PreviousRoadConstants(const
 }
 
 const VulkanBackend::VertexConstants* VulkanBackend::MatchPrevious(uint64_t id, const State& s) {
-    auto it = motion_was_.find(id);
-    if (it == motion_was_.end() || it->second.empty()) return nullptr;
-    auto& list = it->second;
-    size_t best = 0;
+    auto it = motion_was_.heads.find(id);
+    if (it == motion_was_.heads.end()) return nullptr;
+    // the unused previous draw of this identity whose constants are closest to this draw's (several cars share a
+    // model); a lone one is taken without comparing
+    uint32_t best = ~0u, candidates = 0;
     float best_d = 3.4e38f;
-    for (size_t i = 0; i < list.size() && list.size() > 1; i++) {
-        float d = 0;
-        for (size_t r = 0; r < 192; r++)
-            for (size_t c = 0; c < 4; c++) d += std::fabs(list[i][r][c] - s.vsc[r][c]);
-        if (d < best_d) {
-            best_d = d;
-            best = i;
+    for (uint32_t e = it->second; e != ~0u; e = motion_was_.entries[e].next) {
+        if (motion_was_.entries[e].used) continue;
+        if (++candidates == 1) best = e;
+    }
+    if (best == ~0u) return nullptr;
+    if (candidates > 1) {
+        for (uint32_t e = it->second; e != ~0u; e = motion_was_.entries[e].next) {
+            if (motion_was_.entries[e].used) continue;
+            const VertexConstants& c = motion_was_.constants[e];
+            float d = 0;
+            for (size_t r = 0; r < 192 && d < best_d; r++)
+                for (size_t k = 0; k < 4; k++) d += std::fabs(c[r][k] - s.vsc[r][k]);
+            if (d < best_d) {
+                best_d = d;
+                best = e;
+            }
         }
     }
-    motion_match_ = list[best];
-    list[best] = list.back();
-    list.pop_back();
-    return &motion_match_;
+    motion_was_.entries[best].used = true;
+    return &motion_was_.constants[best];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6970,7 +7000,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
                 uint32_t ident[22] = {prim, start, count, s.index_data, s.base_vertex, s.vs_handle};
                 for (int i = 0; i < 16; i++) ident[6 + i] = s.streams[size_t(i)].vb;
                 const uint64_t id = Hash(ident, sizeof(ident), s.vs->hash);
-                motion_now_[id].push_back(s.vsc);
+                motion_now_.Add(id, s.vsc);
                 prev_consts = MatchPrevious(id, s);
             }
             if (trace_motion) {
