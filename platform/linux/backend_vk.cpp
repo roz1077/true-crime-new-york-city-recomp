@@ -308,6 +308,7 @@ struct DeferredDraw {
     VkPipeline pipe = VK_NULL_HANDLE;
     VkPipeline depth_pipe = VK_NULL_HANDLE;
     VkDescriptorSet set = VK_NULL_HANDLE;
+    uint32_t offsets[3] = {};  // dynamic offsets of the set's VC, DC and VCP buffers (bindings 0, 1, 10)
     VkBuffer vbufs[16]{};
     VkDeviceSize voffs[16]{};
     uint32_t vbind[16]{};
@@ -1129,23 +1130,30 @@ private:
     // Both keep their memory from frame to frame (no allocation per draw, which cost 2-3 ms a frame on the Deck).
     struct MotionDraws {
         struct Entry {
-            uint32_t next;  // next entry of the same identity, ~0u at the end
+            uint32_t next;     // next entry of the same identity, ~0u at the end
+            uint32_t ordinal;  // its place among the frame's draws of that identity
             bool used;
+        };
+        struct Head {
+            uint32_t first, count;
         };
         std::vector<VertexConstants> constants;
         std::vector<Entry> entries;
-        std::unordered_map<uint64_t, uint32_t> heads;  // identity -> first entry
+        std::unordered_map<uint64_t, Head> heads;  // identity -> latest entry, draws of it so far
         void Clear() {
             constants.clear();
             entries.clear();
             heads.clear();
         }
-        void Add(uint64_t id, const VertexConstants& c) {
+        // returns the draw's ordinal among this identity's draws this frame
+        uint32_t Add(uint64_t id, const VertexConstants& c) {
             const uint32_t at = uint32_t(entries.size());
-            auto [it, fresh] = heads.try_emplace(id, at);
-            entries.push_back({fresh ? ~0u : it->second, false});
-            if (!fresh) it->second = at;
+            auto [it, fresh] = heads.try_emplace(id, Head{at, 0});
+            const uint32_t ordinal = it->second.count++;
+            entries.push_back({fresh ? ~0u : it->second.first, ordinal, false});
+            it->second.first = at;
             constants.push_back(c);
+            return ordinal;
         }
     } motion_now_, motion_was_;
     VertexConstants motion_match_{};
@@ -1158,6 +1166,9 @@ private:
     RoadProjection road_projection_now_, road_projection_was_;
     std::map<std::string, uint32_t> motion_trace_;
     std::map<std::string, uint32_t> pass_reasons_;
+    // draw sets already written this frame, by the buffers, image views, layouts and samplers they name (the
+    // constants are dynamic offsets): most draws reuse one instead of writing 11 descriptors
+    std::unordered_map<uint64_t, VkDescriptorSet> draw_set_cache_;
     std::map<std::string, double> splits_ms_;  // TCNYC_PERF_SPLITS
     uint64_t splits_draws_ = 0;
     std::map<std::string, uint32_t> submit_where_;  // TCNYC_PERF_SPLITS: mid-frame submits (each waits) by caller
@@ -1166,7 +1177,7 @@ private:
         const char* why = "";
     };
     std::unordered_map<uint32_t, UploadStat> upload_stats_;  // TCNYC_PERF_SPLITS: texture uploads by address  // TCNYC_PERF: why each new scene pass started
-    const VertexConstants* MatchPrevious(uint64_t id, const State& s);
+    const VertexConstants* MatchPrevious(uint64_t id, uint32_t ordinal, const State& s);
     const VertexConstants* PreviousRoadConstants(const VertexConstants& current);
     // the resolve: dense motion and metadata, then the history blend into history[next]
     struct Taa {
@@ -1735,7 +1746,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     // descriptor set layout: b0 VC, b1 DC, t0-t3, s0-s3
     VkDescriptorSetLayoutBinding bind[11]{};
     bind[0].binding = 0;
-    bind[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bind[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;  // offsets given at bind (draw set cache)
     bind[0].descriptorCount = 1;
     bind[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
                          VK_SHADER_STAGE_GEOMETRY_BIT;
@@ -1805,7 +1816,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     apl.pPushConstantRanges = &aoPush;
     if (vkCreatePipelineLayout(device_, &apl, nullptr, &ao_pipeline_layout_) != VK_SUCCESS) return false;
 
-    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 * 8192},
+    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3 * 8192},
                                      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4 * 8192},
                                      {VK_DESCRIPTOR_TYPE_SAMPLER, 4 * 8192}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -3131,6 +3142,7 @@ void VulkanBackend::EndRecord(bool wait, std::source_location where) {
 void VulkanBackend::ResetFrame() {
     upload_used_ = 0;
     draw_set_next_ = 0;
+    draw_set_cache_.clear();
     const app::Settings settings = app::Snapshot();  // one copy for the whole reset
     // TAA: this frame's matched draws are the next frame's previous ones; a frame without TAA drops the history
     if (!taa_applied_) {
@@ -3866,25 +3878,36 @@ const VulkanBackend::VertexConstants* VulkanBackend::PreviousRoadConstants(const
     return &motion_match_;
 }
 
-const VulkanBackend::VertexConstants* VulkanBackend::MatchPrevious(uint64_t id, const State& s) {
+const VulkanBackend::VertexConstants* VulkanBackend::MatchPrevious(uint64_t id, uint32_t ordinal, const State& s) {
     auto it = motion_was_.heads.find(id);
     if (it == motion_was_.heads.end()) return nullptr;
+    auto distance = [&](uint32_t e, float limit) {
+        const VertexConstants& c = motion_was_.constants[e];
+        float d = 0;
+        for (size_t r = 0; r < 192 && d < limit; r++)
+            for (size_t k = 0; k < 4; k++) d += std::fabs(c[r][k] - s.vsc[r][k]);
+        return d;
+    };
     // the unused previous draw of this identity whose constants are closest to this draw's (several cars share a
-    // model); a lone one is taken without comparing
-    uint32_t best = ~0u, candidates = 0;
-    float best_d = 3.4e38f;
-    for (uint32_t e = it->second; e != ~0u; e = motion_was_.entries[e].next) {
+    // model). The draw in the same place last frame is tried first: draw order is usually stable, so its distance
+    // bounds the others' and their comparisons stop after a few registers. A lone candidate is taken as is.
+    uint32_t best = ~0u, same_place = ~0u, candidates = 0;
+    for (uint32_t e = it->second.first; e != ~0u; e = motion_was_.entries[e].next) {
         if (motion_was_.entries[e].used) continue;
-        if (++candidates == 1) best = e;
+        candidates++;
+        best = e;
+        if (motion_was_.entries[e].ordinal == ordinal) same_place = e;
     }
     if (best == ~0u) return nullptr;
     if (candidates > 1) {
-        for (uint32_t e = it->second; e != ~0u; e = motion_was_.entries[e].next) {
-            if (motion_was_.entries[e].used) continue;
-            const VertexConstants& c = motion_was_.constants[e];
-            float d = 0;
-            for (size_t r = 0; r < 192 && d < best_d; r++)
-                for (size_t k = 0; k < 4; k++) d += std::fabs(c[r][k] - s.vsc[r][k]);
+        float best_d = 3.4e38f;
+        if (same_place != ~0u) {
+            best = same_place;
+            best_d = distance(same_place, best_d);
+        }
+        for (uint32_t e = it->second.first; e != ~0u && best_d > 0; e = motion_was_.entries[e].next) {
+            if (motion_was_.entries[e].used || e == same_place) continue;
+            const float d = distance(e, best_d);
             if (d < best_d) {
                 best_d = d;
                 best = e;
@@ -4397,7 +4420,7 @@ void VulkanBackend::ReplayDeferred(const std::vector<DeferredDraw>& draws, const
         if (d.ibuf) vkCmdBindIndexBuffer(cmd_, d.ibuf, d.ioff, d.itype);
         VkDescriptorSet sets[2] = {d.set, occlusion};
         vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0,
-                                occlusion ? 2u : 1u, sets, 0, nullptr);
+                                occlusion ? 2u : 1u, sets, 3, d.offsets);
         if (!last || std::memcmp(&last->vp, &d.vp, sizeof(d.vp))) vkCmdSetViewport(cmd_, 0, 1, &d.vp);
         if (!last || std::memcmp(&last->sc, &d.sc, sizeof(d.sc))) vkCmdSetScissor(cmd_, 0, 1, &d.sc);
         if (!last || std::memcmp(last->blend, d.blend, sizeof(d.blend))) vkCmdSetBlendConstants(cmd_, d.blend);
@@ -4504,7 +4527,7 @@ void VulkanBackend::FlushDeferredScene(std::source_location where) {
                         vkCmdBindVertexBuffers(cmd_, d.vbind[i], 1, &d.vbufs[i], &d.voffs[i]);
                     if (d.ibuf) vkCmdBindIndexBuffer(cmd_, d.ibuf, d.ioff, d.itype);
                     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &d.set,
-                                            0, nullptr);
+                                            3, d.offsets);
                     vkCmdSetViewport(cmd_, 0, 1, &d.vp);
                     vkCmdSetScissor(cmd_, 0, 1, &d.sc);
                     vkCmdSetBlendConstants(cmd_, d.blend);
@@ -7000,8 +7023,8 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
                 uint32_t ident[22] = {prim, start, count, s.index_data, s.base_vertex, s.vs_handle};
                 for (int i = 0; i < 16; i++) ident[6 + i] = s.streams[size_t(i)].vb;
                 const uint64_t id = Hash(ident, sizeof(ident), s.vs->hash);
-                motion_now_.Add(id, s.vsc);
-                prev_consts = MatchPrevious(id, s);
+                const uint32_t ordinal = motion_now_.Add(id, s.vsc);
+                prev_consts = MatchPrevious(id, ordinal, s);
             }
             if (trace_motion) {
                 motion_trace_[prev_consts ? "matched" : "unmatched"]++;
@@ -7275,23 +7298,19 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
 
     splits.At("upload constants");
-    if (draw_set_next_ >= draw_sets_.size()) {
-        LOG_FIRST(4, "vulkan: more than %zu draws in a frame, dropping the rest", draw_sets_.size());
-        return;
-    }
-    VkDescriptorSet set = draw_sets_[draw_set_next_++];
-    VkDescriptorBufferInfo bi[3] = {{vc_alloc.buffer, vc_alloc.offset, VkDeviceSize(sizeof(s.vsc))},
-                                    {dc_alloc.buffer, dc_alloc.offset, VkDeviceSize(sizeof(c))},
-                                    {vcp_alloc.buffer, vcp_alloc.offset, VkDeviceSize(sizeof(VertexConstants))}};
+    const uint32_t dyn_offsets[3] = {uint32_t(vc_alloc.offset), uint32_t(dc_alloc.offset), uint32_t(vcp_alloc.offset)};
+    VkDescriptorBufferInfo bi[3] = {{vc_alloc.buffer, 0, VkDeviceSize(sizeof(s.vsc))},
+                                    {dc_alloc.buffer, 0, VkDeviceSize(sizeof(c))},
+                                    {vcp_alloc.buffer, 0, VkDeviceSize(sizeof(VertexConstants))}};
     VkDescriptorImageInfo ii[4]{};
     VkDescriptorImageInfo si[4]{};
     VkWriteDescriptorSet writes[11]{};
     for (int i = 0; i < 2; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = set;
+        writes[i].dstSet = VK_NULL_HANDLE;  // set on a cache miss below
         writes[i].dstBinding = uint32_t(i);
         writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         writes[i].pBufferInfo = &bi[i];
     }
     splits.At("descriptor buffers");
@@ -7305,27 +7324,48 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
                               : white_sampler_;
         writes[2 + i] = {};
         writes[2 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[2 + i].dstSet = set;
+        writes[2 + i].dstSet = VK_NULL_HANDLE;  // set on a cache miss below
         writes[2 + i].dstBinding = uint32_t(2 + i);
         writes[2 + i].descriptorCount = 1;
         writes[2 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         writes[2 + i].pImageInfo = &ii[i];
         writes[6 + i] = {};
         writes[6 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[6 + i].dstSet = set;
+        writes[6 + i].dstSet = VK_NULL_HANDLE;  // set on a cache miss below
         writes[6 + i].dstBinding = uint32_t(6 + i);
         writes[6 + i].descriptorCount = 1;
         writes[6 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         writes[6 + i].pImageInfo = &si[i];
     }
     writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[10].dstSet = set;
+    writes[10].dstSet = VK_NULL_HANDLE;  // set on a cache miss below
     writes[10].dstBinding = 10;
     writes[10].descriptorCount = 1;
-    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     writes[10].pBufferInfo = &bi[2];
     splits.At("samplers and image infos");
-    vkUpdateDescriptorSets(device_, 11, writes, 0, nullptr);
+    // the set: one written earlier this frame naming the same buffers, images and samplers, else a new one
+    uint64_t set_key = Hash(&vc_alloc.buffer, sizeof(VkBuffer));
+    set_key = Hash(&dc_alloc.buffer, sizeof(VkBuffer), set_key);
+    set_key = Hash(&vcp_alloc.buffer, sizeof(VkBuffer), set_key);
+    for (int i = 0; i < 4; i++) {
+        set_key = Hash(&ii[i].imageView, sizeof(VkImageView), set_key);
+        set_key = Hash(&ii[i].imageLayout, sizeof(VkImageLayout), set_key);
+        set_key = Hash(&si[i].sampler, sizeof(VkSampler), set_key);
+    }
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (auto found = draw_set_cache_.find(set_key); found != draw_set_cache_.end()) {
+        set = found->second;
+    } else {
+        if (draw_set_next_ >= draw_sets_.size()) {
+            LOG_FIRST(4, "vulkan: more than %zu draw sets in a frame, dropping the rest", draw_sets_.size());
+            return;
+        }
+        set = draw_sets_[draw_set_next_++];
+        for (VkWriteDescriptorSet& w : writes) w.dstSet = set;
+        vkUpdateDescriptorSets(device_, 11, writes, 0, nullptr);
+        draw_set_cache_[set_key] = set;
+    }
     splits.At("vkUpdateDescriptorSets");
     laps.Lap(&perf_geom_ms_);
 
@@ -7383,6 +7423,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         d.pipe = pipe;
         d.depth_pipe = depth_pipe;
         d.set = set;
+        std::memcpy(d.offsets, dyn_offsets, sizeof(dyn_offsets));
         d.vb_count = nb;
         for (uint32_t i = 0; i < nb; i++) {
             d.vbind[i] = bound[i];
@@ -7438,7 +7479,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
     for (uint32_t i = 0; i < nb; i++) vkCmdBindVertexBuffers(cmd_, bound[i], 1, &vbufs[i], &offs[i]);
     if (idx_buffer) vkCmdBindIndexBuffer(cmd_, idx_buffer, idx_off, idx_type);
-    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 3, dyn_offsets);
     if (!viewport_valid_ || std::memcmp(&vp, &bound_vp_, sizeof(vp)) != 0 ||
         std::memcmp(&sc, &bound_sc_, sizeof(sc)) != 0) {
         vkCmdSetViewport(cmd_, 0, 1, &vp);
