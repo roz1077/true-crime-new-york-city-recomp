@@ -28,7 +28,7 @@ struct Settings {
     uint32_t msaa = 0;               // 0, 2, 4 or 8 samples; off by default, it is the costliest option
     bool smaa = true;                // SMAA 1x on the finished frame
     bool taa = false;                // experimental temporal AA in place of SMAA on the 3D scene (Windows)
-    uint32_t upscaler = 0;           // below 100% render scale: 0 bilinear, 1 AMD FSR 1, 2 FSR 3.1, 3 DLSS
+    uint32_t upscaler = 0;           // 0 bilinear, 1 AMD FSR 1, 2 FSR 3.1, 3 DLSS, 4 FSR 4.1
     uint32_t sharpening = 0;         // RCAS sharpening on the finished frame, percent (0 off)
     bool bloom = true;                // bright-pass bloom on the finished frame
     uint32_t bloom_strength = 100;    // bloom brightness, percent of the original

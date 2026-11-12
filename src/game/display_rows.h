@@ -328,6 +328,10 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
             std::snprintf(text, kTextBytes, "UPSCALER %s",
                           v.render_percent == 67 ? "FSR 3.1 QUALITY" :
                           v.render_percent == 100 ? "FSR 3.1 NATIVE AA" : "FSR 3.1 REQUIRES 67% OR 100%");
+        else if (v.upscaler == choices::kFsr4)
+            std::snprintf(text, kTextBytes, "UPSCALER %s",
+                          v.render_percent == 67 ? "FSR 4.1 QUALITY" :
+                          v.render_percent == 100 ? "FSR 4.1 NATIVE AA" : "FSR 4.1 REQUIRES 67% OR 100%");
 #if defined(TCNYC_HAVE_DLSS)
         else if (v.upscaler == choices::kDlss)
             std::snprintf(text, kTextBytes, "UPSCALER %s",

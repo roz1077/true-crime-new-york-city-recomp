@@ -86,7 +86,7 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Apply display changes | Applies the display mode and resolution. A change that fails puts the previous mode back. |
 | Aspect ratio | Auto, 4:3, 16:10, 16:9, 21:9 or 32:9. The 3D view widens; HUD and menus stay 16:9 in the middle, and the intro movies stretch to fill the screen. 4:3 and the wide shapes take effect after a restart. |
 | Render scale | 25% to 200% of the output height. |
-| Upscaler | Bilinear or AMD FSR 1 below 100% Render scale. Windows also offers experimental FSR 3.1 and DLSS Quality at 67% Render scale and Native AA at 100%; DLSS needs an NVIDIA RTX adapter and NVIDIA's `nvngx_dlss.dll` beside the executable. |
+| Upscaler | Bilinear or AMD FSR 1 below 100% Render scale. Windows also offers experimental FSR 3.1, FSR 4.1 and DLSS Quality at 67% Render scale and Native AA at 100%. FSR 4.1 needs AMD's SDK 2.x loader/upscaler DLLs and uses FSR 3.1 when the driver exposes only 3.1; DLSS needs an NVIDIA RTX adapter and NVIDIA's `nvngx_dlss.dll`. |
 | Sharpening | Off to 100%: AMD FidelityFX RCAS sharpening of the 3D frame, at any render scale. The HUD is not sharpened. Off by default. |
 | Field of view | 80% to 150% of the game's view, gameplay camera only; aiming still zooms. |
 | Object detail | Original, High, Very high or Maximum: how far buildings and props keep their detailed models. Vehicles keep the game's own detail level. Maximum is much slower. |
@@ -237,7 +237,7 @@ Ubuntu 24.04 has no `libsdl3-dev`; build SDL 3.4.16 (`release-3.4.16`) from sour
 - [Zydis](https://github.com/zyantific/zydis) — x86 instruction decoding.
 - [toml++](https://github.com/marzer/tomlplusplus), [Dear ImGui](https://github.com/ocornut/imgui), [SDL](https://github.com/libsdl-org/SDL) and [SMAA](https://github.com/iryoku/smaa) — configuration, overlay, window/input and anti-aliasing.
 - [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT) — upscaling and sharpening.
-- [AMD FidelityFX SDK 1.1.4](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v1.1.4) (MIT) — optional FSR 3.1 on D3D12. Place AMD's signed `amd_fidelityfx_dx12.dll` from the SDK's `PrebuiltSignedDLL` directory beside `TrueCrimeNYC.exe` and restart the game.
+- [AMD FidelityFX SDK 2.4](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0) (MIT) — optional FSR 3.1 and FSR 4.1 on D3D12. Place AMD's signed `amd_fidelityfx_loader_dx12.dll` and `amd_fidelityfx_upscaler_dx12.dll` from the SDK's `signedbin` directory beside `TrueCrimeNYC.exe`. The older combined `amd_fidelityfx_dx12.dll` still works as an FSR 3.1 fallback.
 - [NVIDIA DLSS](https://github.com/NVIDIA/DLSS) (NVIDIA proprietary, redistributable runtime) — optional experimental DLSS on D3D12 for RTX adapters; the release `nvngx_dlss.dll` is placed beside `TrueCrimeNYC.exe`.
 - [LLVM / Clang](https://llvm.org/) — the compiler bundled with the Windows release to build the game code on first launch.
 - [shaderc](https://github.com/google/shaderc) / [glslang](https://github.com/KhronosGroup/glslang) and [stb](https://github.com/nothings/stb) — run-time shader compilation and texture image loading on Linux.

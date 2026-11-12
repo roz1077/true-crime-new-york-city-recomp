@@ -20,10 +20,12 @@ inline constexpr bool Fsr3Scale(uint32_t percent) { return percent == 67 || perc
 // read, but the row only offers it when the backend was compiled in.
 inline constexpr uint32_t kDlss = 3;
 inline constexpr bool DlssScale(uint32_t percent) { return percent == 67 || percent == 100; }
+inline constexpr uint32_t kFsr4 = 4;
+inline constexpr bool Fsr4Scale(uint32_t percent) { return percent == 67 || percent == 100; }
 #if defined(_WIN32) && defined(TCNYC_HAVE_DLSS)
-inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kDlss};
+inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kDlss, kFsr4};
 #elif defined(_WIN32)
-inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3};
+inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kFsr4};
 #else
 inline constexpr uint32_t kUpscalers[] = {0, 1};
 #endif

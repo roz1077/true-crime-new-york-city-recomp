@@ -44,8 +44,8 @@
 #include "../../third_party/smaa/AreaTex.h"
 #include "../../third_party/smaa/SMAAShader.h"
 #include "../../third_party/smaa/SearchTex.h"
-#include "../../third_party/fsr3/ffx_api/dx12/ffx_api_dx12.h"
-#include "../../third_party/fsr3/ffx_api/ffx_upscale.h"
+#include "../../third_party/fsr3/api/include/dx12/ffx_api_dx12.h"
+#include "../../third_party/fsr3/upscalers/include/ffx_upscale.h"
 #if defined(TCNYC_HAVE_DLSS)
 // The NGX headers are proprietary and are not vendored: TCNYC_DLSS_SDK points at a local
 // NVIDIA/DLSS checkout. The loader is header-only, so the game has no link-time nvngx dependency.
@@ -1364,6 +1364,10 @@ private:
         uint32_t w = 0, h = 0;
         uint32_t out_w = 0, out_h = 0;
         bool infinite_depth = false;
+        bool sdk2 = false;          // loader + upscaler DLLs from FidelityFX SDK 2.x
+        bool provider_four = false; // the active context selected FSR 4.x
+        int provider_choice = -1;   // the Upscaler value the context was made for
+        std::string provider_name;
         bool failed = false;
         bool valid = false;
         PerfClock::time_point last_dispatch{};
@@ -1396,7 +1400,10 @@ private:
 #endif
     } dlss_;
     void LoadFsr3();
+    bool FsrSelected() const;
     bool Fsr3Enabled() const;
+    bool Fsr4Enabled() const;
+    bool FsrEnabled() const { return Fsr3Enabled() || Fsr4Enabled(); }
     void LoadDlss();
     bool DlssEnabled() const;
     bool EnsureDlss(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h);
@@ -1411,7 +1418,7 @@ private:
         dlss_.valid = false;
 #endif
     }
-    bool TemporalEnabled() const { return render_.taa || Fsr3Enabled() || DlssEnabled(); }
+    bool TemporalEnabled() const { return render_.taa || FsrEnabled() || DlssEnabled(); }
     bool EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h, bool infinite_depth);
     void InitFsr3Profile();
     void CollectFsr3Profile(Frame& frame);
@@ -4885,7 +4892,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     const auto& hud_texture = stages.desc[0];
     const bool hud_source = !stages.rt[0] || (hud_texture &&
         uint64_t(hud_texture->width) * hud_texture->height <= kSmallTargetPixels);
-    const bool temporal_upscaler = Fsr3Enabled() || DlssEnabled();
+    const bool temporal_upscaler = FsrEnabled() || DlssEnabled();
     const bool fsr_hud = temporal_upscaler && bound_motion_ && a.pretransformed && hud_source &&
                          blend_on && bsrc == 0x302 && bdst == 0x303 && !SimpleState(s, kMZWriteEnable) &&
                          BlendOp(SimpleState(s, kMBlendOp)) == D3D12_BLEND_OP_ADD &&
@@ -6524,7 +6531,7 @@ float4 taa(O i) : SV_Target {
 bool D3D12Backend::EnsureMotion(Target& rt) {
     if (motion_failed_) return false;
     const uint32_t samples = rt.res->GetDesc().SampleDesc.Count;
-    const DXGI_FORMAT format = (Fsr3Enabled() || DlssEnabled()) ? kMotionReactiveFormat : kMotionFormat;
+    const DXGI_FORMAT format = (FsrEnabled() || DlssEnabled()) ? kMotionReactiveFormat : kMotionFormat;
     if (!motion_ || motion_w_ != rt.w || motion_h_ != rt.h || motion_samples_ != samples || motion_format_ != format) {
         if (motion_) Release(std::move(motion_));
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
@@ -6630,10 +6637,23 @@ D3D12Backend::~D3D12Backend() {
 }
 
 void D3D12Backend::LoadFsr3() {
-    if (render_.upscaler != game::choices::kFsr3 || !game::choices::Fsr3Scale(render_.render_percent) ||
-        fsr3_.module || fsr3_.failed) return;
-    const auto path = app::ExeDir() / "amd_fidelityfx_dx12.dll";
-    fsr3_.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!FsrSelected() || fsr3_.module || fsr3_.failed) return;
+    // SDK 2.x splits the combined DLL into a loader and an upscaler. Prefer that pair when both
+    // are present; fall back to the SDK 1.x combined DLL so existing installs keep working.
+    const auto loader_path = app::ExeDir() / "amd_fidelityfx_loader_dx12.dll";
+    const auto upscaler_path = app::ExeDir() / "amd_fidelityfx_upscaler_dx12.dll";
+    std::error_code ec;
+    if (std::filesystem::exists(loader_path, ec) && std::filesystem::exists(upscaler_path, ec)) {
+        fsr3_.module = LoadLibraryExW(loader_path.c_str(), nullptr,
+                                      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        fsr3_.sdk2 = fsr3_.module != nullptr;
+    }
+    if (!fsr3_.module) {
+        const auto path = app::ExeDir() / "amd_fidelityfx_dx12.dll";
+        fsr3_.module = LoadLibraryExW(path.c_str(), nullptr,
+                                      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        fsr3_.sdk2 = false;
+    }
     if (fsr3_.module) {
         fsr3_.create = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(fsr3_.module, "ffxCreateContext"));
         fsr3_.destroy = reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(fsr3_.module, "ffxDestroyContext"));
@@ -6641,7 +6661,11 @@ void D3D12Backend::LoadFsr3() {
         fsr3_.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(fsr3_.module, "ffxQuery"));
     }
     fsr3_.failed = !fsr3_.create || !fsr3_.destroy || !fsr3_.dispatch || !fsr3_.query;
-    if (fsr3_.failed) LOGR("d3d12: FSR 3.1 requires AMD's amd_fidelityfx_dx12.dll beside the game");
+    if (fsr3_.failed)
+        LOGR("d3d12: FSR needs AMD's amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll "
+             "(SDK 2.x), or the older amd_fidelityfx_dx12.dll, beside the game");
+    else
+        LOGR("d3d12: FidelityFX API %s", fsr3_.sdk2 ? "SDK 2.x loader" : "SDK 1.x combined DLL");
 }
 
 #if defined(TCNYC_HAVE_DLSS)
@@ -6735,8 +6759,18 @@ void D3D12Backend::LoadDlss() {
 void D3D12Backend::LoadDlss() {}
 #endif
 
+bool D3D12Backend::FsrSelected() const {
+    return (render_.upscaler == game::choices::kFsr3 && game::choices::Fsr3Scale(render_.render_percent)) ||
+           (render_.upscaler == game::choices::kFsr4 && game::choices::Fsr4Scale(render_.render_percent));
+}
+
 bool D3D12Backend::Fsr3Enabled() const {
     return render_.upscaler == game::choices::kFsr3 && game::choices::Fsr3Scale(render_.render_percent) &&
+           fsr3_.dispatch && !fsr3_.failed;
+}
+
+bool D3D12Backend::Fsr4Enabled() const {
+    return render_.upscaler == game::choices::kFsr4 && game::choices::Fsr4Scale(render_.render_percent) &&
            fsr3_.dispatch && !fsr3_.failed;
 }
 
@@ -6953,8 +6987,9 @@ void D3D12Backend::ReleaseDlss() {}
 #endif
 
 bool D3D12Backend::EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h, bool infinite_depth) {
+    const int provider_choice = int(render_.upscaler);
     if (fsr3_.context && fsr3_.w == w && fsr3_.h == h && fsr3_.out_w == out_w && fsr3_.out_h == out_h &&
-        fsr3_.infinite_depth == infinite_depth) return true;
+        fsr3_.infinite_depth == infinite_depth && fsr3_.provider_choice == provider_choice) return true;
     if (fsr3_.context) {
         Flush();
         fsr3_.destroy(&fsr3_.context, nullptr);
@@ -6978,7 +7013,7 @@ bool D3D12Backend::EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t o
                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
         fsr3_.failed = true;
-        LOGR("d3d12: could not allocate FSR 3.1 resources");
+        LOGR("d3d12: could not allocate FSR resources");
         return false;
     }
     dev_->CreateRenderTargetView(fsr3_.depth.res.Get(), nullptr, Cpu(rtv_heap_.Get(), kFsr3DepthRtv, rtv_inc_));
@@ -6997,36 +7032,58 @@ bool D3D12Backend::EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t o
     std::vector<const char*> names(count);
     versions.versionIds = ids.data();
     versions.versionNames = names.data();
+    auto pick = [&](const char* prefix) -> uint64_t {
+        const size_t length = std::strlen(prefix);
+        for (size_t i = 0; i < std::min<uint64_t>(count, names.size()); ++i) {
+            if (names[i] && std::strncmp(names[i], prefix, length) == 0) {
+                fsr3_.provider_name = names[i];
+                return ids[i];
+            }
+        }
+        return 0;
+    };
+    const bool want_four = render_.upscaler == game::choices::kFsr4;
     uint64_t provider = 0;
     if (fsr3_.query(nullptr, &versions.header) == FFX_API_RETURN_OK) {
-        for (size_t i = 0; i < std::min<uint64_t>(count, names.size()); ++i) {
-            if (names[i] && std::strncmp(names[i], "3.1.", 4) == 0) {
-                provider = ids[i];
-                break;
-            }
+        provider = want_four ? pick("4.") : pick("3.1.");
+        if (!provider) {
+            const char* fallback = want_four ? "3.1." : "4.";
+            LOGR("d3d12: FSR %s provider unavailable, falling back to %s", want_four ? "4.1" : "3.1",
+                 want_four ? "3.1" : "4.1");
+            provider = pick(fallback);
         }
     }
     if (!provider) {
         fsr3_.failed = true;
-        LOGR("d3d12: AMD FSR 3.1 provider is unavailable");
+        LOGR("d3d12: no AMD FSR upscaler provider is available");
         return false;
     }
-    ffxOverrideVersion version{{FFX_API_DESC_TYPE_OVERRIDE_VERSION, nullptr}, provider};
+    fsr3_.provider_four = fsr3_.provider_name.rfind("4.", 0) == 0;
+    ffxCreateContextDescUpscaleVersion api_version{};
+    api_version.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION, nullptr};
+    api_version.version = FFX_UPSCALER_VERSION;
+    ffxOverrideVersion version{{FFX_API_DESC_TYPE_OVERRIDE_VERSION,
+                                fsr3_.sdk2 ? &api_version.header : nullptr},
+                               provider};
     ffxCreateBackendDX12Desc backend{{FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12, &version.header}, dev_.Get()};
     ffxCreateContextDescUpscale desc{};
     desc.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, &backend.header};
     desc.flags = FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
     if (infinite_depth) desc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
+    if (fsr3_.provider_four) {
+        // The guest's scene is display-referred SDR, not linear, and there is no exposure texture.
+        desc.flags |= FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    }
     if (std::getenv("TCNYC_TRACE_TAA")) {
         desc.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
-        desc.fpMessage = [](uint32_t, const wchar_t* message) { LOGR("FSR 3.1: %ls", message); };
+        desc.fpMessage = [](uint32_t, const wchar_t* message) { LOGR("FSR: %ls", message); };
     }
     desc.maxRenderSize = {w, h};
     desc.maxUpscaleSize = {out_w, out_h};
     const auto result = fsr3_.create(&fsr3_.context, &desc.header, nullptr);
     if (result != FFX_API_RETURN_OK) {
         fsr3_.failed = true;
-        LOGR("d3d12: FSR 3.1 context creation failed (%u)", result);
+        LOGR("d3d12: FSR context creation failed (%u), provider %s", result, fsr3_.provider_name.c_str());
         return false;
     }
     fsr3_.w = w;
@@ -7034,10 +7091,11 @@ bool D3D12Backend::EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t o
     fsr3_.out_w = out_w;
     fsr3_.out_h = out_h;
     fsr3_.infinite_depth = infinite_depth;
+    fsr3_.provider_choice = provider_choice;
     ffxQueryGetProviderVersion active{{FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION, nullptr}, 0, nullptr};
     fsr3_.query(&fsr3_.context, &active.header);
-    LOGR("d3d12: FSR context %ux%u -> %ux%u, provider %s", w, h, out_w, out_h,
-         active.versionName ? active.versionName : "unknown");
+    LOGR("d3d12: FSR context %ux%u -> %ux%u, provider %s, flags 0x%X", w, h, out_w, out_h,
+         active.versionName ? active.versionName : fsr3_.provider_name.c_str(), desc.flags);
     return true;
 }
 
@@ -7066,7 +7124,7 @@ ID3D12Resource* D3D12Backend::DispatchFsr3(ID3D12Resource* color, D3D12_RESOURCE
                constants, 32, -1, motion ? motion_.Get() : nullptr, motion_format_,
                Cpu(rtv_heap_.Get(), kFsr3ReactiveRtv, rtv_inc_), DXGI_FORMAT_R8_UNORM)) {
         fsr3_.failed = true;
-        LOGR("d3d12: FSR 3.1 depth and reactive mask pass could not be recorded");
+        LOGR("d3d12: FSR depth and reactive mask pass could not be recorded");
         return nullptr;
     }
 
@@ -7100,13 +7158,14 @@ ID3D12Resource* D3D12Backend::DispatchFsr3(ID3D12Resource* color, D3D12_RESOURCE
     dispatch.cameraFar = camera.near_z;
     dispatch.cameraFovAngleVertical = 2.0f * std::atan(1.0f / camera.ys);
     dispatch.viewSpaceToMetersFactor = 1.0f;
+    dispatch.flags = fsr3_.provider_four ? FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB : 0;
     const auto result = fsr3_.dispatch(&fsr3_.context, &dispatch.header);
     Begin();  // FidelityFX binds its own descriptor heap.
     Transition(color, color_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(dense.res.Get(), dense.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (result != FFX_API_RETURN_OK) {
         fsr3_.failed = true;
-        LOGR("d3d12: FSR 3.1 dispatch failed (%u)", result);
+        LOGR("d3d12: FSR dispatch failed (%u), provider %s", result, fsr3_.provider_name.c_str());
         return nullptr;
     }
     Transition(output.res.Get(), output.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -7115,10 +7174,11 @@ ID3D12Resource* D3D12Backend::DispatchFsr3(ID3D12Resource* color, D3D12_RESOURCE
     if (!PassN(shader.c_str(), "fsrHud", kFsr3OutputFormat, Cpu(rtv_heap_.Get(), kFsr3OutputRtv, rtv_inc_),
                out_w, out_h, hud_inputs, hud_formats, constants, 32, -1,
                taa_.metadata.res.Get(), kTemporalMetadataFormat))
-        LOGR("d3d12: FSR 3.1 HUD preservation pass could not be recorded");
+        LOGR("d3d12: FSR HUD preservation pass could not be recorded");
     Transition(output.res.Get(), output.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    if (!fsr3_.valid) LOGR("d3d12: FSR 3.1 %s dispatch succeeded",
-                          render_.render_percent == 100 ? "Native AA" : "Quality");
+    if (!fsr3_.valid)
+        LOGR("d3d12: %s %s dispatch succeeded", fsr3_.provider_four ? "FSR 4.1" : "FSR 3.1",
+             render_.render_percent == 100 ? "Native AA" : "Quality");
     fsr3_.valid = true;
     fsr3_.last_dispatch = now;
     return output.res.Get();
@@ -7233,9 +7293,9 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
     // A backend switch must not carry the other backend's history. The selected backend is the only
     // one that dispatches; clearing the other's valid flag makes a later switch start from reset.
 #if defined(TCNYC_HAVE_DLSS)
-    if (Fsr3Enabled()) dlss_.valid = false;
+    if (FsrEnabled()) dlss_.valid = false;
 #endif
-    if (DlssEnabled() && !Fsr3Enabled()) fsr3_.valid = false;
+    if (DlssEnabled() && !FsrEnabled()) fsr3_.valid = false;
     if (DlssEnabled() && camera_valid) {
         if (auto* dlss = DispatchDlss(color, state, cam, reset, p, motion)) {
             taa_.camera = cam;
@@ -7243,7 +7303,7 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
             return dlss;
         }
     }
-    if (Fsr3Enabled() && camera_valid) {
+    if (FsrEnabled() && camera_valid) {
         if (auto* fsr = DispatchFsr3(color, state, cam, reset, p, motion)) {
             taa_.camera = cam;
             taa_.valid = true;
@@ -7697,7 +7757,7 @@ void D3D12Backend::Present(const Surface& front) {
             for (; i; i /= b) r += (f /= float(b)) * float(i % b);
             return r;
         };
-        const uint32_t phases = Fsr3Enabled() && render_.render_percent == 67 ? 18 : 8;
+        const uint32_t phases = FsrEnabled() && render_.render_percent == 67 ? 18 : 8;
         const uint32_t i = uint32_t(frame_ % phases) + 1;
         taa_jitter_[0] = halton(i, 2) - 0.5f;
         taa_jitter_[1] = halton(i, 3) - 0.5f;

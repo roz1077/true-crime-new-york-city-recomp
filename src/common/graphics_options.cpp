@@ -547,9 +547,10 @@ const char *Help(Row row) {
         return "How bright the bloom glow is. 100% is the original, very subtle look.";
     case Row::Upscaler:
 #ifdef _WIN32
-        return "FSR 1 sharpens when scaling up. Experimental FSR 3.1 runs in Quality at 67% Render scale "
-               "and Native AA at 100%; it requires AMD's amd_fidelityfx_dx12.dll beside the game. "
-               "DLSS is experimental and needs an NVIDIA RTX adapter and NVIDIA's nvngx_dlss.dll beside the game.";
+        return "FSR 1 sharpens when scaling up. Experimental FSR 3.1 and FSR 4.1 run in Quality at 67% Render "
+               "scale and Native AA at 100%. FSR 4.1 needs AMD's SDK 2.x loader and upscaler DLLs beside the "
+               "game; it uses FSR 3.1 when the driver exposes only 3.1. DLSS is experimental and needs an "
+               "NVIDIA RTX adapter and NVIDIA's nvngx_dlss.dll beside the game.";
 #else
         return "How the picture is scaled up when Render scale is below 100%. AMD FSR 1 keeps edges sharper than "
                "Bilinear and sharpens lightly; Sharpening sets how much.";
@@ -692,6 +693,11 @@ std::string Value(Row row) {
             if (s.render_percent == 67) return "FSR 3.1 Quality";
             if (s.render_percent == 100) return "FSR 3.1 Native AA";
             return "FSR 3.1 requires 67% or 100%";
+        }
+        if (s.upscaler == choices::kFsr4) {
+            if (s.render_percent == 67) return "FSR 4.1 Quality";
+            if (s.render_percent == 100) return "FSR 4.1 Native AA";
+            return "FSR 4.1 requires 67% or 100%";
         }
 #if defined(TCNYC_HAVE_DLSS)
         if (s.upscaler == choices::kDlss) {
