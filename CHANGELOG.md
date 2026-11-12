@@ -28,6 +28,8 @@
 - AMD FSR 1 upscaling (Upscaler: Bilinear or AMD FSR 1) when Render scale is below 100%, and
   RCAS sharpening (Sharpening: Off to 100%) of the 3D frame at any render scale. The HUD,
   movies and still pictures are not sharpened. Windows and Linux.
+- TAA (Windows, F10): temporal anti-aliasing in place of SMAA, using the game camera and per-object motion
+  for cars, people and the road. Needs no extra DLLs. Off by default.
 - FSR 3.1, FSR 4.1 and DLSS offer Performance (50%) and Balanced (58%) presets beside Quality and
   Native AA; the jitter pattern lengthens at lower scales. The F10 Upscaler row says when AMD's DLLs
   are missing or only FSR 3.1 is offered. Sharpening now also applies to DLSS output. Brief far-plane

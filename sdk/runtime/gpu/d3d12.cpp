@@ -7217,7 +7217,10 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
     if (!color) return nullptr;
     auto& state = color == t.res.Get() ? t.state : t.resolved_state;
     Transition(color, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    if (!taa_.history[0].res || taa_.w != t.w || taa_.h != t.h || taa_.fmt != t.fmt) {
+    // FSR and DLSS keep their own history; TAA's two history images are made only while TAA itself is selected
+    const bool need_history = render_.taa;
+    if (!taa_.dense_motion.res || taa_.w != t.w || taa_.h != t.h || taa_.fmt != t.fmt ||
+        need_history != bool(taa_.history[0].res)) {
         Flush();
         for (auto& f : frames_)
             if (f.fence && !WaitFence(f.fence)) return nullptr;
@@ -7227,6 +7230,7 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
         for (uint32_t i = 0; i < kTaaRtvs; i++) {
             SmaaTexture& tex = *targets[i];
             if (tex.res) Release(std::move(tex.res));
+            if (i < kTaaHistoryCount && !need_history) continue;
             D3D12_RESOURCE_DESC td = Texture2DDesc(formats[i], t.w, t.h);
             td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
             tex.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -7242,16 +7246,12 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
         taa_.h = t.h;
         taa_.fmt = t.fmt;
         ResetTemporalHistory();
-        LOGR("d3d12: TAA history and dense motion %ux%u", t.w, t.h);
+        LOGR("d3d12: %s %ux%u", need_history ? "TAA history and dense motion" : "dense motion", t.w, t.h);
     }
     // the cameras: this frame's, and the one the history was made with
     // The scene hook records the camera of the frame after the one drawn (tested: one frame earlier is steady), so the
-    // frame drawn uses the snapshot one present back. TCNYC_TAA_CAMERA_OFFSET overrides it for testing.
-    static const int64_t offset = [] {
-        const char* e = std::getenv("TCNYC_TAA_CAMERA_OFFSET");
-        return e ? int64_t(std::atoll(e)) : int64_t(-1);
-    }();
-    const CameraFrame cam = CameraOf(uint64_t(int64_t(presents_) + 8 + offset));
+    // frame drawn uses the snapshot one present back.
+    const CameraFrame cam = CameraOf(presents_ + 8 - 1);
     float inv[16], m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     // depth turns into view distance with the camera's own planes (the scene depth's range is normalised for the
     // distance blur and is not in view units)
@@ -7332,7 +7332,7 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
             return fsr;
         }
     }
-    if (!render_.taa) return nullptr;
+    if (!render_.taa || !in.res || !out.res) return nullptr;
     if (fsr3_.valid) p[23] = 1.0f;  // the previous output used FidelityFX's history
     Transition(in.res.Get(), in.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(out.res.Get(), out.state, D3D12_RESOURCE_STATE_RENDER_TARGET);

@@ -407,7 +407,7 @@ const char *Label(Row row) {
     case Row::Msaa:
         return "MSAA";
     case Row::Taa:
-        return "TAA (experimental)";
+        return "TAA";
     case Row::Smaa:
         return "SMAA";
     case Row::Bloom:
@@ -510,8 +510,8 @@ const char *Help(Row row) {
     case Row::Msaa:
         return "Smooths geometry edges. Higher counts require more GPU memory.";
     case Row::Taa:
-        return "Experimental temporal anti-aliasing in place of SMAA on the 3D scene. Smooths edges and shimmer over "
-               "several frames; moving cars and people can leave trails. A test of whether FSR 3 or DLSS could work.";
+        return "Temporal anti-aliasing in place of SMAA on the 3D scene. Smooths edges and shimmer over several "
+               "frames and needs no extra DLLs. The FSR and DLSS upscalers replace it when selected.";
     case Row::Smaa:
         return "Smooths jagged edges on the finished frame (SMAA 1x). The HUD is smoothed with it.";
     case Row::Bloom:
