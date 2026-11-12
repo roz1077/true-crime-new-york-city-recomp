@@ -449,6 +449,8 @@ std::recursive_mutex& UiLock() {
 
 void ApplyDisplay() { PostMessageW(g_hwnd, kApplyDisplay, 0, 0); }
 
+bool RequestQuit() { return g_hwnd && PostMessageW(g_hwnd, WM_CLOSE, 0, 0); }
+
 // Asks the window thread to switch to this mode and size, and returns a request number, or 0 when
 // the window would not accept the message. The settings change only if the switch works; the caller
 // polls DisplayApplyResult for this request's own answer and saves after a success.

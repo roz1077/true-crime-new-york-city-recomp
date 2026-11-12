@@ -2,9 +2,9 @@
 // (native_graphics.cpp): cursor movement, value changes and row text. No
 // runtime dependencies, so a test can compile it.
 //
-// The tab has two pages. Main follows the game's SUBTITLES row with the
-// Graphics menu's display and rendering options; its HDR SETTINGS row opens
-// the HDR page, whose BACK row (or Back / B) returns to it.
+// Main follows the game's SUBTITLES row with display and rendering options.
+// HDR SETTINGS opens a native subpage. The top-level Exit Game selection
+// uses the same row renderer for its confirmation.
 #pragma once
 
 #include <cstdint>
@@ -22,7 +22,7 @@ inline constexpr uint32_t kTabBarFocus = 1, kRowListFocus = 4;
 inline constexpr uint32_t kUp = 0x01, kDown = 0x02, kLeft = 0x04, kRight = 0x08, kBack = 0x20, kAccept = 0x100,
                           kCancel = 0x200;
 
-enum class Page { Main, Hdr };
+enum class Page { Main, Hdr, Exit };
 
 enum class Option {
     DisplayMode,
@@ -54,6 +54,9 @@ enum class Option {
     HdrPeak,
     HdrHighlights,
     HdrBack, // returns to the main page
+    ExitPrompt,
+    ExitCancel,
+    ExitConfirm,
     Count,
 };
 inline constexpr uint32_t kOptionCount = uint32_t(Option::Count);
@@ -72,9 +75,11 @@ inline constexpr Option kMainOptions[] = {
     Option::ShowFps,     Option::HdrPage};
 inline constexpr Option kHdrOptions[] = {Option::Hdr, Option::HdrPaperWhite, Option::HdrPeak, Option::HdrHighlights,
                                          Option::HdrBack};
+inline constexpr Option kExitOptions[] = {Option::ExitPrompt, Option::ExitCancel, Option::ExitConfirm};
 
 inline constexpr std::span<const Option> Options(Page page) {
     if (page == Page::Hdr) return kHdrOptions;
+    if (page == Page::Exit) return kExitOptions;
     return kMainOptions;
 }
 // rows the game draws itself: SUBTITLES on the main page
@@ -117,6 +122,7 @@ struct Step {
     uint32_t row = 0, focus = kRowListFocus;
     int change = 0;     // -1 or 1: change the option on this row
     bool apply = false; // A on the display mode or resolution row
+    bool quit = false;  // A on Exit Game in the confirmation page
 };
 
 // One input in the Display tab's row list. The game's own row count for the
@@ -128,6 +134,25 @@ inline Step Input(Page page, uint32_t row, uint32_t input) {
     Step s;
     s.page = page;
     s.row = row;
+    if (page == Page::Exit) {
+        s.handled = true;
+        const uint32_t cancel = RowOf(page, Option::ExitCancel);
+        const uint32_t confirm = RowOf(page, Option::ExitConfirm);
+        if (input & (kBack | kCancel)) {
+            s.page = Page::Main;
+        } else if (input & kUp) {
+            s.row = cancel;
+        } else if (input & kDown) {
+            s.row = confirm;
+        } else if (input & kAccept) {
+            if (row == cancel) {
+                s.page = Page::Main;
+            } else {
+                s.quit = row == confirm;
+            }
+        }
+        return s;
+    }
     const uint32_t rows = RowCount(page);
     const bool added = row >= NativeRows(page) && row < rows;
     if (input & kDown) {
@@ -172,7 +197,7 @@ inline Step Input(Page page, uint32_t row, uint32_t input) {
 // that follows the selected row; first is the logical row in the top slot.
 inline constexpr uint32_t kShownRows = 5;
 static_assert(RowCount(Page::Main) >= kShownRows && RowCount(Page::Hdr) >= kShownRows,
-              "every page fills the tab's five slots");
+              "the settings pages fill the tab's five slots");
 
 inline uint32_t Scroll(uint32_t row, uint32_t first) {
     if (row < first) return row;
@@ -413,6 +438,15 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
         break;
     case Option::HdrBack:
         std::snprintf(text, kTextBytes, "BACK");
+        break;
+    case Option::ExitConfirm:
+        std::snprintf(text, kTextBytes, "EXIT GAME");
+        break;
+    case Option::ExitPrompt:
+        std::snprintf(text, kTextBytes, "EXIT GAME?");
+        break;
+    case Option::ExitCancel:
+        std::snprintf(text, kTextBytes, "CANCEL");
         break;
     default:
         text[0] = 0;

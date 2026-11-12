@@ -277,6 +277,12 @@ int Instance() {
 
 void* Window() { return g_window; }
 
+bool RequestQuit() {
+    SDL_Event event{};
+    event.type = SDL_EVENT_QUIT;
+    return SDL_PushEvent(&event);
+}
+
 Mode Desktop() {
     return {g_desktop_w.load(std::memory_order_relaxed), g_desktop_h.load(std::memory_order_relaxed)};
 }

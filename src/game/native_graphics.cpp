@@ -14,6 +14,7 @@
 // Its HDR SETTINGS row swaps the rows for an HDR page (g_page).
 // The rules are in display_rows.h.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -46,12 +47,15 @@ constexpr uint32_t kDisplayCount = 0x08015D89;  // number of rows
 constexpr uint32_t kDisplayText = 0xDBCC9F60;   // + row: the row's text
 constexpr uint32_t kDisplayColour = 0xA471F488; // + row: the row's text colour
 constexpr uint32_t kOptionsPage = 0x6ADBF5A0;   // OptionsPageController: tab, 0 to 3
+constexpr uint32_t kTopTitle = 0xE4BCA648;     // MainStaticTitleRender text
 
 // MenuPauseInterface fields
+constexpr uint32_t kTopTab = 0x2C; // Main through Options, 0 to 4
 constexpr uint32_t kPage = 0x30;  // 0x0F to 0x12: the Options tabs
 constexpr uint32_t kRow = 0x34;   // selected row
 constexpr uint32_t kFocus = 0x7C; // kTabBarFocus or kRowListFocus
 constexpr uint32_t kDisplayPage = 0x11;
+constexpr uint32_t kMainTab = 0, kOptionsTab = 4, kTopBarFocus = 0;
 constexpr uint32_t kColourSelected = 0x80808080, kColourNormal = 0x60606060; // as the game's rows
 constexpr uint32_t kInputEvent = 9;
 
@@ -269,7 +273,90 @@ bool g_entered = false;
 uint32_t g_first = 0;
 Page g_page = Page::Main;
 
+// The guest indexes a five-element title table with the tab field. Leave the
+// real tab on Options to draw the confirmation panel and override its title.
+struct ExitSelection {
+    uint32_t owner = 0, tab = 0, page = 0, row = 0;
+};
+ExitSelection g_exit;
+
+// MenuShellInterface owns the New Game / Load Game / Options list after Start.
+// The tag already has a fourth row and highlight position for its demo item.
+constexpr uint32_t kShellRow = 0x68, kShellState = 0x6C, kShellDemo = 0x70;
+constexpr uint32_t kShellChoiceState = 1, kShellExitRow = 3;
+constexpr uint32_t kShellCount = 0xFC9CB9A7, kShellText = 0x33384F13, kShellColour = 0xC5B0BD5B;
+constexpr uint32_t kShellInputReady = 0x003EE31A, kShellDialogOpen = 0x00373554;
+constexpr uint32_t kShellAlternateBack = 0x800;
+uint32_t g_shell_exit_owner = 0;
+
 } // namespace
+
+X86_EXTERN_FUNC(__imp__sub_000AD5C0);
+X86_FUNC(sub_000AD5C0) {
+    const uint32_t self = ctx.ecx, out = X86_MEM32(ctx.esp + 4), port = X86_MEM32(ctx.esp + 8);
+    const bool confirming = self && g_shell_exit_owner == self;
+    if (out && self && !X86_MEM8(self + kShellDemo)) {
+        if (port == kShellCount) {
+            X86_MEM32(out) = confirming ? RowCount(Page::Exit) : kShellExitRow + 1;
+            ::kernel::Return(ctx, 0, 2);
+            return;
+        }
+        if (confirming && port >= kShellColour && port < kShellColour + RowCount(Page::Exit)) {
+            const bool selected = port - kShellColour == X86_MEM32(self + kShellRow);
+            X86_MEM32(out) = selected ? kColourSelected : kColourNormal;
+            ::kernel::Return(ctx, 0, 2);
+            return;
+        }
+        if ((confirming && port >= kShellText && port < kShellText + RowCount(Page::Exit)) ||
+            (!confirming && port == kShellText + kShellExitRow)) {
+            const Option option = confirming ? OptionAt(Page::Exit, port - kShellText) : Option::ExitConfirm;
+            if (const uint32_t buffer = TextBuffer(uint32_t(option))) {
+                char label[kTextBytes];
+                Text({}, option, label);
+                std::memcpy(base + buffer, label, std::strlen(label) + 1);
+                X86_MEM32(out) = buffer;
+                ::kernel::Return(ctx, 0, 2);
+                return;
+            }
+        }
+    }
+    __imp__sub_000AD5C0(ctx, base);
+}
+
+X86_EXTERN_FUNC(__imp__sub_000B6400);
+X86_FUNC(sub_000B6400) {
+    const uint32_t self = ctx.ecx, event = X86_MEM32(ctx.esp + 4), input = X86_MEM32(ctx.esp + 8);
+    if (self == g_shell_exit_owner && event == 1) g_shell_exit_owner = 0;
+    if (self && event == kInputEvent && X86_MEM32(self + kShellState) == kShellChoiceState &&
+        !X86_MEM8(self + kShellDemo) && X86_MEM8(kShellInputReady) && !X86_MEM8(kShellDialogOpen)) {
+        const uint32_t row = X86_MEM32(self + kShellRow);
+        if (g_shell_exit_owner == self) {
+            const Step step = Input(Page::Exit, row, input | ((input & kShellAlternateBack) ? kBack : 0));
+            X86_MEM32(self + kShellRow) = step.row;
+            if (step.page != Page::Exit) {
+                g_shell_exit_owner = 0;
+                X86_MEM32(self + kShellRow) = kShellExitRow;
+            }
+            if (step.quit && !app::RequestQuit()) LOGE("Main menu: could not request game exit");
+            ::kernel::Return(ctx, 0, 3);
+            return;
+        }
+        if (row == kShellExitRow && (input & (kAccept | kDown))) {
+            if (input & kAccept) {
+                g_shell_exit_owner = self;
+                X86_MEM32(self + kShellRow) = RowOf(Page::Exit, Option::ExitCancel);
+            }
+            ::kernel::Return(ctx, 0, 3);
+            return;
+        }
+        if (row == kShellExitRow - 1 && (input & kDown) && !(input & (kAccept | kUp))) {
+            __imp__sub_000B6400(ctx, base);
+            X86_MEM32(self + kShellRow) = kShellExitRow;
+            return;
+        }
+    }
+    __imp__sub_000B6400(ctx, base);
+}
 
 // 0xB13C0: Display tab setup (thiscall): copies the game's display settings
 // into the menu for cancel. Runs on opening Options and on entering the tab.
@@ -306,19 +393,30 @@ X86_FUNC(sub_000C7B80) {
     PollDisplayApply();
     MaybeSave(); // the row getter runs every frame while the tab is open
     const uint32_t self = ctx.ecx, out = X86_MEM32(ctx.esp + 4), port = X86_MEM32(ctx.esp + 8);
+    const bool exiting = self && self == g_exit.owner;
+    const Page row_page = exiting ? Page::Exit : g_page;
+    if (out && exiting && port == kTopTitle) {
+        if (const uint32_t buffer = TextBuffer(uint32_t(Option::ExitConfirm))) {
+            std::memcpy(base + buffer, "EXIT GAME", sizeof("EXIT GAME"));
+            X86_MEM32(out) = buffer;
+            ::kernel::Return(ctx, 0, 2);
+            return;
+        }
+    }
     const bool text = port >= kDisplayText && port < kDisplayText + kShownRows;
     const bool colour = port >= kDisplayColour && port < kDisplayColour + kShownRows;
     if (out && (text || colour)) {
         // slot on screen -> logical row
-        const uint32_t slot = port - (text ? kDisplayText : kDisplayColour), row = g_first + slot;
+        const uint32_t slot = port - (text ? kDisplayText : kDisplayColour);
+        const uint32_t row = (exiting ? 0 : g_first) + slot;
         if (colour) {
             const bool lit = slot == X86_MEM32(self + kRow) && X86_MEM32(self + kFocus) == kRowListFocus;
             X86_MEM32(out) = lit ? kColourSelected : kColourNormal;
             ::kernel::Return(ctx, 0, 2);
             return;
         }
-        if (row >= NativeRows(g_page) && row < RowCount(g_page)) {
-            const Option option = OptionAt(g_page, row);
+        if (row >= NativeRows(row_page) && row < RowCount(row_page)) {
+            const Option option = OptionAt(row_page, row);
             char buffer_text[kTextBytes];
             Text(Current(), option, buffer_text);
             if (const uint32_t buffer = TextBuffer(uint32_t(option))) {
@@ -335,7 +433,10 @@ X86_FUNC(sub_000C7B80) {
     __imp__sub_000C7B80(ctx, base);
 
     if (ctx.eax != 0 || !out) return;
-    if (port == kDisplayCount) X86_MEM32(out) = kShownRows;
+    if (port == kDisplayCount) {
+        const bool awaiting_accept = exiting && X86_MEM32(self + kFocus) == kTopBarFocus;
+        X86_MEM32(out) = awaiting_accept ? 1 : std::min(kShownRows, RowCount(row_page));
+    }
     if (Tracing() && port == kOptionsPage) {
         static thread_local uint32_t last_page = UINT32_MAX;
         const uint32_t page = X86_MEM32(out);
@@ -353,6 +454,40 @@ X86_FUNC(sub_000CB400) {
     MaybeSave();
     const uint32_t self = ctx.ecx, event = X86_MEM32(ctx.esp + 4), input = X86_MEM32(ctx.esp + 8);
     const uint32_t page = self ? X86_MEM32(self + kPage) : 0;
+    if (self && self == g_exit.owner && event == 1) g_exit = {};
+    if (self && self == g_exit.owner && event == kInputEvent) {
+        if (X86_MEM32(self + kFocus) == kRowListFocus) {
+            const Step step = Input(Page::Exit, X86_MEM32(self + kRow), input);
+            X86_MEM32(self + kRow) = step.row;
+            if (step.page != Page::Exit) X86_MEM32(self + kFocus) = kTopBarFocus;
+            if (step.quit && !g_display_request) {
+                FlushSettings();
+                if (!app::RequestQuit()) LOGE("Pause menu: could not request game exit");
+            }
+            ::kernel::Return(ctx, 0, 3);
+            return;
+        }
+
+        if (input & (kLeft | kRight | kBack | kCancel)) {
+            const uint32_t target = (input & kLeft) ? kOptionsTab : kMainTab;
+            const bool back = (input & (kBack | kCancel)) != 0;
+            X86_MEM32(self + kTopTab) = g_exit.tab;
+            X86_MEM32(self + kPage) = g_exit.page;
+            X86_MEM32(self + kRow) = g_exit.row;
+            g_exit = {};
+            if (back || X86_MEM32(self + kTopTab) != target)
+                __imp__sub_000CB400(ctx, base);
+            else
+                ::kernel::Return(ctx, 0, 3);
+            return;
+        }
+        if (input & kAccept) {
+            X86_MEM32(self + kFocus) = kRowListFocus;
+            X86_MEM32(self + kRow) = RowOf(Page::Exit, Option::ExitCancel);
+        }
+        ::kernel::Return(ctx, 0, 3);
+        return;
+    }
     if (self && Tracing() && event == kInputEvent && page >= 0x0F && page <= 0x12) {
         const uint32_t row = X86_MEM32(self + kRow), focus = X86_MEM32(self + kFocus);
         static thread_local uint32_t last[4] = {UINT32_MAX};
@@ -395,6 +530,20 @@ X86_FUNC(sub_000CB400) {
             return;
         }
     }
+    const bool top_navigation = self && event == kInputEvent && (input & (kLeft | kRight)) &&
+                                X86_MEM32(self + kFocus) == kTopBarFocus;
+    const uint32_t old_tab = top_navigation ? X86_MEM32(self + kTopTab) : UINT32_MAX;
     __imp__sub_000CB400(ctx, base);
+    if (top_navigation && X86_MEM32(self + kFocus) == kTopBarFocus) {
+        const uint32_t tab = X86_MEM32(self + kTopTab);
+        const bool wrapped_left = old_tab == kMainTab && tab == kOptionsTab && (input & kLeft);
+        const bool wrapped_right = old_tab == kOptionsTab && tab == kMainTab && !(input & kLeft);
+        if (wrapped_left || wrapped_right) {
+            g_exit = {self, tab, X86_MEM32(self + kPage), X86_MEM32(self + kRow)};
+            X86_MEM32(self + kTopTab) = kOptionsTab;
+            X86_MEM32(self + kPage) = kDisplayPage;
+            X86_MEM32(self + kRow) = 0;
+        }
+    }
     if (event == kInputEvent && page == kDisplayPage && !OnDisplayRows(base, self)) FlushSettings();
 }
