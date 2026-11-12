@@ -1828,7 +1828,8 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
         if ((ao_color_samples_ & VK_SAMPLE_COUNT_1_BIT) == 0) ao_color_samples_ = VK_SAMPLE_COUNT_1_BIT;
     }
     if (!CreateSwapchain() || !CreateCommands() || !CreateUpload()) return false;
-    if (const char* enabled = std::getenv("TCNYC_SCENE_FP16"); enabled && std::atoi(enabled) != 0) {
+    // FP16 scene colour is on by default; TCNYC_SCENE_FP16=0 keeps the scene targets BGRA8
+    if (const char* enabled = std::getenv("TCNYC_SCENE_FP16"); !enabled || !*enabled || std::atoi(enabled) != 0) {
         constexpr auto format = VK_FORMAT_R16G16B16A16_SFLOAT;
         VkFormatProperties properties{};
         vkGetPhysicalDeviceFormatProperties(physical_, format, &properties);

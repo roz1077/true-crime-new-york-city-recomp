@@ -1617,7 +1617,8 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     if (defer_scene_) LOGR("d3d12: experimental deferred AO enabled (TCNYC_DEFER_SCENE=1)");
     HWND hwnd = static_cast<HWND>(app::Window());
     if (!CreateDevice()) return false;
-    if (EnvFlag("TCNYC_SCENE_FP16")) {
+    // FP16 scene colour is on by default; TCNYC_SCENE_FP16=0 keeps the scene targets BGRA8
+    if (const char* fp16 = std::getenv("TCNYC_SCENE_FP16"); !fp16 || !*fp16 || std::atoi(fp16) != 0) {
         D3D12_FEATURE_DATA_FORMAT_SUPPORT support{kSceneFp16};
         constexpr auto required = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
                                   D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE;

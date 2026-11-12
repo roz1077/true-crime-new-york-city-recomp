@@ -113,8 +113,8 @@ MSAA is off by default because it is the most demanding option; depth of field w
 
 Most of these also appear in the game's own **Options > Display** tab, with HDR on its own HDR SETTINGS page. Back cancels and A confirms there, as with the game's options; a display change is saved only once it has been applied.
 
-Set `TCNYC_SCENE_FP16=1` before launch to test higher-precision scene colour on D3D12 or Vulkan.
-Guest surfaces retain their original formats.
+The 3D scene renders in higher-precision (FP16) colour on D3D12 and Vulkan when the GPU supports it. Set
+`TCNYC_SCENE_FP16=0` before launch to use the original 8-bit scene targets. Guest surfaces retain their original formats.
 
 </details>
 

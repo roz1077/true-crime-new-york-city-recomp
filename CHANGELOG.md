@@ -11,7 +11,7 @@
   on unsupported hardware. Native RTX rendering still needs validation.
 - Linux Vulkan records large deferred scene batches on two threads by default.
   Set `TCNYC_DRAW_WORKER=0` to disable parallel recording.
-- Experimental FP16 scene colour on D3D12 and Vulkan. Set `TCNYC_SCENE_FP16=1` before launch.
+- FP16 scene colour on D3D12 and Vulkan, on by default where supported. Set `TCNYC_SCENE_FP16=0` to turn it off.
 - Pipelines are kept between runs: the driver's compiled pipelines are saved beside the
   shader cache (`shader-cache/.../pipelines.bin` on Windows, `~/.cache/TrueCrimeNYC/pipelines.bin`
   on Linux) a few seconds after the last new one, so effects and areas seen before no longer
