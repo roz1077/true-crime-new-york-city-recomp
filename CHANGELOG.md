@@ -5,8 +5,12 @@
 ### Graphics
 - Linux / Steam Deck: TAA (with the same per-object motion and road handling as Windows) and experimental
   AMD FSR 3.1 (Performance, Balanced, Quality, Native AA), built from AMD's open FidelityFX SDK 1.1.4 Vulkan
-  backend. FSR 4 has no Linux build from AMD. The bloom chain now works on Linux (a shader cache key bug made
-  it fall back to the single-pass bloom).
+  backend. FSR 3.1 protects marked HUD pixels and supplies a reactive mask for effects. It uses FP16 and
+  wave64 shaders where supported. The Vulkan bloom chain now runs after fixing a shader cache key collision.
+- Experimental Vulkan DLSS in optional SDK builds, with the same four presets and clean fallback
+  on unsupported hardware. Native RTX rendering still needs validation.
+- Linux Vulkan can record large deferred scene batches on two threads. To try it without ambient occlusion,
+  start with `TCNYC_DRAW_WORKER=1 TCNYC_DEFER_SCENE=1`. The worker is opt-in.
 - Pipelines are kept between runs: the driver's compiled pipelines are saved beside the
   shader cache (`shader-cache/.../pipelines.bin` on Windows, `~/.cache/TrueCrimeNYC/pipelines.bin`
   on Linux) a few seconds after the last new one, so effects and areas seen before no longer

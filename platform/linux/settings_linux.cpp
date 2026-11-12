@@ -78,7 +78,7 @@ void Load() {
     s.vsync = t["vsync"].value_or(s.vsync);
     s.low_latency = t["low_latency"].value_or(s.low_latency);
     s.taa = t["taa"].value_or(s.taa);
-    s.upscaler = uint32_t(std::clamp<int64_t>(t["upscaler"].value_or(int64_t(s.upscaler)), 0, 2));  // bilinear, FSR 1, FSR 3.1
+    s.upscaler = uint32_t(std::clamp<int64_t>(t["upscaler"].value_or(int64_t(s.upscaler)), 0, 3));
     s.sharpening = uint32_t(std::clamp<int64_t>(t["sharpening"].value_or(int64_t(s.sharpening)), 0, 100));
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     // as settings.cpp: a file without the key keeps the built-in default (Settings::msaa); older

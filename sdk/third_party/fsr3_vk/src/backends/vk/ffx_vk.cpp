@@ -175,6 +175,8 @@ typedef struct BackendContext_VK {
 
     VkDevice                device = VK_NULL_HANDLE;
     VkPhysicalDevice        physicalDevice = VK_NULL_HANDLE;
+    bool                    tcnycFloat16 = false;
+    bool                    tcnycWave64 = false;
     VkFunctionTable         vkFunctionTable = {};
 
     FfxGpuJobDescription*   pGpuJobs;
@@ -1468,6 +1470,8 @@ FfxErrorCode CreateBackendContextVK(FfxInterface* backendInterface, FfxEffect ef
         if (vkDeviceContext->vkPhysicalDevice != VK_NULL_HANDLE) {
             backendContext->physicalDevice = vkDeviceContext->vkPhysicalDevice;
         }
+        backendContext->tcnycFloat16 = vkDeviceContext->tcnycFloat16;
+        backendContext->tcnycWave64 = vkDeviceContext->tcnycWave64;
 
         // load vulkan functions
         backendContext->vkFunctionTable.vkSetDebugUtilsObjectNameEXT = (PFN_vkSetDebugUtilsObjectNameEXT)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkSetDebugUtilsObjectNameEXT");
@@ -1988,8 +1992,8 @@ FfxErrorCode GetDeviceCapabilitiesVK(FfxInterface* backendInterface, FfxDeviceCa
     // no shader model in vulkan so assume the minimum
     deviceCapabilities->maximumSupportedShaderModel = FFX_SHADER_MODEL_5_1;
     deviceCapabilities->waveLaneCountMin = 32;
-    deviceCapabilities->waveLaneCountMax = 32;
-    deviceCapabilities->fp16Supported = false;
+    deviceCapabilities->waveLaneCountMax = backendContext->tcnycWave64 ? 64 : 32;
+    deviceCapabilities->fp16Supported = backendContext->tcnycFloat16;
     deviceCapabilities->raytracingSupported = false;
     deviceCapabilities->deviceCoherentMemorySupported = false;
     deviceCapabilities->dedicatedAllocationSupported = false;
@@ -2003,35 +2007,7 @@ FfxErrorCode GetDeviceCapabilitiesVK(FfxInterface* backendInterface, FfxDeviceCa
 
     for (uint32_t i = 0; i < backendContext->numDeviceExtensions; i++)
     {
-        if (strcmp(backendContext->extensionProperties[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME) == 0)
-        {
-            // check if we the max subgroup size allows us to use wave64
-            VkPhysicalDeviceSubgroupSizeControlProperties subgroupSizeControlProperties = {};
-            subgroupSizeControlProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
-
-            VkPhysicalDeviceProperties2 deviceProperties2 = {};
-            deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-            deviceProperties2.pNext = &subgroupSizeControlProperties;
-            vkGetPhysicalDeviceProperties2(context->physicalDevice, &deviceProperties2);
-
-            deviceCapabilities->waveLaneCountMin = subgroupSizeControlProperties.minSubgroupSize;
-            deviceCapabilities->waveLaneCountMax = subgroupSizeControlProperties.maxSubgroupSize;
-        }
-        else if (strcmp(backendContext->extensionProperties[i].extensionName, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) == 0)
-        {
-            // check for fp16 support
-            VkPhysicalDeviceShaderFloat16Int8Features shaderFloat18Int8Features = {};
-            shaderFloat18Int8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
-
-            VkPhysicalDeviceFeatures2 physicalDeviceFeatures2 = {};
-            physicalDeviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            physicalDeviceFeatures2.pNext = &shaderFloat18Int8Features;
-
-            vkGetPhysicalDeviceFeatures2(context->physicalDevice, &physicalDeviceFeatures2);
-
-            deviceCapabilities->fp16Supported = (bool)shaderFloat18Int8Features.shaderFloat16;
-        }
-        else if (strcmp(backendContext->extensionProperties[i].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0)
+        if (strcmp(backendContext->extensionProperties[i].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0)
         {
             // check for ray tracing support
             VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
@@ -2099,10 +2075,7 @@ FfxErrorCode GetDeviceCapabilitiesVK(FfxInterface* backendInterface, FfxDeviceCa
         }
     }
 
-    // tcnyc: only what the game's device enables. It turns on none of these features or extensions, so the 32-bit,
-    // default-subgroup-size shader variants and plain pipeline barriers are used.
-    deviceCapabilities->fp16Supported = false;
-    deviceCapabilities->waveLaneCountMax = deviceCapabilities->waveLaneCountMin;
+    // tcnyc: the game enables only the explicitly passed FP16 and subgroup features.
     deviceCapabilities->extendedSynchronizationSupported = false;
     deviceCapabilities->deviceCoherentMemorySupported = false;
     deviceCapabilities->bufferMarkerSupported = false;

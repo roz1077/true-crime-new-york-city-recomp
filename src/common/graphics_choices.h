@@ -15,8 +15,7 @@ inline constexpr uint32_t kAnisoLevels[] = {0, 2, 4, 8, 16}; // 0: as the game a
 inline constexpr uint32_t kMsaaSamples[] = {0, 2, 4, 8};     // 0: off
 inline constexpr uint32_t kAoModes[] = {0, 1, 2};            // off, half resolution, full resolution
 inline constexpr uint32_t kFsr3 = 2;
-// DLSS is a Windows/D3D12 backend. The value exists on every build so an old settings file can be
-// read, but the row only offers it when the backend was compiled in.
+// Keep DLSS's setting value even when the optional backend was omitted.
 inline constexpr uint32_t kDlss = 3;
 inline constexpr uint32_t kFsr4 = 4;
 // The temporal upscalers (FSR 3.1, FSR 4.1, DLSS) run at their standard presets' render scales only.
@@ -42,6 +41,8 @@ inline constexpr const char *TemporalPresetName(uint32_t percent) {
 inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kDlss, kFsr4};
 #elif defined(_WIN32)
 inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kFsr4};
+#elif defined(TCNYC_HAVE_DLSS)
+inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kDlss};
 #else
 inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3};  // FSR 3.1 through AMD's open Vulkan backend
 #endif

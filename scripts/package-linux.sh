@@ -85,6 +85,25 @@ cp "$REPO/CHANGELOG.md" "$PKG/CHANGELOG.md"
 cp "$REPO/sdk/THIRD_PARTY.txt" "$PKG/THIRD_PARTY.txt"
 cp "$REPO/sdk/LICENSE" "$PKG/LICENSES/XboxXBE-Recomp-LICENSE.txt"
 cp "$REPO/LICENSE" "$PKG/LICENSES/Project-LICENSE.txt"
+cp "$REPO/sdk/third_party/fsr3_vk/LICENSE.txt" "$PKG/LICENSES/AMD-FidelityFX-SDK-1.1.4.txt"
+
+if [ -f "$BUILD/CMakeCache.txt" ]; then
+    DLSS_SDK=$(sed -n 's/^TCNYC_DLSS_SDK:PATH=//p' "$BUILD/CMakeCache.txt")
+    if [ -n "$DLSS_SDK" ]; then
+        case "$DLSS_SDK" in /*) ;; *) DLSS_SDK="$REPO/$DLSS_SDK" ;; esac
+        if [ -f "$DLSS_SDK/include/nvsdk_ngx_helpers_vk.h" ] &&
+           [ -f "$DLSS_SDK/lib/Linux_x86_64/libnvsdk_ngx.a" ]; then
+            dlss_runtime=("$DLSS_SDK"/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.*)
+            if [ "${#dlss_runtime[@]}" -ne 1 ] || [ ! -f "${dlss_runtime[0]}" ]; then
+                echo "Expected one NVIDIA DLSS runtime library in $DLSS_SDK/lib/Linux_x86_64/rel" >&2
+                exit 1
+            fi
+            install -m 0644 "${dlss_runtime[0]}" "$PKG/lib/"
+            ln -s "$(basename "${dlss_runtime[0]}")" "$PKG/lib/libnvidia-ngx-dlss.so"
+            install -m 0644 "$DLSS_SDK/LICENSE.txt" "$PKG/LICENSES/NVIDIA-RTX-SDK.txt"
+        fi
+    fi
+fi
 for file in /usr/share/doc/libshaderc1/copyright /usr/share/doc/glslang-dev/copyright; do
     if [ -f "$file" ]; then
         cp "$file" "$PKG/LICENSES/$(basename "$(dirname "$file")")-copyright.txt"

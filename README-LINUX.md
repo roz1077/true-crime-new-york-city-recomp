@@ -38,6 +38,8 @@ The package also contains:
 - `README.md`, `README-LINUX.md`, `BUILD.txt` and `THIRD_PARTY.txt`.
 - `LICENSES/XboxXBE-Recomp-LICENSE.txt` for the SDK, plus `LICENSES/imgui-LICENSE.txt`
   and the shaderc/glslang copyright files when the build host provides them.
+- The FidelityFX 1.1.4 licence. Packages built with the optional DLSS SDK also
+  include the Linux DLSS runtime and NVIDIA RTX SDK licence.
 - `assets/PUT-THE-GAME-HERE.txt`; no game files are included.
 
 ## Steam and SteamOS handhelds
@@ -56,6 +58,16 @@ gamescope's output.
 
 See `README.md`. **F10**, or **Back + Start** on controller 1, opens the Graphics
 menu. The menu works with keyboard, mouse and controller.
+
+TAA and FSR 3.1 use the Vulkan motion target and require independent blending.
+FSR 3.1 supports Performance (50%), Balanced (58%), Quality (67%) and Native AA
+(100%). It restores marked HUD pixels after upscaling and uses a reactive mask
+for translucent effects. Supported GPUs use the FP16 and wave64 shader variants.
+
+Experimental Vulkan DLSS is available in builds configured with
+`-DTCNYC_DLSS_SDK=/path/to/NVIDIA/DLSS`. It uses the same render scales and
+requires an NVIDIA RTX GPU and the NGX runtime. Native RTX rendering still
+needs validation.
 
 Button prompts follow the controller in use: Steam Deck prompts for the Deck's own controller,
 PlayStation prompts for a PlayStation pad (also behind Steam Input), and Xbox prompts for an Xbox pad

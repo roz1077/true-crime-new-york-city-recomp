@@ -1,15 +1,18 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [Parameter(Mandatory = $true)][string]$SdkDir,
-    [Parameter(Mandatory = $true)][string]$RuntimeDir
+    [Parameter(Mandatory = $true)][string]$RuntimeDir,
+    [string]$OutputPath
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $root = Split-Path -Parent $PSScriptRoot
-$output = Join-Path $root 'TrueCrimeNYC.zip'
-$temp = Join-Path $root ('TrueCrimeNYC-' + [guid]::NewGuid() + '.tmp')
+$output = if ($OutputPath) {
+    $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+} else { Join-Path $root 'TrueCrimeNYC.zip' }
+$temp = Join-Path (Split-Path -Parent $output) ('TrueCrimeNYC-' + [guid]::NewGuid() + '.tmp')
 
 # Fixed archive timestamps make the zip reproducible. SOURCE_DATE_EPOCH (a Unix
 # timestamp) overrides the default, which is 2000-01-01T00:00:00Z.
@@ -87,6 +90,29 @@ $sdkLicence = Join-Path $SdkDir 'LICENSE'
 if (!(Test-Path -LiteralPath $sdkLicence -PathType Leaf)) {
     throw "SDK licence not found: $sdkLicence"
 }
+$ffxSdk = if ($env:TCNYC_FIDELITYFX_SDK) { $env:TCNYC_FIDELITYFX_SDK } else { Join-Path $root 'tools/FidelityFX' }
+$ffxBin = Join-Path $ffxSdk 'signedbin'
+if (!(Test-Path -LiteralPath $ffxBin -PathType Container)) {
+    $ffxBin = Join-Path $ffxSdk 'Kits/FidelityFX/signedbin'
+}
+$ffxFiles = 'amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll'
+$bundleFfx = $env:TCNYC_FIDELITYFX_SDK -or ($ffxFiles | Where-Object {
+    Test-Path -LiteralPath (Join-Path $ffxBin $_) -PathType Leaf
+})
+if ($bundleFfx) {
+    $ffxLicence = 'LICENSE.md', 'docs/license.md' | ForEach-Object { Join-Path $ffxSdk $_ } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (!$ffxLicence) { throw "AMD FidelityFX SDK licence not found in $ffxSdk" }
+}
+$cache = Join-Path $BuildDir 'CMakeCache.txt'
+$dlssSdk = if (Test-Path -LiteralPath $cache -PathType Leaf) {
+    $match = Select-String -LiteralPath $cache -Pattern '^TCNYC_DLSS_SDK:PATH=(.+)$' | Select-Object -First 1
+    if ($match) {
+        $value = $match.Matches[0].Groups[1].Value
+        if ([IO.Path]::IsPathRooted($value)) { $value } else { Join-Path $root $value }
+    }
+}
+$bundleDlss = $dlssSdk -and (Test-Path -LiteralPath (Join-Path $dlssSdk 'include/nvsdk_ngx.h') -PathType Leaf)
 
 # The package must run on a plain Windows install. A build made with a MinGW-target clang (for
 # example llvm-mingw from winget, when it is first on PATH) links the game against libc++.dll and
@@ -197,6 +223,14 @@ try {
         Add-ReleaseFile (Join-Path $SdkDir 'THIRD_PARTY.txt') 'THIRD_PARTY.txt'
         Add-ReleaseFile $sdkLicence 'LICENSES/XboxXBE-Recomp-LICENSE.txt'
         Add-ReleaseFile (Join-Path $root 'LICENSE') 'LICENSES/Project-LICENSE.txt'
+        if ($bundleFfx) {
+            foreach ($name in $ffxFiles) { Add-ReleaseFile (Join-Path $ffxBin $name) $name }
+            Add-ReleaseFile $ffxLicence 'LICENSES/AMD-FidelityFX-SDK.md'
+        }
+        if ($bundleDlss) {
+            Add-ReleaseFile (Join-Path $dlssSdk 'lib/Windows_x86_64/rel/nvngx_dlss.dll') 'nvngx_dlss.dll'
+            Add-ReleaseFile (Join-Path $dlssSdk 'LICENSE.txt') 'LICENSES/NVIDIA-RTX-SDK.txt'
+        }
 
         $compiler = (Resolve-Path -LiteralPath $compiler).Path
         foreach ($name in 'clang.exe', 'lld-link.exe', 'xbe_recomp.exe', 'TrueCrimeNYC.lib', 'LLVM-LICENSE.txt') {
@@ -248,7 +282,7 @@ try {
     }
     Move-Item -LiteralPath $temp -Destination $output -Force
     $zipHash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash.ToLowerInvariant()
-    Set-Content -LiteralPath "$output.sha256" -Value "$zipHash  TrueCrimeNYC.zip" -Encoding Ascii
+    Set-Content -LiteralPath "$output.sha256" -Value "$zipHash  $(Split-Path -Leaf $output)" -Encoding Ascii
     Write-Output "Created $output"
     Write-Output "SHA256 $zipHash"
 } finally {

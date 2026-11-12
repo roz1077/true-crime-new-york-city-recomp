@@ -544,6 +544,10 @@ const char *Help(Row row) {
                "50% (Performance), 58% (Balanced), 67% (Quality) or 100% (Native AA). FSR 4.1 needs AMD's SDK 2.x loader and upscaler DLLs beside the "
                "game; it uses FSR 3.1 when the driver exposes only 3.1. DLSS is experimental and needs an "
                "NVIDIA RTX adapter and NVIDIA's nvngx_dlss.dll beside the game.";
+#elif defined(TCNYC_HAVE_DLSS)
+        return "FSR 1 keeps edges sharper than Bilinear below 100% Render scale. FSR 3.1 and experimental DLSS "
+               "use 50% (Performance), 58% (Balanced), 67% (Quality) or 100% (Native AA). "
+               "DLSS requires an NVIDIA RTX adapter and the NGX runtime.";
 #else
         return "How the picture is scaled up. AMD FSR 1 keeps edges sharper than Bilinear below 100% Render scale. "
                "Experimental FSR 3.1 runs at Render scale 50% (Performance), 58% (Balanced), 67% (Quality) or 100% "
@@ -692,22 +696,32 @@ std::string Value(Row row) {
             if (s.upscaler == choices::kFsr4 && state == gpu::FsrState::No4) label += " (using 3.1)";
             return label;
         }
-#ifdef _WIN32
-#if defined(TCNYC_HAVE_DLSS)
         if (s.upscaler == choices::kDlss) {
+#if !defined(TCNYC_HAVE_DLSS)
+            return "DLSS (not built)";
+#else
+#ifdef _WIN32
             static const bool forced = [] {
                 const char* e = std::getenv("TCNYC_DLSS_FORCE");
                 return e && *e && std::atoi(e) != 0;
             }();
+#else
+            constexpr bool forced = false;
+#endif
             const gpu::DlssState state = gpu::g_dlss_state.load(std::memory_order_relaxed);
             if (state == gpu::DlssState::NotBuilt) return "DLSS (not built)";
             if (state == gpu::DlssState::Unavailable && !forced) return "DLSS (unavailable)";
-            const char* suffix = state == gpu::DlssState::Unavailable ? " (forced test)" : "";
             const char* preset = choices::TemporalPresetName(s.render_percent);
             if (!preset) return "DLSS needs 50, 58, 67 or 100%";
+#ifdef _WIN32
+            const char* suffix = state == gpu::DlssState::Unavailable ? " (forced test)" : "";
             return std::string("DLSS ") + preset + suffix;
-        }
+#else
+            return std::string("DLSS ") + preset + " (experimental)";
 #endif
+#endif
+        }
+#ifdef _WIN32
         if (s.render_percent == 100) return s.upscaler == 1 ? "AMD FSR 1 (inactive)" : "Bilinear";
 #endif
         if (s.render_percent >= 100) return "Not needed at 100%";

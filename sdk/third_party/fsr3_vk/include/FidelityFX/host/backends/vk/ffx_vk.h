@@ -90,6 +90,8 @@ typedef struct VkDeviceContext {
     VkDevice                vkDevice;           /// The Vulkan device
     VkPhysicalDevice        vkPhysicalDevice;   /// The Vulkan physical device
     PFN_vkGetDeviceProcAddr vkDeviceProcAddr;   /// The device's function address table
+    bool                    tcnycFloat16;       /// FP16 and Int16 enabled on the logical device
+    bool                    tcnycWave64;        /// Compute pipelines may request subgroup size 64
 } VkDeviceContext;
 
 /// Create a <c><i>FfxDevice</i></c> from a <c><i>VkDevice</i></c>.

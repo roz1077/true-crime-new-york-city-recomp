@@ -63,6 +63,8 @@ FsrInputs fsrInputs(O i) {
     [branch] if (flags.x > 0 && metadata.y != -2) o.reactive = MOTION_LOAD(pixel).z;
     return o;
 }
+float fsrReactive(O i) : SV_Target { return fsrInputs(i).reactive; }
+float dlssDepth(O i) : SV_Target { return fsrMetadata.Load(int3(int2(i.p.xy), 0)).x; }
 struct MotionOut {
     float2 velocity : SV_Target0;
     float2 metadata : SV_Target1;
