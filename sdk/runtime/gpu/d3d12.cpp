@@ -7,6 +7,8 @@
 #endif
 #include <windows.h>
 #include <d3d12.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <d3d11shader.h>
@@ -75,6 +77,154 @@
 using Microsoft::WRL::ComPtr;
 
 namespace gpu {
+
+// TCNYC_SAMPLE=1: a sampling profiler for the render thread, the Windows counterpart of the Linux one. A sampler
+// thread wakes every millisecond and, when the render thread used CPU since the last tick, suspends it briefly
+// and records its instruction plus two callers (through the x64 unwind data, so no frame pointers are needed).
+// Every 10 s logs/samples.txt gets the top functions by self time and by self-or-caller time, named through the
+// PDB beside the executable. It costs one short suspension a millisecond, so it barely distorts the thread.
+namespace winsampler {
+constexpr size_t kMax = 1 << 20;
+struct Sample {
+    uint64_t pc[8];  // the instruction, then its callers
+};
+Sample g_samples[kMax];
+std::atomic<size_t> g_count{0};
+std::atomic<uint64_t> g_frames{0};
+std::atomic<bool> g_started{false};
+
+void Run(HANDLE thread) {
+    ULONG64 last = 0;
+    QueryThreadCycleTime(thread, &last);
+    for (;;) {
+        Sleep(1);
+        ULONG64 now = 0;
+        if (!QueryThreadCycleTime(thread, &now)) return;
+        if (now == last) continue;  // the thread was waiting: no CPU time to attribute
+        last = now;
+        if (SuspendThread(thread) == DWORD(-1)) return;
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        Sample smp{};
+        if (GetThreadContext(thread, &ctx)) {
+            for (int depth = 0; depth < 8 && ctx.Rip; depth++) {
+                smp.pc[depth] = ctx.Rip;
+                DWORD64 image = 0;
+                RUNTIME_FUNCTION* fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+                if (!fn) {  // a leaf: the return address is at the stack pointer
+                    ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+                    ctx.Rsp += 8;
+                    continue;
+                }
+                void* handler = nullptr;
+                DWORD64 frame = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler, &frame, nullptr);
+            }
+        }
+        ResumeThread(thread);
+        const size_t i = g_count.fetch_add(1, std::memory_order_relaxed);
+        if (i < kMax) g_samples[i] = smp;
+    }
+}
+
+// on the render thread, once
+void Start() {
+    if (g_started.exchange(true) || !std::getenv("TCNYC_SAMPLE")) return;
+    HANDLE self = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0))
+        return;
+    std::thread(Run, self).detach();
+    LOGR("sampler: render thread sampled each millisecond it runs (TCNYC_SAMPLE)");
+}
+
+std::string Name(uint64_t pc) {
+    alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
+    auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 255;
+    DWORD64 off = 0;
+    if (SymFromAddr(GetCurrentProcess(), pc, &off, sym)) return sym->Name;
+    HMODULE mod = nullptr;
+    char path[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(pc), &mod))
+        GetModuleFileNameA(mod, path, MAX_PATH);
+    const char* base = std::strrchr(path, '\\');
+    return std::string("[") + (base ? base + 1 : path) + "]";
+}
+
+// counts since the start, written over logs/samples.txt
+void Dump() {
+    if (!g_started.load() || !std::getenv("TCNYC_SAMPLE")) return;
+    static bool sym_ready = false;
+    if (!sym_ready) {
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        sym_ready = SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+    }
+    const size_t n = std::min(g_count.load(), kMax);
+    const uint64_t frames = g_frames.load();
+    std::unordered_map<uint64_t, std::string> names;
+    auto name = [&](uint64_t pc) -> const std::string& {
+        auto it = names.find(pc);
+        if (it == names.end()) it = names.emplace(pc, Name(pc)).first;
+        return it->second;
+    };
+    // a thread that ran during the tick may already be back in a wait when it is suspended
+    auto waiting = [](const std::string& f) {
+        for (const char* w : {"ZwWait", "NtWait", "ZwDelayExecution", "NtDelayExecution", "RtlDelayExecution",
+                              "NtGdiDdDDIWaitFor", "RtlSleepConditionVariable", "ZwRemoveIoCompletion",
+                              "NtRemoveIoCompletion", "ZwAlertThreadByThreadId"})
+            if (f.rfind(w, 0) == 0) return true;
+        return false;
+    };
+    std::unordered_map<std::string, uint32_t> self, inclusive, own;
+    size_t waits = 0;
+    for (size_t i = 0; i < n; i++) {
+        const Sample& s = g_samples[i];
+        if (waiting(name(s.pc[0]))) {
+            waits++;
+            continue;
+        }
+        self[name(s.pc[0])]++;
+        std::string seen[3];
+        for (int d = 0; d < 3 && s.pc[d]; d++) {
+            seen[d] = name(s.pc[d]);
+            if ((d < 1 || seen[d] != seen[0]) && (d < 2 || seen[d] != seen[1])) inclusive[seen[d]]++;
+        }
+        // time in the driver, the runtime and libraries charged to the nearest function of this executable
+        for (int d = 0; d < 8 && s.pc[d]; d++) {
+            HMODULE mod = nullptr;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(s.pc[d]), &mod) &&
+                mod == GetModuleHandleA(nullptr)) {
+                own[name(s.pc[d])]++;
+                break;
+            }
+        }
+    }
+    auto top = [&](FILE* f, const char* title, const std::unordered_map<std::string, uint32_t>& m) {
+        std::vector<std::pair<std::string, uint32_t>> v(m.begin(), m.end());
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        const size_t busy = n - waits;
+        std::fprintf(f, "%s (%zu busy samples)\n", title, busy);
+        for (size_t k = 0; k < v.size() && k < 60; k++)
+            std::fprintf(f, "%5.1f%%  %s\n", 100.0 * v[k].second / std::max<size_t>(busy, 1), v[k].first.c_str());
+        std::fprintf(f, "\n");
+    };
+    const size_t busy = n - waits;
+    LOGR("sampler: %zu busy samples (%zu caught waiting) over %llu frames, %.2f ms of render-thread CPU a frame",
+         busy, waits, (unsigned long long)frames, frames ? double(busy) / double(frames) : 0.0);
+    std::error_code ec;
+    std::filesystem::create_directories(app::ExeDir() / "logs", ec);
+    if (FILE* f = std::fopen((app::ExeDir() / "logs" / "samples.txt").string().c_str(), "w")) {
+        top(f, "self", self);
+        top(f, "self or within two callers", inclusive);
+        top(f, "by the nearest function of this executable", own);
+        std::fclose(f);
+    }
+}
+}  // namespace winsampler
 
 namespace {
 
@@ -4776,6 +4926,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
     PerfScope perf_draw{g_perf.draw};
     g_perf.draws++;
+    winsampler::Start();
     if (cap_) CapStep(s.rt);
     if (DepthCopy(s)) return;
     DrawEnd draw_end{ext_};
@@ -7703,6 +7854,14 @@ void D3D12Backend::Present(const Surface& front) {
     ResetFrame();
     CountFps();
     if (diag::Perf()) LogPerf();
+    if (winsampler::g_started.load(std::memory_order_relaxed)) {
+        static auto next = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        winsampler::g_frames.fetch_add(1, std::memory_order_relaxed);
+        if (std::chrono::steady_clock::now() >= next) {
+            next += std::chrono::seconds(10);
+            winsampler::Dump();
+        }
+    }
     ApplySettings();  // reads render_
     if (fsr_profile_queries_)
         cl_->EndQuery(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
