@@ -404,7 +404,7 @@ uint32_t ComponentBytes(uint32_t type, const HostElement& he) {
 }
 constexpr uint32_t kElementOffsetEnd = 0x10000;  // the element offset is stored as uint16_t
 
-bool RawReadable(const State& s, const Inputs& inputs) {
+bool RawReadable(const State& s, const Inputs& inputs, uint16_t& repack_streams) {
     for (int k = 0; k < inputs.nregs; k++) {
         const auto& in = inputs.layout.inputs[size_t(inputs.regs[k])];
         uint32_t stride = StrideOf(s, inputs.layout, in);
@@ -423,6 +423,10 @@ bool RawReadable(const State& s, const Inputs& inputs) {
                       in.offset, stride);
             return false;
         }
+        if (!g_component_aligned_vertices &&
+            (stride % kStrideAlign || in.offset % std::min<uint32_t>(he.bytes, 4) ||
+             uint64_t(in.offset) + he.bytes > stride))
+            repack_streams |= uint16_t(1u << in.stream);
     }
     return true;
 }
@@ -464,22 +468,6 @@ int AddRawBuffer(const State& s, const VertexShader& layout, const VertexShader:
     return slot;
 }
 
-// D3D12 only: true when the input assembler cannot read this stream in place (a stride that is not a whole
-// number of dwords, or an element off its alignment or reading past the stride)
-bool NeedsRepack(const State& s, const Inputs& inputs, int stream) {
-    if (g_component_aligned_vertices) return false;
-    for (int k = 0; k < inputs.nregs; k++) {
-        const auto& in = inputs.layout.inputs[size_t(inputs.regs[k])];
-        if (in.stream != stream) continue;
-        const uint32_t stride = StrideOf(s, inputs.layout, in);
-        const HostElement he = RawElement(in.type, in.offset, stride);
-        if (stride % kStrideAlign || in.offset % std::min<uint32_t>(he.bytes, 4) ||
-            uint64_t(in.offset) + he.bytes > stride)
-            return true;
-    }
-    return false;
-}
-
 // the stream's elements copied to aligned offsets in a new, dword-strided buffer; offsets gets each element's
 // new offset by register. The bytes a host format reads past the guest element (the w of a 3-component
 // short) are zero, and the decode replaces them.
@@ -502,7 +490,14 @@ int AddRepackedBuffer(const State& s, const Inputs& inputs, int stream, const Dr
         const uint32_t align = std::min<uint32_t>(he.bytes, 4);
         cursor = (cursor + align - 1) / align * align;
         offsets[reg] = uint16_t(cursor);
-        fields[nf++] = {in.offset, cursor, TypeBytes(in.type)};
+        const uint32_t bytes = TypeBytes(in.type);
+        // Copy adjacent attributes together when their guest and host layouts agree.
+        if (nf && fields[nf - 1].src + fields[nf - 1].bytes == in.offset &&
+            fields[nf - 1].dst + fields[nf - 1].bytes == cursor) {
+            fields[nf - 1].bytes += bytes;
+        } else {
+            fields[nf++] = {in.offset, cursor, bytes};
+        }
         cursor += he.bytes;
     }
     if (!stride || !nf) return -1;
@@ -528,7 +523,9 @@ int AddRepackedBuffer(const State& s, const Inputs& inputs, int stream, const Dr
                 case 4: std::memcpy(to, from, 4); break;
                 case 6: std::memcpy(to, from, 6); break;
                 case 8: std::memcpy(to, from, 8); break;
+                case 10: std::memcpy(to, from, 10); break;
                 case 12: std::memcpy(to, from, 12); break;
+                case 14: std::memcpy(to, from, 14); break;
                 case 16: std::memcpy(to, from, 16); break;
                 default: std::memcpy(to, from, fields[f].bytes); break;
             }
@@ -579,24 +576,24 @@ bool UseIndexList(Assembled& out) {
 constexpr uint64_t kDenseSpanPerVertex = 4;
 constexpr uint64_t kDenseSpanSlack = 1024;
 
-bool AssembleRaw(const State& s, const Inputs& inputs, const DrawRange& d, Assembled& out) {
+bool AssembleRaw(const State& s, const Inputs& inputs, const DrawRange& d, Assembled& out,
+                 uint16_t repack_streams) {
     bool dense = uint64_t(d.span) <= uint64_t(d.count) * kDenseSpanPerVertex + kDenseSpanSlack;
     int slot[16];
     std::fill(std::begin(slot), std::end(slot), -1);
-    bool repacked[16] = {};
     uint16_t offsets[16] = {};
     for (int k = 0; k < inputs.nregs; k++) {
         int reg = inputs.regs[k];
         const auto& in = inputs.layout.inputs[size_t(reg)];
+        const bool repacked = (repack_streams & (1u << in.stream)) != 0;
         if (slot[in.stream] < 0) {
-            repacked[in.stream] = NeedsRepack(s, inputs, in.stream);
-            slot[in.stream] = repacked[in.stream]
+            slot[in.stream] = repacked
                                   ? AddRepackedBuffer(s, inputs, in.stream, d, dense, out, offsets)
                                   : AddRawBuffer(s, inputs.layout, in, d, dense, out);
             if (slot[in.stream] < 0) return false;
         }
         HostElement he = RawElement(in.type, in.offset, StrideOf(s, inputs.layout, in));
-        const uint16_t offset = repacked[in.stream] ? offsets[reg] : uint16_t(in.offset);
+        const uint16_t offset = repacked ? offsets[reg] : uint16_t(in.offset);
         out.elements[size_t(reg)] = {he.format, uint8_t(slot[in.stream]), offset};
         out.decode |= uint64_t(he.decode) << (reg * 4);
     }
@@ -809,15 +806,15 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
     }
 
     // the guest's own vertices when the input assembler can read every element of them
-    bool raw = kRawVertices && !force_converted && raw_ok && RawReadable(s, inputs);
+    uint16_t repack_streams = 0;
+    bool raw = kRawVertices && !force_converted && raw_ok && RawReadable(s, inputs, repack_streams);
     // Flat-shaded strips keep the converted path's list rebuild, where the provoking vertex matters, for the
     // layouts that only reach the raw path by repacking (as before repacking existed).
-    if (raw && d.prim == 6 && s.simple[kMShadeMode >> 2] == 0x1D00)
-        for (int k = 0; k < nregs && raw; k++)
-            if (NeedsRepack(s, inputs, layout->inputs[size_t(regs[k])].stream)) raw = false;
+    if (repack_streams && d.prim == 6 && s.simple[kMShadeMode >> 2] == 0x1D00) raw = false;
     sp.At("  (asm) raw readable");
     try {
-        bool ok = raw ? AssembleRaw(s, inputs, d, out) : AssembleConverted(s, inputs, d, out, force_converted);
+        bool ok = raw ? AssembleRaw(s, inputs, d, out, repack_streams)
+                      : AssembleConverted(s, inputs, d, out, force_converted);
         sp.At(raw ? "  (asm) raw build" : "  (asm) converted build");
         if (!ok) ResetAssembled(out);
         return ok;
