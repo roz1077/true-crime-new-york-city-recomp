@@ -702,6 +702,8 @@ struct Tex {
     uint32_t levels = 1;
     uint64_t sig = 0;
     uint64_t frame = 0;
+    uint64_t sig_epoch = 0;  // the lock epoch with the signature
+    uint64_t changed = 0;    // the present its bytes last changed
     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
     uint8_t flags = 0;  // Extension::Decoded's
     const Tex* swap = nullptr;  // the texture pack's image drawn in its place
@@ -1445,7 +1447,36 @@ private:
     bool motion_failed_ = false;
     bool bound_motion_ = false;  // the bound targets include the motion target
     // this frame's scene program draws by identity (geometry and program), and last frame's, with their constants
-    std::unordered_map<uint64_t, std::vector<VertexConstants>> motion_now_, motion_was_;
+    // this frame's and last frame's scene program draws: their constants in a flat pool, chained per draw identity,
+    // keeping their memory from frame to frame (as the Vulkan backend; no allocation per draw)
+    struct MotionDraws {
+        struct Entry {
+            uint32_t next;     // next entry of the same identity, ~0u at the end
+            uint32_t ordinal;  // its place among the frame's draws of that identity
+            bool used;
+        };
+        struct Head {
+            uint32_t first, count;
+        };
+        std::vector<VertexConstants> constants;
+        std::vector<Entry> entries;
+        std::unordered_map<uint64_t, Head> heads;
+        void Clear() {
+            constants.clear();
+            entries.clear();
+            heads.clear();
+        }
+        // returns the draw's ordinal among this identity's draws this frame
+        uint32_t Add(uint64_t id, const VertexConstants& c) {
+            const uint32_t at = uint32_t(entries.size());
+            auto [it, fresh] = heads.try_emplace(id, Head{at, 0});
+            const uint32_t ordinal = it->second.count++;
+            entries.push_back({fresh ? ~0u : it->second.first, ordinal, false});
+            it->second.first = at;
+            constants.push_back(c);
+            return ordinal;
+        }
+    } motion_now_, motion_was_;
     VertexConstants motion_match_{};
     // The road programs build static world positions from streamed strips, then project with c92â€“c95.
     static constexpr size_t kRoadProjection = 188;  // guest constant 92 is host constant 188
@@ -1458,7 +1489,7 @@ private:
     std::map<std::string, uint32_t> motion_trace_;  // TCNYC_TRACE_MOTION counts
     bool EnsureMotion(Target& rt);
     // the constants of the previous frame's draw like this one, closest to its own (several cars share a model)
-    const VertexConstants* MatchPrevious(uint64_t id, const State& s);
+    const VertexConstants* MatchPrevious(uint64_t id, uint32_t ordinal, const State& s);
     const VertexConstants* PreviousRoadConstants(const VertexConstants& current);
     // FSR 1 upscaling to out_w x out_h when the scene is smaller, and RCAS sharpening; repoints color at the result
     void UpscaleAndSharpen(ID3D12Resource*& color, DXGI_FORMAT& fmt, uint32_t w, uint32_t h, uint32_t out_w,
@@ -3552,14 +3583,23 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
     if (tx.frame != presents_ + 1 || !same || tx.palette != palette.hash || tx.prompt_style != prompt_style) {
         const uint64_t total = TotalSize(d);
         tx.frame = presents_ + 1;
+        const bool palette_changed = tx.palette != palette.hash;
         tx.palette = palette.hash;
         const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
-        uint64_t sig;
-        {
+        // The lock epoch is checked every frame. The bytes are hashed every frame while the texture has changed in
+        // the last second, else every 4th frame (spread over textures by address), as the Vulkan backend: a silent
+        // in-place rewrite of a long-unchanged texture then shows up to 3 frames late.
+        const uint64_t epoch = DirtyEpoch(d.data);
+        const bool hash_now = !same || epoch != tx.sig_epoch || palette_changed || presents_ < tx.changed + 60 ||
+                              ((presents_ + (d.data >> 8)) & 3) == 0;
+        uint64_t sig = tx.sig;
+        if (hash_now) {
             PerfScope perf_sig{g_perf.sig};
-            sig = MemSig(d.data, total) ^ DirtyEpoch(d.data) ^ palette.hash;
+            sig = MemSig(d.data, total) ^ epoch ^ palette.hash;
         }
+        tx.sig_epoch = epoch;
         if (sig != tx.sig || !same || tx.prompt_style != prompt_style) {
+            tx.changed = presents_;
             tx.prompt_style = prompt_style;
             PerfScope perf_up{g_perf.texup};
             g_perf.texups++;
@@ -4864,8 +4904,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             uint32_t ident[22] = {prim, start, count, s.index_data, s.base_vertex, s.vs_handle};
             for (int i = 0; i < 16; i++) ident[6 + i] = s.streams[size_t(i)].vb;
             const uint64_t id = Hash(ident, sizeof(ident), s.vs->hash);
-            motion_now_[id].push_back(s.vsc);
-            prev_consts = MatchPrevious(id, s);
+            const uint32_t ordinal = motion_now_.Add(id, s.vsc);
+            prev_consts = MatchPrevious(id, ordinal, s);
         }
         if (trace_motion) {
             motion_trace_[prev_consts ? "matched" : "unmatched"]++;
@@ -6415,25 +6455,47 @@ const D3D12Backend::VertexConstants* D3D12Backend::PreviousRoadConstants(const V
     return &motion_match_;
 }
 
-const D3D12Backend::VertexConstants* D3D12Backend::MatchPrevious(uint64_t id, const State& s) {
-    auto it = motion_was_.find(id);
-    if (it == motion_was_.end() || it->second.empty()) return nullptr;
-    auto& list = it->second;
-    size_t best = 0;
-    float best_d = 3.4e38f;
-    for (size_t i = 0; i < list.size() && list.size() > 1; i++) {
-        float d = 0;
-        for (size_t r = 0; r < 192; r++)
-            for (size_t c = 0; c < 4; c++) d += std::fabs(list[i][r][c] - s.vsc[r][c]);
-        if (d < best_d) {
-            best_d = d;
-            best = i;
+const D3D12Backend::VertexConstants* D3D12Backend::MatchPrevious(uint64_t id, uint32_t ordinal, const State& s) {
+    auto it = motion_was_.heads.find(id);
+    if (it == motion_was_.heads.end()) return nullptr;
+    // the unused previous draw of this identity whose constants are closest to this draw's (several cars share a
+    // model). Last frame's draw in the same place is taken when it is within 3% (one pass for distance and size);
+    // otherwise its distance bounds the others', whose comparisons stop early. A lone candidate is taken as is.
+    uint32_t best = ~0u, same_place = ~0u, candidates = 0;
+    for (uint32_t e = it->second.first; e != ~0u; e = motion_was_.entries[e].next) {
+        if (motion_was_.entries[e].used) continue;
+        candidates++;
+        best = e;
+        if (motion_was_.entries[e].ordinal == ordinal) same_place = e;
+    }
+    if (best == ~0u) return nullptr;
+    if (candidates > 1) {
+        float best_d = 3.4e38f;
+        if (same_place != ~0u) {
+            best = same_place;
+            const VertexConstants& c = motion_was_.constants[same_place];
+            float d = 0, size = 0;
+            for (size_t r = 0; r < 192; r++)
+                for (size_t k = 0; k < 4; k++) {
+                    d += std::fabs(c[r][k] - s.vsc[r][k]);
+                    size += std::fabs(s.vsc[r][k]);
+                }
+            best_d = d <= 0.03f * size ? 0 : d;
+        }
+        for (uint32_t e = it->second.first; e != ~0u && best_d > 0; e = motion_was_.entries[e].next) {
+            if (motion_was_.entries[e].used || e == same_place) continue;
+            const VertexConstants& c = motion_was_.constants[e];
+            float d = 0;
+            for (size_t r = 0; r < 192 && d < best_d; r++)
+                for (size_t k = 0; k < 4; k++) d += std::fabs(c[r][k] - s.vsc[r][k]);
+            if (d < best_d) {
+                best_d = d;
+                best = e;
+            }
         }
     }
-    motion_match_ = list[best];
-    list[best] = list.back();
-    list.pop_back();
-    return &motion_match_;
+    motion_was_.entries[best].used = true;
+    return &motion_was_.constants[best];
 }
 
 // 4x4 inverse (general, Gauss-Jordan); false when singular
@@ -7544,7 +7606,7 @@ void D3D12Backend::Present(const Surface& front) {
 #endif
     if (!aa) {
         ResetTemporalHistory();
-        motion_now_.clear();
+        motion_now_.Clear();
         road_projection_now_ = {};
     }
     if (!aa && t && render_.smaa) aa = ApplySmaa(*t);
@@ -7568,8 +7630,8 @@ void D3D12Backend::Present(const Surface& front) {
         motion_trace_.clear();
     }
     // TAA object motion: this frame's draws are the next frame's previous ones
-    motion_was_ = std::move(motion_now_);
-    motion_now_.clear();
+    std::swap(motion_was_, motion_now_);
+    motion_now_.Clear();
     road_projection_was_ = road_projection_now_;
     road_projection_now_ = {};
     motion_rt_ = nullptr;
@@ -7703,7 +7765,7 @@ void D3D12Backend::ApplySettings() {
     bool remake = ext_ && ext_->Settings();
     if (std::fabs(want - scale_) > 1e-4f || std::fabs(want_stretch - stretch_) > 1e-4f || want_msaa != msaa_ || remake) {
         ResetTemporalHistory();
-        motion_was_.clear();
+        motion_was_.Clear();
         road_projection_was_ = {};
         Flush();
         scene_depth_.clear();
