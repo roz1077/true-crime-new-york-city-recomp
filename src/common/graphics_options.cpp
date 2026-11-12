@@ -366,18 +366,11 @@ bool Enabled(Row row) {
     app::SettingsLock lock;  // the native Display tab can write these from the game thread
     if (row == Row::ApplyDisplay) return !g_menu.apply_pending && DisplayPending();
     if (row == Row::DumpFormat) return app::Get().dump_textures;
-    if (row == Row::Upscaler) {
-#ifdef _WIN32
-        return app::Get().render_percent <= 100;
-#else
-        return app::Get().render_percent < 100;
-#endif
-    }
+    if (row == Row::Upscaler) return app::Get().render_percent <= 100;
     if (row == Row::BloomStrength) return app::Get().bloom;
     if (row == Row::ColourGrading) return gpu::g_lut_loaded.load(std::memory_order_relaxed);
 #ifndef _WIN32
     if (row == Row::LowLatency) return false;  // Direct3D 12 only
-    if (row == Row::Taa) return false;         // Direct3D 12 only for now
 #endif
     // The HDR toggle stays reachable on an SDR display so a failed detection can be retried and
     // the fallback is visible; its sliders only matter once HDR is actually active.
@@ -552,8 +545,9 @@ const char *Help(Row row) {
                "game; it uses FSR 3.1 when the driver exposes only 3.1. DLSS is experimental and needs an "
                "NVIDIA RTX adapter and NVIDIA's nvngx_dlss.dll beside the game.";
 #else
-        return "How the picture is scaled up when Render scale is below 100%. AMD FSR 1 keeps edges sharper than "
-               "Bilinear and sharpens lightly; Sharpening sets how much.";
+        return "How the picture is scaled up. AMD FSR 1 keeps edges sharper than Bilinear below 100% Render scale. "
+               "Experimental FSR 3.1 runs at Render scale 50% (Performance), 58% (Balanced), 67% (Quality) or 100% "
+               "(Native AA).";
 #endif
     case Row::Sharpening:
         return "Sharpens the finished 3D frame (AMD FidelityFX RCAS). Offsets the softness of SMAA and of render "
@@ -688,7 +682,6 @@ std::string Value(Row row) {
         std::snprintf(text, sizeof(text), "%u%%", s.bloom_strength);
         return text;
     case Row::Upscaler:
-#ifdef _WIN32
         if (s.upscaler == choices::kFsr3 || s.upscaler == choices::kFsr4) {
             const char* name = s.upscaler == choices::kFsr4 ? "FSR 4.1" : "FSR 3.1";
             const gpu::FsrState state = gpu::g_fsr_state.load(std::memory_order_relaxed);
@@ -699,6 +692,7 @@ std::string Value(Row row) {
             if (s.upscaler == choices::kFsr4 && state == gpu::FsrState::No4) label += " (using 3.1)";
             return label;
         }
+#ifdef _WIN32
 #if defined(TCNYC_HAVE_DLSS)
         if (s.upscaler == choices::kDlss) {
             static const bool forced = [] {

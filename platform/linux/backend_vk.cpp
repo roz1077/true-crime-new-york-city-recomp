@@ -46,6 +46,11 @@
 #include "gpu/ao.h"
 #include "gpu/backend.h"
 #include "gpu/post_fx.h"
+#include "gpu/taa.h"
+#include "common/graphics_choices.h"
+// AMD FidelityFX FSR 3.1 (SDK 1.1.4) with its Vulkan backend, built from sdk/third_party/fsr3_vk
+#include <FidelityFX/host/ffx_fsr3upscaler.h>
+#include <FidelityFX/host/backends/vk/ffx_vk.h>
 #include "gpu/shaders.h"
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
@@ -358,6 +363,7 @@ struct PsoKey {
     uint32_t samples = 1;
     uint32_t sprite = 0;  // a program's point list drawn as point sprites
     uint32_t a2c = 0;     // alpha-tested opaque draw into a multisampled target: alpha to coverage
+    uint32_t motion = 0;  // TAA: 1 the pass has the motion attachment, 2 the pixel shader also writes it
     bool operator==(const PsoKey&) const = default;
 };
 
@@ -663,13 +669,14 @@ private:
     void Fail(const char* what, VkResult r);
     void Transition(VkImage image, VkImageLayout& layout, VkImageLayout want, VkFormat format, uint32_t levels = 1,
                     uint32_t layers = 1);
-    VkRenderPass RenderPassFor(VkFormat color, VkFormat depth);
-    VkRenderPass RenderPassForMs(VkFormat color, VkFormat depth, uint32_t samples);
-    VkFramebuffer FramebufferFor(Target* rt, Target* ds);
+    // motion: the TAA motion attachment as a second colour attachment, last in the framebuffer
+    VkRenderPass RenderPassFor(VkFormat color, VkFormat depth, bool motion = false);
+    VkRenderPass RenderPassForMs(VkFormat color, VkFormat depth, uint32_t samples, bool motion = false);
+    VkFramebuffer FramebufferFor(Target* rt, Target* ds, bool motion = false);
     void BindTargets(const State& s, Target*& rt, Target*& ds);
     void BeginScenePass(Target* rt, Target* ds);
     void FlushPass();
-    VkPipeline ClearPipeline(VkFormat format, VkFormat depth, uint32_t mask, uint32_t samples);
+    VkPipeline ClearPipeline(VkFormat format, VkFormat depth, uint32_t mask, uint32_t samples, bool motion = false);
 
     // deferred scene display list and receiver AO
     bool DeferredPending() const { return !deferred_.empty(); }
@@ -717,7 +724,9 @@ private:
     // shaders and pipelines
     VkShaderModule CompileShader(const std::string& src, shaderc_shader_kind kind, const char* entry);
     VkShaderModule GeometryShaderFor(bool points, bool sprite);
-    VkShaderModule VertexShaderFor(const State& s, const Assembled& a, bool prog, bool sprite, uint64_t& key);
+    // prev: TAA's variant that also runs the program on the previous frame's constants (binding 10)
+    VkShaderModule VertexShaderFor(const State& s, const Assembled& a, bool prog, bool sprite, uint64_t& key,
+                                   bool prev = false);
     VkShaderModule PixelShaderFor(const PixelKey& pk, uint64_t& key);
     bool CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps, VkPipeline& out,
                         VkRenderPass pass_override = VK_NULL_HANDLE);
@@ -1060,6 +1069,98 @@ private:
     bool dof_active_ = false;
     bool bloom_active_ = false;
     float shadow_spacing_ = 0;  // ShadowSpacing of the setting, read once a frame
+
+    // TAA (taa.h; d3d12.cpp has the same design). The scene's program draws are jittered by taa_jitter_ (pixels,
+    // in ext.xy) and those matched to the same draw last frame also run their program on its constants (binding 10)
+    // and write their uv motion to motion_, a second colour attachment beside the frame's scene target.
+    using VertexConstants = std::array<std::array<float, 4>, 192>;
+    static constexpr VkFormat kMotionFormat = VK_FORMAT_R16G16B16A16_SFLOAT;  // xy motion, z reactive, w unused
+    static constexpr VkFormat kDenseFormat = VK_FORMAT_R16G16_SFLOAT;
+    static constexpr VkFormat kMetadataFormat = VK_FORMAT_R32G32_SFLOAT;  // reversed depth, motion kind
+    bool independent_blend_ = false;  // the device feature TAA's motion attachment needs
+    bool taa_on_ = false;           // the TAA setting this frame
+    bool taa_applied_ = false;      // this frame's present ran the TAA resolve
+    float taa_jitter_[2] = {};      // this frame's jitter in pixels
+    struct MotionImage : AoImage {
+        uint64_t cleared = ~0ull;   // frame it was last cleared
+        bool failed = false;
+    } motion_;
+    std::vector<uint64_t> motion_fb_keys_;  // framebuffers holding motion_.view, retired with it
+    Target* motion_rt_ = nullptr;   // this frame's scene target the motion image is bound beside
+    bool pass_motion_ = false;      // the open pass has the motion attachment
+    bool EnsureMotion(Target& rt);
+    void DestroyMotion();
+    std::unordered_map<uint64_t, std::vector<VertexConstants>> motion_now_, motion_was_;
+    VertexConstants motion_match_{};
+    static constexpr size_t kRoadProjection = 188;  // guest constant 92: the road programs' projection rows
+    struct RoadProjection {
+        std::array<VertexConstants::value_type, 4> rows{};
+        bool seen = false;
+        bool consistent = true;
+    };
+    RoadProjection road_projection_now_, road_projection_was_;
+    std::map<std::string, uint32_t> motion_trace_;
+    const VertexConstants* MatchPrevious(uint64_t id, const State& s);
+    const VertexConstants* PreviousRoadConstants(const VertexConstants& current);
+    // the resolve: dense motion and metadata, then the history blend into history[next]
+    struct Taa {
+        SmaaImage history[2], dense, metadata;
+        VkFramebuffer motion_fb = VK_NULL_HANDLE;  // dense + metadata
+        uint32_t w = 0, h = 0, next = 0;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        CameraFrame camera;
+        bool valid = false, failed = false;
+        VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet sets[2] = {};
+        VkShaderModule vs = VK_NULL_HANDLE;
+        VkPipeline motion_pipe[2] = {};  // single-sample, multisampled motion
+        VkPipeline resolve_pipe = VK_NULL_HANDLE;
+        VkFormat resolve_format = VK_FORMAT_UNDEFINED;
+    } taa_;
+    bool EnsureTaa(uint32_t w, uint32_t h, VkFormat format, bool need_history);
+    void DestroyTaaImages();
+    VkPipeline MakeTaaPipeline(VkShaderModule ps, const char* entry, VkFormat f0, VkFormat f1);
+    void WriteTaaSet(VkDescriptorSet set, VkImageView t0, VkImageView t1, VkImageView t2, VkImageView t3,
+                     VkImageLayout l2);
+    VkRenderPass TaaMotionPass();
+    // the TAA output for the frame target (readable), or null: SMAA then runs as usual
+    VkImageView ApplyTaa(Target& ft, VkImageView color);
+    void ResetTemporalHistory() {
+        taa_.valid = false;
+        fsr3_.valid = false;
+    }
+    // FSR 3.1 (the Upscaler setting, at the temporal presets' render scales): TAA's motion pass feeds it the dense
+    // motion and the metadata's reversed depth; it writes an output-sized image the present pass reads
+    bool fsr_on_ = false;
+    // TCNYC_PROFILE_FSR3=1 (as on D3D12): the temporal passes' GPU time and their CPU recording time, plus the
+    // whole frame's CPU time, averaged over 120 frames
+    struct TemporalProfile {
+        bool on = false;
+        VkQueryPool pool = VK_NULL_HANDLE;
+        float period_ns = 1;
+        bool pending = false;
+        double gpu_ms = 0, cpu_ms = 0, frame_ms = 0;
+        uint32_t count = 0;
+        std::chrono::steady_clock::time_point frame_start;
+    } profile_;
+    struct Fsr3Vk {
+        std::unique_ptr<FfxFsr3UpscalerContext> context;
+        std::vector<uint8_t> scratch;
+        AoImage output;  // R8G8B8A8, storage + sampled
+        // the shared images FSR 3.1 expects the application to allocate (ffxFsr3UpscalerGetSharedResourceDescriptions):
+        // dilated depth, dilated motion, reconstructed previous nearest depth; kept in the general layout
+        AoImage shared[3];
+        uint32_t w = 0, h = 0, out_w = 0, out_h = 0;
+        bool infinite = false;
+        int depth_mode_frames = 0;
+        bool valid = false, failed = false, logged = false;
+        std::chrono::steady_clock::time_point last;
+    } fsr3_;
+    bool EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h, bool infinite);
+    void DestroyFsr3();
+    VkImageView DispatchFsr3(Target& ft, const CameraFrame& cam, bool reset);
 
     // the open pass
     Target* pass_rt_ = nullptr;
@@ -1566,7 +1667,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     if (vkCreateSampler(device_, &ws, nullptr, &white_sampler_) != VK_SUCCESS) return false;
 
     // descriptor set layout: b0 VC, b1 DC, t0-t3, s0-s3
-    VkDescriptorSetLayoutBinding bind[10]{};
+    VkDescriptorSetLayoutBinding bind[11]{};
     bind[0].binding = 0;
     bind[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bind[0].descriptorCount = 1;
@@ -1584,8 +1685,11 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
         bind[6 + i].descriptorCount = 1;
         bind[6 + i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
+    bind[10] = bind[0];  // b2 VCP: TAA's previous-frame vertex constants (the draw's own when it has none)
+    bind[10].binding = 10;
+    bind[10].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 10;
+    li.bindingCount = 11;
     li.pBindings = bind;
     if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &set_layout_) != VK_SUCCESS) return false;
 
@@ -1635,7 +1739,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     apl.pPushConstantRanges = &aoPush;
     if (vkCreatePipelineLayout(device_, &apl, nullptr, &ao_pipeline_layout_) != VK_SUCCESS) return false;
 
-    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * 8192},
+    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 * 8192},
                                      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4 * 8192},
                                      {VK_DESCRIPTOR_TYPE_SAMPLER, 4 * 8192}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1864,6 +1968,10 @@ bool VulkanBackend::CreateDevice() {
     features.fillModeNonSolid = supported.fillModeNonSolid;
     features.geometryShader = supported.geometryShader;
     geometry_ = supported.geometryShader == VK_TRUE;
+    // TAA's motion attachment is written unblended beside a blended colour attachment
+    features.independentBlend = supported.independentBlend;
+    independent_blend_ = supported.independentBlend == VK_TRUE;
+    if (!independent_blend_) LOGR("vulkan: no independent blending, TAA is unavailable");
     LOGR("vulkan: console point/line expansion %s", geometry_ ? "on (geometry shaders)" : "off (unsupported)");
     fill_non_solid_ = supported.fillModeNonSolid == VK_TRUE;
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -2952,6 +3060,46 @@ void VulkanBackend::ResetFrame() {
     upload_used_ = 0;
     draw_set_next_ = 0;
     const app::Settings settings = app::Snapshot();  // one copy for the whole reset
+    // TAA: this frame's matched draws are the next frame's previous ones; a frame without TAA drops the history
+    if (!taa_applied_) {
+        ResetTemporalHistory();
+        motion_now_.clear();
+        road_projection_now_ = {};
+    }
+    if (!motion_trace_.empty() && frames_ % 120 == 0) {
+        std::string line;
+        for (const auto& [k, v] : motion_trace_) line += " | " + k + " " + std::to_string(v / 120);
+        LOGR("motion: per frame%s", line.c_str());
+        motion_trace_.clear();
+    }
+    motion_was_ = std::move(motion_now_);
+    motion_now_.clear();
+    road_projection_was_ = road_projection_now_;
+    road_projection_now_ = {};
+    motion_rt_ = nullptr;
+    taa_applied_ = false;
+    const bool want_fsr = settings.upscaler == game::choices::kFsr3 &&
+                          game::choices::TemporalScale(settings.render_percent) && !fsr3_.failed;
+    const bool want_temporal = (settings.taa || want_fsr) && independent_blend_;
+    if (want_temporal != taa_on_ || want_fsr != fsr_on_) ResetTemporalHistory();
+    taa_on_ = want_temporal;
+    fsr_on_ = want_fsr && want_temporal;
+    // the next frame's jitter: an 8-step Halton (2, 3) pattern within the pixel
+    if (taa_on_) {
+        auto halton = [](uint32_t i, uint32_t b) {
+            float f = 1, r = 0;
+            for (; i; i /= b) r += (f /= float(b)) * float(i % b);
+            return r;
+        };
+        // AMD's guidance under FSR: 8 x (output / render)^2 phases, so each output pixel is covered
+        const float ratio = 100.0f / float(std::max(settings.render_percent, 1u));
+        const uint32_t phases = fsr_on_ && settings.render_percent < 100 ? uint32_t(std::lround(8.0f * ratio * ratio)) : 8;
+        const uint32_t i = uint32_t((frames_ + 1) % phases) + 1;
+        taa_jitter_[0] = halton(i, 2) - 0.5f;
+        taa_jitter_[1] = halton(i, 3) - 0.5f;
+    } else {
+        taa_jitter_[0] = taa_jitter_[1] = 0;
+    }
     ResetDeferred(settings.ao);
     scene_dof_ = settings.dof;
     scene_depth_.clear();
@@ -3182,12 +3330,13 @@ bool VulkanBackend::EnsureTraceBuffer(VkDeviceSize size) {
 
 // PART3
 
-VkRenderPass VulkanBackend::RenderPassFor(VkFormat color, VkFormat depth) {
-    uint64_t key = uint64_t(color) | (uint64_t(depth) << 32);
+VkRenderPass VulkanBackend::RenderPassFor(VkFormat color, VkFormat depth, bool motion) {
+    motion = motion && color != VK_FORMAT_UNDEFINED;
+    uint64_t key = uint64_t(color) | (uint64_t(depth) << 32) | (motion ? (1ull << 61) : 0);
     auto it = passes_.find(key);
     if (it != passes_.end()) return it->second;
-    VkAttachmentDescription att[2]{};
-    VkAttachmentReference refs[2]{};
+    VkAttachmentDescription att[3]{};
+    VkAttachmentReference refs[3]{};
     uint32_t n = 0;
     if (color != VK_FORMAT_UNDEFINED) {
         att[n].format = color;
@@ -3211,13 +3360,18 @@ VkRenderPass VulkanBackend::RenderPassFor(VkFormat color, VkFormat depth) {
         att[n].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         att[n].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth_ref = n;
-        refs[1] = {n++, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        refs[2] = {n++, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    }
+    if (motion) {
+        att[n] = att[0];
+        att[n].format = kMotionFormat;
+        refs[1] = {n++, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     }
     VkSubpassDescription sub{};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = color != VK_FORMAT_UNDEFINED ? 1u : 0u;
+    sub.colorAttachmentCount = color != VK_FORMAT_UNDEFINED ? (motion ? 2u : 1u) : 0u;
     sub.pColorAttachments = color != VK_FORMAT_UNDEFINED ? &refs[0] : nullptr;
-    sub.pDepthStencilAttachment = depth != VK_FORMAT_UNDEFINED ? &refs[1] : nullptr;
+    sub.pDepthStencilAttachment = depth != VK_FORMAT_UNDEFINED ? &refs[2] : nullptr;
     VkSubpassDependency dep[2]{};
     dep[0].srcSubpass = VK_SUBPASS_EXTERNAL;
     dep[0].dstSubpass = 0;
@@ -3246,13 +3400,14 @@ VkRenderPass VulkanBackend::RenderPassFor(VkFormat color, VkFormat depth) {
     return pass;
 }
 
-VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint32_t samples) {
+VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint32_t samples, bool motion) {
+    motion = motion && color != VK_FORMAT_UNDEFINED;
     uint64_t key = uint64_t(color) | (uint64_t(depth) << 32) | (uint64_t(samples) << 48) | (1ull << 63) |
-                   (msaa_store_ ? (1ull << 62) : 0);
+                   (msaa_store_ ? (1ull << 62) : 0) | (motion ? (1ull << 61) : 0);
     auto it = passes_.find(key);
     if (it != passes_.end()) return it->second;
 
-    VkAttachmentDescription2 att[4]{};
+    VkAttachmentDescription2 att[5]{};
     uint32_t n = 0;
     uint32_t color_ref = VK_ATTACHMENT_UNUSED, color_res = VK_ATTACHMENT_UNUSED;
     uint32_t depth_ref = VK_ATTACHMENT_UNUSED, depth_res = VK_ATTACHMENT_UNUSED;
@@ -3302,6 +3457,20 @@ VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint
         att[n].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
         depth_res = n++;
     }
+    // the motion attachment: multisampled like the colour, kept (the TAA pass reads its sample 0), never resolved
+    uint32_t motion_ref = VK_ATTACHMENT_UNUSED;
+    if (motion) {
+        att[n] = {VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2};
+        att[n].format = kMotionFormat;
+        att[n].samples = VkSampleCountFlagBits(samples);
+        att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[n].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        att[n].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        motion_ref = n++;
+    }
 
     VkAttachmentReference2 cref{}, cres{}, dref{}, dres{};
     cref = {VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2};
@@ -3325,9 +3494,12 @@ VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint
 
     VkSubpassDescription2 sub{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = color != VK_FORMAT_UNDEFINED ? 1u : 0u;
-    sub.pColorAttachments = color != VK_FORMAT_UNDEFINED ? &cref : nullptr;
-    sub.pResolveAttachments = color != VK_FORMAT_UNDEFINED ? &cres : nullptr;
+    VkAttachmentReference2 crefs[2] = {cref, cref}, cress[2] = {cres, cres};
+    crefs[1].attachment = motion_ref;
+    cress[1].attachment = VK_ATTACHMENT_UNUSED;
+    sub.colorAttachmentCount = color != VK_FORMAT_UNDEFINED ? (motion ? 2u : 1u) : 0u;
+    sub.pColorAttachments = color != VK_FORMAT_UNDEFINED ? crefs : nullptr;
+    sub.pResolveAttachments = color != VK_FORMAT_UNDEFINED ? cress : nullptr;
     sub.pDepthStencilAttachment = depth != VK_FORMAT_UNDEFINED ? &dref : nullptr;
     sub.pNext = depth != VK_FORMAT_UNDEFINED ? &dsr : nullptr;
 
@@ -3362,8 +3534,9 @@ VkRenderPass VulkanBackend::RenderPassForMs(VkFormat color, VkFormat depth, uint
     return pass;
 }
 
-VkFramebuffer VulkanBackend::FramebufferFor(Target* rt, Target* ds) {
-    VkImageView attach[4]{};
+VkFramebuffer VulkanBackend::FramebufferFor(Target* rt, Target* ds, bool motion) {
+    motion = motion && rt && motion_.view;
+    VkImageView attach[5]{};
     uint32_t n = 0;
     if (rt) {
         attach[n++] = rt->view;
@@ -3373,16 +3546,18 @@ VkFramebuffer VulkanBackend::FramebufferFor(Target* rt, Target* ds) {
         attach[n++] = ds->view;
         if (ds->samples > 1) attach[n++] = ds->resolved_view;
     }
+    if (motion) attach[n++] = motion_.view;
     uint64_t key = Hash(attach, sizeof(VkImageView) * n);
     auto it = framebuffers_.find(key);
     if (it != framebuffers_.end()) return it->second;
+    if (motion) motion_fb_keys_.push_back(key);
     const uint32_t samples = rt ? rt->samples : ds ? ds->samples : 1;
     VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     info.renderPass = samples > 1
                           ? RenderPassForMs(rt ? rt->format : VK_FORMAT_UNDEFINED,
-                                            ds ? ds->format : VK_FORMAT_UNDEFINED, samples)
+                                            ds ? ds->format : VK_FORMAT_UNDEFINED, samples, motion)
                           : RenderPassFor(rt ? rt->format : VK_FORMAT_UNDEFINED,
-                                          ds ? ds->format : VK_FORMAT_UNDEFINED);
+                                          ds ? ds->format : VK_FORMAT_UNDEFINED, motion);
     info.attachmentCount = n;
     info.pAttachments = attach;
     info.width = rt ? rt->w : ds->w;
@@ -3410,6 +3585,7 @@ void VulkanBackend::FlushPass() {
         pass_ = VK_NULL_HANDLE;
         pass_fb_ = VK_NULL_HANDLE;
         pass_rt_ = pass_ds_ = nullptr;
+        pass_motion_ = false;
     }
 }
 
@@ -3421,14 +3597,21 @@ void VulkanBackend::BeginScenePass(Target* rt, Target* ds) {
     pass_rt_ = rt;
     pass_ds_ = ds;
     BeginRecord();
+    // TAA: the frame's scene target gets the motion image beside it, from its first depth-tested use in a frame
+    if (taa_on_ && rt && ds && !rt->depth && rt->gw == width_ && rt->gh == height_ && rt != motion_rt_)
+        EnsureMotion(*rt);
+    const bool motion = taa_on_ && rt && rt == motion_rt_ && motion_.view && motion_.samples == rt->samples;
+    pass_motion_ = motion;
     if (rt) Transition(rt->image, rt->layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, rt->format);
     if (ds) Transition(ds->image, ds->layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, ds->format);
+    if (motion) Transition(motion_.image, motion_.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, kMotionFormat);
     pass_ = (rt && rt->samples > 1) || (ds && ds->samples > 1)
                 ? RenderPassForMs(rt ? rt->format : VK_FORMAT_UNDEFINED,
                                   ds ? ds->format : VK_FORMAT_UNDEFINED,
-                                  rt ? rt->samples : ds->samples)
-                : RenderPassFor(rt ? rt->format : VK_FORMAT_UNDEFINED, ds ? ds->format : VK_FORMAT_UNDEFINED);
-    pass_fb_ = FramebufferFor(rt, ds);
+                                  rt ? rt->samples : ds->samples, motion)
+                : RenderPassFor(rt ? rt->format : VK_FORMAT_UNDEFINED, ds ? ds->format : VK_FORMAT_UNDEFINED,
+                                motion);
+    pass_fb_ = FramebufferFor(rt, ds, motion);
     if (pass_ == VK_NULL_HANDLE || pass_fb_ == VK_NULL_HANDLE) {
         pass_rt_ = pass_ds_ = nullptr;
         pass_ = VK_NULL_HANDLE;
@@ -3483,6 +3666,95 @@ void VulkanBackend::BindTargets(const State& s, Target*& rt, Target*& ds) {
         if (!rt && !ds) return;
     }
     BeginScenePass(rt, ds);
+}
+
+// ---------------------------------------------------------------------------------------------
+// TAA motion (d3d12.cpp EnsureMotion / MatchPrevious / PreviousRoadConstants)
+
+void VulkanBackend::DestroyMotion() {
+    for (uint64_t key : motion_fb_keys_) {
+        auto it = framebuffers_.find(key);
+        if (it == framebuffers_.end()) continue;
+        retired_framebuffers_.push_back(it->second);
+        framebuffer_targets_.erase(key);
+        framebuffers_.erase(it);
+    }
+    motion_fb_keys_.clear();
+    if (motion_.image) {
+        RetiredGpu r;
+        r.image = motion_.image;
+        r.memory = motion_.memory;
+        r.view = motion_.view;
+        retired_gpu_.push_back(r);
+    }
+    static_cast<AoImage&>(motion_) = {};
+    motion_.cleared = ~0ull;
+}
+
+// The motion image beside rt (its size and sample count), cleared to "no motion" once a frame. Outside a pass.
+bool VulkanBackend::EnsureMotion(Target& rt) {
+    if (motion_.failed) return false;
+    if (!motion_.image || motion_.w != rt.w || motion_.h != rt.h || motion_.samples != rt.samples) {
+        DestroyMotion();
+        if (!CreateAoImage(motion_, rt.w, rt.h, kMotionFormat, rt.samples,
+                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+            static_cast<AoImage&>(motion_) = {};
+            motion_.failed = true;
+            LOGE("vulkan: TAA motion image could not be created, TAA uses camera motion only");
+            return false;
+        }
+        motion_.cleared = ~0ull;
+        LOGR("vulkan: TAA motion target %ux%u, %u samples", rt.w, rt.h, rt.samples);
+    }
+    if (motion_.cleared != frames_) {
+        Transition(motion_.image, motion_.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, kMotionFormat);
+        VkClearColorValue none{};
+        none.float32[0] = none.float32[1] = 60000.0f;
+        none.float32[3] = 1.0f;
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd_, motion_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &none, 1, &range);
+        motion_.cleared = frames_;
+    }
+    motion_rt_ = &rt;
+    return true;
+}
+
+const VulkanBackend::VertexConstants* VulkanBackend::PreviousRoadConstants(const VertexConstants& current) {
+    auto first = current.begin() + kRoadProjection;
+    auto& now = road_projection_now_;
+    if (!now.seen) {
+        std::copy_n(first, now.rows.size(), now.rows.begin());
+        now.seen = true;
+    } else if (!std::equal(now.rows.begin(), now.rows.end(), first)) {
+        now.consistent = false;
+    }
+    const auto& was = road_projection_was_;
+    if (!now.consistent || !was.seen || !was.consistent) return nullptr;
+    motion_match_ = current;
+    std::copy(was.rows.begin(), was.rows.end(), motion_match_.begin() + kRoadProjection);
+    return &motion_match_;
+}
+
+const VulkanBackend::VertexConstants* VulkanBackend::MatchPrevious(uint64_t id, const State& s) {
+    auto it = motion_was_.find(id);
+    if (it == motion_was_.end() || it->second.empty()) return nullptr;
+    auto& list = it->second;
+    size_t best = 0;
+    float best_d = 3.4e38f;
+    for (size_t i = 0; i < list.size() && list.size() > 1; i++) {
+        float d = 0;
+        for (size_t r = 0; r < 192; r++)
+            for (size_t c = 0; c < 4; c++) d += std::fabs(list[i][r][c] - s.vsc[r][c]);
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    motion_match_ = list[best];
+    list[best] = list.back();
+    list.pop_back();
+    return &motion_match_;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4278,6 +4550,7 @@ std::string InjectBindings(std::string src) {
         std::string prefix;
         if (trimmed.rfind("cbuffer VC", 0) == 0) prefix = "[[vk::binding(0, 0)]] ";
         else if (trimmed.rfind("cbuffer DC", 0) == 0) prefix = "[[vk::binding(1, 0)]] ";
+        else if (trimmed.rfind("cbuffer VCP", 0) == 0) prefix = "[[vk::binding(10, 0)]] ";  // TAA's previous constants
         else if (trimmed.find(" : register(t") != std::string::npos) {
             size_t p = trimmed.find(" : register(t") + 13;
             if (p < trimmed.size() && trimmed[p] >= '0' && trimmed[p] <= '3')
@@ -4316,10 +4589,19 @@ VkShaderModule VulkanBackend::CompileShader(const std::string& src, shaderc_shad
     const std::string yflip = "q.y = 1 - p.y * 2 / surf.y;";
     const size_t at = injected.find(yflip);
     if (at != std::string::npos) injected.replace(at, yflip.size(), "q.y = p.y * 2 / surf.y - 1;");
+    // TAA: the previous frame's position gets the same flip, and the motion's v (uv down) follows clip y down
+    const std::string prev_yflip = "qp.y = 1 - pp.y * 2 / surf.y;";
+    if (const size_t pat = injected.find(prev_yflip); pat != std::string::npos)
+        injected.replace(pat, prev_yflip.size(), "qp.y = pp.y * 2 / surf.y - 1;");
+    const std::string motion_uv = "(was - now) * float2(0.5, -0.5)";
+    if (const size_t mat = injected.find(motion_uv); mat != std::string::npos)
+        injected.replace(mat, motion_uv.size(), "(was - now) * float2(0.5, 0.5)");
     const shaderc_shader_kind shader_kind = kind;
 
-    // compiled SPIR-V persisted between runs, keyed by the final source and stage
-    const uint64_t cache_key = Hash(injected.data(), injected.size()) ^ (uint64_t(kind) << 56);
+    // compiled SPIR-V persisted between runs, keyed by the final source, stage and entry point (one source can
+    // hold several: the bloom chain's bright, down and up)
+    const uint64_t cache_key = Hash(entry, std::strlen(entry), Hash(injected.data(), injected.size())) ^
+                               (uint64_t(kind) << 56);
     static const std::filesystem::path cache_dir = [] {
         if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
             return std::filesystem::path(xdg) / "TrueCrimeNYC" / "shaders";
@@ -4425,7 +4707,8 @@ void main(point VOut v[1], inout TriangleStream<VOut> strip) {
 }
 
 VkShaderModule VulkanBackend::VertexShaderFor(const State& s, const Assembled& a, bool prog, bool sprite,
-                                              uint64_t& key) {
+                                              uint64_t& key, bool prev) {
+    prev = prev && prog;
     // key by what the source is built from, not by the source text: generating and hashing the HLSL for every draw
     // is far too slow with ~1500 draws a frame. The string is only built on a cache miss.
     uint64_t program_hash = 0;
@@ -4443,8 +4726,9 @@ VkShaderModule VulkanBackend::VertexShaderFor(const State& s, const Assembled& a
     key = Hash(&a.decode, sizeof(a.decode), key);
     key = Hash(&a.pretransformed, sizeof(a.pretransformed), key);
     key = Hash(&sprite, sizeof(sprite), key);
+    if (prev) key = Hash(&prev, sizeof(prev), key);
     if (auto it = vs_cache_.find(key); it != vs_cache_.end()) return it->second;
-    std::string src = prog ? VertexProgramHlsl(s.vs->program, a.regs, a.decode)
+    std::string src = prog ? VertexProgramHlsl(s.vs->program, a.regs, a.decode, prev)
                            : FixedVertexHlsl(a.regs, a.pretransformed, a.decode, fk);
     if (sprite) {
         // a point sprite's program hands its point size to SpriteHlsl in tc3
@@ -4560,9 +4844,12 @@ bool VulkanBackend::CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderM
     cb.dstAlphaBlendFactor = BlendFactor(k.dst, true);
     cb.alphaBlendOp = BlendOp(k.op);
     cb.colorWriteMask = k.wmask & 0xF;
+    // TAA's motion attachment: written as is by the draws that have motion, left alone by every other
+    VkPipelineColorBlendAttachmentState cbs[2] = {cb, {}};
+    cbs[1].colorWriteMask = k.motion == 2 ? 0xF : 0;
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend.attachmentCount = k.rtfmt != 0 ? 1u : 0u;
-    blend.pAttachments = &cb;
+    blend.attachmentCount = k.rtfmt != 0 ? (k.motion ? 2u : 1u) : 0u;
+    blend.pAttachments = cbs;
 
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                             VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
@@ -4610,8 +4897,9 @@ bool VulkanBackend::CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderM
     info.layout = pipeline_layout_;
     info.renderPass = pass_override != VK_NULL_HANDLE
                           ? pass_override
-                          : k.samples > 1 ? RenderPassForMs(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.samples)
-                                          : RenderPassFor(VkFormat(k.rtfmt), VkFormat(k.dsfmt));
+                          : k.samples > 1 ? RenderPassForMs(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.samples,
+                                                            k.motion != 0)
+                                          : RenderPassFor(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.motion != 0);
     if (info.renderPass == VK_NULL_HANDLE) return false;
     VkResult r = CreatePipelines(1, &info, nullptr, &out);
     if (r != VK_SUCCESS) {
@@ -6225,9 +6513,10 @@ void VulkanBackend::FillConstants(const State& s, const PixelKey& pk, const std:
 
 // PART5
 
-VkPipeline VulkanBackend::ClearPipeline(VkFormat format, VkFormat depth, uint32_t mask, uint32_t samples) {
+VkPipeline VulkanBackend::ClearPipeline(VkFormat format, VkFormat depth, uint32_t mask, uint32_t samples,
+                                        bool motion) {
     const uint64_t key = uint64_t(format) | (uint64_t(depth) << 32) | (uint64_t(mask) << 40) |
-                         (uint64_t(samples) << 48);
+                         (uint64_t(samples) << 48) | (motion ? (1ull << 63) : 0);
     if (auto it = clear_pipelines_.find(key); it != clear_pipelines_.end()) return it->second;
     if (!clear_vs_) {
         static const char* kClearHlsl = R"(
@@ -6261,9 +6550,10 @@ float4 psmain() : SV_Target { return colour; }
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineColorBlendAttachmentState cb{};
     cb.colorWriteMask = mask & 0xF;
+    VkPipelineColorBlendAttachmentState cbs[2] = {cb, {}};  // the TAA motion attachment, untouched
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend.attachmentCount = 1;
-    blend.pAttachments = &cb;
+    blend.attachmentCount = motion ? 2u : 1u;
+    blend.pAttachments = cbs;
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = 2;
@@ -6289,7 +6579,7 @@ float4 psmain() : SV_Target { return colour; }
     info.pColorBlendState = &blend;
     info.pDynamicState = &dynamic;
     info.layout = pipeline_layout_;
-    info.renderPass = samples > 1 ? RenderPassForMs(format, depth, samples) : RenderPassFor(format, depth);
+    info.renderPass = samples > 1 ? RenderPassForMs(format, depth, samples, motion) : RenderPassFor(format, depth, motion);
     if (info.renderPass == VK_NULL_HANDLE) return VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     if (CreatePipelines(1, &info, nullptr, &pipeline) != VK_SUCCESS)
@@ -6370,7 +6660,7 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
         // vkCmdClearAttachments has no channel mask; draw the colour over the rects
         if (color_mask != 0xF) {
             VkPipeline pipeline = ClearPipeline(rt->format, ds ? ds->format : VK_FORMAT_UNDEFINED, color_mask,
-                                                 rt->samples);
+                                                 rt->samples, pass_motion_);
             if (pipeline) {
                 float col[4];
                 Color(color, col);
@@ -6520,11 +6810,64 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         }
     }
 
+    // TAA object motion (d3d12.cpp): an opaque, depth-writing program draw into the scene matched to last frame's
+    // same draw runs its program again on that draw's constants and writes its uv motion beside the colour. The
+    // three road programs rebuild their strips every frame, so they reuse the previous frame's projection rows.
+    const VertexConstants* prev_consts = nullptr;
+    static const bool trace_motion = std::getenv("TCNYC_TRACE_MOTION") != nullptr;
+    {
+        const bool blend_on = SimpleState(s, kMBlendEnable) != 0;
+        const uint32_t bsrc = SimpleState(s, kMSrcBlend), bdst = SimpleState(s, kMDestBlend);
+        const bool solid = !blend_on || (bsrc == 1 && bdst == 0) || (bsrc == 0x302 && bdst == 0x303);
+        const bool scene_draw = rt && rt->gw == width_ && rt->gh == height_ && ds && !a.pretransformed;
+        if (trace_motion && scene_draw) {
+            const char* reason = !pass_motion_ ? "no motion target" : !prog ? "fixed function" :
+                                 !s.rs[kRsZEnable] ? "no depth test" : !SimpleState(s, kMZWriteEnable) ? "no depth write" :
+                                 !solid ? "blend" : nullptr;
+            if (reason) motion_trace_[reason]++;
+        }
+        if (pass_motion_ && prog && !a.pretransformed && ds && s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable) &&
+            solid) {
+            const bool road = s.vs->hash == 0x4CC5C030CD8CB305ull || s.vs->hash == 0x18591ECD120BF283ull ||
+                              s.vs->hash == 0xEE65083728927C2Full;
+            if (road) {
+                prev_consts = PreviousRoadConstants(s.vsc);
+            } else {
+                uint32_t ident[22] = {prim, start, count, s.index_data, s.base_vertex, s.vs_handle};
+                for (int i = 0; i < 16; i++) ident[6 + i] = s.streams[size_t(i)].vb;
+                const uint64_t id = Hash(ident, sizeof(ident), s.vs->hash);
+                motion_now_[id].push_back(s.vsc);
+                prev_consts = MatchPrevious(id, s);
+            }
+            if (trace_motion) {
+                motion_trace_[prev_consts ? "matched" : "unmatched"]++;
+                if (road && prev_consts) motion_trace_["road-projection"]++;
+            }
+            if (prev_consts) {
+                uint64_t mkey = 0;
+                VkShaderModule mvs = VertexShaderFor(s, a, prog, sprite, mkey, true);
+                if (mvs) {
+                    vs = mvs;
+                    vkey = mkey;
+                } else {
+                    LOG_FIRST(4, "vulkan: TAA motion vertex shader failed, drawing without motion");
+                    prev_consts = nullptr;
+                }
+            }
+        }
+    }
     PixelKey pk = MakePixelKey(s, info.data());
     pk.quad = count <= 4 && !s.rs[kRsZEnable] && a.topology != Topology::Points;
     pk.ao = ao_receiver ? 1 : 0;
+    pk.motion = prev_consts ? 1 : 0;
     uint64_t pkey = 0;
     VkShaderModule ps = PixelShaderFor(pk, pkey);
+    if (!ps && pk.motion) {
+        LOG_FIRST(4, "vulkan: TAA motion pixel shader failed, drawing without motion");
+        pk.motion = 0;
+        prev_consts = nullptr;
+        ps = PixelShaderFor(pk, pkey);
+    }
     if (!ps && pk.ao) {
         // The AO variant failed to compile: draw the game's original shader.
         LOG_FIRST(4, "vulkan: AO pixel shader variant failed, drawing without AO");
@@ -6654,6 +6997,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     k.fill = s.rs[kRsFillMode];
     if (a.topology == Topology::Triangles && SimpleState(s, kMSolidOffsetEnable))
         k.zslope = SimpleState(s, kMSlopeScale) ? -Bits(SimpleState(s, kMSlopeScale)) : 0.0f;
+    k.motion = pass_motion_ ? (pk.motion ? 2u : 1u) : 0u;
 
     VkPipeline pipe = VK_NULL_HANDLE;
     if (auto it = pipelines_.find(k); it != pipelines_.end()) {
@@ -6669,6 +7013,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (defer_now && (ao_roles & kAoDepth)) {
         PixelKey dpk = pk;
         dpk.ao = 3;
+        dpk.motion = 0;  // the prepass writes only the view distance
         uint64_t dkey = 0;
         VkShaderModule dps = PixelShaderFor(dpk, dkey);
         if (dps) {
@@ -6681,6 +7026,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             dk.blend = dk.src = dk.dst = dk.op = 0;
             dk.wmask = 1;  // red
             dk.sten = dk.sfunc = dk.smask = dk.swmask = dk.sfail = dk.szfail = dk.spass = 0;
+            dk.motion = 0;  // the AO prepass has no motion attachment
             if (auto it = pipelines_.find(dk); it != pipelines_.end()) {
                 depth_pipe = it->second;
             } else {
@@ -6707,10 +7053,16 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     const bool frame = rt && rt->gw == width_ && rt->gh == height_;
     RegionClip(a, info, descs, frame ? width_ : 0, frame ? height_ : 0, c);
 
+    // TAA: the frame's sub-pixel jitter on the scene's program draws (the vertex epilogue adds ext.xy). Vulkan's
+    // clip y points down, so the y offset has the opposite sign to D3D12's for the same pixel shift.
+    if (pass_motion_ && prog && !a.pretransformed && rt && rt == motion_rt_) {
+        c.ext[0] = 2.0f * taa_jitter_[0] / float(rt->w);
+        c.ext[1] = 2.0f * taa_jitter_[1] / float(rt->h);
+    }
     if (rt && !a.pretransformed) rt->scene_frame = frames_ + 1;
     Target* dof_ds = ds ? ds : pass_ds_;
     // Distance blur uses the main target's full-size scene depth, multisampled or not (as d3d12.cpp).
-    if (scene_dof_ && dof_ds && rt && !a.pretransformed &&
+    if ((scene_dof_ || taa_on_) && dof_ds && rt && !a.pretransformed &&
         s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable) && rt->gw == width_ && rt->gh == height_ &&
         dof_ds->w == rt->w && dof_ds->h == rt->h && s.viewport.w == width_ && s.viewport.h == height_) {
         const WRange r = DrawWRange(s, prog);
@@ -6742,17 +7094,26 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (!vc || !dc) return;
     std::memcpy(vc, s.vsc.data(), sizeof(s.vsc));
     std::memcpy(dc, &c, sizeof(c));
+    // binding 10: the matched draw's previous constants, else this draw's own (the binding must be valid)
+    UploadAlloc vcp_alloc = vc_alloc;
+    if (prev_consts) {
+        void* vcp = nullptr;
+        vcp_alloc = AllocUpload(sizeof(VertexConstants), 256, &vcp);
+        if (!vcp) return;
+        std::memcpy(vcp, prev_consts->data(), sizeof(VertexConstants));
+    }
 
     if (draw_set_next_ >= draw_sets_.size()) {
         LOG_FIRST(4, "vulkan: more than %zu draws in a frame, dropping the rest", draw_sets_.size());
         return;
     }
     VkDescriptorSet set = draw_sets_[draw_set_next_++];
-    VkDescriptorBufferInfo bi[2] = {{vc_alloc.buffer, vc_alloc.offset, VkDeviceSize(sizeof(s.vsc))},
-                                    {dc_alloc.buffer, dc_alloc.offset, VkDeviceSize(sizeof(c))}};
+    VkDescriptorBufferInfo bi[3] = {{vc_alloc.buffer, vc_alloc.offset, VkDeviceSize(sizeof(s.vsc))},
+                                    {dc_alloc.buffer, dc_alloc.offset, VkDeviceSize(sizeof(c))},
+                                    {vcp_alloc.buffer, vcp_alloc.offset, VkDeviceSize(sizeof(VertexConstants))}};
     VkDescriptorImageInfo ii[4]{};
     VkDescriptorImageInfo si[4]{};
-    VkWriteDescriptorSet writes[10]{};
+    VkWriteDescriptorSet writes[11]{};
     for (int i = 0; i < 2; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = set;
@@ -6784,7 +7145,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         writes[6 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         writes[6 + i].pImageInfo = &si[i];
     }
-    vkUpdateDescriptorSets(device_, 10, writes, 0, nullptr);
+    writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[10].dstSet = set;
+    writes[10].dstBinding = 10;
+    writes[10].descriptorCount = 1;
+    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[10].pBufferInfo = &bi[2];
+    vkUpdateDescriptorSets(device_, 11, writes, 0, nullptr);
     laps.Lap(&perf_geom_ms_);
 
     // geometry
@@ -7788,8 +8155,549 @@ bool VulkanBackend::EnsureSmaa(uint32_t w, uint32_t h, VkFormat format) {
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// TAA resolve (taa.h, as d3d12.cpp ApplyTaa): resolveMotion writes the dense motion and the metadata (reversed depth,
+// motion kind) from depth, the camera and the draws' own motion; taa blends the frame with the reprojected history.
+
+namespace {
+// 4x4 inverse (Gauss-Jordan); false when singular
+bool Invert4(const float* m, float* out) {
+    float a[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 8; c++) a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r ? 1.0f : 0.0f);
+    for (int col = 0; col < 4; col++) {
+        int pivot = col;
+        for (int r = col + 1; r < 4; r++)
+            if (std::fabs(a[r][col]) > std::fabs(a[pivot][col])) pivot = r;
+        if (std::fabs(a[pivot][col]) < 1e-12f) return false;
+        if (pivot != col)
+            for (int c = 0; c < 8; c++) std::swap(a[col][c], a[pivot][c]);
+        const float d = a[col][col];
+        for (int c = 0; c < 8; c++) a[col][c] /= d;
+        for (int r = 0; r < 4; r++) {
+            if (r == col) continue;
+            const float f = a[r][col];
+            for (int c = 0; c < 8; c++) a[r][c] -= f * a[col][c];
+        }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) out[r * 4 + c] = a[r][c + 4];
+    return true;
+}
+}  // namespace
+
+// dense motion + metadata, both kept for the resolve
+VkRenderPass VulkanBackend::TaaMotionPass() {
+    const uint64_t key = uint64_t(kDenseFormat) | (uint64_t(kMetadataFormat) << 32) | (1ull << 60);
+    if (auto it = passes_.find(key); it != passes_.end()) return it->second;
+    VkAttachmentDescription att[2]{};
+    VkAttachmentReference refs[2]{};
+    const VkFormat formats[2] = {kDenseFormat, kMetadataFormat};
+    for (uint32_t i = 0; i < 2; i++) {
+        att[i].format = formats[i];
+        att[i].samples = VK_SAMPLE_COUNT_1_BIT;
+        att[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[i].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        att[i].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        refs[i] = {i, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    }
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 2;
+    sub.pColorAttachments = refs;
+    VkSubpassDependency dep{};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    info.attachmentCount = 2;
+    info.pAttachments = att;
+    info.subpassCount = 1;
+    info.pSubpasses = &sub;
+    info.dependencyCount = 1;
+    info.pDependencies = &dep;
+    VkRenderPass pass = VK_NULL_HANDLE;
+    if (vkCreateRenderPass(device_, &info, nullptr, &pass) != VK_SUCCESS) return VK_NULL_HANDLE;
+    passes_[key] = pass;
+    return pass;
+}
+
+// a full-screen pass of the TAA layout into f0, or into f0 and f1 (the motion pass)
+VkPipeline VulkanBackend::MakeTaaPipeline(VkShaderModule ps, const char* entry, VkFormat f0, VkFormat f1) {
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cb[2]{};
+    cb[0].colorWriteMask = cb[1].colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = f1 != VK_FORMAT_UNDEFINED ? 2u : 1u;
+    blend.pAttachments = cb;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dyn;
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = taa_.vs;
+    stages[0].pName = "vs";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = ps;
+    stages[1].pName = entry;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &vi;
+    info.pInputAssemblyState = &ia;
+    info.pViewportState = &vp;
+    info.pRasterizationState = &rs;
+    info.pMultisampleState = &ms;
+    info.pDepthStencilState = &dss;
+    info.pColorBlendState = &blend;
+    info.pDynamicState = &dynamic;
+    info.layout = taa_.layout;
+    info.renderPass = f1 != VK_FORMAT_UNDEFINED ? TaaMotionPass() : RenderPassFor(f0, VK_FORMAT_UNDEFINED);
+    if (!info.renderPass) return VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (CreatePipelines(1, &info, nullptr, &pipeline) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return pipeline;
+}
+
+void VulkanBackend::WriteTaaSet(VkDescriptorSet set, VkImageView t0, VkImageView t1, VkImageView t2, VkImageView t3,
+                                VkImageLayout l2) {
+    VkDescriptorImageInfo images[4]{};
+    const VkImageView views[4] = {t0, t1, t2, t3};
+    for (int i = 0; i < 4; i++) {
+        images[i].imageView = views[i] ? views[i] : white_view_;
+        images[i].imageLayout = i == 2 && views[i] ? l2 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    VkDescriptorImageInfo samplers[2]{};
+    samplers[0].sampler = smaa_linear_;
+    samplers[1].sampler = smaa_point_;
+    VkWriteDescriptorSet writes[6]{};
+    for (int i = 0; i < 4; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = uint32_t(2 + i);
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[i].pImageInfo = &images[i];
+    }
+    for (int i = 0; i < 2; i++) {
+        writes[4 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[4 + i].dstSet = set;
+        writes[4 + i].dstBinding = uint32_t(6 + i);
+        writes[4 + i].descriptorCount = 1;
+        writes[4 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[4 + i].pImageInfo = &samplers[i];
+    }
+    vkUpdateDescriptorSets(device_, 6, writes, 0, nullptr);
+}
+
+void VulkanBackend::DestroyTaaImages() {
+    if (taa_.motion_fb) vkDestroyFramebuffer(device_, taa_.motion_fb, nullptr);
+    taa_.motion_fb = VK_NULL_HANDLE;
+    for (SmaaImage* image : {&taa_.history[0], &taa_.history[1], &taa_.dense, &taa_.metadata}) {
+        if (image->framebuffer) vkDestroyFramebuffer(device_, image->framebuffer, nullptr);
+        if (image->view) vkDestroyImageView(device_, image->view, nullptr);
+        if (image->image) vkDestroyImage(device_, image->image, nullptr);
+        if (image->memory) vkFreeMemory(device_, image->memory, nullptr);
+        *image = SmaaImage();
+    }
+    taa_.w = taa_.h = 0;
+    taa_.valid = false;
+}
+
+// the layout, shaders and pipelines once; the images for this size and format (history only when TAA blends)
+bool VulkanBackend::EnsureTaa(uint32_t w, uint32_t h, VkFormat format, bool need_history) {
+    if (taa_.failed) return false;
+    if (!EnsurePostLayout()) return false;  // its samplers
+    if (!taa_.layout) {
+        VkDescriptorSetLayoutBinding bind[6]{};
+        for (int i = 0; i < 4; i++) {
+            bind[i].binding = uint32_t(2 + i);
+            bind[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            bind[i].descriptorCount = 1;
+            bind[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        for (int i = 0; i < 2; i++) {
+            bind[4 + i].binding = uint32_t(6 + i);
+            bind[4 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            bind[4 + i].descriptorCount = 1;
+            bind[4 + i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = 6;
+        li.pBindings = bind;
+        if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &taa_.set_layout) != VK_SUCCESS) return false;
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &taa_.set_layout;
+        VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 32};
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &push;
+        if (vkCreatePipelineLayout(device_, &pl, nullptr, &taa_.layout) != VK_SUCCESS) return false;
+        VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8}, {VK_DESCRIPTOR_TYPE_SAMPLER, 4}};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = 2;
+        pi.poolSizeCount = 2;
+        pi.pPoolSizes = sizes;
+        if (vkCreateDescriptorPool(device_, &pi, nullptr, &taa_.pool) != VK_SUCCESS) return false;
+        const VkDescriptorSetLayout layouts[2] = {taa_.set_layout, taa_.set_layout};
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = taa_.pool;
+        ai.descriptorSetCount = 2;
+        ai.pSetLayouts = layouts;
+        if (vkAllocateDescriptorSets(device_, &ai, taa_.sets) != VK_SUCCESS) return false;
+        taa_.vs = CompileShader(kTaaHlsl, shaderc_vertex_shader, "vs");
+        static const std::string single = kTaaHlsl;
+        static const std::string ms = std::string("#define MOTION_MS 1\n") + kTaaHlsl;
+        VkShaderModule motion_ps[2] = {CompileShader(single, shaderc_fragment_shader, "resolveMotion"),
+                                       CompileShader(ms, shaderc_fragment_shader, "resolveMotion")};
+        if (!taa_.vs || !motion_ps[0] || !motion_ps[1]) return false;
+        for (int i = 0; i < 2; i++) {
+            taa_.motion_pipe[i] = MakeTaaPipeline(motion_ps[i], "resolveMotion", kDenseFormat, kMetadataFormat);
+            if (!taa_.motion_pipe[i]) return false;
+        }
+    }
+    if (need_history && taa_.resolve_format != format) {
+        static const std::string resolve = std::string("#define TAA_RESOLVE 1\n") + kTaaHlsl;
+        VkShaderModule ps = CompileShader(resolve, shaderc_fragment_shader, "taa");
+        if (!ps) return false;
+        if (taa_.resolve_pipe) {
+            vkDeviceWaitIdle(device_);
+            vkDestroyPipeline(device_, taa_.resolve_pipe, nullptr);
+        }
+        taa_.resolve_pipe = MakeTaaPipeline(ps, "taa", format, VK_FORMAT_UNDEFINED);
+        if (!taa_.resolve_pipe) return false;
+        taa_.resolve_format = format;
+    }
+    if (taa_.dense.image && taa_.w == w && taa_.h == h && taa_.format == format &&
+        need_history == (taa_.history[0].image != VK_NULL_HANDLE))
+        return true;
+    vkDeviceWaitIdle(device_);
+    DestroyTaaImages();
+    if (!CreateSmaaImage(taa_.dense, w, h, kDenseFormat, false) ||
+        !CreateSmaaImage(taa_.metadata, w, h, kMetadataFormat, false))
+        return false;
+    if (need_history && (!CreateSmaaImage(taa_.history[0], w, h, format, true) ||
+                         !CreateSmaaImage(taa_.history[1], w, h, format, true)))
+        return false;
+    const VkImageView views[2] = {taa_.dense.view, taa_.metadata.view};
+    VkFramebufferCreateInfo fb{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fb.renderPass = TaaMotionPass();
+    fb.attachmentCount = 2;
+    fb.pAttachments = views;
+    fb.width = w;
+    fb.height = h;
+    fb.layers = 1;
+    if (!fb.renderPass || vkCreateFramebuffer(device_, &fb, nullptr, &taa_.motion_fb) != VK_SUCCESS) return false;
+    taa_.w = w;
+    taa_.h = h;
+    taa_.format = format;
+    taa_.valid = false;
+    LOGR("vulkan: %s %ux%u", need_history ? "TAA history and dense motion" : "dense motion", w, h);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// FSR 3.1 (AMD FidelityFX SDK 1.1.4 Vulkan backend), on the inputs TAA's motion pass makes (d3d12.cpp DispatchFsr3)
+
+void VulkanBackend::DestroyFsr3() {
+    if (fsr3_.context) {
+        vkDeviceWaitIdle(device_);
+        ffxFsr3UpscalerContextDestroy(fsr3_.context.get());
+        fsr3_.context.reset();
+    }
+    if (fsr3_.output.image || fsr3_.shared[0].image) {
+        vkDeviceWaitIdle(device_);
+        DestroyAoImage(fsr3_.output);
+        for (AoImage& image : fsr3_.shared) DestroyAoImage(image);
+    }
+    fsr3_.w = fsr3_.h = fsr3_.out_w = fsr3_.out_h = 0;
+    fsr3_.valid = false;
+}
+
+bool VulkanBackend::EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h, bool infinite) {
+    if (fsr3_.failed) return false;
+    if (fsr3_.context && fsr3_.w == w && fsr3_.h == h && fsr3_.out_w == out_w && fsr3_.out_h == out_h &&
+        fsr3_.infinite == infinite)
+        return true;
+    DestroyFsr3();
+    auto fail = [&](const char* why, int code) {
+        LOGE("vulkan: FSR 3.1 %s (%d), using TAA's inputs without it", why, code);
+        fsr3_.failed = true;
+        g_fsr_state.store(::gpu::FsrState::NoDll, std::memory_order_relaxed);
+        DestroyFsr3();
+        return false;
+    };
+    if (fsr3_.scratch.empty()) fsr3_.scratch.resize(ffxGetScratchMemorySizeVK(physical_, FFX_FSR3UPSCALER_CONTEXT_COUNT));
+    VkDeviceContext device_context{device_, physical_, vkGetDeviceProcAddr};
+    FfxFsr3UpscalerContextDescription desc{};
+    FfxErrorCode r = ffxGetInterfaceVK(&desc.backendInterface, ffxGetDeviceVK(&device_context), fsr3_.scratch.data(),
+                                       fsr3_.scratch.size(), FFX_FSR3UPSCALER_CONTEXT_COUNT);
+    if (r != FFX_OK) return fail("has no Vulkan interface", int(r));
+    desc.flags = FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED | (infinite ? FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE : 0);
+    desc.maxRenderSize = {w, h};
+    desc.maxUpscaleSize = {out_w, out_h};
+    fsr3_.context = std::make_unique<FfxFsr3UpscalerContext>();
+    r = ffxFsr3UpscalerContextCreate(fsr3_.context.get(), &desc);
+    if (r != FFX_OK) {
+        fsr3_.context.reset();
+        return fail("context could not be created", int(r));
+    }
+    if (!CreateAoImage(fsr3_.output, out_w, out_h, VK_FORMAT_R8G8B8A8_UNORM, 1,
+                       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return fail("output could not be created", 0);
+    static constexpr VkFormat kSharedFormats[3] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_UINT};
+    for (int i = 0; i < 3; i++) {
+        if (!CreateAoImage(fsr3_.shared[i], w, h, kSharedFormats[i], 1,
+                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+            return fail("shared images could not be created", i);
+        Transition(fsr3_.shared[i].image, fsr3_.shared[i].layout, VK_IMAGE_LAYOUT_GENERAL, kSharedFormats[i]);
+    }
+    fsr3_.w = w;
+    fsr3_.h = h;
+    fsr3_.out_w = out_w;
+    fsr3_.out_h = out_h;
+    fsr3_.infinite = infinite;
+    fsr3_.valid = false;
+    g_fsr_state.store(::gpu::FsrState::No4, std::memory_order_relaxed);  // FSR 3.1 only on Vulkan
+    LOGR("vulkan: FSR 3.1 context %ux%u -> %ux%u%s", w, h, out_w, out_h, infinite ? ", infinite depth" : "");
+    return true;
+}
+
+// FSR 3.1 from the frame (ft's colour), the metadata's reversed depth and the dense motion; null on failure
+VkImageView VulkanBackend::DispatchFsr3(Target& ft, const CameraFrame& cam, bool reset) {
+    // the output: the frame's shape fitted to the window (as D3D12), or the frame's own size at 100%
+    uint32_t out_w = ft.w, out_h = ft.h;
+    const float aspect = aspect_ > 0 ? aspect_ : float(width_) / float(std::max(1u, height_));
+    if (app::Snapshot().render_percent < 100) {
+        const float width = std::min(float(extent_.width), float(extent_.height) * aspect);
+        out_w = uint32_t(std::lround(width));
+        out_h = uint32_t(std::lround(width / aspect));
+        if (out_w < ft.w || out_h < ft.h) return VK_NULL_HANDLE;
+    }
+    // keep the depth mode through brief far-plane flips (d3d12.cpp)
+    bool infinite = cam.far_z <= 0;
+    if (fsr3_.context && infinite != fsr3_.infinite) {
+        if (++fsr3_.depth_mode_frames < 30) infinite = fsr3_.infinite;
+    } else {
+        fsr3_.depth_mode_frames = 0;
+    }
+    if (!EnsureFsr3(ft.w, ft.h, out_w, out_h, infinite)) return VK_NULL_HANDLE;
+    if (infinite == fsr3_.infinite) fsr3_.depth_mode_frames = 0;
+
+    VkImage color = ft.samples > 1 ? ft.resolved_image : ft.image;
+    VkImageLayout& color_layout = ft.samples > 1 ? ft.resolved_layout : ft.layout;
+    Transition(color, color_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ft.format);
+    Transition(fsr3_.output.image, fsr3_.output.layout, VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM);
+
+    const app::Settings settings = app::Snapshot();
+    auto described = [](VkImage image, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags usage) {
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = format;
+        info.extent = {w, h, 1};
+        info.mipLevels = 1;
+        info.arrayLayers = 1;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.usage = usage;
+        return ffxGetImageResourceDescriptionVK(image, info);
+    };
+    FfxFsr3UpscalerDispatchDescription d{};
+    d.commandList = ffxGetCommandListVK(cmd_);
+    d.color = ffxGetResourceVK(reinterpret_cast<void*>(color),
+                               described(color, ft.format, ft.w, ft.h, VK_IMAGE_USAGE_SAMPLED_BIT), L"color",
+                               FFX_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    d.depth = ffxGetResourceVK(reinterpret_cast<void*>(taa_.metadata.image),
+                               described(taa_.metadata.image, kMetadataFormat, ft.w, ft.h, VK_IMAGE_USAGE_SAMPLED_BIT),
+                               L"depth", FFX_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    d.motionVectors = ffxGetResourceVK(reinterpret_cast<void*>(taa_.dense.image),
+                                       described(taa_.dense.image, kDenseFormat, ft.w, ft.h, VK_IMAGE_USAGE_SAMPLED_BIT),
+                                       L"motion", FFX_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    static const wchar_t* const kSharedNames[3] = {L"dilated depth", L"dilated motion", L"previous nearest depth"};
+    FfxResource shared[3];
+    for (int i = 0; i < 3; i++)
+        shared[i] = ffxGetResourceVK(reinterpret_cast<void*>(fsr3_.shared[i].image),
+                                     described(fsr3_.shared[i].image, fsr3_.shared[i].format, ft.w, ft.h,
+                                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+                                     kSharedNames[i], FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+    d.dilatedDepth = shared[0];
+    d.dilatedMotionVectors = shared[1];
+    d.reconstructedPrevNearestDepth = shared[2];
+    d.output = ffxGetResourceVK(reinterpret_cast<void*>(fsr3_.output.image),
+                                described(fsr3_.output.image, VK_FORMAT_R8G8B8A8_UNORM, out_w, out_h,
+                                          VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+                                L"output", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+    d.jitterOffset = {taa_jitter_[0], taa_jitter_[1]};
+    d.motionVectorScale = {float(ft.w), float(ft.h)};
+    d.renderSize = {ft.w, ft.h};
+    d.upscaleSize = {out_w, out_h};
+    d.enableSharpening = settings.sharpening > 0;
+    d.sharpness = float(settings.sharpening) / 100.0f;
+    d.reset = reset || !fsr3_.valid;
+    const auto now = std::chrono::steady_clock::now();
+    d.frameTimeDelta = d.reset ? 1000.0f / 60.0f
+                               : std::clamp(std::chrono::duration<float, std::milli>(now - fsr3_.last).count(), 1.0f,
+                                            1000.0f);
+    d.preExposure = 1.0f;
+    // FidelityFX names the planes by depth-buffer endpoint for reversed depth
+    d.cameraNear = fsr3_.infinite ? FLT_MAX : cam.far_z > 0 ? cam.far_z : 1e7f;
+    d.cameraFar = cam.near_z;
+    d.cameraFovAngleVertical = 2.0f * std::atan(1.0f / cam.ys);
+    d.viewSpaceToMetersFactor = 1.0f;
+    const FfxErrorCode r = ffxFsr3UpscalerContextDispatch(fsr3_.context.get(), &d);
+    bound_pipe_ = VK_NULL_HANDLE;
+    viewport_valid_ = false;
+    if (r != FFX_OK) {
+        LOG_FIRST(4, "vulkan: FSR 3.1 dispatch failed (%d)", int(r));
+        fsr3_.valid = false;
+        return VK_NULL_HANDLE;
+    }
+    // the backend leaves the output as it was given (general); the present pass samples it
+    fsr3_.output.layout = VK_IMAGE_LAYOUT_GENERAL;
+    Transition(fsr3_.output.image, fsr3_.output.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               VK_FORMAT_R8G8B8A8_UNORM);
+    if (!fsr3_.valid && !fsr3_.logged) {
+        LOGR("vulkan: FSR 3.1 %s dispatch succeeded", game::choices::TemporalPresetName(settings.render_percent)
+                                                          ? game::choices::TemporalPresetName(settings.render_percent)
+                                                          : "");
+        fsr3_.logged = true;
+    }
+    fsr3_.valid = true;
+    fsr3_.last = now;
+    return fsr3_.output.view;
+}
+
+VkImageView VulkanBackend::ApplyTaa(Target& ft, VkImageView color) {
+    if (taa_.failed || ft.depth || !ft.w || !ft.h) return VK_NULL_HANDLE;
+    auto depth_it = scene_depth_.find(&ft);
+    Target* d = depth_it != scene_depth_.end() ? depth_it->second.depth : nullptr;
+    if (!d || !d->sample_view || (d->samples > 1 ? !d->resolved_image : !d->image)) {
+        ResetTemporalHistory();
+        return VK_NULL_HANDLE;
+    }
+    if (!EnsureTaa(ft.w, ft.h, ft.format, !fsr_on_)) {
+        if (!taa_.failed) LOGE("vulkan: TAA could not be set up, using SMAA");
+        taa_.failed = true;
+        DestroyTaaImages();
+        return VK_NULL_HANDLE;
+    }
+    // the camera of the frame drawn: the scene hook's is one frame ahead (d3d12.cpp)
+    const CameraFrame cam = CameraOf(frames_ + 8 - 1);
+    float inv[16], m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    const bool camera_valid = cam.serial && cam.xs > 0 && cam.ys > 0 && cam.near_z > 0 && Invert4(cam.view, inv);
+    const bool reset = !taa_.valid || !camera_valid || cam.world_generation != taa_.camera.world_generation;
+    if (!reset)
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) {
+                float sum = 0;
+                for (int k = 0; k < 4; k++) sum += inv[r * 4 + k] * taa_.camera.view[k * 4 + c];
+                m[r * 4 + c] = sum;
+            }
+    static const bool trace = std::getenv("TCNYC_TRACE_TAA") != nullptr;
+    if (trace && (frames_ % 30 == 0 || (reset && taa_.valid)))
+        LOGR("taa: frame %llu serial %llu reset %d xs %.4f ys %.4f planes %.3f %.1f target %ux%u jitter %.2f %.2f "
+             "world %u", (unsigned long long)frames_, (unsigned long long)cam.serial, reset ? 1 : 0, cam.xs, cam.ys,
+             cam.near_z, cam.far_z, ft.w, ft.h, taa_jitter_[0], taa_jitter_[1], cam.world_generation);
+    const bool motion = motion_.view && motion_rt_ == &ft && motion_.cleared == frames_ &&
+                        motion_.w == ft.w && motion_.h == ft.h;
+    static const int view_mode = [] {
+        const char* e = std::getenv("TCNYC_TAA_VIEW");
+        return e ? std::atoi(e) : 0;
+    }();
+    float p[32] = {m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14],
+                   m[15], cam.xs, cam.ys, taa_.camera.xs, taa_.camera.ys, cam.near_z,
+                   cam.far_z > 0 ? cam.far_z : 1e7f, 1.0f, reset ? 1.0f : 0.0f, taa_jitter_[0] / float(ft.w),
+                   taa_jitter_[1] / float(ft.h), 1.0f / float(ft.w), 1.0f / float(ft.h), motion ? 1.0f : 0.0f,
+                   float(view_mode), 0, 0};
+
+    // inputs readable
+    if (d->samples > 1)
+        Transition(d->resolved_image, d->resolved_layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, d->format);
+    else
+        Transition(d->image, d->layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, d->format);
+    if (motion) Transition(motion_.image, motion_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kMotionFormat);
+
+    auto draw = [&](VkPipeline pipe, VkDescriptorSet set, VkRenderPass pass, VkFramebuffer fb) {
+        VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rp.renderPass = pass;
+        rp.framebuffer = fb;
+        rp.renderArea = {{0, 0}, {ft.w, ft.h}};
+        vkCmdBeginRenderPass(cmd_, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        VkViewport viewport{0, 0, float(ft.w), float(ft.h), 0, 1};
+        VkRect2D scissor{{0, 0}, {ft.w, ft.h}};
+        vkCmdSetViewport(cmd_, 0, 1, &viewport);
+        vkCmdSetScissor(cmd_, 0, 1, &scissor);
+        vkCmdPushConstants(cmd_, taa_.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(p), p);
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, taa_.layout, 0, 1, &set, 0, nullptr);
+        vkCmdDraw(cmd_, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cmd_);
+    };
+
+    // 1: dense motion and metadata
+    Transition(taa_.dense.image, taa_.dense.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, kDenseFormat);
+    Transition(taa_.metadata.image, taa_.metadata.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, kMetadataFormat);
+    WriteTaaSet(taa_.sets[0], color, nullptr, d->sample_view, motion ? motion_.view : nullptr,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    draw(taa_.motion_pipe[motion && motion_.samples > 1 ? 1 : 0], taa_.sets[0], TaaMotionPass(), taa_.motion_fb);
+    Transition(taa_.dense.image, taa_.dense.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kDenseFormat);
+    Transition(taa_.metadata.image, taa_.metadata.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kMetadataFormat);
+
+    // FSR 3.1 in place of the blend
+    if (fsr_on_) {
+        bound_pipe_ = VK_NULL_HANDLE;
+        viewport_valid_ = false;
+        VkImageView fsr = camera_valid ? DispatchFsr3(ft, cam, reset) : VK_NULL_HANDLE;
+        taa_.valid = camera_valid && fsr;
+        taa_.camera = cam;
+        return fsr;
+    }
+    // 2: the history blend into history[next]
+    SmaaImage& out = taa_.history[taa_.next];
+    SmaaImage& in = taa_.history[taa_.next ^ 1];
+    Transition(in.image, in.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.format);
+    Transition(out.image, out.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, out.format);
+    WriteTaaSet(taa_.sets[1], color, in.view, taa_.dense.view, taa_.metadata.view,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    draw(taa_.resolve_pipe, taa_.sets[1], RenderPassFor(out.format, VK_FORMAT_UNDEFINED), out.framebuffer);
+    Transition(out.image, out.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, out.format);
+    bound_pipe_ = VK_NULL_HANDLE;
+    viewport_valid_ = false;
+    taa_.next ^= 1;
+    taa_.valid = camera_valid;
+    taa_.camera = cam;
+    return out.view;
+}
+
 void VulkanBackend::Present(const Surface& front) {
     LapTimer present_lap(perf_, &perf_present_ms_);
+    SnapshotCamera(frames_);  // the camera this frame was drawn with, for TAA (one frame ahead; see ApplyTaa)
     if (draw_log_) std::fprintf(draw_log_, "FRAME %llu\n", frames_ + 1);
     FlushPass();
     EndRecord(true);
@@ -8095,8 +9003,38 @@ void VulkanBackend::Present(const Surface& front) {
 
     EnsureGradeLut();  // the colour grading table, uploaded on this command buffer the first time
 
+    // TAA replaces SMAA on the 3D scene when it is on (movies and still pictures keep SMAA)
+    VkImageView taa_view = VK_NULL_HANDLE;
+    if (taa_on_ && direct && ft && !ft->depth && ft->w && ft->h && ft->scene_frame == frames_ + 1 &&
+        front.picture == gpu::Picture::Unknown) {
+        static const bool profile = std::getenv("TCNYC_PROFILE_FSR3") != nullptr;
+        if (profile && !profile_.pool) {
+            VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            q.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            q.queryCount = 2;
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(physical_, &props);
+            profile_.period_ns = props.limits.timestampPeriod;
+            profile_.on = vkCreateQueryPool(device_, &q, nullptr, &profile_.pool) == VK_SUCCESS &&
+                          props.limits.timestampComputeAndGraphics;
+        }
+        const auto cpu_at = std::chrono::steady_clock::now();
+        if (profile_.on) {
+            vkCmdResetQueryPool(cmd_, profile_.pool, 0, 2);
+            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile_.pool, 0);
+        }
+        taa_view = ApplyTaa(*ft, source_view);
+        if (profile_.on) {
+            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile_.pool, 1);
+            profile_.pending = true;
+            profile_.cpu_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpu_at).count();
+        }
+    }
+    taa_applied_ = taa_view != VK_NULL_HANDLE;
+    if (taa_view) source_view = taa_view;
     // SMAA 1x on the finished scene, before the post chain samples it
-    const bool smaa_on = snapshot.smaa && direct && ft && !ft->depth && ft->w && ft->h;
+    const bool smaa_on = !taa_view && snapshot.smaa && direct && ft && !ft->depth && ft->w && ft->h;
     if (smaa_on && EnsureSmaa(ft->w, ft->h, ft->format)) {
         auto write = [&](VkDescriptorSet set, VkImageView t0, VkImageView t1, VkImageView t2) {
             VkDescriptorImageInfo images[3]{};
@@ -8160,7 +9098,7 @@ void VulkanBackend::Present(const Surface& front) {
     if (snapshot.bloom && direct && ft && !ft->depth && ft->w && ft->h)
         bloom_view = BuildBloom(source_view, ft->w, ft->h);
     // FSR 1 upscaling and sharpening of the 3D scene (not of movies and still pictures)
-    if (direct && ft && !ft->depth && front.picture == gpu::Picture::Unknown)
+    if (direct && ft && !ft->depth && front.picture == gpu::Picture::Unknown && !(fsr_on_ && taa_view))
         source_view = UpscaleAndSharpen(source_view, ft->format, ft->w, ft->h, extent_.width, extent_.height, snapshot);
 
     // PC distance blur: the main target's depth, resolved with MSAA or the image itself without (as d3d12.cpp)
@@ -8411,6 +9349,25 @@ void VulkanBackend::Present(const Surface& front) {
         if (WriteSwapTga(path.c_str(), trace_ptr_, extent_.width, extent_.height, swapchain_format_,
                          hdr_output_, float(snapshot.hdr_paper_white)))
             LOGR("linux: trace present %s saved (%ux%u)", path.c_str(), extent_.width, extent_.height);
+    }
+    if (profile_.pending && waited) {
+        uint64_t t[2] = {};
+        if (vkGetQueryPoolResults(device_, profile_.pool, 0, 2, sizeof(t), t, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] >= t[0])
+            profile_.gpu_ms += double(t[1] - t[0]) * profile_.period_ns / 1e6;
+        const auto now = std::chrono::steady_clock::now();
+        if (profile_.count)
+            profile_.frame_ms += std::chrono::duration<double, std::milli>(now - profile_.frame_start).count();
+        profile_.frame_start = now;
+        if (++profile_.count == 121) {
+            const app::Settings ps = app::Snapshot();
+            LOGR("temporal profile: %s %u%% %ux%u | 120 frames | frame %.2f ms | temporal GPU %.3f ms | temporal CPU "
+                 "%.3f ms", fsr_on_ ? "FSR 3.1" : "TAA", ps.render_percent, ft ? ft->w : 0, ft ? ft->h : 0,
+                 profile_.frame_ms / 120.0, profile_.gpu_ms / 121.0, profile_.cpu_ms / 121.0);
+            profile_.gpu_ms = profile_.cpu_ms = profile_.frame_ms = 0;
+            profile_.count = 0;
+        }
+        profile_.pending = false;
     }
     frame_end.finished = true;
     ResetFrame();

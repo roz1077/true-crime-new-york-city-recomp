@@ -43,7 +43,7 @@ inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kDlss, kFsr4};
 #elif defined(_WIN32)
 inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kFsr4};
 #else
-inline constexpr uint32_t kUpscalers[] = {0, 1};
+inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3};  // FSR 3.1 through AMD's open Vulkan backend
 #endif
 inline constexpr uint32_t kBloomStrengths[] = {50, 100, 150, 200, 300, 400};  // percent of the original
 inline constexpr uint32_t kShadowLevels[] = {0, 1, 2};  // shadow resolution and softness: off or original, then two steps

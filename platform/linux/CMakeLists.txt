@@ -68,6 +68,27 @@ file(SHA1 "${XBE_FILE}" XBE_SHA1)
 set(XBE_HASH "${CMAKE_CURRENT_BINARY_DIR}/TrueCrimeNYC_xbe.cpp")
 file(CONFIGURE OUTPUT "${XBE_HASH}" CONTENT "extern const char kImageSha1[] = \"${XBE_SHA1}\";\n")
 
+# AMD FidelityFX FSR 3.1 (SDK 1.1.4, MIT) for the Vulkan temporal upscaler: AMD's sources with their SPIR-V
+# permutation headers generated on Windows by scripts/gen_fsr3_vk_shaders.py (sdk/third_party/fsr3_vk)
+set(FSR3_VK "${REPO}/sdk/third_party/fsr3_vk")
+add_library(ffx_fsr3_vk STATIC
+    "${FSR3_VK}/src/components/fsr3upscaler/ffx_fsr3upscaler.cpp"
+    "${FSR3_VK}/src/backends/vk/ffx_vk.cpp"
+    "${FSR3_VK}/src/backends/shared/ffx_shader_blobs.cpp"
+    "${FSR3_VK}/src/backends/shared/blob_accessors/ffx_fsr3upscaler_shaderblobs.cpp"
+    "${FSR3_VK}/src/shared/ffx_assert.cpp"
+    "${FSR3_VK}/src/shared/ffx_message.cpp"
+    "${FSR3_VK}/src/shared/ffx_object_management.cpp"
+    "${FSR3_VK}/src/shared/ffx_breadcrumbs_list.cpp"
+    "${FSR3_VK}/ffx_linux_stubs.cpp")
+target_include_directories(ffx_fsr3_vk PRIVATE
+    "${FSR3_VK}/include/FidelityFX/host" "${FSR3_VK}/src/shared" "${FSR3_VK}/src/components"
+    "${FSR3_VK}/src/backends/shared" "${FSR3_VK}/src/backends/shared/blob_accessors" "${FSR3_VK}/generated")
+target_include_directories(ffx_fsr3_vk PUBLIC "${FSR3_VK}/include")
+target_compile_definitions(ffx_fsr3_vk PRIVATE FFX_FSR3UPSCALER FFX_GCC)
+target_compile_options(ffx_fsr3_vk PRIVATE -include "${FSR3_VK}/ffx_linux_compat.h" -O2 -w -fPIC)
+target_link_libraries(ffx_fsr3_vk PRIVATE PkgConfig::VULKAN)
+
 add_executable(TrueCrimeNYC ${GEN_SRC} ${RT_SRC} ${GAME_SRC} ${HOST} ${HARNESS} ${IMGUI_SRC} ${XBE_HASH})
 
 target_include_directories(TrueCrimeNYC PRIVATE
@@ -89,5 +110,5 @@ if(TARGET SDL3::SDL3-static)
 else()
     set(SDL3_TARGET SDL3::SDL3)
 endif()
-target_link_libraries(TrueCrimeNYC PRIVATE ${SDL3_TARGET} PkgConfig::VULKAN PkgConfig::SHADERC pthread dl)
+target_link_libraries(TrueCrimeNYC PRIVATE ${SDL3_TARGET} PkgConfig::VULKAN PkgConfig::SHADERC ffx_fsr3_vk pthread dl)
 target_link_options(TrueCrimeNYC PRIVATE -static-libstdc++)

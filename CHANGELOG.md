@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Graphics
+- Linux / Steam Deck: TAA (with the same per-object motion and road handling as Windows) and experimental
+  AMD FSR 3.1 (Performance, Balanced, Quality, Native AA), built from AMD's open FidelityFX SDK 1.1.4 Vulkan
+  backend. FSR 4 has no Linux build from AMD. The bloom chain now works on Linux (a shader cache key bug made
+  it fall back to the single-pass bloom).
 - Pipelines are kept between runs: the driver's compiled pipelines are saved beside the
   shader cache (`shader-cache/.../pipelines.bin` on Windows, `~/.cache/TrueCrimeNYC/pipelines.bin`
   on Linux) a few seconds after the last new one, so effects and areas seen before no longer
