@@ -528,12 +528,16 @@ private:
         switch (c.op) {
             case Op::State: {
                 uint8_t* s = reinterpret_cast<uint8_t*>(&state_);
+                static const size_t vsc_lo = At(state_, &state_.vsc), vsc_hi = vsc_lo + sizeof(state_.vsc);
+                bool vsc_changed = false;
                 for (const uint8_t* p = data; p < data + c.size;) {
                     uint32_t head[2];
                     std::memcpy(head, p, 8);
                     std::memcpy(s + head[0], p + 8, head[1]);
+                    vsc_changed |= head[0] < vsc_hi && head[0] + head[1] > vsc_lo;
                     p += 8 + head[1];
                 }
+                if (vsc_changed || !state_.vsc_serial) state_.vsc_serial++;
                 if (c.vs >= 0) state_.vs = b.vs[size_t(c.vs)];
                 if (c.ps >= 0) state_.ps = b.ps[size_t(c.ps)];
                 break;

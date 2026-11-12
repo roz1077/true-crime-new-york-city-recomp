@@ -91,6 +91,7 @@ struct Sample {
 Sample g_samples[kMax];
 std::atomic<size_t> g_count{0};
 std::atomic<uint64_t> g_frames{0};
+std::atomic<uint64_t> g_draws{0};
 std::atomic<bool> g_started{false};
 
 void Run(HANDLE thread) {
@@ -213,8 +214,11 @@ void Dump() {
         std::fprintf(f, "\n");
     };
     const size_t busy = n - waits;
-    LOGR("sampler: %zu busy samples (%zu caught waiting) over %llu frames, %.2f ms of render-thread CPU a frame",
-         busy, waits, (unsigned long long)frames, frames ? double(busy) / double(frames) : 0.0);
+    const uint64_t draws = g_draws.load();
+    LOGR("sampler: %zu busy samples (%zu caught waiting) over %llu frames, %.2f ms of render-thread CPU a frame, "
+         "%.2f us a draw (%llu draws)",
+         busy, waits, (unsigned long long)frames, frames ? double(busy) / double(frames) : 0.0,
+         draws ? 1000.0 * double(busy) / double(draws) : 0.0, (unsigned long long)draws);
     std::error_code ec;
     std::filesystem::create_directories(app::ExeDir() / "logs", ec);
     if (FILE* f = std::fopen((app::ExeDir() / "logs" / "samples.txt").string().c_str(), "w")) {
@@ -1391,6 +1395,7 @@ private:
     // the constants last uploaded in this command list, reused while a draw's are the same; 0 after a submit
     decltype(State::vsc) last_vsc_{};
     D3D12_GPU_VIRTUAL_ADDRESS last_vsc_gpu_ = 0;
+    uint64_t last_vsc_serial_ = 0;  // State::vsc_serial of the constants at last_vsc_gpu_, 0 when unknown
     DrawConstants last_dc_{};
     D3D12_GPU_VIRTUAL_ADDRESS last_dc_gpu_ = 0;
     ComPtr<ID3D12GraphicsCommandList> lists_[kFrames];
@@ -4387,7 +4392,9 @@ uint8_t* D3D12Backend::UploadVertexConstants(const State& s) {
     Alloc vc = Upload(sizeof(s.vsc), 256);
     if (!vc.res) return nullptr;
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
-    std::memcpy(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
+    // with the render thread's serial the copy kept for comparing is not needed
+    if (!s.vsc_serial) std::memcpy(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
+    last_vsc_serial_ = s.vsc_serial;
     last_vsc_gpu_ = vc.gpu;
     return vc.cpu;
 }
@@ -4395,7 +4402,9 @@ uint8_t* D3D12Backend::UploadVertexConstants(const State& s) {
 bool D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
                                    GuestExtent size, DrawConstants& c) {
     // the extension edits the uploaded copy, so its draws always get their own
-    bool same = !ext_ && last_vsc_gpu_ && !std::memcmp(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
+    bool same = !ext_ && last_vsc_gpu_ &&
+                (s.vsc_serial ? s.vsc_serial == last_vsc_serial_
+                              : !last_vsc_serial_ && !std::memcmp(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc)));
     uint8_t* vsc = same ? nullptr : UploadVertexConstants(s);
     if (!same && !vsc) return false;
     FillSurfaceConstants(s, size, c);
@@ -4927,6 +4936,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     PerfScope perf_draw{g_perf.draw};
     g_perf.draws++;
     winsampler::Start();
+    if (winsampler::g_started.load(std::memory_order_relaxed)) winsampler::g_draws.fetch_add(1, std::memory_order_relaxed);
     if (cap_) CapStep(s.rt);
     if (DepthCopy(s)) return;
     DrawEnd draw_end{ext_};
