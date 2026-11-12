@@ -9,8 +9,8 @@
   wave64 shaders where supported. The Vulkan bloom chain now runs after fixing a shader cache key collision.
 - Experimental Vulkan DLSS in optional SDK builds, with the same four presets and clean fallback
   on unsupported hardware. Native RTX rendering still needs validation.
-- Linux Vulkan can record large deferred scene batches on two threads. To try it without ambient occlusion,
-  start with `TCNYC_DRAW_WORKER=1 TCNYC_DEFER_SCENE=1`. The worker is opt-in.
+- Linux Vulkan records large deferred scene batches on two threads by default.
+  Set `TCNYC_DRAW_WORKER=0` to disable parallel recording.
 - Pipelines are kept between runs: the driver's compiled pipelines are saved beside the
   shader cache (`shader-cache/.../pipelines.bin` on Windows, `~/.cache/TrueCrimeNYC/pipelines.bin`
   on Linux) a few seconds after the last new one, so effects and areas seen before no longer

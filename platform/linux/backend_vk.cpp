@@ -27,6 +27,7 @@
 #include <source_location>
 #include <span>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -1721,11 +1722,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     // testing only: no occlusion set can be bound, to exercise the non-AO receiver fallback
     ao_fail_test_ = std::getenv("TCNYC_AO_FAIL_TEST") != nullptr;
     trace_ = std::getenv("TCNYC_TRACE") != nullptr;
-    if (const char* e = std::getenv("TCNYC_DEFER_SCENE")) defer_forced_ = *e && std::atoi(e) != 0;
     ao_mode_ = app::Snapshot().ao;
-    defer_scene_ = defer_forced_ || ao_mode_ != 0;
-    msaa_store_ = defer_scene_;
-    if (defer_scene_) LOGR("vulkan: deferred scene display list enabled (%s)", defer_forced_ ? "TCNYC_DEFER_SCENE" : "ambient occlusion setting");
     if (const char* e = std::getenv("TCNYC_TRACE_PRESENT")) trace_present_ = std::atoi(e) != 0;
     if (const char* e = std::getenv("TCNYC_DUMP_TEX")) {
         const char* p = e;
@@ -1819,6 +1816,13 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
         if ((ao_color_samples_ & VK_SAMPLE_COUNT_1_BIT) == 0) ao_color_samples_ = VK_SAMPLE_COUNT_1_BIT;
     }
     if (!CreateSwapchain() || !CreateCommands() || !CreateUpload()) return false;
+    const char* defer_override = std::getenv("TCNYC_DEFER_SCENE");
+    defer_forced_ = defer_override ? std::atoi(defer_override) != 0 : draw_worker_.joinable();
+    defer_scene_ = defer_forced_ || ao_mode_ != 0;
+    msaa_store_ = defer_scene_;
+    if (defer_scene_)
+        LOGR("vulkan: deferred scene display list enabled (%s)",
+             defer_forced_ ? (defer_override ? "TCNYC_DEFER_SCENE" : "draw recording worker") : "ambient occlusion setting");
 
     // 1x1 white for stages with no texture
     VkImageCreateInfo wi{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -2952,17 +2956,21 @@ bool VulkanBackend::CreateCommands() {    VkCommandPoolCreateInfo pool{VK_STRUCT
     alloc.commandBufferCount = 1;
     if (vkAllocateCommandBuffers(device_, &alloc, &cmd_) != VK_SUCCESS) return false;
     if (const char* enabled = std::getenv("TCNYC_DRAW_WORKER");
-        enabled && std::atoi(enabled) != 0 &&
+        (!enabled || std::atoi(enabled) != 0) &&
         vkCreateCommandPool(device_, &pool, nullptr, &draw_worker_pool_) == VK_SUCCESS) {
-        draw_worker_ = std::thread([this] {
-            for (;;) {
-                draw_job_ready_.acquire();
-                if (!draw_job_.cmd) return;
-                draw_job_.recorded = RecordDrawBatch(draw_job_);
-                draw_job_done_.release();
-            }
-        });
-        LOGR("vulkan: parallel deferred draw recording enabled");
+        try {
+            draw_worker_ = std::thread([this] {
+                for (;;) {
+                    draw_job_ready_.acquire();
+                    if (!draw_job_.cmd) return;
+                    draw_job_.recorded = RecordDrawBatch(draw_job_);
+                    draw_job_done_.release();
+                }
+            });
+            LOGR("vulkan: parallel deferred draw recording enabled");
+        } catch (const std::system_error& e) {
+            LOGR("vulkan: draw recording worker unavailable (%s)", e.what());
+        }
     }
     VkSemaphoreCreateInfo sem{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
