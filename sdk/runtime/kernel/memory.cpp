@@ -20,6 +20,9 @@ namespace mem {
 
 static uint8_t* g_base = nullptr;
 static std::recursive_mutex g_lock;
+// bumped under g_lock by every call that changes what AllocationSize answers; its per-thread cache checks it
+static std::atomic<uint64_t> g_layout{1};
+static void LayoutChanged() { g_layout.fetch_add(1, std::memory_order_release); }
 
 uint8_t* Base() { return g_base; }
 
@@ -239,6 +242,7 @@ static void EnsureRanges() {
 
 bool ReserveImage(uint32_t base, uint32_t size) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    LayoutChanged();
     const uint64_t end = (uint64_t(base) + size + 0xFFFF) & ~0xFFFFull;
     if (!size || base < kUserLow || end > kUserHigh) return false;
     EnsureRanges();
@@ -262,6 +266,7 @@ static Reservation* FindReservation(uint32_t addr, uint32_t* start) {
 
 uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t protect) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    LayoutChanged();
     EnsureRanges();
     if (!size || size > 0xFFFFFFFFu - 0xFFFFu) return 0xC000000D;  // STATUS_INVALID_PARAMETER
     bool reserve = type & kMemReserve;
@@ -302,6 +307,7 @@ uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t
 
 uint32_t FreeVirtual(uint32_t& base, uint32_t& size, uint32_t type) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    LayoutChanged();
     uint32_t start;
     Reservation* r = FindReservation(base, &start);
     if (!r) return 0xC000009F;  // STATUS_MEMORY_NOT_ALLOCATED
@@ -355,6 +361,7 @@ bool QueryVirtual(uint32_t addr, RegionInfo& out) {
 
 uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint32_t align) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    LayoutChanged();
     EnsureRanges();
     if (size > 0xFFFFFFFFu - (kPage - 1)) return 0;
     size = (size + kPage - 1) & ~(kPage - 1);
@@ -380,12 +387,14 @@ uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint3
 
 void FreeContiguous(uint32_t va) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    LayoutChanged();
     uint32_t size;
     if (g_contig.Free(va, &size)) Decommit(va, size);
 }
 
 uint32_t AllocSystem(uint32_t size, uint32_t align) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    LayoutChanged();
     EnsureRanges();
     if (size > 0xFFFFFFFFu - 15u) return 0;
     size = (size + 15) & ~15u;
@@ -403,11 +412,13 @@ uint32_t AllocSystem(uint32_t size, uint32_t align) {
 
 void FreeSystem(uint32_t va) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    LayoutChanged();
     g_system.Free(va);
 }
 
 uint32_t AllocStack(uint32_t size) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    LayoutChanged();
     EnsureRanges();
     if (size > 0xFFFFFFFFu - 0xFFFFu) return 0;
     size = (size + 0xFFFF) & ~0xFFFFu;
@@ -425,6 +436,7 @@ uint32_t AllocStack(uint32_t size) {
 
 void FreeStack(uint32_t top) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    LayoutChanged();
     auto it = g_stack_tops.find(top);
     if (it == g_stack_tops.end()) return;
     uint32_t size;
@@ -432,13 +444,27 @@ void FreeStack(uint32_t top) {
     g_stack_tops.erase(it);
 }
 
-uint32_t AllocationSize(uint32_t va) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+static uint32_t AllocationSizeLocked(uint32_t va) {
     if (uint32_t s = g_contig.SizeOf(va)) return s;
     if (uint32_t s = g_system.SizeOf(va)) return s;
     uint32_t start;
     if (Reservation* r = FindReservation(va, &start)) return r->size - (va - start);
     return 0;
+}
+
+// The renderer asks for the same vertex buffers and textures every draw: answers are kept per thread until any
+// allocation or free changes the layout, which saves the lock and the allocator searches.
+uint32_t AllocationSize(uint32_t va) {
+    struct Entry {
+        uint32_t va = 0, size = 0;
+        uint64_t layout = 0;
+    };
+    thread_local Entry cache[256];
+    Entry& e = cache[(va >> 4 ^ va >> 12) & 255];
+    if (e.layout == g_layout.load(std::memory_order_acquire) && e.va == va) return e.size;
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    e = {va, AllocationSizeLocked(va), g_layout.load(std::memory_order_relaxed)};
+    return e.size;
 }
 
 uint32_t PhysicalFromVirtual(uint32_t va) {
