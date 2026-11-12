@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.2.0 — Beta 3 (2026-11-12)
 
 ### Graphics
 - Linux / Steam Deck: TAA (with the same per-object motion and road handling as Windows) and experimental
