@@ -412,10 +412,12 @@ bool RawReadable(const State& s, const Inputs& inputs) {
         // Vulkan (g_component_aligned_vertices) needs only the component alignment, which keeps the guest's
         // 14-byte strides of packed short positions on the raw path instead of converting them on the CPU
         const uint32_t align = g_component_aligned_vertices ? ComponentBytes(in.type, he) : 0;
-        bool readable = he.format && he.bytes && stride &&
-                        (align ? stride % align == 0 && in.offset % align == 0
-                               : stride % kStrideAlign == 0 && in.offset % std::min<uint32_t>(he.bytes, 4) == 0) &&
-                        in.offset < kElementOffsetEnd && uint64_t(in.offset) + he.bytes <= stride;
+        // D3D12 reads elements on the dword grid; a stream off it is repacked while its vertices are copied
+        // (AddRepackedBuffer), far cheaper than converting every element to floats on the CPU
+        bool readable = he.format && he.bytes && stride && in.offset < kElementOffsetEnd &&
+                        (align ? stride % align == 0 && in.offset % align == 0 &&
+                                     uint64_t(in.offset) + he.bytes <= stride
+                               : uint64_t(in.offset) + TypeBytes(in.type) <= stride);
         if (!readable) {
             LOG_FIRST(32, "vertex: converted on the CPU: v%d type %02X offset %u stride %u", inputs.regs[k], in.type,
                       in.offset, stride);
@@ -459,6 +461,80 @@ int AddRawBuffer(const State& s, const VertexShader& layout, const VertexShader:
         if (!GatherVertices(s, d, data, stride, g)) return -1;
         out.buffers[out.buffer_count++] = {g.data(), uint32_t(bytes), stride};
     }
+    return slot;
+}
+
+// D3D12 only: true when the input assembler cannot read this stream in place (a stride that is not a whole
+// number of dwords, or an element off its alignment or reading past the stride)
+bool NeedsRepack(const State& s, const Inputs& inputs, int stream) {
+    if (g_component_aligned_vertices) return false;
+    for (int k = 0; k < inputs.nregs; k++) {
+        const auto& in = inputs.layout.inputs[size_t(inputs.regs[k])];
+        if (in.stream != stream) continue;
+        const uint32_t stride = StrideOf(s, inputs.layout, in);
+        const HostElement he = RawElement(in.type, in.offset, stride);
+        if (stride % kStrideAlign || in.offset % std::min<uint32_t>(he.bytes, 4) ||
+            uint64_t(in.offset) + he.bytes > stride)
+            return true;
+    }
+    return false;
+}
+
+// the stream's elements copied to aligned offsets in a new, dword-strided buffer; offsets gets each element's
+// new offset by register. The bytes a host format reads past the guest element (the w of a 3-component
+// short) are zero, and the decode replaces them.
+int AddRepackedBuffer(const State& s, const Inputs& inputs, int stream, const DrawRange& d, bool dense,
+                      Assembled& out, uint16_t* offsets) {
+    using namespace kernel;
+    if (out.buffer_count >= out.buffers.size() || d.first_vertex < 0) return -1;
+    struct Field {
+        uint32_t src, dst, bytes;
+    };
+    Field fields[16];
+    int nf = 0;
+    uint32_t stride = 0, cursor = 0;
+    for (int k = 0; k < inputs.nregs; k++) {
+        const int reg = inputs.regs[k];
+        const auto& in = inputs.layout.inputs[size_t(reg)];
+        if (in.stream != stream) continue;
+        stride = StrideOf(s, inputs.layout, in);
+        const HostElement he = RawElement(in.type, in.offset, stride);
+        const uint32_t align = std::min<uint32_t>(he.bytes, 4);
+        cursor = (cursor + align - 1) / align * align;
+        offsets[reg] = uint16_t(cursor);
+        fields[nf++] = {in.offset, cursor, TypeBytes(in.type)};
+        cursor += he.bytes;
+    }
+    if (!stride || !nf) return -1;
+    const uint32_t packed = (cursor + kStrideAlign - 1) / kStrideAlign * kStrideAlign;
+    const uint32_t n = dense ? d.span : d.count;
+    if (uint64_t(n) * packed > kMaxAssemblyBytes) return -1;
+    const auto& st = s.streams[size_t(stream)];
+    const uint8_t* data = static_cast<const uint8_t*>(HostPtr(mem::VirtualFromPhysical(R32(st.vb + kResData))));
+    const int slot = int(out.buffer_count);
+    auto& g = out.gathered[out.buffer_count];
+    g.assign(size_t(n) * packed, 0);
+    for (uint32_t i = 0; i < n; i++) {
+        const int64_t v = dense ? d.first_vertex + i : DrawVertex(s, d, i);
+        if (v < 0) return -1;
+        const uint8_t* src = data + size_t(v) * stride;
+        uint8_t* dst = &g[size_t(i) * packed];
+        for (int f = 0; f < nf; f++) {
+            uint8_t* to = dst + fields[f].dst;
+            const uint8_t* from = src + fields[f].src;
+            // fixed sizes inline to a load and a store; a general memcpy call per element cost as much as the copy
+            switch (fields[f].bytes) {
+                case 2: std::memcpy(to, from, 2); break;
+                case 4: std::memcpy(to, from, 4); break;
+                case 6: std::memcpy(to, from, 6); break;
+                case 8: std::memcpy(to, from, 8); break;
+                case 12: std::memcpy(to, from, 12); break;
+                case 16: std::memcpy(to, from, 16); break;
+                default: std::memcpy(to, from, fields[f].bytes); break;
+            }
+        }
+    }
+    out.buffers[out.buffer_count++] = {g.data(), uint32_t(g.size()), packed};
     return slot;
 }
 
@@ -507,15 +583,21 @@ bool AssembleRaw(const State& s, const Inputs& inputs, const DrawRange& d, Assem
     bool dense = uint64_t(d.span) <= uint64_t(d.count) * kDenseSpanPerVertex + kDenseSpanSlack;
     int slot[16];
     std::fill(std::begin(slot), std::end(slot), -1);
+    bool repacked[16] = {};
+    uint16_t offsets[16] = {};
     for (int k = 0; k < inputs.nregs; k++) {
         int reg = inputs.regs[k];
         const auto& in = inputs.layout.inputs[size_t(reg)];
         if (slot[in.stream] < 0) {
-            slot[in.stream] = AddRawBuffer(s, inputs.layout, in, d, dense, out);
+            repacked[in.stream] = NeedsRepack(s, inputs, in.stream);
+            slot[in.stream] = repacked[in.stream]
+                                  ? AddRepackedBuffer(s, inputs, in.stream, d, dense, out, offsets)
+                                  : AddRawBuffer(s, inputs.layout, in, d, dense, out);
             if (slot[in.stream] < 0) return false;
         }
         HostElement he = RawElement(in.type, in.offset, StrideOf(s, inputs.layout, in));
-        out.elements[size_t(reg)] = {he.format, uint8_t(slot[in.stream]), uint16_t(in.offset)};
+        const uint16_t offset = repacked[in.stream] ? offsets[reg] : uint16_t(in.offset);
+        out.elements[size_t(reg)] = {he.format, uint8_t(slot[in.stream]), offset};
         out.decode |= uint64_t(he.decode) << (reg * 4);
     }
     out.vertex_count = dense ? d.span : d.count;
@@ -728,6 +810,11 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
 
     // the guest's own vertices when the input assembler can read every element of them
     bool raw = kRawVertices && !force_converted && raw_ok && RawReadable(s, inputs);
+    // Flat-shaded strips keep the converted path's list rebuild, where the provoking vertex matters, for the
+    // layouts that only reach the raw path by repacking (as before repacking existed).
+    if (raw && d.prim == 6 && s.simple[kMShadeMode >> 2] == 0x1D00)
+        for (int k = 0; k < nregs && raw; k++)
+            if (NeedsRepack(s, inputs, layout->inputs[size_t(regs[k])].stream)) raw = false;
     sp.At("  (asm) raw readable");
     try {
         bool ok = raw ? AssembleRaw(s, inputs, d, out) : AssembleConverted(s, inputs, d, out, force_converted);
