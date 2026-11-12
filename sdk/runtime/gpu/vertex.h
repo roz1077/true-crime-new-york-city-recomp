@@ -17,6 +17,7 @@ enum VertexDecode : uint8_t {
     kDecodeIntW1,    // SHORT3
     kDecodePacked,   // NORMPACKED3, 11:11:10 signed in a uint
     kDecodeFloat2H,  // x y w as 3 floats
+    kDecodePacked16, // NORMPACKED3 read as two 16-bit halves (an attribute at a 2-byte offset, Vulkan only)
 };
 
 // a buffer the draw reads: guest vertices as they are, or the float4 copy converted on the CPU
@@ -59,6 +60,9 @@ void FvfInputs(uint32_t fvf, VertexShader& out);
 // indices: the title's 16 bit indices, null for an unindexed draw
 // force_converted: the reference renderer needs CPU vertices even when the GPU path can read
 // guest memory directly
+// Set by a renderer whose input assembler needs vertex attributes aligned only to their component size (Vulkan),
+// not to dwords (D3D12): more of the guest's vertex layouts are then read in place
+inline bool g_component_aligned_vertices = false;
 bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, Assembled& out,
               bool force_converted = false);
 

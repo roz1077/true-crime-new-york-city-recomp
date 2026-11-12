@@ -204,15 +204,17 @@ std::string VsInputs(uint16_t regs, uint64_t decode) {
     for (int r = 0; r < 16; r++) {
         if (!((regs >> r) & 1)) continue;
         uint32_t d = uint32_t(decode >> (r * 4)) & 15;
-        const char* type = d == kDecodeInt || d == kDecodeIntW1 ? "int4" : d == kDecodePacked ? "uint" : "float4";
+        const char* type = d == kDecodeInt || d == kDecodeIntW1 ? "int4" : d == kDecodePacked ? "uint"
+                           : d == kDecodePacked16 ? "uint2" : "float4";
         raw += F("    %s v%d : ATTR%d;\n", type, r, r);
         in += F("    float4 v%d;\n", r);
-        packed |= d == kDecodePacked;
+        packed |= d == kDecodePacked || d == kDecodePacked16;
         switch (d) {
             case kDecodeW1: body += F("    i.v%d = float4(ri.v%d.xyz, 1);\n", r, r); break;
             case kDecodeInt: body += F("    i.v%d = float4(ri.v%d);\n", r, r); break;
             case kDecodeIntW1: body += F("    i.v%d = float4(float3(ri.v%d.xyz), 1);\n", r, r); break;
             case kDecodePacked: body += F("    i.v%d = UnpackNp3(ri.v%d);\n", r, r); break;
+            case kDecodePacked16: body += F("    i.v%d = UnpackNp3(ri.v%d.x | (ri.v%d.y << 16));\n", r, r, r); break;
             case kDecodeFloat2H: body += F("    i.v%d = float4(ri.v%d.xy, 0, ri.v%d.z);\n", r, r, r); break;
             default: body += F("    i.v%d = ri.v%d;\n", r, r); break;
         }

@@ -1,3 +1,6 @@
+#include <chrono>
+#include <map>
+#include <string>
 #include "gpu/vertex.h"
 
 #include <algorithm>
@@ -380,17 +383,39 @@ uint32_t StrideOf(const State& s, const VertexShader& layout, const VertexShader
     return st.stride ? st.stride : layout.stream_stride[size_t(in.stream)];
 }
 
-constexpr uint32_t kStrideAlign = 4;            // the input assembler reads strides in dwords
+constexpr uint32_t kStrideAlign = 4;            // D3D12's input assembler reads strides in dwords
+
+// the host element for an input read raw: NORMPACKED3 at an offset or stride that is not a multiple of 4 is read as
+// two 16-bit halves where the renderer allows component alignment (Vulkan), and joined again in the vertex shader
+HostElement RawElement(uint32_t type, uint32_t offset, uint32_t stride) {
+    if (type == 0x16 && g_component_aligned_vertices && (offset % 4 || stride % 4))
+        return {36 /* DXGI_FORMAT_R16G16_UINT */, kDecodePacked16, 4};
+    return HostFormat(type);
+}
+
+// the bytes of one component of a D3DVSDT type (Vulkan aligns attributes to their component size)
+uint32_t ComponentBytes(uint32_t type, const HostElement& he) {
+    if (he.decode == kDecodePacked16) return 2;
+    switch (type & 0x0F) {
+        case 0x1: case 0x5: return 2;  // shorts
+        case 0x0: case 0x4: return 1;  // D3DCOLOR, bytes
+        default: return std::min<uint32_t>(he.bytes, 4);
+    }
+}
 constexpr uint32_t kElementOffsetEnd = 0x10000;  // the element offset is stored as uint16_t
 
 bool RawReadable(const State& s, const Inputs& inputs) {
     for (int k = 0; k < inputs.nregs; k++) {
         const auto& in = inputs.layout.inputs[size_t(inputs.regs[k])];
-        HostElement he = HostFormat(in.type);
         uint32_t stride = StrideOf(s, inputs.layout, in);
-        bool readable = he.format && he.bytes && stride && stride % kStrideAlign == 0 && in.offset < kElementOffsetEnd &&
-                        in.offset % std::min<uint32_t>(he.bytes, 4) == 0 &&
-                        uint64_t(in.offset) + he.bytes <= stride;
+        HostElement he = RawElement(in.type, in.offset, stride);
+        // Vulkan (g_component_aligned_vertices) needs only the component alignment, which keeps the guest's
+        // 14-byte strides of packed short positions on the raw path instead of converting them on the CPU
+        const uint32_t align = g_component_aligned_vertices ? ComponentBytes(in.type, he) : 0;
+        bool readable = he.format && he.bytes && stride &&
+                        (align ? stride % align == 0 && in.offset % align == 0
+                               : stride % kStrideAlign == 0 && in.offset % std::min<uint32_t>(he.bytes, 4) == 0) &&
+                        in.offset < kElementOffsetEnd && uint64_t(in.offset) + he.bytes <= stride;
         if (!readable) {
             LOG_FIRST(32, "vertex: converted on the CPU: v%d type %02X offset %u stride %u", inputs.regs[k], in.type,
                       in.offset, stride);
@@ -489,7 +514,7 @@ bool AssembleRaw(const State& s, const Inputs& inputs, const DrawRange& d, Assem
             slot[in.stream] = AddRawBuffer(s, inputs.layout, in, d, dense, out);
             if (slot[in.stream] < 0) return false;
         }
-        HostElement he = HostFormat(in.type);
+        HostElement he = RawElement(in.type, in.offset, StrideOf(s, inputs.layout, in));
         out.elements[size_t(reg)] = {he.format, uint8_t(slot[in.stream]), uint16_t(in.offset)};
         out.decode |= uint64_t(he.decode) << (reg * 4);
     }
@@ -609,15 +634,33 @@ void RetainVertexAttributes(State& s, uint32_t start, uint32_t count, const uint
     }
 }
 
+// TCNYC_PERF_SPLITS (Linux): time per step of Assemble, collected by the Vulkan backend when it sets this
+std::map<std::string, double>* g_assemble_splits = nullptr;
+namespace {
+struct AsmSplit {
+    std::chrono::steady_clock::time_point t =
+        g_assemble_splits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void At(const char* n) {
+        if (!g_assemble_splits) return;
+        const auto now = std::chrono::steady_clock::now();
+        (*g_assemble_splits)[n] += std::chrono::duration<double, std::milli>(now - t).count();
+        t = now;
+    }
+};
+}  // namespace
+
 bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* ip, Assembled& out,
               bool force_converted) {
+    AsmSplit sp;
     ResetAssembled(out);
+    sp.At("  (asm) reset");
     if (!count || prim < 1 || prim > 10) return false;
 
     VertexShader fvf_layout;
     const VertexShader* layout = PickLayout(s, fvf_layout);
     out.pretransformed = Pretransformed(s);
     if (!layout) return false;
+    sp.At("  (asm) layout");
 
     // never read an index outside the bound index buffer
     if (!ClampIndexCount(ip, count) || !count) return false;
@@ -629,6 +672,7 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
     // the vertex range the draw reads
     IndexBounds bounds = {0, count - 1};
     if (ip) bounds = IndexRange(ip, count);
+    sp.At("  (asm) clamp and index range");
     DrawRange d;
     d.prim = prim;
     d.start = start;
@@ -669,6 +713,7 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
         if (!BufferReadable(buffer, first_byte, element_span)) converted_ok = false;
         if (!BufferReadable(buffer, first * stride, uint64_t(d.span) * stride)) raw_ok = false;
     }
+    sp.At("  (asm) buffer checks");
     if (!converted_ok) {
         LOG_FIRST(16, "vertex: draw %u..%u is outside its vertex buffers", start, start + count - 1);
         return false;
@@ -676,8 +721,10 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
 
     // the guest's own vertices when the input assembler can read every element of them
     bool raw = kRawVertices && !force_converted && raw_ok && RawReadable(s, inputs);
+    sp.At("  (asm) raw readable");
     try {
         bool ok = raw ? AssembleRaw(s, inputs, d, out) : AssembleConverted(s, inputs, d, out, force_converted);
+        sp.At(raw ? "  (asm) raw build" : "  (asm) converted build");
         if (!ok) ResetAssembled(out);
         return ok;
     } catch (const std::bad_alloc&) {

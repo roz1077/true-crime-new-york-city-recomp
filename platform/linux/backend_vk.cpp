@@ -70,6 +70,7 @@ Mode WindowPixels();
 }
 
 namespace gpu {
+extern std::map<std::string, double>* g_assemble_splits;  // vertex.cpp, TCNYC_PERF_SPLITS
 
 namespace {
 
@@ -164,6 +165,33 @@ struct ScopeTimer {
 };
 
 // one clock per segment: hand the current segment's total to the next one
+// TCNYC_PERF_SPLITS=1: finer CPU timing of the draw path, by named step, logged every 120 frames
+struct Splits {
+    bool on;
+    std::chrono::steady_clock::time_point t;
+    std::map<std::string, double>* out;
+    Splits(bool enabled, std::map<std::string, double>* m)
+        : on(enabled), t(on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}), out(m) {}
+    void At(const char* name) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        (*out)[name] += std::chrono::duration<double, std::milli>(now - t).count();
+        t = now;
+    }
+};
+
+// adds the scope's time to one named split (TCNYC_PERF_SPLITS)
+struct SplitScope {
+    std::map<std::string, double>* out;
+    const char* name;
+    std::chrono::steady_clock::time_point t;
+    SplitScope(bool on, std::map<std::string, double>* m, const char* n)
+        : out(on ? m : nullptr), name(n), t(on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~SplitScope() {
+        if (out) (*out)[name] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+    }
+};
+
 struct LapTimer {
     bool on;
     std::chrono::steady_clock::time_point start;
@@ -589,6 +617,7 @@ VkFormat ElementFormat(uint32_t dxgi) {
         case 14: return VK_FORMAT_R16G16B16A16_SINT;
         case 16: return VK_FORMAT_R32G32_SFLOAT;
         case 28: return VK_FORMAT_R8G8B8A8_UNORM;
+        case 36: return VK_FORMAT_R16G16_UINT;  // NORMPACKED3 in halves (vertex.cpp RawElement)
         case 37: return VK_FORMAT_R16G16_SNORM;
         case 38: return VK_FORMAT_R16G16_SINT;
         case 41: return VK_FORMAT_R32_SFLOAT;
@@ -610,7 +639,7 @@ uint32_t ElementBytes(uint32_t dxgi) {
         case 2: return 16;
         case 6: return 12;
         case 13: case 14: case 16: return 8;
-        case 28: case 37: case 38: case 41: case 42: case 87: return 4;
+        case 28: case 36: case 37: case 38: case 41: case 42: case 87: return 4;
         case 49: case 58: case 59: return 2;
         case 61: return 1;
         default: return 16;
@@ -665,7 +694,7 @@ private:
 
     // recording
     void BeginRecord();
-    void EndRecord(bool wait);
+    void EndRecord(bool wait, std::source_location where = std::source_location::current());
     void Fail(const char* what, VkResult r);
     void Transition(VkImage image, VkImageLayout& layout, VkImageLayout want, VkFormat format, uint32_t levels = 1,
                     uint32_t layers = 1);
@@ -962,6 +991,12 @@ private:
     std::unordered_map<uint64_t, VkFramebuffer> framebuffers_;
     std::unordered_map<uint64_t, std::pair<Target*, Target*>> framebuffer_targets_;
     std::unordered_map<TargetKey, Target*, TargetKeyHash> targets_;
+    // EnsureTexture's "is this texture a render target" check, by (address, depth flag, width, height): rebuilt
+    // only when targets_ changed (targets_gen_), instead of scanning every target for every texture stage of
+    // every draw
+    uint64_t targets_gen_ = 1, target_index_gen_ = 0;
+    std::unordered_map<uint64_t, Target*> target_index_;
+    Target* SampledTarget(uint32_t data, bool depth, uint32_t w, uint32_t h);
     std::unordered_map<Target*, SceneDepth> scene_depth_;
     bool scene_dof_ = false;
 
@@ -1100,6 +1135,15 @@ private:
     };
     RoadProjection road_projection_now_, road_projection_was_;
     std::map<std::string, uint32_t> motion_trace_;
+    std::map<std::string, uint32_t> pass_reasons_;
+    std::map<std::string, double> splits_ms_;  // TCNYC_PERF_SPLITS
+    uint64_t splits_draws_ = 0;
+    std::map<std::string, uint32_t> submit_where_;  // TCNYC_PERF_SPLITS: mid-frame submits (each waits) by caller
+    struct UploadStat {
+        uint32_t count = 0, bytes = 0, w = 0, h = 0, format = 0;
+        const char* why = "";
+    };
+    std::unordered_map<uint32_t, UploadStat> upload_stats_;  // TCNYC_PERF_SPLITS: texture uploads by address  // TCNYC_PERF: why each new scene pass started
     const VertexConstants* MatchPrevious(uint64_t id, const State& s);
     const VertexConstants* PreviousRoadConstants(const VertexConstants& current);
     // the resolve: dense motion and metadata, then the history blend into history[next]
@@ -1971,6 +2015,8 @@ bool VulkanBackend::CreateDevice() {
     // TAA's motion attachment is written unblended beside a blended colour attachment
     features.independentBlend = supported.independentBlend;
     independent_blend_ = supported.independentBlend == VK_TRUE;
+    // Vulkan's input assembler needs attributes aligned to their component size only (vertex.cpp RawReadable)
+    g_component_aligned_vertices = true;
     if (!independent_blend_) LOGR("vulkan: no independent blending, TAA is unavailable");
     LOGR("vulkan: console point/line expansion %s", geometry_ ? "on (geometry shaders)" : "off (unsupported)");
     fill_non_solid_ = supported.fillModeNonSolid == VK_TRUE;
@@ -3010,8 +3056,12 @@ void VulkanBackend::Fail(const char* what, VkResult r) {
     }
 }
 
-void VulkanBackend::EndRecord(bool wait) {
+void VulkanBackend::EndRecord(bool wait, std::source_location where) {
     if (!recording_) return;
+    {
+        static const bool split_on = std::getenv("TCNYC_PERF_SPLITS") != nullptr;
+        if (split_on) submit_where_["line " + std::to_string(where.line())]++;
+    }
     if (failed_) {
         // A prior failure left the fence unsignalled: finish the buffer but never wait on it.
         deferred_.clear();
@@ -3065,6 +3115,56 @@ void VulkanBackend::ResetFrame() {
         ResetTemporalHistory();
         motion_now_.clear();
         road_projection_now_ = {};
+    }
+    if (!splits_ms_.empty() && frames_ % 120 == 0) {
+        std::vector<std::pair<double, std::string>> v;
+        double total = 0;
+        for (const auto& [k, ms] : splits_ms_) {
+            v.push_back({ms / 120.0, k});
+            total += ms / 120.0;
+        }
+        std::sort(v.rbegin(), v.rend());
+        std::string line;
+        for (const auto& [ms, k] : v) {
+            char part[96];
+            std::snprintf(part, sizeof(part), " | %s %.2f", k.c_str(), ms);
+            line += part;
+        }
+        LOGR("draw splits: %.2f ms per frame, %.0f draws%s", total, splits_draws_ / 120.0, line.c_str());
+        splits_draws_ = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> top;
+        uint64_t total_bytes = 0, total_count = 0, hashed = 0;
+        for (const auto& [addr, u] : upload_stats_) {
+            top.push_back({u.count, addr});
+            total_bytes += uint64_t(u.bytes) * u.count;
+            total_count += u.count;
+        }
+        (void)hashed;
+        std::sort(top.rbegin(), top.rend());
+        std::string tl;
+        for (size_t i = 0; i < top.size() && i < 6; i++) {
+            const UploadStat& u = upload_stats_[top[i].second];
+            char part[128];
+            std::snprintf(part, sizeof(part), " | %08X %ux%u f%02X %u B x%u (%s)", top[i].second, u.w, u.h, u.format,
+                          u.bytes, u.count, u.why);
+            tl += part;
+        }
+{
+            std::string sl;
+            for (const auto& [k, v] : submit_where_) sl += " | " + k + " " + std::to_string(v / 120.0).substr(0, 5);
+            LOGR("submits: per frame%s", sl.c_str());
+            submit_where_.clear();
+        }
+                LOGR("texture uploads: %.1f per frame, %.0f KB per frame%s", total_count / 120.0,
+             total_bytes / 120.0 / 1024.0, tl.c_str());
+        upload_stats_.clear();
+        splits_ms_.clear();
+    }
+    if (!pass_reasons_.empty() && frames_ % 120 == 0) {
+        std::string line;
+        for (const auto& [k, v] : pass_reasons_) line += " | " + k + " " + std::to_string(v / 120);
+        LOGR("passes: per frame%s", line.c_str());
+        pass_reasons_.clear();
     }
     if (!motion_trace_.empty() && frames_ % 120 == 0) {
         std::string line;
@@ -3650,6 +3750,14 @@ void VulkanBackend::BindTargets(const State& s, Target*& rt, Target*& ds) {
             BeginScenePass(rt, ds);
         }
         return;
+    }
+    if (perf_) {
+        const bool rt_same = (want_rt && same_target(pass_rt_, rd, false)) || (!want_rt && !pass_rt_);
+        const bool ds_same = (want_ds && same_target(pass_ds_, dd, true)) || (!want_ds && !pass_ds_);
+        const char* why = pass_ == VK_NULL_HANDLE ? "closed before" :
+                          !rt_same && !ds_same ? "both changed" : !rt_same ? "colour changed" :
+                          !want_ds ? "depth dropped" : !pass_ds_ ? "depth added" : "depth changed";
+        pass_reasons_[why]++;
     }
     FlushPass();
     if (perf_) perf_pass_new_++;
@@ -5097,6 +5205,7 @@ void VulkanBackend::DestroyTargets() {
         delete t;
     }
     targets_.clear();
+    targets_gen_++;
     {
         std::lock_guard lock(late_lock_);
         for (auto& [address, l] : late_)
@@ -5278,6 +5387,7 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
             t->epoch = DirtyEpoch(t->data);
             if (!CreateTargetImages(*t)) {
                 targets_.erase(it);
+                targets_gen_++;
                 delete t;
                 return nullptr;
             }
@@ -5327,6 +5437,7 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
         return nullptr;
     }
     targets_[key] = t;
+    targets_gen_++;
     // a reused address can collect a few shapes; drop the ones idle for a long time. Small targets
     // stay for a minute, as on D3D12 (76e299a): the top-right HUD icon is a 104x60 target the game
     // redraws on weapon changes but samples only when the HUD layer redraws, and once dropped the
@@ -5340,6 +5451,7 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
                 RetireTargetResources(c);
                 delete c;
                 e = targets_.erase(e);
+                targets_gen_++;
             } else {
                 ++e;
             }
@@ -5613,6 +5725,19 @@ uint64_t MemSig(uint32_t data, uint32_t total) {
     return sig;
 }
 
+Target* VulkanBackend::SampledTarget(uint32_t data, bool depth, uint32_t w, uint32_t h) {
+    auto key = [](uint32_t a, bool dp, uint32_t gw, uint32_t gh) {
+        return uint64_t(a) | uint64_t(dp) << 32 | uint64_t(gw & 0x3FFF) << 33 | uint64_t(gh & 0x3FFF) << 47;
+    };
+    if (target_index_gen_ != targets_gen_) {
+        target_index_.clear();
+        for (auto& [tk, cand] : targets_) target_index_.try_emplace(key(cand->data, cand->depth, cand->gw, cand->gh), cand);
+        target_index_gen_ = targets_gen_;
+    }
+    auto it = target_index_.find(key(data, depth, w, h));
+    return it != target_index_.end() ? it->second : nullptr;
+}
+
 Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
     if (is_target) *is_target = false;
     sampled_target_ = nullptr;
@@ -5639,15 +5764,8 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
     // D3D12 only samples a target for a 2D, one-level, uncompressed texture; a cube, volume or
     // compressed texture that happens to sit at a target's address is guest data, not the target.
     if (!d.cube && d.depth == 1 && !Format(d.format).compressed) {
-        Target* target = nullptr;
-        for (auto& [tk, cand] : targets_) {
-            if (cand->data != d.data || cand->depth != depth_tex) continue;
-            if (cand->gw == d.width && cand->gh == d.height) {
-                target = cand;
-                break;
-            }
-            // D3D12 BindTexture: only a target of the texture's size is sampled; any other size reads guest memory
-        }
+        // D3D12 BindTexture: only a target of the texture's size is sampled; any other size reads guest memory
+        Target* target = SampledTarget(d.data, depth_tex, d.width, d.height);
         if (target) {
             target->last_use = frames_ + 1;
             if (target->data == s.rt.data || target->data == s.zs.data) {
@@ -5782,11 +5900,23 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
     if (!same || t->frame != frames_ + 1 || t->palette != palette_hash || t->prompt_style != prompt_style) {
         t->frame = frames_ + 1;
         t->palette = palette_hash;
+        static const bool split_on = std::getenv("TCNYC_PERF_SPLITS") != nullptr;
+        SplitScope check(split_on, &splits_ms_, "  (in textures) change check");
         const uint64_t sig = MemSig(d.data, TotalSize(d)) ^ DirtyEpoch(d.data) ^ palette_hash;
         if (!same || sig != t->sig || t->prompt_style != prompt_style) {
             t->sig = sig;
             t->prompt_style = prompt_style;
 
+            SplitScope upload(split_on, &splits_ms_, "  (in textures) upload");
+            if (split_on) {
+                auto& u = upload_stats_[d.data];
+                u.count++;
+                u.bytes = TotalSize(d);
+                u.why = !same ? "new image" : t->prompt_style != prompt_style ? "prompt style" : "bytes changed";
+                u.w = d.width;
+                u.h = d.height;
+                u.format = d.format;
+            }
             UploadTexture(t, d, palette_va ? colours : nullptr, depth_tex);
             t->pack_gen = 0;  // new bytes: the pack and dump key is taken again
             t->swap = nullptr;
@@ -6140,35 +6270,30 @@ void VulkanBackend::UploadTexture(Tex* t, const TextureDesc& d, const uint32_t* 
             copies.push_back(copy);
         }
     }
-    VkDeviceSize total = 0;
-    for (const auto& im : images) total += im.size();
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    void* map = nullptr;
-    StagingBuffer(device_, mem_props_, total ? total : 1, buffer, memory, &map);
-    if (!map) return;
-    VkDeviceSize at = 0;
-    for (size_t i = 0; i < images.size(); i++) {
-        copies[i].bufferOffset = at;
-        std::memcpy(static_cast<uint8_t*>(map) + at, images[i].data(), images[i].size());
-        at += images[i].size();
-    }
+    // The levels go through the frame's upload ring and the copies are recorded into the frame's command buffer in
+    // order, outside a pass. They used to be submitted on their own, waiting for the GPU twice per texture, which
+    // stalled the frame for every new texture. The ring is reused only after the frame's fence.
     // An upload of a texture no pending scene draw uses need not force a replay. The upload
     // itself stays in submission order before any later deferred replay and cannot affect it.
     if (deferred_read_images_.count(t->image)) FlushDeferredScene();
-    const bool old_skip = skip_deferred_flush_;
-    skip_deferred_flush_ = true;
-    EndRecord(true);
+    VkDeviceSize total = 0;
+    for (const auto& im : images) total = ((total + 15) & ~VkDeviceSize(15)) + im.size();
+    void* map = nullptr;
+    const UploadAlloc staging = AllocUpload(total ? total : 1, 16, &map);
+    if (!map) return;
+    VkDeviceSize at = 0;
+    for (size_t i = 0; i < images.size(); i++) {
+        at = (at + 15) & ~VkDeviceSize(15);  // block-compressed copies need offsets a multiple of the block size
+        copies[i].bufferOffset = staging.offset + at;
+        std::memcpy(static_cast<uint8_t*>(map) + at, images[i].data(), images[i].size());
+        at += images[i].size();
+    }
+    FlushPass();
     BeginRecord();
     Transition(t->image, t->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, t->format, t->levels, t->layers);
     for (const VkBufferImageCopy& copy : copies)
-        vkCmdCopyBufferToImage(cmd_, buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        vkCmdCopyBufferToImage(cmd_, staging.buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     Transition(t->image, t->layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, t->format, t->levels, t->layers);
-    EndRecord(true);
-    skip_deferred_flush_ = old_skip;
-    vkUnmapMemory(device_, memory);
-    vkDestroyBuffer(device_, buffer, nullptr);
-    vkFreeMemory(device_, memory, nullptr);
     tex_uploads_++;
 }
 
@@ -6699,8 +6824,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
     ScopeTimer timer(perf_, &perf_draw_ms_);
     LapTimer laps(perf_, &perf_assemble_ms_);
+    static const bool split_on = std::getenv("TCNYC_PERF_SPLITS") != nullptr;
+    Splits splits(split_on, &splits_ms_);
+    if (split_on) g_assemble_splits = &splits_ms_;
     Assembled& a = scratch_;
     if (!Assemble(s, prim, start, count, indices, a) || !a.vertex_count) return;
+    splits.At("assemble");
+    if (split_on) splits_draws_++;
 
     // Shaders and textures first: an upload may submit and close any open pass, so
     // the target pass must not be open yet.
@@ -6711,6 +6841,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     uint64_t vkey = 0;
     VkShaderModule vs = VertexShaderFor(s, a, prog, sprite, vkey);
     if (!vs) return;
+    splits.At("vertex shader lookup");
 
     laps.Lap(&perf_tex_ms_);
     std::array<TexInfo, 4> info{};
@@ -6753,6 +6884,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (trace_)
         for (int i = 0; i < 4; i++)
             if (descs[size_t(i)].data) frame_tex_.insert(descs[size_t(i)].data);
+    splits.At("textures");
     laps.Lap(&perf_pixel_ms_);
     laps.Lap(&perf_target_ms_);
     Target* rt = nullptr;
@@ -6760,6 +6892,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     BindTargets(s, rt, ds);
     if (rt && ds) depth_drawn_.insert(rt->data);
     if (!pass_) return;
+    splits.At("bind targets");
 
     // Deferred scene display list: world draws into the full-size game view are recorded and
     // replayed after the AO prepass. Everything else stays immediate.
@@ -6810,6 +6943,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         }
     }
 
+    splits.At("deferral checks");
     // TAA object motion (d3d12.cpp): an opaque, depth-writing program draw into the scene matched to last frame's
     // same draw runs its program again on that draw's constants and writes its uv motion beside the colour. The
     // three road programs rebuild their strips every frame, so they reuse the previous frame's projection rows.
@@ -6856,7 +6990,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             }
         }
     }
+    splits.At("motion matching");
     PixelKey pk = MakePixelKey(s, info.data());
+    splits.At("pixel key");
     pk.quad = count <= 4 && !s.rs[kRsZEnable] && a.topology != Topology::Points;
     pk.ao = ao_receiver ? 1 : 0;
     pk.motion = prev_consts ? 1 : 0;
@@ -6875,6 +7011,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         ps = PixelShaderFor(pk, pkey);
     }
     if (!ps) return;
+    splits.At("pixel shader lookup");
 
     if (draw_log_ || trace_) {
         char head[560];
@@ -6944,6 +7081,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
 
     laps.Lap(&perf_pipe_ms_);
+    splits.At("draw log and skip list");
     PsoKey k;
     std::memset(&k, 0, sizeof(k));
     k.vs = vkey;
@@ -7007,6 +7145,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         pipelines_[k] = pipe;
     }
 
+    splits.At("pipeline key and lookup");
     // The same draw for the AO depth prepass: depth plus the R32F view distance, with blending
     // off and only the red channel written. Alpha tests and discards still apply.
     VkPipeline depth_pipe = VK_NULL_HANDLE;
@@ -7036,6 +7175,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         }
     }
     laps.Lap(&perf_const_ms_);
+    splits.At("AO depth pipeline");
 
     // constants
     GuestExtent size;
@@ -7087,6 +7227,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             c.texsize[i][0] = float(descs[size_t(i)].width);
             c.texsize[i][1] = float(descs[size_t(i)].height);
         }
+    splits.At("fill constants");
     void* vc = nullptr;
     void* dc = nullptr;
     const UploadAlloc vc_alloc = AllocUpload(sizeof(s.vsc), 256, &vc);
@@ -7103,6 +7244,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         std::memcpy(vcp, prev_consts->data(), sizeof(VertexConstants));
     }
 
+    splits.At("upload constants");
     if (draw_set_next_ >= draw_sets_.size()) {
         LOG_FIRST(4, "vulkan: more than %zu draws in a frame, dropping the rest", draw_sets_.size());
         return;
@@ -7122,6 +7264,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         writes[i].pBufferInfo = &bi[i];
     }
+    splits.At("descriptor buffers");
     const bool clamp_samplers = AnyStageWraps(s) && UnitTexcoords(a);
     for (int i = 0; i < 4; i++) {
         const Tex* drawn = tex[i] && tex[i]->swap ? tex[i]->swap : tex[i];
@@ -7151,7 +7294,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     writes[10].descriptorCount = 1;
     writes[10].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[10].pBufferInfo = &bi[2];
+    splits.At("samplers and image infos");
     vkUpdateDescriptorSets(device_, 11, writes, 0, nullptr);
+    splits.At("vkUpdateDescriptorSets");
     laps.Lap(&perf_geom_ms_);
 
     // geometry
@@ -7186,6 +7331,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         index_count = a.index_count;
     }
 
+    splits.At("geometry upload");
     VkViewport vp{0, 0, float(host_w), float(host_h), 0, 1};
     VkRect2D sc{{0, 0}, {host_w, host_h}};
     if (s.scissor_count) {
@@ -7234,6 +7380,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         d.rt = rt;
         d.ds = ds;
         deferred_.push_back(d);
+        splits.At("deferred record");
         if (rt) {
             rt->drawn = true;
             deferred_write_targets_.insert(rt);
@@ -7290,6 +7437,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     draws_++;
     if (rt) rt->drawn = true;
     if (ds) ds->drawn = true;
+    splits.At("immediate record");
     laps.Stop();
 }
 
