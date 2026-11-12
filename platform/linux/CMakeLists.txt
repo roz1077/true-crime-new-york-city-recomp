@@ -103,7 +103,10 @@ target_include_directories(TrueCrimeNYC PRIVATE
     ${SDL3_INCLUDE_DIRS})
 
 target_compile_definitions(TrueCrimeNYC PRIVATE XBE_RAW_VERTICES=1 XBE_RENDER_THREAD=1)
-target_compile_options(TrueCrimeNYC PRIVATE -march=x86-64-v2 -fno-strict-aliasing -O2 -g)
+# TCNYC_FRAME_POINTERS=ON keeps frame pointers for the sampling profiler's callers (TCNYC_SAMPLE)
+option(TCNYC_FRAME_POINTERS "keep frame pointers (profiling)" OFF)
+target_compile_options(TrueCrimeNYC PRIVATE -march=x86-64-v2 -fno-strict-aliasing -O2 -g
+                       $<$<BOOL:${TCNYC_FRAME_POINTERS}>:-fno-omit-frame-pointer>)
 
 if(TARGET SDL3::SDL3-static)
     set(SDL3_TARGET SDL3::SDL3-static)

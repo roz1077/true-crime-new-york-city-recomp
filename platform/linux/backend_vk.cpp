@@ -37,6 +37,11 @@
 #include <imgui.h>
 #include <shaderc/shaderc.h>
 #include <unistd.h>
+#include <signal.h>
+#include <time.h>
+#include <ucontext.h>
+#include <sys/syscall.h>
+#include <link.h>
 #include <vulkan/vulkan.h>
 
 #include "app/app.h"
@@ -165,6 +170,78 @@ struct ScopeTimer {
 };
 
 // one clock per segment: hand the current segment's total to the next one
+// TCNYC_SAMPLE=1: a sampling profiler for the render thread. A 1 ms CPU-time timer interrupts the thread that draws
+// and records the instruction it was at; logs/samples.txt gets the counts by address (relative to the executable)
+// every 10 s, for addr2line on an unstripped copy of the same build. Unlike per-step timers it costs a few
+// samples a frame, so it does not distort what it measures.
+namespace sampler {
+constexpr size_t kMax = 1 << 20;
+uint64_t g_pcs[kMax], g_callers[kMax];
+std::atomic<size_t> g_count{0};
+uintptr_t g_base = 0;
+uint64_t g_frames = 0;
+// the sampled instruction, and its caller through the frame pointer where one is kept (build with
+// -fno-omit-frame-pointer for callers); a frame pointer outside the stack near the stack pointer is ignored
+void OnTick(int, siginfo_t*, void* ctx) {
+    const size_t i = g_count.fetch_add(1, std::memory_order_relaxed);
+    if (i >= kMax) return;
+    const auto& r = static_cast<ucontext_t*>(ctx)->uc_mcontext.gregs;
+    g_pcs[i] = uint64_t(r[REG_RIP]);
+    const uint64_t rbp = uint64_t(r[REG_RBP]), rsp = uint64_t(r[REG_RSP]);
+    g_callers[i] = rbp >= rsp && rbp < rsp + (1u << 20) && !(rbp & 7) ? *reinterpret_cast<const uint64_t*>(rbp + 8) : 0;
+}
+int FindBase(dl_phdr_info* info, size_t, void*) {
+    if (!g_base) g_base = info->dlpi_addr;  // the first object is the executable
+    return 1;
+}
+// on the drawing thread, once
+void Start() {
+    static bool started = false;
+    if (started || !std::getenv("TCNYC_SAMPLE")) return;
+    started = true;
+    dl_iterate_phdr(FindBase, nullptr);
+    struct sigaction sa {};
+    sa.sa_sigaction = OnTick;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGPROF, &sa, nullptr);
+    clockid_t clock;
+    if (pthread_getcpuclockid(pthread_self(), &clock) != 0) return;
+    sigevent ev {};
+    ev.sigev_notify = SIGEV_THREAD_ID;
+    ev.sigev_signo = SIGPROF;
+    ev._sigev_un._tid = pid_t(syscall(SYS_gettid));
+    timer_t timer;
+    if (timer_create(clock, &ev, &timer) != 0) return;
+    itimerspec spec {};
+    spec.it_interval.tv_nsec = spec.it_value.tv_nsec = 1000000;
+    timer_settime(timer, 0, &spec, nullptr);
+    LOGR("sampler: render thread sampled every 1 ms of its CPU time, executable at %llx",
+         (unsigned long long)g_base);
+}
+// counts by address since the start, written over logs/samples.txt
+void Dump() {
+    if (!g_base) return;
+    const size_t n = std::min(g_count.load(), kMax);
+    std::unordered_map<uint64_t, uint32_t> counts, callers;
+    for (size_t i = 0; i < n; i++) {
+        counts[g_pcs[i] - g_base]++;
+        if (g_callers[i] > g_base) callers[g_callers[i] - g_base]++;
+    }
+    LOGR("sampler: %zu samples over %llu frames, %.2f ms of render-thread CPU a frame", n,
+         (unsigned long long)g_frames, g_frames ? double(n) / double(g_frames) : 0.0);
+    std::error_code ec;
+    std::filesystem::create_directories(app::ExeDir() / "logs", ec);
+    if (FILE* f = std::fopen((app::ExeDir() / "logs" / "samples.txt").string().c_str(), "w")) {
+        for (const auto& [pc, c] : counts) std::fprintf(f, "%llx %u\n", (unsigned long long)pc, c);
+        std::fclose(f);
+    }
+    if (FILE* f = std::fopen((app::ExeDir() / "logs" / "callers.txt").string().c_str(), "w")) {
+        for (const auto& [pc, c] : callers) std::fprintf(f, "%llx %u\n", (unsigned long long)pc, c);
+        std::fclose(f);
+    }
+}
+}  // namespace sampler
+
 // TCNYC_PERF_SPLITS=1: finer CPU timing of the draw path, by named step, logged every 120 frames
 struct Splits {
     bool on;
@@ -283,6 +360,8 @@ struct Tex {
     uint32_t data = 0, guest_format = 0, depth = 1;
     uint64_t epoch = 0, palette = 0;
     uint64_t sig = 0, frame = 0;  // content signature and the frame it was checked on
+    uint64_t sig_epoch = 0;       // the lock epoch with the signature
+    uint64_t changed = 0;         // the frame its bytes last changed
     input::PromptStyle prompt_style = input::PromptStyle::Original;  // glyph set baked into the font atlas
     // texture pack replacement: the key whose image is being loaded, and the ready image
     uint64_t pack_key = 0;
@@ -487,23 +566,11 @@ struct SamplerKey {
 };
 
 struct SamplerKeyHash {
-    size_t operator()(const SamplerKey& k) const {
-        uint64_t h = Hash(&k.mag, sizeof(k.mag));
-        h = Hash(&k.min, sizeof(k.min), h);
-        h = Hash(&k.mip, sizeof(k.mip), h);
-        h = Hash(&k.addr_u, sizeof(k.addr_u), h);
-        h = Hash(&k.addr_v, sizeof(k.addr_v), h);
-        h = Hash(&k.addr_w, sizeof(k.addr_w), h);
-        h = Hash(&k.maxmip, sizeof(k.maxmip), h);
-        h = Hash(&k.aniso, sizeof(k.aniso), h);
-        h = Hash(&k.shadow, sizeof(k.shadow), h);
-        h = Hash(&k.clamp, sizeof(k.clamp), h);
-        h = Hash(&k.lodbias, sizeof(k.lodbias), h);
-        h = Hash(&k.border, sizeof(k.border), h);
-        h = Hash(&k.shadow_func, sizeof(k.shadow_func), h);
-        return size_t(h);
-    }
+    // one pass over the key: 13 uint32_t fields, no padding (hashing them one by one was ~3% of the Deck's render
+    // thread)
+    size_t operator()(const SamplerKey& k) const { return size_t(Hash(&k, sizeof(k))); }
 };
+static_assert(sizeof(SamplerKey) == 13 * sizeof(uint32_t), "SamplerKey is hashed as raw bytes");
 
 uint32_t SwizzleOffset(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     uint32_t xb = 0, yb = 0;
@@ -3907,7 +3974,17 @@ const VulkanBackend::VertexConstants* VulkanBackend::MatchPrevious(uint64_t id, 
         float best_d = 3.4e38f;
         if (same_place != ~0u) {
             best = same_place;
-            best_d = distance(same_place, best_d);
+            // within a few percent of this draw's constants: last frame's draw in the same place is the one (another
+            // instance of the model is far off). Only a larger difference (cars changing order) searches the rest.
+            // The distance and this draw's size in one pass.
+            const VertexConstants& c = motion_was_.constants[same_place];
+            float d = 0, size = 0;
+            for (size_t r = 0; r < 192; r++)
+                for (size_t k = 0; k < 4; k++) {
+                    d += std::fabs(c[r][k] - s.vsc[r][k]);
+                    size += std::fabs(s.vsc[r][k]);
+                }
+            best_d = d <= 0.03f * size ? 0 : d;
         }
         for (uint32_t e = it->second.first; e != ~0u && best_d > 0; e = motion_was_.entries[e].next) {
             if (motion_was_.entries[e].used || e == same_place) continue;
@@ -5823,9 +5900,9 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
         tex_this_frame_at_ = frames_;
         tex_this_frame_targets_ = targets_gen_;
     }
-    uint64_t fast_key = Hash(&d.data, sizeof(d.data));
-    for (uint32_t v : {d.format, d.width, d.height, d.depth, d.levels, d.pitch, uint32_t(d.cube) | uint32_t(d.linear) << 1})
-        fast_key = Hash(&v, sizeof(v), fast_key);
+    const uint32_t fast_fields[8] = {d.data, d.format, d.width, d.height, d.depth, d.levels, d.pitch,
+                                     uint32_t(d.cube) | uint32_t(d.linear) << 1};
+    const uint64_t fast_key = Hash(fast_fields, sizeof(fast_fields));
     if (auto hit = tex_this_frame_.find(fast_key); hit != tex_this_frame_.end()) {
         Tex* t = hit->second;
         if (t->pack_gen != texturedumper::Generation()) LatchPackKey(*t, d, Format(d.format), nullptr);
@@ -5971,11 +6048,21 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
     const auto prompt_style = IsPromptAtlas(d) ? input::ControllerPromptStyle() : input::PromptStyle::Original;
     if (!same || t->frame != frames_ + 1 || t->palette != palette_hash || t->prompt_style != prompt_style) {
         t->frame = frames_ + 1;
+        const bool palette_changed = t->palette != palette_hash;
         t->palette = palette_hash;
         static const bool split_on = std::getenv("TCNYC_PERF_SPLITS") != nullptr;
         SplitScope check(split_on, &splits_ms_, "  (in textures) change check");
-        const uint64_t sig = MemSig(d.data, TotalSize(d)) ^ DirtyEpoch(d.data) ^ palette_hash;
+        // The lock epoch is checked every frame. The bytes are hashed every frame while the texture has changed in
+        // the last second, else every 4th frame (spread over textures by address): hashing every texture up to 64 KB
+        // every frame was about a sixth of the Deck's render thread. A silent in-place rewrite of a long-unchanged
+        // texture then shows up to 3 frames late.
+        const uint64_t epoch = DirtyEpoch(d.data);
+        const bool hash_now = !same || epoch != t->sig_epoch || palette_changed || frames_ < t->changed + 60 ||
+                              ((frames_ + (d.data >> 8)) & 3) == 0;
+        const uint64_t sig = hash_now ? MemSig(d.data, TotalSize(d)) ^ epoch ^ palette_hash : t->sig;
+        t->sig_epoch = epoch;
         if (!same || sig != t->sig || t->prompt_style != prompt_style) {
+            t->changed = frames_;
             t->sig = sig;
             t->prompt_style = prompt_style;
 
@@ -6879,6 +6966,7 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
 }
 
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
+    sampler::Start();
     // a program's point sprites under the fixed-function stages: the XDK builds their combiners
     // from stage 3 alone, the stage with the sprite's coordinates (d3d12.cpp SpriteOnStage3)
     if (prim == 1 /* D3DPT_POINTLIST */ && (s.vs_handle & 1) && s.vs && !s.vs->program.empty() && !s.ps &&
@@ -7322,57 +7410,27 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     VkDescriptorBufferInfo bi[3] = {{vc_alloc.buffer, 0, VkDeviceSize(sizeof(s.vsc))},
                                     {dc_alloc.buffer, 0, VkDeviceSize(sizeof(c))},
                                     {vcp_alloc.buffer, 0, VkDeviceSize(sizeof(VertexConstants))}};
-    VkDescriptorImageInfo ii[4]{};
-    VkDescriptorImageInfo si[4]{};
-    VkWriteDescriptorSet writes[11]{};
-    for (int i = 0; i < 2; i++) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = VK_NULL_HANDLE;  // set on a cache miss below
-        writes[i].dstBinding = uint32_t(i);
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-        writes[i].pBufferInfo = &bi[i];
-    }
+    // the images, layouts and samplers the set names; with the buffers they key a set written earlier this frame
+    struct SetKey {
+        VkBuffer buffers[3];
+        VkImageView views[4];
+        VkSampler samplers[4];
+        VkImageLayout layouts[4];
+    } key;
+    key.buffers[0] = vc_alloc.buffer;
+    key.buffers[1] = dc_alloc.buffer;
+    key.buffers[2] = vcp_alloc.buffer;
     splits.At("descriptor buffers");
     const bool clamp_samplers = AnyStageWraps(s) && UnitTexcoords(a);
     for (int i = 0; i < 4; i++) {
         const Tex* drawn = tex[i] && tex[i]->swap ? tex[i]->swap : tex[i];
-        ii[i].imageView = drawn ? drawn->view : white_view_;
+        key.views[i] = drawn ? drawn->view : white_view_;
         const VkImageLayout layout = drawn ? drawn->layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        ii[i].imageLayout = layout != VK_IMAGE_LAYOUT_UNDEFINED ? layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        si[i].sampler = drawn ? EnsureSampler(s, i, info[size_t(i)], clamp_samplers, drawn->levels)
-                              : white_sampler_;
-        writes[2 + i] = {};
-        writes[2 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[2 + i].dstSet = VK_NULL_HANDLE;  // set on a cache miss below
-        writes[2 + i].dstBinding = uint32_t(2 + i);
-        writes[2 + i].descriptorCount = 1;
-        writes[2 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        writes[2 + i].pImageInfo = &ii[i];
-        writes[6 + i] = {};
-        writes[6 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[6 + i].dstSet = VK_NULL_HANDLE;  // set on a cache miss below
-        writes[6 + i].dstBinding = uint32_t(6 + i);
-        writes[6 + i].descriptorCount = 1;
-        writes[6 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-        writes[6 + i].pImageInfo = &si[i];
+        key.layouts[i] = layout != VK_IMAGE_LAYOUT_UNDEFINED ? layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        key.samplers[i] = drawn ? EnsureSampler(s, i, info[size_t(i)], clamp_samplers, drawn->levels) : white_sampler_;
     }
-    writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[10].dstSet = VK_NULL_HANDLE;  // set on a cache miss below
-    writes[10].dstBinding = 10;
-    writes[10].descriptorCount = 1;
-    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    writes[10].pBufferInfo = &bi[2];
     splits.At("samplers and image infos");
-    // the set: one written earlier this frame naming the same buffers, images and samplers, else a new one
-    uint64_t set_key = Hash(&vc_alloc.buffer, sizeof(VkBuffer));
-    set_key = Hash(&dc_alloc.buffer, sizeof(VkBuffer), set_key);
-    set_key = Hash(&vcp_alloc.buffer, sizeof(VkBuffer), set_key);
-    for (int i = 0; i < 4; i++) {
-        set_key = Hash(&ii[i].imageView, sizeof(VkImageView), set_key);
-        set_key = Hash(&ii[i].imageLayout, sizeof(VkImageLayout), set_key);
-        set_key = Hash(&si[i].sampler, sizeof(VkSampler), set_key);
-    }
+    const uint64_t set_key = Hash(&key, sizeof(key));
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (auto found = draw_set_cache_.find(set_key); found != draw_set_cache_.end()) {
         set = found->second;
@@ -7382,7 +7440,30 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             return;
         }
         set = draw_sets_[draw_set_next_++];
-        for (VkWriteDescriptorSet& w : writes) w.dstSet = set;
+        // a new set: its 11 descriptors (the buffers' offsets are given at bind)
+        const VkDescriptorBufferInfo bi[3] = {{vc_alloc.buffer, 0, VkDeviceSize(sizeof(s.vsc))},
+                                              {dc_alloc.buffer, 0, VkDeviceSize(sizeof(c))},
+                                              {vcp_alloc.buffer, 0, VkDeviceSize(sizeof(VertexConstants))}};
+        VkDescriptorImageInfo ii[4], si[4];
+        VkWriteDescriptorSet writes[11];
+        auto write = [&](int at, uint32_t binding, VkDescriptorType type) -> VkWriteDescriptorSet& {
+            VkWriteDescriptorSet& w = writes[at];
+            w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = set;
+            w.dstBinding = binding;
+            w.descriptorCount = 1;
+            w.descriptorType = type;
+            return w;
+        };
+        write(0, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).pBufferInfo = &bi[0];
+        write(1, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).pBufferInfo = &bi[1];
+        for (int i = 0; i < 4; i++) {
+            ii[i] = {VK_NULL_HANDLE, key.views[i], key.layouts[i]};
+            si[i] = {key.samplers[i], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+            write(2 + i, uint32_t(2 + i), VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE).pImageInfo = &ii[i];
+            write(6 + i, uint32_t(6 + i), VK_DESCRIPTOR_TYPE_SAMPLER).pImageInfo = &si[i];
+        }
+        write(10, 10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC).pBufferInfo = &bi[2];
         vkUpdateDescriptorSets(device_, 11, writes, 0, nullptr);
         draw_set_cache_[set_key] = set;
     }
@@ -7439,7 +7520,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
 
     laps.Lap(&perf_record_ms_);
     if (defer_now) {
-        DeferredDraw d;
+        DeferredDraw& d = deferred_.emplace_back();  // filled in place: the struct is large
         d.pipe = pipe;
         d.depth_pipe = depth_pipe;
         d.set = set;
@@ -7470,7 +7551,6 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         }
         d.rt = rt;
         d.ds = ds;
-        deferred_.push_back(d);
         splits.At("deferred record");
         if (rt) {
             rt->drawn = true;
@@ -9612,6 +9692,8 @@ void VulkanBackend::Present(const Surface& front) {
     ResetFrame();
     ++frames_;
     presents_seen_.store(frames_);
+    if (sampler::g_base) sampler::g_frames++;
+    if (frames_ % 600 == 0) sampler::Dump();
     SavePipelineCache(false);
     if (frames_ % 60 == 0) {
         if (perf_) {
