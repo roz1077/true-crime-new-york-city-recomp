@@ -28,6 +28,10 @@
 - AMD FSR 1 upscaling (Upscaler: Bilinear or AMD FSR 1) when Render scale is below 100%, and
   RCAS sharpening (Sharpening: Off to 100%) of the 3D frame at any render scale. The HUD,
   movies and still pictures are not sharpened. Windows and Linux.
+- Experimental DLSS Super Resolution on Windows when the optional NVIDIA DLSS SDK is configured
+  (`TCNYC_DLSS_SDK`) and NVIDIA's `nvngx_dlss.dll` sits beside the executable. It reuses the
+  temporal colour, reversed depth, motion and jitter inputs, and keeps the HUD preserved. RTX
+  native validation is still pending; the AMD/OptiScaler path is a developer test only.
 - F10: the Depth of field help no longer says it needs MSAA.
 
 ## 0.9.1.0 — Beta 2 (2026-11-11)

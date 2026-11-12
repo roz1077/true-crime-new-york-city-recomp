@@ -28,6 +28,7 @@
 #include <cfloat>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -365,8 +366,13 @@ bool Enabled(Row row) {
     app::SettingsLock lock;  // the native Display tab can write these from the game thread
     if (row == Row::ApplyDisplay) return !g_menu.apply_pending && DisplayPending();
     if (row == Row::DumpFormat) return app::Get().dump_textures;
-    // FSR 1 only upscales; at 100% and above there is nothing for it to do (Sharpening still works)
-    if (row == Row::Upscaler) return app::Get().render_percent < 100;
+    if (row == Row::Upscaler) {
+#ifdef _WIN32
+        return app::Get().render_percent <= 100;
+#else
+        return app::Get().render_percent < 100;
+#endif
+    }
     if (row == Row::BloomStrength) return app::Get().bloom;
     if (row == Row::ColourGrading) return gpu::g_lut_loaded.load(std::memory_order_relaxed);
 #ifndef _WIN32
@@ -540,8 +546,14 @@ const char *Help(Row row) {
     case Row::BloomStrength:
         return "How bright the bloom glow is. 100% is the original, very subtle look.";
     case Row::Upscaler:
+#ifdef _WIN32
+        return "FSR 1 sharpens when scaling up. Experimental FSR 3.1 runs in Quality at 67% Render scale "
+               "and Native AA at 100%; it requires AMD's amd_fidelityfx_dx12.dll beside the game. "
+               "DLSS is experimental and needs an NVIDIA RTX adapter and NVIDIA's nvngx_dlss.dll beside the game.";
+#else
         return "How the picture is scaled up when Render scale is below 100%. AMD FSR 1 keeps edges sharper than "
                "Bilinear and sharpens lightly; Sharpening sets how much.";
+#endif
     case Row::Sharpening:
         return "Sharpens the finished 3D frame (AMD FidelityFX RCAS). Offsets the softness of SMAA and of render "
                "scales below 100%. The HUD is not sharpened.";
@@ -675,6 +687,29 @@ std::string Value(Row row) {
         std::snprintf(text, sizeof(text), "%u%%", s.bloom_strength);
         return text;
     case Row::Upscaler:
+#ifdef _WIN32
+        if (s.upscaler == choices::kFsr3) {
+            if (s.render_percent == 67) return "FSR 3.1 Quality";
+            if (s.render_percent == 100) return "FSR 3.1 Native AA";
+            return "FSR 3.1 requires 67% or 100%";
+        }
+#if defined(TCNYC_HAVE_DLSS)
+        if (s.upscaler == choices::kDlss) {
+            static const bool forced = [] {
+                const char* e = std::getenv("TCNYC_DLSS_FORCE");
+                return e && *e && std::atoi(e) != 0;
+            }();
+            const gpu::DlssState state = gpu::g_dlss_state.load(std::memory_order_relaxed);
+            if (state == gpu::DlssState::NotBuilt) return "DLSS (not built)";
+            if (state == gpu::DlssState::Unavailable && !forced) return "DLSS (unavailable)";
+            const char* suffix = state == gpu::DlssState::Unavailable ? " (forced test)" : "";
+            if (s.render_percent == 67) return std::string("DLSS Quality") + suffix;
+            if (s.render_percent == 100) return std::string("DLSS Native AA") + suffix;
+            return "DLSS requires 67% or 100%";
+        }
+#endif
+        if (s.render_percent == 100) return s.upscaler == 1 ? "AMD FSR 1 (inactive)" : "Bilinear";
+#endif
         if (s.render_percent >= 100) return "Not needed at 100%";
         return s.upscaler == 1 ? "AMD FSR 1" : "Bilinear";
     case Row::Sharpening:

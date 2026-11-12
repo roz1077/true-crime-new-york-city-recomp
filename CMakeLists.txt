@@ -60,6 +60,23 @@ if(TCNYC_DEV_TOOLS)
     target_compile_definitions(TrueCrimeNYC PRIVATE TCNYC_DEV_TOOLS=1)
 endif()
 
+# Optional NVIDIA DLSS SDK. The headers are proprietary, so they are not vendored: point this at a
+# local NVIDIA/DLSS checkout (for example tools/DLSS) to compile the DLSS backend. Without it the
+# game builds and behaves exactly as before.
+set(TCNYC_DLSS_SDK "" CACHE PATH "NVIDIA DLSS SDK checkout containing include/nvsdk_ngx.h")
+if(TCNYC_DLSS_SDK)
+    get_filename_component(TCNYC_DLSS_SDK_ABS "${TCNYC_DLSS_SDK}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(EXISTS "${TCNYC_DLSS_SDK_ABS}/include/nvsdk_ngx.h")
+        target_compile_definitions(TrueCrimeNYC PRIVATE TCNYC_HAVE_DLSS=1)
+        target_include_directories(TrueCrimeNYC PRIVATE "${TCNYC_DLSS_SDK_ABS}/include")
+        message(STATUS "DLSS support enabled from ${TCNYC_DLSS_SDK_ABS}")
+    else()
+        message(WARNING "TCNYC_DLSS_SDK does not contain include/nvsdk_ngx.h; DLSS is disabled")
+    endif()
+else()
+    message(STATUS "DLSS support disabled (set TCNYC_DLSS_SDK to an NVIDIA/DLSS checkout)")
+endif()
+
 # The app uses the per-monitor DPI and dark-mode era APIs; current llvm-mingw still
 # defaults WINVER below Windows 10, which hides their declarations.
 target_compile_definitions(TrueCrimeNYC PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000000)

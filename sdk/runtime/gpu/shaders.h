@@ -35,7 +35,7 @@ struct PixelKey {
     uint32_t quad = 0;       // a screen quad: QuadHlsl
     uint32_t alphatest = 0;  // alpha test on: only then may the shader discard, which turns off early depth tests
     uint32_t ao = 0;         // scene AO: 1 scale by 1 - the occlusion at t4, 3 write view distance (prepass)
-    uint32_t motion = 0;     // TAA: also write the pixel's motion to SV_Target1 (uv to the previous frame)
+    uint32_t motion = 0;     // SV_Target1: 1 = previous-frame UV offset, 2 = guest HUD marker, 3 = FSR reactive coverage
     bool operator==(const PixelKey& o) const;
 };
 

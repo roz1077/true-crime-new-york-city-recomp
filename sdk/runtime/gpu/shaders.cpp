@@ -1041,7 +1041,12 @@ std::string PixelHlsl(const PixelKey& k) {
     else if (k.ao) body += "{ float ao = 1.0 - aoOcc.Load(int3(i.pos.xy, 0));\n"
                            "  outc.rgb = outc.rgb * ao + (1.0 - fogin.a) * fogin.rgb * (1.0 - ao); }\n";
     body += Hooks().Output();
-    if (k.motion)
+    if (k.motion == 2)
+        body += "if (outc.a <= 0) discard;\n"
+                "PsMotion r; r.c = outc; r.m = float4(64000, 64000, 0, 1); return r;\n}\n";
+    else if (k.motion == 3)
+        body += "PsMotion r; r.c = outc; r.m = float4(0, 0, saturate(outc.a) * 0.8, 0); return r;\n}\n";
+    else if (k.motion)
         // the uv this pixel had in the previous frame minus its uv now; 60000 (no previous position) has the TAA
         // resolve use the camera's motion there
         body += "PsMotion r;\nr.c = outc;\n"
@@ -1067,7 +1072,10 @@ std::string QuadHlsl(std::string s) {
     sub("    if (surf.w == 0 && abs(p.x - (surf.x - 0.5)) < 1e-3) p.x = surf.x;\n", "    o.e.xy = p.xy;\n", "");
     sub("    if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;\n", "", "    o.e.zw = p.xy;\n");
     sub("    o.pos = cp;\n", "    o.e = float4(sp, (float2(cp.x, -cp.y) / cp.w + 1) * 0.5 * surf.xy);\n", "");
-    sub("float4 main(VOut i, bool front", R"(float4 unstretch(float4 t, float4 e) {
+    const char* pixel_entry = s.find("PsMotion main(") != std::string::npos
+                                  ? "PsMotion main(VOut i, bool front"
+                                  : "float4 main(VOut i, bool front";
+    sub(pixel_entry, R"(float4 unstretch(float4 t, float4 e) {
     float2 d = e.zw - e.xy, g = float2(ddx(e.x), ddy(e.y));
     return t + (d.x ? d.x / g.x * ddx(t) : 0) + (d.y ? d.y / g.y * ddy(t) : 0);
 }

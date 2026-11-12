@@ -19,6 +19,7 @@
 #include "gpu/backend.h"
 
 #include "kernel/kernel.h"
+#include "level_generation.h"
 #include "xdk/hle.h"
 
 namespace {
@@ -160,6 +161,7 @@ X86_FUNC(sub_00143650) {
     {  // TAA's reprojection: the frame's view matrix
         std::lock_guard lock(gpu::g_camera_mutex);
         std::memcpy(gpu::g_camera_now.view, base + X86_MEM32(ctx.esp + 4) + 0xD0, 64);
+        gpu::g_camera_now.world_generation = game::LevelGeneration();
         gpu::g_camera_now.serial++;
     }
     Light pick = now;

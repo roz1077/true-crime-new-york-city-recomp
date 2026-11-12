@@ -14,7 +14,19 @@ inline constexpr uint32_t kMinRenderPercent = 20, kMaxRenderPercent = 200;
 inline constexpr uint32_t kAnisoLevels[] = {0, 2, 4, 8, 16}; // 0: as the game asks
 inline constexpr uint32_t kMsaaSamples[] = {0, 2, 4, 8};     // 0: off
 inline constexpr uint32_t kAoModes[] = {0, 1, 2};            // off, half resolution, full resolution
-inline constexpr uint32_t kUpscalers[] = {0, 1};              // bilinear, AMD FSR 1
+inline constexpr uint32_t kFsr3 = 2;
+inline constexpr bool Fsr3Scale(uint32_t percent) { return percent == 67 || percent == 100; }
+// DLSS is a Windows/D3D12 backend. The value exists on every build so an old settings file can be
+// read, but the row only offers it when the backend was compiled in.
+inline constexpr uint32_t kDlss = 3;
+inline constexpr bool DlssScale(uint32_t percent) { return percent == 67 || percent == 100; }
+#if defined(_WIN32) && defined(TCNYC_HAVE_DLSS)
+inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kDlss};
+#elif defined(_WIN32)
+inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3};
+#else
+inline constexpr uint32_t kUpscalers[] = {0, 1};
+#endif
 inline constexpr uint32_t kBloomStrengths[] = {50, 100, 150, 200, 300, 400};  // percent of the original
 inline constexpr uint32_t kShadowLevels[] = {0, 1, 2};  // shadow resolution and softness: off or original, then two steps
 inline constexpr uint32_t kLutStrengths[] = {0, 25, 50, 75, 100};

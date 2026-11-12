@@ -324,7 +324,18 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
         std::snprintf(text, kTextBytes, "BLOOM LEVEL %u", v.bloom_strength);
         break;
     case Option::Upscaler:
-        std::snprintf(text, kTextBytes, "UPSCALER %s", v.upscaler == 1 ? "FSR 1" : "BILINEAR");
+        if (v.upscaler == choices::kFsr3)
+            std::snprintf(text, kTextBytes, "UPSCALER %s",
+                          v.render_percent == 67 ? "FSR 3.1 QUALITY" :
+                          v.render_percent == 100 ? "FSR 3.1 NATIVE AA" : "FSR 3.1 REQUIRES 67% OR 100%");
+#if defined(TCNYC_HAVE_DLSS)
+        else if (v.upscaler == choices::kDlss)
+            std::snprintf(text, kTextBytes, "UPSCALER %s",
+                          v.render_percent == 67 ? "DLSS QUALITY" :
+                          v.render_percent == 100 ? "DLSS NATIVE AA" : "DLSS REQUIRES 67% OR 100%");
+#endif
+        else
+            std::snprintf(text, kTextBytes, "UPSCALER %s", v.upscaler == 1 ? "FSR 1" : "BILINEAR");
         break;
     case Option::Sharpening:
         if (v.sharpening)

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -36,12 +37,27 @@
 #include <backends/imgui_impl_win32.h>
 
 #include "app/app.h"
+#include "common/graphics_choices.h"
 #include "common/graphics_menu.h"
 #include "gpu/prompt_glyphs.h"
 // SMAA 1x: the reference shader and its lookup textures (third_party/smaa, MIT)
 #include "../../third_party/smaa/AreaTex.h"
 #include "../../third_party/smaa/SMAAShader.h"
 #include "../../third_party/smaa/SearchTex.h"
+#include "../../third_party/fsr3/ffx_api/dx12/ffx_api_dx12.h"
+#include "../../third_party/fsr3/ffx_api/ffx_upscale.h"
+#if defined(TCNYC_HAVE_DLSS)
+// The NGX headers are proprietary and are not vendored: TCNYC_DLSS_SDK points at a local
+// NVIDIA/DLSS checkout. The loader is header-only, so the game has no link-time nvngx dependency.
+#define NVSDK_NGX_HEADER_ONLY
+#define NVSDK_NGX_NO_CUDA
+// The SDK's logging macros compile to a comma expression when no logger is supplied.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-value"
+#include "nvsdk_ngx_loader.h"
+#pragma clang diagnostic pop
+#include "nvsdk_ngx_helpers_d3d.h"
+#endif
 #include "core/diag.h"
 #include "core/input.h"
 #include "core/log.h"
@@ -60,6 +76,39 @@ using Microsoft::WRL::ComPtr;
 namespace gpu {
 
 namespace {
+
+bool EnvFlag(const char* name) {
+    const char* value = std::getenv(name);
+    return value && *value && std::atoi(value) != 0;
+}
+
+#if defined(TCNYC_HAVE_DLSS)
+// Export order differs from the inline Init_with_ProjectID helper in the SDK headers.
+using PfnNgxInitProjectId = NVSDK_NGX_Result(NVSDK_CONV*)(const char*, NVSDK_NGX_EngineType, const char*,
+                                                           const wchar_t*, ID3D12Device*, NVSDK_NGX_Version,
+                                                           const NVSDK_NGX_FeatureCommonInfo*);
+using PfnNgxGetCapabilityParameters = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter**);
+using PfnNgxGetParameters = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter**);
+using PfnNgxDestroyParameters = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter*);
+using PfnNgxCreateFeature = NVSDK_NGX_Result(NVSDK_CONV*)(ID3D12GraphicsCommandList*, NVSDK_NGX_Feature,
+                                                          NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
+using PfnNgxEvaluateFeature = NVSDK_NGX_Result(NVSDK_CONV*)(ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*,
+                                                            NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback);
+using PfnNgxReleaseFeature = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Handle*);
+using PfnNgxShutdown = NVSDK_NGX_Result(NVSDK_CONV*)(ID3D12Device*);
+
+void NVSDK_CONV DlssLogCallback(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
+    LOGR("NGX: %s", message);
+}
+
+// The game applies jitter as ext.x = 2*jx/w and ext.y = -2*jy/h. FSR currently receives +jx/+jy;
+// DLSS's convention is close enough to test from there, with per-axis overrides for the checks in
+// docs/dlss-plan.md.
+float DlssAxisSign(const char* name, float fallback) {
+    const char* value = std::getenv(name);
+    return value && *value && std::atoi(value) < 0 ? -1.0f : fallback;
+}
+#endif
 
 constexpr int kFrames = 3;
 constexpr uint64_t kStaleFrames = 8;  // frames a target may go unused and still be read back
@@ -91,11 +140,24 @@ constexpr DXGI_FORMAT kBloomFormat = DXGI_FORMAT_R11G11B10_FLOAT;
 constexpr uint32_t kFsrRtvs = 2;
 constexpr uint32_t kFsrRtv = kBloomRtv + kBloomRtvs;
 // after FSR: the TAA history pair (one read, one written each frame)
-constexpr uint32_t kTaaRtvs = 2;
+constexpr uint32_t kTaaHistoryCount = 2;
+constexpr uint32_t kTaaRtvs = kTaaHistoryCount + 2;
 constexpr uint32_t kTaaRtv = kFsrRtv + kFsrRtvs;
 // after TAA: the motion target drawn beside the scene (uv to the previous frame; 60000: none)
 constexpr uint32_t kMotionRtv = kTaaRtv + kTaaRtvs;
+constexpr uint32_t kFsr3DepthRtv = kMotionRtv + 1;
+constexpr uint32_t kFsr3OutputRtv = kFsr3DepthRtv + 1;
+constexpr uint32_t kFsr3ReactiveRtv = kFsr3OutputRtv + 1;
+// DLSS keeps its own input/output targets. Only one temporal backend is active at a time, but the
+// targets are cheap enough to keep separate and it avoids sharing lifetime/reset state with FSR.
+constexpr uint32_t kDlssDepthRtv = kFsr3ReactiveRtv + 1;
+constexpr uint32_t kDlssOutputRtv = kDlssDepthRtv + 1;
+constexpr uint32_t kDlssReactiveRtv = kDlssOutputRtv + 1;
 constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16_FLOAT;
+constexpr DXGI_FORMAT kMotionReactiveFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+constexpr uint32_t kMotionBound = 1, kMotionWrite = 2, kMotionReactiveFormatBit = 4, kReactiveWrite = 8;
+constexpr DXGI_FORMAT kTemporalMetadataFormat = DXGI_FORMAT_R32G32_FLOAT;
+constexpr DXGI_FORMAT kFsr3OutputFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 // The AO prepass writes each pixel's view distance (clip w) here, so AO never has to turn
 // hyperbolic depth back into distance with a guessed near/far: most draws are vertex programs
 // whose projection the port cannot see, and a wrong guess bent flat surfaces into stripes.
@@ -678,7 +740,7 @@ struct PsoKey {
     uint32_t rtfmt;
     uint32_t sprite;  // DrawShaders::sprite
     uint32_t a2c;     // alpha-tested opaque draw into a multisampled target: alpha to coverage
-    uint32_t motion;  // TAA: the motion target is bound beside the colour: 1 masked off, 2 written (R16G16F)
+    uint32_t motion;  // motion target binding, format and write flags
 };
 
 // Blit's settings past the source and its rectangle
@@ -772,6 +834,7 @@ struct GuestExtent {
 
 class D3D12Backend final : public Backend, public Context {
 public:
+    ~D3D12Backend() override;
     bool Init(uint32_t width, uint32_t height) override;
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                uint32_t stencil) override;
@@ -853,6 +916,7 @@ private:
         uint8_t* map = nullptr;
         uint64_t used = 0;
         uint64_t fence = 0;
+        std::array<uint32_t, 5> fsr_profile{};  // scale, input and output dimensions; zero scale means no sample
         std::vector<ComPtr<ID3D12Resource>> garbage;
         std::vector<uint32_t> rtv_garbage, dsv_garbage;  // view indices freed by this frame
         ComPtr<ID3D12Resource> readback;                // largest CPU read-back buffer used by this frame
@@ -929,10 +993,12 @@ private:
               uint32_t h, ID3D12Resource* const src[3], const DXGI_FORMAT fmt[3], const float p[8],
               float blend) override;
     // Pass with count floats of constants (up to 64) instead of 8
-    void PassN(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh, uint32_t w,
+    bool PassN(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh, uint32_t w,
                uint32_t h, ID3D12Resource* const src[3], const DXGI_FORMAT fmt[3], const float* p, uint32_t count,
-               float blend, ID3D12Resource* src4 = nullptr, DXGI_FORMAT fmt4 = DXGI_FORMAT_UNKNOWN);
-    ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* entry, DXGI_FORMAT rtv, float blend);
+               float blend, ID3D12Resource* src4 = nullptr, DXGI_FORMAT fmt4 = DXGI_FORMAT_UNKNOWN,
+               D3D12_CPU_DESCRIPTOR_HANDLE rh2 = {}, DXGI_FORMAT rtv2 = DXGI_FORMAT_UNKNOWN);
+    ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* entry, DXGI_FORMAT rtv, float blend,
+                                           DXGI_FORMAT rtv2 = DXGI_FORMAT_UNKNOWN);
     // Draw, in call order, each callee right after its caller
     bool DepthCopy(const State& s);
     ID3D12PipelineState* EnsureDepthCopyPipeline(uint32_t samples);
@@ -1278,7 +1344,8 @@ private:
     // TAA (experimental): this frame's jitter in host pixels, the history pair, and the camera it was drawn with
     float taa_jitter_[2] = {};
     struct Taa {
-        SmaaTexture history[2];
+        SmaaTexture history[kTaaHistoryCount];
+        SmaaTexture dense_motion, metadata;
         uint32_t w = 0, h = 0, next = 0;  // history[next] is written this frame
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         CameraFrame camera;               // the previous frame's
@@ -1286,12 +1353,84 @@ private:
         bool failed = false;
     } taa_;
     ID3D12Resource* ApplyTaa(Target& t);
+    struct Fsr3 {
+        HMODULE module = nullptr;
+        PfnFfxCreateContext create = nullptr;
+        PfnFfxDestroyContext destroy = nullptr;
+        PfnFfxDispatch dispatch = nullptr;
+        PfnFfxQuery query = nullptr;
+        ffxContext context = nullptr;
+        SmaaTexture depth, reactive, output;
+        uint32_t w = 0, h = 0;
+        uint32_t out_w = 0, out_h = 0;
+        bool infinite_depth = false;
+        bool failed = false;
+        bool valid = false;
+        PerfClock::time_point last_dispatch{};
+    } fsr3_;
+    struct Dlss {
+#if defined(TCNYC_HAVE_DLSS)
+        HMODULE module = nullptr;
+        PfnNgxInitProjectId init = nullptr;
+        PfnNgxGetCapabilityParameters get_caps = nullptr;
+        PfnNgxGetParameters get_params = nullptr;
+        PfnNgxDestroyParameters destroy_params = nullptr;
+        PfnNgxCreateFeature create = nullptr;
+        PfnNgxEvaluateFeature evaluate = nullptr;
+        PfnNgxReleaseFeature release = nullptr;
+        PfnNgxShutdown shutdown = nullptr;
+        NVSDK_NGX_Parameter* caps = nullptr;
+        NVSDK_NGX_Parameter* params = nullptr;
+        NVSDK_NGX_Handle* feature = nullptr;
+        SmaaTexture depth, reactive, output;
+        uint32_t w = 0, h = 0;
+        uint32_t out_w = 0, out_h = 0;
+        int create_flags = 0;
+        bool loaded = false;
+        bool available = false;
+        bool forced = false;
+        bool failed = false;
+        bool valid = false;
+        bool logged_dispatch = false;
+        PerfClock::time_point last_eval{};
+#endif
+    } dlss_;
+    void LoadFsr3();
+    bool Fsr3Enabled() const;
+    void LoadDlss();
+    bool DlssEnabled() const;
+    bool EnsureDlss(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h);
+    ID3D12Resource* DispatchDlss(ID3D12Resource* color, D3D12_RESOURCE_STATES& color_state,
+                                 const CameraFrame& camera, bool reset, const float* constants, bool motion);
+    void ReleaseDlssFeature();
+    void ReleaseDlss();
+    void ResetTemporalHistory() {
+        taa_.valid = false;
+        fsr3_.valid = false;
+#if defined(TCNYC_HAVE_DLSS)
+        dlss_.valid = false;
+#endif
+    }
+    bool TemporalEnabled() const { return render_.taa || Fsr3Enabled() || DlssEnabled(); }
+    bool EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h, bool infinite_depth);
+    void InitFsr3Profile();
+    void CollectFsr3Profile(Frame& frame);
+    static constexpr uint32_t kFsrProfileQueries = 4;
+    ComPtr<ID3D12QueryHeap> fsr_profile_queries_;
+    ComPtr<ID3D12Resource> fsr_profile_readback_;
+    uint64_t fsr_profile_frequency_ = 0;
+    std::array<uint32_t, 5> fsr_profile_mode_{};
+    unsigned fsr_profile_warmup_ = 0, fsr_profile_count_ = 0;
+    double fsr_profile_frame_ms_ = 0, fsr_profile_pass_ms_ = 0;
+    ID3D12Resource* DispatchFsr3(ID3D12Resource* color, D3D12_RESOURCE_STATES& color_state,
+                                const CameraFrame& camera, bool reset, const float* constants, bool motion);
     // TAA object motion: a motion target beside the frame's scene target, written by program draws matched to the
     // same draw in the previous frame, whose vertex constants they run again (VertexProgramHlsl prev)
     using VertexConstants = std::array<std::array<float, 4>, 192>;
     Target* motion_rt_ = nullptr;  // this frame's scene target the motion target is bound beside
     ComPtr<ID3D12Resource> motion_;
     D3D12_RESOURCE_STATES motion_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    DXGI_FORMAT motion_format_ = DXGI_FORMAT_UNKNOWN;
     uint32_t motion_w_ = 0, motion_h_ = 0, motion_samples_ = 0;
     uint64_t motion_cleared_ = ~0ull;  // frame the motion target was last cleared
     bool motion_failed_ = false;
@@ -1299,10 +1438,19 @@ private:
     // this frame's scene program draws by identity (geometry and program), and last frame's, with their constants
     std::unordered_map<uint64_t, std::vector<VertexConstants>> motion_now_, motion_was_;
     VertexConstants motion_match_{};
+    // The road programs build static world positions from streamed strips, then project with c92â€“c95.
+    static constexpr size_t kRoadProjection = 188;  // guest constant 92 is host constant 188
+    struct RoadProjection {
+        std::array<VertexConstants::value_type, 4> rows{};
+        bool seen = false;
+        bool consistent = true;
+    };
+    RoadProjection road_projection_now_, road_projection_was_;
     std::map<std::string, uint32_t> motion_trace_;  // TCNYC_TRACE_MOTION counts
     bool EnsureMotion(Target& rt);
     // the constants of the previous frame's draw like this one, closest to its own (several cars share a model)
     const VertexConstants* MatchPrevious(uint64_t id, const State& s);
+    const VertexConstants* PreviousRoadConstants(const VertexConstants& current);
     // FSR 1 upscaling to out_w x out_h when the scene is smaller, and RCAS sharpening; repoints color at the result
     void UpscaleAndSharpen(ID3D12Resource*& color, DXGI_FORMAT& fmt, uint32_t w, uint32_t h, uint32_t out_w,
                            uint32_t out_h);
@@ -1416,6 +1564,7 @@ private:
 
 bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     render_ = app::Snapshot();
+    LoadFsr3();
     g_reversed_depth = true;
     guest_w_ = width;
     guest_h_ = height;
@@ -1436,8 +1585,14 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
                         ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
     LoadSettings();
+#if !defined(TCNYC_HAVE_DLSS)
+    g_dlss_state.store(DlssState::NotBuilt, std::memory_order_relaxed);
+#endif
+    LoadDlss();
     Begin();
     CreateGradeLut();
+    InitFsr3Profile();
+    if (fsr_profile_queries_) cl_->EndQuery(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
 }
@@ -1654,7 +1809,7 @@ bool D3D12Backend::CreateBackBufferViews() {
 bool D3D12Backend::CreateHeaps() {
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
-    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kSmaaRtvs + kAoRtvs + kBloomRtvs + kFsrRtvs + kTaaRtvs + 1, false,
+    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kDlssReactiveRtv + 1, false,
                           rtv_heap_);
     dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
     CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
@@ -2214,9 +2369,9 @@ bool D3D12Backend::BindTargets(const State& s) {
         ds->drawn = true;
     }
     // TAA: the frame's 3D scene target gets the motion target beside it, from its first depth-tested use in a frame
-    if (render_.taa && rt && ds && !rt->depth && rt->gw == guest_w_ && rt->gh == guest_h_ && rt != motion_rt_)
+    if (TemporalEnabled() && rt && ds && !rt->depth && rt->gw == guest_w_ && rt->gh == guest_h_ && rt != motion_rt_)
         EnsureMotion(*rt);
-    const bool with_motion = rt && rt == motion_rt_ && motion_ && render_.taa;
+    const bool with_motion = rt && rt == motion_rt_ && motion_ && TemporalEnabled();
     if (with_motion) Transition(motion_.Get(), motion_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
     if (rt != bound_rt_ || ds != bound_ds_ || with_motion != bound_motion_) {
         D3D12_CPU_DESCRIPTOR_HANDLE rh[2] = {rt ? Cpu(rtv_heap_.Get(), rt->view, rtv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{},
@@ -2681,8 +2836,8 @@ ID3D12PipelineState* D3D12Backend::EnsureHdrUiPipeline(DXGI_FORMAT rtv) {
 
 // Pass's pipeline for the shader, kept in blit_psos_; null when it can't be made
 ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const char* entry, DXGI_FORMAT rtv,
-                                                      float blend) {
-    uint64_t seed = uint64_t(rtv) << 1 | (blend >= 0 ? 1 : 0);
+                                                      float blend, DXGI_FORMAT rtv2) {
+    uint64_t seed = uint64_t(rtv2) << 32 | uint64_t(rtv) << 1 | (blend >= 0 ? 1 : 0);
     uint64_t source_seed = Hash(hlsl, std::strlen(hlsl), seed);
     auto& pso = blit_psos_[Hash(entry, std::strlen(entry), source_seed)];
     if (pso) return pso.Get();
@@ -2691,6 +2846,10 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
     ID3DBlob* ps = Compile(hlsl, entry, "ps_5_0", h);
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
+    if (rtv2 != DXGI_FORMAT_UNKNOWN) {
+        d.NumRenderTargets = 2;
+        d.RTVFormats[1] = rtv2;
+    }
     if (blend >= 0) {
         auto& b = d.BlendState.RenderTarget[0];
         b.BlendEnable = TRUE;
@@ -2708,11 +2867,12 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
     PassN(hlsl, entry, rtv, rh, w, h, src, fmt, p, 8, blend);
 }
 
-void D3D12Backend::PassN(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh,
+bool D3D12Backend::PassN(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh,
                          uint32_t w, uint32_t h, ID3D12Resource* const src[3], const DXGI_FORMAT fmt[3],
-                         const float* p, uint32_t count, float blend, ID3D12Resource* src4, DXGI_FORMAT fmt4) {
-    ID3D12PipelineState* pso = EnsurePassPipeline(hlsl, entry, rtv, blend);
-    if (!pso) return;
+                         const float* p, uint32_t count, float blend, ID3D12Resource* src4, DXGI_FORMAT fmt4,
+                         D3D12_CPU_DESCRIPTOR_HANDLE rh2, DXGI_FORMAT rtv2) {
+    ID3D12PipelineState* pso = EnsurePassPipeline(hlsl, entry, rtv, blend, rtv2);
+    if (!pso) return false;
     uint32_t slot = AllocSrvSlots(4);
     for (int i = 0; i < 4; i++) {
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
@@ -2725,9 +2885,10 @@ void D3D12Backend::PassN(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D
         dev_->CreateShaderResourceView(r, &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
     }
     Alloc cb = Upload(256, 256);
-    if (!cb.res) return;
+    if (!cb.res) return false;
     std::memcpy(cb.cpu, p, std::min(count, 64u) * sizeof(float));
-    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+    const D3D12_CPU_DESCRIPTOR_HANDLE targets[] = {rh, rh2};
+    cl_->OMSetRenderTargets(rtv2 == DXGI_FORMAT_UNKNOWN ? 1 : 2, targets, FALSE, nullptr);
     SetFullViewport(w, h);
     if (blend >= 0) {
         float f[4] = {blend, blend, blend, blend};
@@ -2736,6 +2897,7 @@ void D3D12Backend::PassN(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D
     }
     DrawFullScreen(pso, cb.gpu, slot);
     bound_rt_ = bound_ds_ = nullptr;
+    return true;
 }
 
 // a copy of the target to read while drawing to it
@@ -2817,7 +2979,15 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     d.BlendState.AlphaToCoverageEnable = k.a2c ? TRUE : FALSE;
     if (k.motion) {  // the motion target beside the colour: unblended, written only by draws that compute motion
         d.BlendState.IndependentBlendEnable = TRUE;
-        d.BlendState.RenderTarget[1].RenderTargetWriteMask = k.motion == 2 ? UINT8(D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN) : UINT8(0);
+        auto& motion = d.BlendState.RenderTarget[1];
+        motion.RenderTargetWriteMask = (k.motion & kMotionWrite)
+                                           ? UINT8(D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN) : 0;
+        if (k.motion & kReactiveWrite) {
+            motion.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_BLUE;
+            motion.BlendEnable = TRUE;
+            motion.SrcBlend = motion.DestBlend = motion.SrcBlendAlpha = motion.DestBlendAlpha = D3D12_BLEND_ONE;
+            motion.BlendOp = motion.BlendOpAlpha = D3D12_BLEND_OP_MAX;
+        }
     }
     d.RasterizerState.FillMode = k.fill == kFillWireframe ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
     d.RasterizerState.CullMode = k.cull ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
@@ -2831,7 +3001,8 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     d.PrimitiveTopologyType = TopologyType(k.topo);
     d.NumRenderTargets = k.has_rt ? (k.motion ? 2 : 1) : 0;
     d.RTVFormats[0] = k.has_rt ? DXGI_FORMAT(k.rtfmt) : DXGI_FORMAT_UNKNOWN;
-    if (k.has_rt && k.motion) d.RTVFormats[1] = kMotionFormat;
+    if (k.has_rt && k.motion)
+        d.RTVFormats[1] = (k.motion & kMotionReactiveFormatBit) ? kMotionReactiveFormat : kMotionFormat;
     d.DSVFormat = k.has_ds ? kDepthFormat : DXGI_FORMAT_UNKNOWN;
     d.SampleDesc.Count = k.samples;
 }
@@ -3727,7 +3898,8 @@ void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
     k.samples = target ? target->res->GetDesc().SampleDesc.Count : 1;
     k.rtfmt = bound_rt_ ? bound_rt_->fmt : 0;
     KeyBlend(s, k);
-    k.motion = bound_rt_ && bound_motion_ ? 1 : 0;
+    k.motion = bound_rt_ && bound_motion_ ? kMotionBound : 0;
+    if (k.motion && motion_format_ == kMotionReactiveFormat) k.motion |= kMotionReactiveFormatBit;
     // alpha-tested cut-outs (fences, leaves, wires) get coverage from their alpha under MSAA, so their edges are
     // smoothed like geometry edges; the test itself moves to half its reference (UploadConstants)
     k.a2c = k.samples > 1 && k.has_rt && !k.blend && SimpleState(s, kMAlphaTestEnable) && bound_rt_->gw >= guest_w_ &&
@@ -4658,23 +4830,39 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     const bool solid = !blend_on || (bsrc == 1 && bdst == 0) || (bsrc == 0x302 && bdst == 0x303);
     // TCNYC_TRACE_MOTION=1: why the 3D scene's draws do or do not write motion, every 120 frames
     static const bool trace_motion = std::getenv("TCNYC_TRACE_MOTION") != nullptr;
-    if (trace_motion && bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ && bound_ds_ &&
-        !a.pretransformed) {
-        const char* why = !bound_motion_ ? "no motion target" : !sh.prog ? "fixed function" : !s.rs[kRsZEnable] ? "no depth test"
-                        : !SimpleState(s, kMZWriteEnable) ? "no depth write" : !solid ? "blend" : "eligible";
+    const bool trace_scene_draw = trace_motion && bound_rt_ && bound_rt_->gw == guest_w_ &&
+                                  bound_rt_->gh == guest_h_ && bound_ds_ && !a.pretransformed;
+    const char* motion_reason = nullptr;
+    if (trace_scene_draw) {
+        motion_reason = !bound_motion_ ? "no motion target" : !sh.prog ? "fixed function" :
+                        !s.rs[kRsZEnable] ? "no depth test" : !SimpleState(s, kMZWriteEnable) ? "no depth write" :
+                        !solid ? "blend" : "eligible";
         char key[64];
-        if (!solid && std::strcmp(why, "blend") == 0) std::snprintf(key, sizeof(key), "blend %X %X", bsrc, bdst);
-        else std::snprintf(key, sizeof(key), "%s", why);
+        if (!solid && std::strcmp(motion_reason, "blend") == 0)
+            std::snprintf(key, sizeof(key), "blend %X %X", bsrc, bdst);
+        else
+            std::snprintf(key, sizeof(key), "%s", motion_reason);
         motion_trace_[key]++;
     }
     if (bound_motion_ && sh.prog && !a.pretransformed && bound_ds_ && s.rs[kRsZEnable] &&
         SimpleState(s, kMZWriteEnable) && solid) {
-        uint32_t ident[22] = {prim, start, count, s.index_data, s.base_vertex, s.vs_handle};
-        for (int i = 0; i < 16; i++) ident[6 + i] = s.streams[size_t(i)].vb;
-        const uint64_t id = Hash(ident, sizeof(ident), s.vs->hash);
-        motion_now_[id].push_back(s.vsc);
-        prev_consts = MatchPrevious(id, s);
-        if (trace_motion) motion_trace_[prev_consts ? "matched" : "unmatched"]++;
+        // Captured curved strip, straight strip and explicit-position road programs.
+        const bool road = s.vs->hash == 0x4CC5C030CD8CB305ull || s.vs->hash == 0x18591ECD120BF283ull ||
+                          s.vs->hash == 0xEE65083728927C2Full;
+        if (road) {
+            prev_consts = PreviousRoadConstants(s.vsc);
+        } else {
+            uint32_t ident[22] = {prim, start, count, s.index_data, s.base_vertex, s.vs_handle};
+            for (int i = 0; i < 16; i++) ident[6 + i] = s.streams[size_t(i)].vb;
+            const uint64_t id = Hash(ident, sizeof(ident), s.vs->hash);
+            motion_now_[id].push_back(s.vsc);
+            prev_consts = MatchPrevious(id, s);
+        }
+        if (trace_motion) {
+            motion_trace_[prev_consts ? "matched" : "unmatched"]++;
+            if (road && prev_consts) motion_trace_["road-projection"]++;
+        }
+        if (trace_scene_draw) motion_reason = prev_consts ? (road ? "road-projection" : "matched") : "unmatched";
         if (prev_consts) {
             sh.motion = true;
             sh.vkey = VertexKey(s, a, sh);
@@ -4685,13 +4873,29 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
                 sh.vkey = VertexKey(s, a, sh);
                 EnsureVertexShader(s, a, sh);
                 prev_consts = nullptr;
+                if (trace_scene_draw) motion_reason = "motion shader failed";
             }
         }
     }
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
     pk.ao = ao_receiver ? 1 : 0;
-    pk.motion = prev_consts ? 1 : 0;
+    // The guest HUD is composited into the scene before Present. Mark its alpha-blended
+    // screen-space draws so Native AA can preserve those pixels from the current frame.
+    const auto& hud_texture = stages.desc[0];
+    const bool hud_source = !stages.rt[0] || (hud_texture &&
+        uint64_t(hud_texture->width) * hud_texture->height <= kSmallTargetPixels);
+    const bool temporal_upscaler = Fsr3Enabled() || DlssEnabled();
+    const bool fsr_hud = temporal_upscaler && bound_motion_ && a.pretransformed && hud_source &&
+                         blend_on && bsrc == 0x302 && bdst == 0x303 && !SimpleState(s, kMZWriteEnable) &&
+                         BlendOp(SimpleState(s, kMBlendOp)) == D3D12_BLEND_OP_ADD &&
+                         (SimpleState(s, kMColorWriteEnable) & 0x010101);
+    const bool reactive = temporal_upscaler && bound_motion_ && motion_format_ == kMotionReactiveFormat &&
+                          !a.pretransformed && bound_ds_ && s.rs[kRsZEnable] && !SimpleState(s, kMZWriteEnable) &&
+                          blend_on && bsrc == 0x302 && (bdst == 0x303 || bdst == 1) &&
+                          BlendOp(SimpleState(s, kMBlendOp)) == D3D12_BLEND_OP_ADD &&
+                          (SimpleState(s, kMColorWriteEnable) & 0x010101);
+    pk.motion = prev_consts ? 1 : fsr_hud ? 2 : reactive ? 3 : 0;
     sh.pkey = Hash(&pk, sizeof(pk));
     EnsurePixelShader(pk, sh);
     if (ao_receiver && !sh.ps_code) {
@@ -4718,7 +4922,12 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     PsoKey k;
     BuildPipelineKey(s, a, sh.vh, sh.ph, k);
     k.sprite = sh.sprite;
-    if (prev_consts) k.motion = 2;
+    if (pk.motion == 3) {
+        k.motion |= kReactiveWrite;
+        if (trace_motion) motion_trace_["reactive"]++;
+    } else if (pk.motion) {
+        k.motion |= kMotionWrite;
+    }
     ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
     if (!pso) return;
     depth_replay_ = {};
@@ -4766,7 +4975,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     const bool depth_available = bound_ds_ && bound_ds_->res;
     // scene_view: a widescreen game view is full width but shorter than the 640x480 surface
     // (letterboxed by the title); a shadow or mirror pass is much smaller.
-    if ((render_.dof || render_.ao != 0 || render_.taa) && depth_available && bound_rt_ && !a.pretransformed && k.zwrite &&
+    if ((render_.dof || render_.ao != 0 || TemporalEnabled()) && depth_available && bound_rt_ && !a.pretransformed && k.zwrite &&
         bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ &&
         bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h && scene_view) {
         const WRange r = DrawWRange(s, sh.prog);
@@ -4783,7 +4992,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
                                                                 range.far_w > 0 ? r.far_w / range.far_w : 1.0f});
     }
     // TAA: the frame's sub-pixel jitter on the 3D scene's program draws (the vertex epilogue adds ext.xy)
-    if (render_.taa && sh.prog && depth_available && bound_rt_ && !a.pretransformed && bound_rt_->gw == guest_w_ &&
+    if (TemporalEnabled() && sh.prog && depth_available && bound_rt_ && !a.pretransformed && bound_rt_->gw == guest_w_ &&
         bound_rt_->gh == guest_h_) {
         c.ext[0] = 2.0f * taa_jitter_[0] / float(bound_rt_->w);
         c.ext[1] = -2.0f * taa_jitter_[1] / float(bound_rt_->h);
@@ -4793,6 +5002,13 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     if (cap_) {
         CaptureDraw(s, prim, count, k, c, stages, sh.vkey);
+        if (motion_reason) {
+            fprintf(cap_, " | motion %s start %u index %08X base %08X program %016llX", motion_reason, start,
+                    s.index_data, s.base_vertex, static_cast<unsigned long long>(sh.prog ? s.vs->hash : 0));
+            for (size_t i = 0; i < s.streams.size(); ++i) {
+                if (s.streams[i].vb) fprintf(cap_, " vb%zu %08X", i, s.streams[i].vb);
+            }
+        }
         EndDrawCapture(s, a, count, c);
         CaptureShaders(s, a, sh, pk);
     }
@@ -4961,7 +5177,7 @@ void D3D12Backend::FlushDeferredScene() {
             if (b.has_rt) rh[0] = b.rtv;
             if (b.has_ds) dh = b.dsv;
             // the scene target's bundles were recorded with TAA's motion target beside it (BindTargets)
-            const bool with_motion = b.has_rt && motion_rt_ && motion_ && render_.taa &&
+            const bool with_motion = b.has_rt && motion_rt_ && motion_ && TemporalEnabled() &&
                                      b.rtv.ptr == Cpu(rtv_heap_.Get(), motion_rt_->view, rtv_inc_).ptr;
             if (with_motion) Transition(motion_.Get(), motion_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
             cl_->OMSetRenderTargets(b.has_rt ? (with_motion ? 2 : 1) : 0, b.has_rt ? rh : nullptr, FALSE,
@@ -5563,6 +5779,7 @@ bool D3D12Backend::ResizeSwap() {
     }
     if (w == bb_w_ && h == bb_h_ && !chain_change)
         return std::all_of(std::begin(bb_), std::end(bb_), [](const auto& buffer) { return bool(buffer); });
+    ResetTemporalHistory();
     Flush();
     for (auto& f : frames_) {
         if (f.fence && !WaitFence(f.fence)) {
@@ -5716,10 +5933,27 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
         auto& state = color == t.res.Get() ? t.state : t.resolved_state;
         Transition(color, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
-    DXGI_FORMAT color_fmt = t.fmt;
+    DXGI_FORMAT color_fmt = aa ? aa->GetDesc().Format : t.fmt;
     // passes before the blit draw to their own targets; the back buffer and its viewport are set after them
-    if (bloom > 0) o.bloom_tex = BuildBloom(color, t.fmt, t.w, t.h);
-    if (scene) UpscaleAndSharpen(color, color_fmt, t.w, t.h, uint32_t(std::lround(vw)), uint32_t(std::lround(vh)));
+    const bool fsr3_output = color == fsr3_.output.res.Get();
+#if defined(TCNYC_HAVE_DLSS)
+    const bool dlss_output = color == dlss_.output.res.Get();
+#else
+    const bool dlss_output = false;
+#endif
+    const bool temporal_output = fsr3_output || dlss_output;
+    if (fsr3_output) {
+        o.src_w = float(fsr3_.out_w);
+        o.src_h = float(fsr3_.out_h);
+    } else if (dlss_output) {
+#if defined(TCNYC_HAVE_DLSS)
+        o.src_w = float(dlss_.out_w);
+        o.src_h = float(dlss_.out_h);
+#endif
+    }
+    if (bloom > 0) o.bloom_tex = BuildBloom(color, color_fmt, uint32_t(o.src_w), uint32_t(o.src_h));
+    if (scene && !temporal_output)
+        UpscaleAndSharpen(color, color_fmt, t.w, t.h, uint32_t(std::lround(vw)), uint32_t(std::lround(vh)));
 
     cl_->OMSetRenderTargets(1, &frame_rtv_, FALSE, nullptr);
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
@@ -6114,15 +6348,18 @@ const char* kTaaHlsl = R"(
 cbuffer B : register(b1) { float4 m0; float4 m1; float4 m2; float4 m3; float4 proj; float4 z; float4 px; float4 flags; };
 Texture2D cur : register(t0);
 Texture2D hist : register(t1);
-#if DEPTH_MS
+#if TAA_RESOLVE
+Texture2D<float2> denseMotion : register(t2);
+Texture2D<float2> motionMetadata : register(t3);
+#elif DEPTH_MS
 Texture2DMS<float> depthTex : register(t2);
 #define DEPTH_LOAD(p) depthTex.Load(p, 0)
-Texture2DMS<float2> motionTex : register(t3);
+Texture2DMS<float4> motionTex : register(t3);
 #define MOTION_LOAD(p) motionTex.Load(p, 0)
 #else
 Texture2D<float> depthTex : register(t2);
 #define DEPTH_LOAD(p) depthTex.Load(int3(p, 0))
-Texture2D<float2> motionTex : register(t3);
+Texture2D<float4> motionTex : register(t3);
 #define MOTION_LOAD(p) motionTex.Load(int3(p, 0))
 #endif
 SamplerState ls : register(s0);
@@ -6134,6 +6371,67 @@ O vs(uint id : SV_VertexID) {
     o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
     o.uv = t;
     return o;
+}
+#if !TAA_RESOLVE
+Texture2D<float2> fsrMetadata : register(t1);
+struct FsrInputs {
+    float depth : SV_Target0;
+    float reactive : SV_Target1;
+};
+FsrInputs fsrInputs(O i) {
+    const int2 pixel = int2(i.p.xy);
+    FsrInputs o;
+    const float2 metadata = fsrMetadata.Load(int3(pixel, 0));
+    o.depth = metadata.x;
+    o.reactive = 0;
+    [branch] if (flags.x > 0 && metadata.y != -2) o.reactive = MOTION_LOAD(pixel).z;
+    return o;
+}
+struct MotionOut {
+    float2 velocity : SV_Target0;
+    float2 metadata : SV_Target1;
+};
+MotionOut resolveMotion(O i) {
+    const int2 pixel = int2(i.p.xy);
+    const float depth = DEPTH_LOAD(pixel);
+    MotionOut o;
+    o.velocity = 0;
+    o.metadata = float2(depth, -1);
+    float2 object = 60000;
+    [branch] if (flags.x > 0) object = MOTION_LOAD(pixel).xy;
+    if (object.x > 62000) {
+        o.metadata.y = -2;
+        return o;
+    }
+    if (z.w > 0) return o;
+
+    // Reconstruct the world point at this input texel, undoing the projection jitter.
+    const float2 uv = i.uv - px.xy;
+    const float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
+    const float w = z.x * z.y / max(z.y - (1 - depth) * (z.y - z.x), 1e-4) * z.z;
+    const float4 view = float4(ndc.x * w / proj.x, ndc.y * w / proj.y, w, 1);
+    const float4 prev = view.x * m0 + view.y * m1 + view.z * m2 + view.w * m3;
+    const float2 pndc = prev.xy * proj.zw / max(prev.z, 1e-3);
+    const float2 camera = float2(pndc.x * 0.5 + 0.5, 0.5 - pndc.y * 0.5) - uv;
+    const bool cameraValid = prev.z > 1e-3 && all(isfinite(camera));
+
+    if (all(abs(object) < 50000)) {
+        o.velocity = clamp(object, -2, 2);
+        o.metadata.y = 1 + (cameraValid ? min(length((object - camera) / px.zw), 4) : 4);
+    } else if (cameraValid) {
+        o.velocity = clamp(camera, -2, 2);
+        o.metadata.y = 0;
+    }
+    return o;
+}
+#else
+float4 fsrHud(O i) : SV_Target {
+    uint width, height;
+    motionMetadata.GetDimensions(width, height);
+    const uint2 size = uint2(width, height);
+    const int3 pixel = int3(min(uint2(i.uv * size), size - 1), 0);
+    if (motionMetadata.Load(pixel).y != -2) discard;
+    return cur.SampleLevel(ls, i.uv, 0);
 }
 float3 ToYCoCg(float3 c) {
     return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25)));
@@ -6163,55 +6461,40 @@ float4 taa(O i) : SV_Target {
     int2 ip = int2(i.p.xy);
     // this frame shifted by its jitter: read it back where the pixel centre landed, so the blend does not wobble
     float3 c = cur.SampleLevel(ls, i.uv + px.xy, 0).rgb;
+    if (z.w > 0) return float4(c, 1);
     // the neighbourhood's mean and spread in YCoCg, and the nearest depth around (edges move with the nearer surface)
     float3 sum1 = 0, sum2 = 0;
-    float near_raw = 1;
+    float near_depth = -1;
+    float motion_kind = -1;
     int2 near_at = ip;
+    const int2 last = int2(round(1.0 / px.zw)) - 1;
     [unroll] for (int y = -1; y <= 1; y++)
         [unroll] for (int x = -1; x <= 1; x++) {
             float3 n = ToYCoCg(cur.Load(int3(ip + int2(x, y), 0)).rgb);
             sum1 += n;
             sum2 += n * n;
-            float r = 1.0 - DEPTH_LOAD(ip + int2(x, y));
-            if (r < near_raw) {
-                near_raw = r;
-                near_at = ip + int2(x, y);
+            int2 at = clamp(ip + int2(x, y), 0, last);
+            float2 info = motionMetadata.Load(int3(at, 0));
+            if (info.x > near_depth) {
+                near_depth = info.x;
+                motion_kind = info.y;
+                near_at = at;
             }
         }
-    if (z.w > 0) return float4(c, 1);
+    if (motion_kind < 0) return float4(c, 1);
     float3 mean = sum1 / 9;
     float3 sigma = sqrt(max(sum2 / 9 - mean * mean, 0.0));
-    float raw = near_raw;
-    float w = z.x * z.y / max(z.y - raw * (z.y - z.x), 1e-4) * z.z;
-    float2 uv = i.uv - px.xy;  // without this frame's jitter
-    float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
-    float4 view = float4(ndc.x * w / proj.x, ndc.y * w / proj.y, w, 1);
-    float4 prev = view.x * m0 + view.y * m1 + view.z * m2 + view.w * m3;
-    float2 puv;
-    // the draw's own motion where it wrote one (cars, people, the world; flags.x set when the target is this frame's),
-    // else the camera's
-    float2 objmv = float2(60000, 60000);
-    [branch] if (flags.x > 0) objmv = MOTION_LOAD(near_at);
-    // where the camera alone would have moved this pixel
-    const bool cam_ok = prev.z > 1e-3;
-    float2 cam_puv = uv;
-    if (cam_ok) {
-        float2 pndc = prev.xy * proj.zw / prev.z;
-        cam_puv = float2(pndc.x * 0.5 + 0.5, 0.5 - pndc.y * 0.5);
-    }
-    if (objmv.x < 50000) {
-        puv = uv + objmv;
-    } else {
-        if (!cam_ok) return float4(c, 1);
-        puv = cam_puv;
-    }
+    const float2 velocity = denseMotion.Load(int3(near_at, 0));
+    const float2 puv = i.uv + velocity;
     if (any(puv < 0) || any(puv > 1)) return float4(c, 1);
     // how far the pixel moved, in pixels: the clip is loose when still (stable) and tight in motion (no trails)
-    float moved = length((puv - uv) / px.zw);
+    float moved = length(velocity / px.zw);
     float motion = saturate(moved / 2.0);
     // an object moving by itself (its motion differs from the camera's by half a pixel or more): the strictest
     // handling; the world, whose motion is the camera's, keeps the steadier one
-    const bool own = objmv.x < 50000 && (!cam_ok || length((puv - cam_puv) / px.zw) > 0.5);
+    const bool draw_motion = motion_kind >= 1;
+    const float difference = draw_motion ? motion_kind - 1 : 0;
+    const bool own = difference > 0.5;
     // variance clip: the history pulled toward the mean until it lies within the neighbourhood's spread
     float3 h = ToYCoCg(HistoryAt(puv));
     // loose where nothing moves (steady fine detail), tight where anything does (no trails); per-object motion makes
@@ -6228,11 +6511,12 @@ float4 taa(O i) : SV_Target {
     // TCNYC_TAA_VIEW=1: the motion used, red and green its size across and down (16 pixels full), blue 1 where the
     // draw's own motion was used, 0 the camera's; =2: red how far the draw's motion is from the camera's (4 pixels
     // full), blue as in 1
-    if (flags.y > 1.5) return float4(saturate(length((puv - cam_puv) / px.zw) / 4), 0, objmv.x < 50000 ? 1 : 0, 1);
-    if (flags.y > 0.5) return float4(saturate(abs((puv - uv) / px.zw) / 16), objmv.x < 50000 ? 1 : 0, 1);
+    if (flags.y > 1.5) return float4(saturate(difference / 4), 0, draw_motion ? 1 : 0, 1);
+    if (flags.y > 0.5) return float4(saturate(abs(velocity / px.zw) / 16), draw_motion ? 1 : 0, 1);
     float wc = alpha / (1 + ToYCoCg(c).x), wh = (1 - alpha) / (1 + h.x);
     return float4((c * wc + hc * wh) / (wc + wh), 1);
 }
+#endif
 )";
 
 // The motion target for the scene target rt (its size and sample count), cleared to "no motion" (60000) the first
@@ -6240,13 +6524,14 @@ float4 taa(O i) : SV_Target {
 bool D3D12Backend::EnsureMotion(Target& rt) {
     if (motion_failed_) return false;
     const uint32_t samples = rt.res->GetDesc().SampleDesc.Count;
-    if (!motion_ || motion_w_ != rt.w || motion_h_ != rt.h || motion_samples_ != samples) {
+    const DXGI_FORMAT format = (Fsr3Enabled() || DlssEnabled()) ? kMotionReactiveFormat : kMotionFormat;
+    if (!motion_ || motion_w_ != rt.w || motion_h_ != rt.h || motion_samples_ != samples || motion_format_ != format) {
         if (motion_) Release(std::move(motion_));
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
-        D3D12_RESOURCE_DESC td = Texture2DDesc(kMotionFormat, rt.w, rt.h);
+        D3D12_RESOURCE_DESC td = Texture2DDesc(format, rt.w, rt.h);
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         td.SampleDesc.Count = samples;
-        D3D12_CLEAR_VALUE cv{kMotionFormat, {60000.0f, 60000.0f, 0, 1}};
+        D3D12_CLEAR_VALUE cv{format, {60000.0f, 60000.0f, 0, 1}};
         motion_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
         if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, motion_state_, &cv,
                                                  IID_PPV_ARGS(&motion_)))) {
@@ -6258,6 +6543,7 @@ bool D3D12Backend::EnsureMotion(Target& rt) {
         motion_w_ = rt.w;
         motion_h_ = rt.h;
         motion_samples_ = samples;
+        motion_format_ = format;
         motion_cleared_ = ~0ull;
         LOGR("d3d12: TAA motion target %ux%u, %u samples", rt.w, rt.h, samples);
     }
@@ -6269,6 +6555,23 @@ bool D3D12Backend::EnsureMotion(Target& rt) {
     }
     motion_rt_ = &rt;
     return true;
+}
+
+const D3D12Backend::VertexConstants* D3D12Backend::PreviousRoadConstants(const VertexConstants& current) {
+    auto first = current.begin() + kRoadProjection;
+    auto& now = road_projection_now_;
+    if (!now.seen) {
+        std::copy_n(first, now.rows.size(), now.rows.begin());
+        now.seen = true;
+    } else if (!std::equal(now.rows.begin(), now.rows.end(), first)) {
+        now.consistent = false;
+    }
+
+    const auto& was = road_projection_was_;
+    if (!now.consistent || !was.seen || !was.consistent) return nullptr;
+    motion_match_ = current;
+    std::copy(was.rows.begin(), was.rows.end(), motion_match_.begin() + kRoadProjection);
+    return &motion_match_;
 }
 
 const D3D12Backend::VertexConstants* D3D12Backend::MatchPrevious(uint64_t id, const State& s) {
@@ -6317,11 +6620,515 @@ bool Invert4(const float* m, float* out) {
     return true;
 }
 
+D3D12Backend::~D3D12Backend() {
+    ReleaseDlss();
+    if (fsr3_.context) {
+        WaitFence(fence_value_);
+        fsr3_.destroy(&fsr3_.context, nullptr);
+    }
+    if (fsr3_.module) FreeLibrary(fsr3_.module);
+}
+
+void D3D12Backend::LoadFsr3() {
+    if (render_.upscaler != game::choices::kFsr3 || !game::choices::Fsr3Scale(render_.render_percent) ||
+        fsr3_.module || fsr3_.failed) return;
+    const auto path = app::ExeDir() / "amd_fidelityfx_dx12.dll";
+    fsr3_.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (fsr3_.module) {
+        fsr3_.create = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(fsr3_.module, "ffxCreateContext"));
+        fsr3_.destroy = reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(fsr3_.module, "ffxDestroyContext"));
+        fsr3_.dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(fsr3_.module, "ffxDispatch"));
+        fsr3_.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(fsr3_.module, "ffxQuery"));
+    }
+    fsr3_.failed = !fsr3_.create || !fsr3_.destroy || !fsr3_.dispatch || !fsr3_.query;
+    if (fsr3_.failed) LOGR("d3d12: FSR 3.1 requires AMD's amd_fidelityfx_dx12.dll beside the game");
+}
+
+#if defined(TCNYC_HAVE_DLSS)
+void D3D12Backend::LoadDlss() {
+    if (render_.upscaler != game::choices::kDlss || !game::choices::DlssScale(render_.render_percent)) return;
+    if (dlss_.module || dlss_.failed) return;
+    dlss_.forced = EnvFlag("TCNYC_DLSS_FORCE");
+    const bool trace = EnvFlag("TCNYC_TRACE_DLSS");
+
+    if (const char* override = std::getenv("TCNYC_NGX_PATH"); override && *override) {
+        std::error_code ec;
+        std::filesystem::path path = std::filesystem::path(override);
+        std::filesystem::path absolute = std::filesystem::absolute(path, ec);
+        if (!ec) path = absolute;
+        dlss_.module = LoadLibraryExW(path.c_str(), nullptr,
+                                      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        if (!dlss_.module) LOGR("dlss: TCNYC_NGX_PATH could not be loaded (%ls)", path.c_str());
+    }
+    if (!dlss_.module) dlss_.module = NGXLoadCoreLibrary(dev_->GetAdapterLuid());
+    if (!dlss_.module) {
+        dlss_.failed = true;
+        g_dlss_state.store(DlssState::Unavailable, std::memory_order_relaxed);
+        LOGR("dlss: no NGX core; DLSS requires an NVIDIA driver or OptiScaler's NGX replacement");
+        return;
+    }
+    wchar_t module_path[MAX_PATH] = {};
+    GetModuleFileNameW(dlss_.module, module_path, MAX_PATH);
+    LOGR("dlss: NGX core %ls", module_path);
+
+    auto symbol = [&](const char* name) { return GetProcAddress(dlss_.module, name); };
+    dlss_.init = reinterpret_cast<PfnNgxInitProjectId>(symbol("NVSDK_NGX_D3D12_Init_ProjectID"));
+    dlss_.get_caps =
+        reinterpret_cast<PfnNgxGetCapabilityParameters>(symbol("NVSDK_NGX_D3D12_GetCapabilityParameters"));
+    dlss_.get_params = reinterpret_cast<PfnNgxGetParameters>(symbol("NVSDK_NGX_D3D12_GetParameters"));
+    dlss_.destroy_params =
+        reinterpret_cast<PfnNgxDestroyParameters>(symbol("NVSDK_NGX_D3D12_DestroyParameters"));
+    dlss_.create = reinterpret_cast<PfnNgxCreateFeature>(symbol("NVSDK_NGX_D3D12_CreateFeature"));
+    dlss_.evaluate = reinterpret_cast<PfnNgxEvaluateFeature>(symbol("NVSDK_NGX_D3D12_EvaluateFeature"));
+    dlss_.release = reinterpret_cast<PfnNgxReleaseFeature>(symbol("NVSDK_NGX_D3D12_ReleaseFeature"));
+    dlss_.shutdown = reinterpret_cast<PfnNgxShutdown>(symbol("NVSDK_NGX_D3D12_Shutdown1"));
+    if (!dlss_.init || !dlss_.get_params || !dlss_.create || !dlss_.evaluate || !dlss_.release) {
+        dlss_.failed = true;
+        g_dlss_state.store(DlssState::Unavailable, std::memory_order_relaxed);
+        LOGR("dlss: NGX module is missing required D3D12 entry points");
+        return;
+    }
+
+    static const std::wstring exe_dir = app::ExeDir().wstring();
+    static const wchar_t* paths[] = {exe_dir.c_str()};
+    NVSDK_NGX_FeatureCommonInfo info{};
+    info.PathListInfo.Path = paths;
+    info.PathListInfo.Length = 1;
+    info.LoggingInfo.LoggingCallback = &DlssLogCallback;
+    info.LoggingInfo.MinimumLoggingLevel =
+        trace ? NVSDK_NGX_LOGGING_LEVEL_VERBOSE : NVSDK_NGX_LOGGING_LEVEL_ON;
+    info.LoggingInfo.DisableOtherLoggingSinks = false;
+
+    const auto init_result = dlss_.init("96db5f8f-31d1-4b6e-93a8-f9e43081780b", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                        "1.0", exe_dir.c_str(), dev_.Get(), NVSDK_NGX_Version_API, &info);
+    LOGR("dlss: init result 0x%08X", unsigned(init_result));
+    if (init_result != NVSDK_NGX_Result_Success) {
+        dlss_.failed = true;
+        g_dlss_state.store(DlssState::Unavailable, std::memory_order_relaxed);
+        return;
+    }
+
+    if (dlss_.get_caps && dlss_.get_caps(&dlss_.caps) == NVSDK_NGX_Result_Success && dlss_.caps) {
+        int available = 0, needs_driver = 0, major = 0, minor = 0;
+        dlss_.caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &available);
+        dlss_.caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
+        dlss_.caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &major);
+        dlss_.caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &minor);
+        dlss_.available = available != 0;
+        LOGR("dlss: SuperSampling.Available %d, needs driver %d, minimum driver %d.%d", available, needs_driver,
+             major, minor);
+    } else {
+        LOGR("dlss: capability parameters unavailable");
+    }
+
+    if (!dlss_.get_params || dlss_.get_params(&dlss_.params) != NVSDK_NGX_Result_Success || !dlss_.params) {
+        dlss_.failed = true;
+        g_dlss_state.store(DlssState::Unavailable, std::memory_order_relaxed);
+        LOGR("dlss: parameter allocation failed");
+        return;
+    }
+    dlss_.loaded = true;
+    g_dlss_state.store(dlss_.available ? DlssState::Available : DlssState::Unavailable,
+                       std::memory_order_relaxed);
+}
+#else
+void D3D12Backend::LoadDlss() {}
+#endif
+
+bool D3D12Backend::Fsr3Enabled() const {
+    return render_.upscaler == game::choices::kFsr3 && game::choices::Fsr3Scale(render_.render_percent) &&
+           fsr3_.dispatch && !fsr3_.failed;
+}
+
+bool D3D12Backend::DlssEnabled() const {
+#if defined(TCNYC_HAVE_DLSS)
+    return render_.upscaler == game::choices::kDlss && game::choices::DlssScale(render_.render_percent) &&
+           dlss_.loaded && !dlss_.failed && (dlss_.available || dlss_.forced);
+#else
+    return false;
+#endif
+}
+
+#if defined(TCNYC_HAVE_DLSS)
+void D3D12Backend::ReleaseDlssFeature() {
+    if (dlss_.feature && dlss_.release) dlss_.release(dlss_.feature);
+    dlss_.feature = nullptr;
+    dlss_.valid = false;
+}
+
+bool D3D12Backend::EnsureDlss(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h) {
+    if (!DlssEnabled()) return false;
+    if (dlss_.feature && dlss_.w == w && dlss_.h == h && dlss_.out_w == out_w && dlss_.out_h == out_h) return true;
+
+    if (dlss_.feature || dlss_.output.res) {
+        Flush();
+        for (auto& f : frames_)
+            if (f.fence && !WaitFence(f.fence)) return false;
+        ReleaseDlssFeature();
+    }
+
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    auto make_target = [&](SmaaTexture& target, uint32_t width, uint32_t height, DXGI_FORMAT format,
+                           D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
+        D3D12_RESOURCE_DESC desc = Texture2DDesc(format, width, height);
+        desc.Flags = flags;
+        target.state = state;
+        return SUCCEEDED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                                        IID_PPV_ARGS(target.res.ReleaseAndGetAddressOf())));
+    };
+    if (!make_target(dlss_.depth, w, h, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                     D3D12_RESOURCE_STATE_RENDER_TARGET) ||
+        !make_target(dlss_.reactive, w, h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                     D3D12_RESOURCE_STATE_RENDER_TARGET) ||
+        !make_target(dlss_.output, out_w, out_h, kFsr3OutputFormat,
+                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
+        dlss_.failed = true;
+        LOGR("d3d12: could not allocate DLSS resources");
+        return false;
+    }
+    dev_->CreateRenderTargetView(dlss_.depth.res.Get(), nullptr, Cpu(rtv_heap_.Get(), kDlssDepthRtv, rtv_inc_));
+    dev_->CreateRenderTargetView(dlss_.reactive.res.Get(), nullptr, Cpu(rtv_heap_.Get(), kDlssReactiveRtv, rtv_inc_));
+    dev_->CreateRenderTargetView(dlss_.output.res.Get(), nullptr, Cpu(rtv_heap_.Get(), kDlssOutputRtv, rtv_inc_));
+    dlss_.w = w;
+    dlss_.h = h;
+    dlss_.out_w = out_w;
+    dlss_.out_h = out_h;
+
+    const int flags = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+    const int quality = render_.render_percent >= 100 ? NVSDK_NGX_PerfQuality_Value_DLAA
+                                                      : NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    dlss_.params->Reset();
+    dlss_.params->Set(NVSDK_NGX_Parameter_Width, w);
+    dlss_.params->Set(NVSDK_NGX_Parameter_Height, h);
+    dlss_.params->Set(NVSDK_NGX_Parameter_OutWidth, out_w);
+    dlss_.params->Set(NVSDK_NGX_Parameter_OutHeight, out_h);
+    dlss_.params->Set(NVSDK_NGX_Parameter_PerfQualityValue, quality);
+    dlss_.params->Set(NVSDK_NGX_Parameter_RTXValue, 0);
+    dlss_.params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
+    dlss_.params->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
+    dlss_.params->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
+    if (const char* preset = std::getenv("TCNYC_DLSS_PRESET"); preset && *preset) {
+        int value = 0;
+        if (*preset == 'J' || *preset == 'j') value = NVSDK_NGX_DLSS_Hint_Render_Preset_J;
+        else if (*preset == 'K' || *preset == 'k') value = NVSDK_NGX_DLSS_Hint_Render_Preset_K;
+        else if (*preset == 'L' || *preset == 'l') value = NVSDK_NGX_DLSS_Hint_Render_Preset_L;
+        else if (*preset == 'M' || *preset == 'm') value = NVSDK_NGX_DLSS_Hint_Render_Preset_M;
+        if (value) {
+            dlss_.params->Set(render_.render_percent >= 100 ? NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA
+                                                            : NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+                              value);
+        }
+    }
+
+    const auto result = dlss_.create(cl_, NVSDK_NGX_Feature_SuperSampling, dlss_.params, &dlss_.feature);
+    Begin();  // NGX binds its own descriptor heap.
+    LOGR("d3d12: DLSS CreateFeature result 0x%08X", unsigned(result));
+    if (result != NVSDK_NGX_Result_Success || !dlss_.feature) {
+        dlss_.failed = true;
+        LOGR("d3d12: DLSS feature creation failed (0x%08X)", unsigned(result));
+        return false;
+    }
+    dlss_.create_flags = flags;
+    dlss_.valid = false;
+    dlss_.logged_dispatch = false;
+    dlss_.last_eval = PerfClock::now();
+    dlss_.available = true;
+    g_dlss_state.store(DlssState::Available, std::memory_order_relaxed);
+    LOGR("d3d12: DLSS %ux%u -> %ux%u, %s, flags 0x%X", w, h, out_w, out_h,
+         render_.render_percent >= 100 ? "Native AA" : "Quality", flags);
+    return true;
+}
+
+ID3D12Resource* D3D12Backend::DispatchDlss(ID3D12Resource* color, D3D12_RESOURCE_STATES& color_state,
+                                          const CameraFrame& camera, bool reset, const float* constants, bool motion) {
+    (void)camera;
+    uint32_t out_w = taa_.w, out_h = taa_.h;
+    if (render_.render_percent < 100) {
+        const float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
+        const float width = std::min(float(bb_w_), float(bb_h_) * aspect);
+        out_w = uint32_t(std::lround(width));
+        out_h = uint32_t(std::lround(width / aspect));
+        if (out_w < taa_.w || out_h < taa_.h) return nullptr;
+    }
+    if (!EnsureDlss(taa_.w, taa_.h, out_w, out_h)) return nullptr;
+
+    static const std::string shader = std::string("#define TAA_RESOLVE 1\n") + kTaaHlsl;
+    static const std::string ms_inputs = std::string("#define DEPTH_MS 1\n") + kTaaHlsl;
+    ID3D12Resource* inputs[3] = {nullptr, taa_.metadata.res.Get(), nullptr};
+    const DXGI_FORMAT input_formats[3] = {DXGI_FORMAT_UNKNOWN, kTemporalMetadataFormat, DXGI_FORMAT_UNKNOWN};
+    auto& depth = dlss_.depth;
+    auto& reactive = dlss_.reactive;
+    auto& output = dlss_.output;
+    Transition(depth.res.Get(), depth.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Transition(reactive.res.Get(), reactive.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (!PassN(motion && motion_samples_ > 1 ? ms_inputs.c_str() : kTaaHlsl, "fsrInputs", DXGI_FORMAT_R32_FLOAT,
+               Cpu(rtv_heap_.Get(), kDlssDepthRtv, rtv_inc_), taa_.w, taa_.h, inputs, input_formats,
+               constants, 32, -1, motion ? motion_.Get() : nullptr, motion_format_,
+               Cpu(rtv_heap_.Get(), kDlssReactiveRtv, rtv_inc_), DXGI_FORMAT_R8_UNORM)) {
+        dlss_.failed = true;
+        LOGR("d3d12: DLSS depth and reactive input pass could not be recorded");
+        return nullptr;
+    }
+
+    auto& dense = taa_.dense_motion;
+    Transition(color, color_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(depth.res.Get(), depth.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(reactive.res.Get(), reactive.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(dense.res.Get(), dense.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(output.res.Get(), output.state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const float jitter_x = DlssAxisSign("TCNYC_DLSS_JITTER_X", 1.0f);
+    const float jitter_y = DlssAxisSign("TCNYC_DLSS_JITTER_Y", 1.0f);
+    const float mv_x = DlssAxisSign("TCNYC_DLSS_MV_X", 1.0f);
+    const float mv_y = DlssAxisSign("TCNYC_DLSS_MV_Y", 1.0f);
+    const bool use_reactive = EnvFlag("TCNYC_DLSS_REACTIVE");
+    const auto now = PerfClock::now();
+    const float frame_ms = dlss_.valid
+        ? std::clamp(std::chrono::duration<float, std::milli>(now - dlss_.last_eval).count(), 1.0f, 1000.0f)
+        : 1000.0f / 60.0f;
+
+    dlss_.params->Reset();
+    dlss_.params->Set(NVSDK_NGX_Parameter_Color, color);
+    dlss_.params->Set(NVSDK_NGX_Parameter_Output, output.res.Get());
+    dlss_.params->Set(NVSDK_NGX_Parameter_Depth, depth.res.Get());
+    dlss_.params->Set(NVSDK_NGX_Parameter_MotionVectors, dense.res.Get());
+    dlss_.params->Set(NVSDK_NGX_Parameter_Width, taa_.w);
+    dlss_.params->Set(NVSDK_NGX_Parameter_Height, taa_.h);
+    dlss_.params->Set(NVSDK_NGX_Parameter_OutWidth, out_w);
+    dlss_.params->Set(NVSDK_NGX_Parameter_OutHeight, out_h);
+    dlss_.params->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, taa_jitter_[0] * jitter_x);
+    dlss_.params->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, taa_jitter_[1] * jitter_y);
+    dlss_.params->Set(NVSDK_NGX_Parameter_Reset, reset || !dlss_.valid ? 1 : 0);
+    dlss_.params->Set(NVSDK_NGX_Parameter_MV_Scale_X, float(taa_.w) * mv_x);
+    dlss_.params->Set(NVSDK_NGX_Parameter_MV_Scale_Y, float(taa_.h) * mv_y);
+    dlss_.params->Set(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, frame_ms);
+    dlss_.params->Set(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, 1.0f);
+    if (use_reactive) dlss_.params->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, reactive.res.Get());
+
+    const auto result = dlss_.evaluate(cl_, dlss_.feature, dlss_.params, nullptr);
+    Begin();  // NGX binds its own descriptor heap.
+    Transition(color, color_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(dense.res.Get(), dense.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (result != NVSDK_NGX_Result_Success) {
+        dlss_.failed = true;
+        LOGR("d3d12: DLSS evaluation failed (0x%08X)", unsigned(result));
+        return nullptr;
+    }
+    Transition(output.res.Get(), output.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12Resource* hud_inputs[3] = {color, nullptr, nullptr};
+    const DXGI_FORMAT hud_formats[3] = {color->GetDesc().Format, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+    if (!PassN(shader.c_str(), "fsrHud", kFsr3OutputFormat, Cpu(rtv_heap_.Get(), kDlssOutputRtv, rtv_inc_),
+               out_w, out_h, hud_inputs, hud_formats, constants, 32, -1, taa_.metadata.res.Get(),
+               kTemporalMetadataFormat))
+        LOGR("d3d12: DLSS HUD preservation pass could not be recorded");
+    Transition(output.res.Get(), output.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (!dlss_.logged_dispatch) {
+        dlss_.logged_dispatch = true;
+        LOGR("d3d12: DLSS %s dispatch succeeded", render_.render_percent == 100 ? "Native AA" : "Quality");
+    }
+    dlss_.valid = true;
+    dlss_.last_eval = now;
+    return output.res.Get();
+}
+
+void D3D12Backend::ReleaseDlss() {
+    if (dlss_.feature || dlss_.params) WaitFence(fence_value_);
+    ReleaseDlssFeature();
+    if (dlss_.params && dlss_.destroy_params) dlss_.destroy_params(dlss_.params);
+    dlss_.params = nullptr;
+    dlss_.caps = nullptr;
+    if (dlss_.shutdown) dlss_.shutdown(dev_.Get());
+    if (dlss_.module) FreeLibrary(dlss_.module);
+    dlss_.module = nullptr;
+}
+#else
+void D3D12Backend::ReleaseDlssFeature() {}
+bool D3D12Backend::EnsureDlss(uint32_t, uint32_t, uint32_t, uint32_t) { return false; }
+ID3D12Resource* D3D12Backend::DispatchDlss(ID3D12Resource*, D3D12_RESOURCE_STATES&, const CameraFrame&, bool,
+                                          const float*, bool) {
+    return nullptr;
+}
+void D3D12Backend::ReleaseDlss() {}
+#endif
+
+bool D3D12Backend::EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h, bool infinite_depth) {
+    if (fsr3_.context && fsr3_.w == w && fsr3_.h == h && fsr3_.out_w == out_w && fsr3_.out_h == out_h &&
+        fsr3_.infinite_depth == infinite_depth) return true;
+    if (fsr3_.context) {
+        Flush();
+        fsr3_.destroy(&fsr3_.context, nullptr);
+        fsr3_.context = nullptr;
+    }
+    fsr3_.valid = false;
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    auto make_target = [&](SmaaTexture& target, uint32_t width, uint32_t height, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
+                           D3D12_RESOURCE_STATES state) {
+        D3D12_RESOURCE_DESC desc = Texture2DDesc(format, width, height);
+        desc.Flags = flags;
+        target.state = state;
+        return SUCCEEDED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                                        IID_PPV_ARGS(target.res.ReleaseAndGetAddressOf())));
+    };
+    if (!make_target(fsr3_.depth, w, h, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                     D3D12_RESOURCE_STATE_RENDER_TARGET) ||
+        !make_target(fsr3_.reactive, w, h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                     D3D12_RESOURCE_STATE_RENDER_TARGET) ||
+        !make_target(fsr3_.output, out_w, out_h, kFsr3OutputFormat,
+                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
+        fsr3_.failed = true;
+        LOGR("d3d12: could not allocate FSR 3.1 resources");
+        return false;
+    }
+    dev_->CreateRenderTargetView(fsr3_.depth.res.Get(), nullptr, Cpu(rtv_heap_.Get(), kFsr3DepthRtv, rtv_inc_));
+    dev_->CreateRenderTargetView(fsr3_.reactive.res.Get(), nullptr, Cpu(rtv_heap_.Get(), kFsr3ReactiveRtv, rtv_inc_));
+    dev_->CreateRenderTargetView(fsr3_.output.res.Get(), nullptr, Cpu(rtv_heap_.Get(), kFsr3OutputRtv, rtv_inc_));
+
+    uint64_t count = 0;
+    ffxQueryDescGetVersions versions{{FFX_API_QUERY_DESC_TYPE_GET_VERSIONS, nullptr},
+                                     FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, dev_.Get(), &count, nullptr, nullptr};
+    if (fsr3_.query(nullptr, &versions.header) != FFX_API_RETURN_OK || !count || count > 64) {
+        fsr3_.failed = true;
+        LOGR("d3d12: FidelityFX upscaler providers could not be enumerated");
+        return false;
+    }
+    std::vector<uint64_t> ids(count);
+    std::vector<const char*> names(count);
+    versions.versionIds = ids.data();
+    versions.versionNames = names.data();
+    uint64_t provider = 0;
+    if (fsr3_.query(nullptr, &versions.header) == FFX_API_RETURN_OK) {
+        for (size_t i = 0; i < std::min<uint64_t>(count, names.size()); ++i) {
+            if (names[i] && std::strncmp(names[i], "3.1.", 4) == 0) {
+                provider = ids[i];
+                break;
+            }
+        }
+    }
+    if (!provider) {
+        fsr3_.failed = true;
+        LOGR("d3d12: AMD FSR 3.1 provider is unavailable");
+        return false;
+    }
+    ffxOverrideVersion version{{FFX_API_DESC_TYPE_OVERRIDE_VERSION, nullptr}, provider};
+    ffxCreateBackendDX12Desc backend{{FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12, &version.header}, dev_.Get()};
+    ffxCreateContextDescUpscale desc{};
+    desc.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, &backend.header};
+    desc.flags = FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
+    if (infinite_depth) desc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
+    if (std::getenv("TCNYC_TRACE_TAA")) {
+        desc.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+        desc.fpMessage = [](uint32_t, const wchar_t* message) { LOGR("FSR 3.1: %ls", message); };
+    }
+    desc.maxRenderSize = {w, h};
+    desc.maxUpscaleSize = {out_w, out_h};
+    const auto result = fsr3_.create(&fsr3_.context, &desc.header, nullptr);
+    if (result != FFX_API_RETURN_OK) {
+        fsr3_.failed = true;
+        LOGR("d3d12: FSR 3.1 context creation failed (%u)", result);
+        return false;
+    }
+    fsr3_.w = w;
+    fsr3_.h = h;
+    fsr3_.out_w = out_w;
+    fsr3_.out_h = out_h;
+    fsr3_.infinite_depth = infinite_depth;
+    ffxQueryGetProviderVersion active{{FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION, nullptr}, 0, nullptr};
+    fsr3_.query(&fsr3_.context, &active.header);
+    LOGR("d3d12: FSR context %ux%u -> %ux%u, provider %s", w, h, out_w, out_h,
+         active.versionName ? active.versionName : "unknown");
+    return true;
+}
+
+ID3D12Resource* D3D12Backend::DispatchFsr3(ID3D12Resource* color, D3D12_RESOURCE_STATES& color_state,
+                                          const CameraFrame& camera, bool reset, const float* constants, bool motion) {
+    uint32_t out_w = taa_.w, out_h = taa_.h;
+    if (render_.render_percent < 100) {
+        const float aspect = app::Widescreen() ? app::AspectRatio() : 4.0f / 3.0f;
+        const float width = std::min(float(bb_w_), float(bb_h_) * aspect);
+        out_w = uint32_t(std::lround(width));
+        out_h = uint32_t(std::lround(width / aspect));
+        if (out_w < taa_.w || out_h < taa_.h) return nullptr;
+    }
+    if (!EnsureFsr3(taa_.w, taa_.h, out_w, out_h, camera.far_z <= 0)) return nullptr;
+    static const std::string shader = std::string("#define TAA_RESOLVE 1\n") + kTaaHlsl;
+    static const std::string ms_inputs = std::string("#define DEPTH_MS 1\n") + kTaaHlsl;
+    ID3D12Resource* inputs[3] = {nullptr, taa_.metadata.res.Get(), nullptr};
+    const DXGI_FORMAT input_formats[3] = {DXGI_FORMAT_UNKNOWN, kTemporalMetadataFormat, DXGI_FORMAT_UNKNOWN};
+    auto& depth = fsr3_.depth;
+    auto& reactive = fsr3_.reactive;
+    auto& output = fsr3_.output;
+    Transition(depth.res.Get(), depth.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Transition(reactive.res.Get(), reactive.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (!PassN(motion && motion_samples_ > 1 ? ms_inputs.c_str() : kTaaHlsl, "fsrInputs", DXGI_FORMAT_R32_FLOAT,
+               Cpu(rtv_heap_.Get(), kFsr3DepthRtv, rtv_inc_), taa_.w, taa_.h, inputs, input_formats,
+               constants, 32, -1, motion ? motion_.Get() : nullptr, motion_format_,
+               Cpu(rtv_heap_.Get(), kFsr3ReactiveRtv, rtv_inc_), DXGI_FORMAT_R8_UNORM)) {
+        fsr3_.failed = true;
+        LOGR("d3d12: FSR 3.1 depth and reactive mask pass could not be recorded");
+        return nullptr;
+    }
+
+    auto& dense = taa_.dense_motion;
+    Transition(color, color_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(depth.res.Get(), depth.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(reactive.res.Get(), reactive.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(dense.res.Get(), dense.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(output.res.Get(), output.state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ffxDispatchDescUpscale dispatch{};
+    dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+    dispatch.commandList = cl_;
+    dispatch.color = ffxApiGetResourceDX12(color);
+    dispatch.depth = ffxApiGetResourceDX12(depth.res.Get());
+    dispatch.reactive = ffxApiGetResourceDX12(reactive.res.Get());
+    dispatch.motionVectors = ffxApiGetResourceDX12(dense.res.Get());
+    dispatch.output = ffxApiGetResourceDX12(output.res.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    dispatch.jitterOffset = {taa_jitter_[0], taa_jitter_[1]};
+    dispatch.motionVectorScale = {float(taa_.w), float(taa_.h)};
+    dispatch.renderSize = {taa_.w, taa_.h};
+    dispatch.upscaleSize = {out_w, out_h};
+    dispatch.enableSharpening = render_.sharpening > 0;
+    dispatch.sharpness = float(render_.sharpening) / 100.0f;
+    dispatch.reset = reset || !fsr3_.valid;
+    const auto now = PerfClock::now();
+    dispatch.frameTimeDelta = dispatch.reset ? 1000.0f / 60.0f :
+        std::clamp(std::chrono::duration<float, std::milli>(now - fsr3_.last_dispatch).count(), 1.0f, 1000.0f);
+    dispatch.preExposure = 1.0f;
+    // FidelityFX names the planes by depth-buffer endpoint for reversed Z.
+    dispatch.cameraNear = camera.far_z > 0 ? camera.far_z : FLT_MAX;
+    dispatch.cameraFar = camera.near_z;
+    dispatch.cameraFovAngleVertical = 2.0f * std::atan(1.0f / camera.ys);
+    dispatch.viewSpaceToMetersFactor = 1.0f;
+    const auto result = fsr3_.dispatch(&fsr3_.context, &dispatch.header);
+    Begin();  // FidelityFX binds its own descriptor heap.
+    Transition(color, color_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(dense.res.Get(), dense.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (result != FFX_API_RETURN_OK) {
+        fsr3_.failed = true;
+        LOGR("d3d12: FSR 3.1 dispatch failed (%u)", result);
+        return nullptr;
+    }
+    Transition(output.res.Get(), output.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12Resource* hud_inputs[3] = {color, nullptr, nullptr};
+    const DXGI_FORMAT hud_formats[3] = {color->GetDesc().Format, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+    if (!PassN(shader.c_str(), "fsrHud", kFsr3OutputFormat, Cpu(rtv_heap_.Get(), kFsr3OutputRtv, rtv_inc_),
+               out_w, out_h, hud_inputs, hud_formats, constants, 32, -1,
+               taa_.metadata.res.Get(), kTemporalMetadataFormat))
+        LOGR("d3d12: FSR 3.1 HUD preservation pass could not be recorded");
+    Transition(output.res.Get(), output.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (!fsr3_.valid) LOGR("d3d12: FSR 3.1 %s dispatch succeeded",
+                          render_.render_percent == 100 ? "Native AA" : "Quality");
+    fsr3_.valid = true;
+    fsr3_.last_dispatch = now;
+    return output.res.Get();
+}
+
 ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
     if (taa_.failed || t.depth || !t.w || !t.h) return nullptr;
     const auto depth = scene_depth_.find(&t);
     if (depth == scene_depth_.end() || !depth->second.target || !depth->second.target->res) {
-        taa_.valid = false;
+        ResetTemporalHistory();
         return nullptr;
     }
     ID3D12Resource* color = ResolveColor(t);
@@ -6333,16 +7140,18 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
         for (auto& f : frames_)
             if (f.fence && !WaitFence(f.fence)) return nullptr;
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
-        for (uint32_t i = 0; i < 2; i++) {
-            SmaaTexture& tex = taa_.history[i];
+        SmaaTexture* const targets[] = {&taa_.history[0], &taa_.history[1], &taa_.dense_motion, &taa_.metadata};
+        const DXGI_FORMAT formats[] = {t.fmt, t.fmt, kMotionFormat, kTemporalMetadataFormat};
+        for (uint32_t i = 0; i < kTaaRtvs; i++) {
+            SmaaTexture& tex = *targets[i];
             if (tex.res) Release(std::move(tex.res));
-            D3D12_RESOURCE_DESC td = Texture2DDesc(t.fmt, t.w, t.h);
+            D3D12_RESOURCE_DESC td = Texture2DDesc(formats[i], t.w, t.h);
             td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
             tex.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
             if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, tex.state, nullptr,
                                                      IID_PPV_ARGS(&tex.res)))) {
                 taa_.failed = true;
-                LOGE("d3d12: TAA history could not be created, TAA is off");
+                LOGE("d3d12: temporal targets could not be created, TAA is off");
                 return nullptr;
             }
             dev_->CreateRenderTargetView(tex.res.Get(), nullptr, Cpu(rtv_heap_.Get(), kTaaRtv + i, rtv_inc_));
@@ -6350,8 +7159,8 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
         taa_.w = t.w;
         taa_.h = t.h;
         taa_.fmt = t.fmt;
-        taa_.valid = false;
-        LOGR("d3d12: TAA history %ux%u", t.w, t.h);
+        ResetTemporalHistory();
+        LOGR("d3d12: TAA history and dense motion %ux%u", t.w, t.h);
     }
     // the cameras: this frame's, and the one the history was made with
     // The scene hook records the camera of the frame after the one drawn (tested: one frame earlier is steady), so the
@@ -6364,9 +7173,9 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
     float inv[16], m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     // depth turns into view distance with the camera's own planes (the scene depth's range is normalised for the
     // distance blur and is not in view units)
-    bool reset = !taa_.valid || !cam.serial || cam.xs <= 0 || cam.ys <= 0 || cam.near_z <= 0 ||
-                 !taa_.camera.serial || taa_.camera.xs <= 0;
-    if (!reset && Invert4(cam.view, inv)) {
+    const bool camera_valid = cam.serial && cam.xs > 0 && cam.ys > 0 && cam.near_z > 0 && Invert4(cam.view, inv);
+    const bool reset = !taa_.valid || !camera_valid || cam.world_generation != taa_.camera.world_generation;
+    if (!reset) {
         // row vectors: view = world * V, so previous view = view * inverse(V) * V_previous
         for (int r = 0; r < 4; r++)
             for (int c = 0; c < 4; c++) {
@@ -6374,19 +7183,18 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
                 for (int k = 0; k < 4; k++) sum += inv[r * 4 + k] * taa_.camera.view[k * 4 + c];
                 m[r * 4 + c] = sum;
             }
-    } else {
-        reset = true;
     }
     const SceneDepth& sd = depth->second;
     // TCNYC_TRACE_TAA=1: the inputs, every 30th frame
     static const bool trace = std::getenv("TCNYC_TRACE_TAA") != nullptr;
-    if (trace && presents_ % 30 == 0) {
+    if (trace && (presents_ % 30 == 0 || (reset && taa_.valid))) {
         const float* v = cam.view;
         LOGR("taa: frame %llu serial %llu prev %llu reset %d xs %.4f ys %.4f pxs %.4f pys %.4f near %.3f far %.3f "
-             "wscale %.3f cam planes %.3f %.1f target %ux%u jitter %.2f %.2f",
+             "wscale %.3f cam planes %.3f %.1f target %ux%u jitter %.2f %.2f world %u prev %u",
              (unsigned long long)presents_, (unsigned long long)cam.serial,
              (unsigned long long)taa_.camera.serial, reset ? 1 : 0, cam.xs, cam.ys, taa_.camera.xs, taa_.camera.ys,
-             sd.near_z, sd.far_z, sd.w_scale, cam.near_z, cam.far_z, t.w, t.h, taa_jitter_[0], taa_jitter_[1]);
+             sd.near_z, sd.far_z, sd.w_scale, cam.near_z, cam.far_z, t.w, t.h, taa_jitter_[0], taa_jitter_[1],
+             cam.world_generation, taa_.camera.world_generation);
         LOGR("taa:   view %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.2f %.2f %.2f %.3f", v[0],
              v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
         LOGR("taa:   cur->prev %.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f | %.3f %.3f %.3f", m[0], m[1], m[2],
@@ -6398,7 +7206,7 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
     const bool motion = motion_ && motion_cleared_ == frame_ && motion_w_ == t.w && motion_h_ == t.h &&
                         motion_samples_ == ds.res->GetDesc().SampleDesc.Count;
     if (motion) Transition(motion_.Get(), motion_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    const float p[32] = {m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
+    float p[32] = {m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
                          m[12], m[13], m[14], m[15],
                          cam.xs, cam.ys, taa_.camera.xs, taa_.camera.ys,
                          cam.near_z, cam.far_z > 0 ? cam.far_z : 1e7f, 1.0f, reset ? 1.0f : 0.0f,
@@ -6406,18 +7214,53 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
                          motion ? 1.0f : 0.0f, float(TaaView()), 0, 0};
     SmaaTexture& out = taa_.history[taa_.next];
     SmaaTexture& in = taa_.history[taa_.next ^ 1];
+    SmaaTexture& dense = taa_.dense_motion;
+    SmaaTexture& metadata = taa_.metadata;
+    static const std::string kMs = std::string("#define DEPTH_MS 1\n") + kTaaHlsl;
+    static const std::string kResolve = std::string("#define TAA_RESOLVE 1\n") + kTaaHlsl;
+    const bool ms = ds.res->GetDesc().SampleDesc.Count > 1;
+    ID3D12Resource* motion_inputs[3] = {nullptr, nullptr, ds.res.Get()};
+    const DXGI_FORMAT motion_formats[3] = {kBgra, kBgra, kDepthRead};
+    const auto dense_rtv = Cpu(rtv_heap_.Get(), kTaaRtv + kTaaHistoryCount, rtv_inc_);
+    const auto metadata_rtv = Cpu(rtv_heap_.Get(), kTaaRtv + kTaaHistoryCount + 1, rtv_inc_);
+    Transition(dense.res.Get(), dense.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Transition(metadata.res.Get(), metadata.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (!PassN(ms ? kMs.c_str() : kTaaHlsl, "resolveMotion", kMotionFormat, dense_rtv, t.w, t.h,
+               motion_inputs, motion_formats, p, 32, -1, motion ? motion_.Get() : nullptr, motion_format_,
+               metadata_rtv, kTemporalMetadataFormat)) return nullptr;
+    Transition(dense.res.Get(), dense.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(metadata.res.Get(), metadata.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    // A backend switch must not carry the other backend's history. The selected backend is the only
+    // one that dispatches; clearing the other's valid flag makes a later switch start from reset.
+#if defined(TCNYC_HAVE_DLSS)
+    if (Fsr3Enabled()) dlss_.valid = false;
+#endif
+    if (DlssEnabled() && !Fsr3Enabled()) fsr3_.valid = false;
+    if (DlssEnabled() && camera_valid) {
+        if (auto* dlss = DispatchDlss(color, state, cam, reset, p, motion)) {
+            taa_.camera = cam;
+            taa_.valid = true;
+            return dlss;
+        }
+    }
+    if (Fsr3Enabled() && camera_valid) {
+        if (auto* fsr = DispatchFsr3(color, state, cam, reset, p, motion)) {
+            taa_.camera = cam;
+            taa_.valid = true;
+            return fsr;
+        }
+    }
+    if (!render_.taa) return nullptr;
+    if (fsr3_.valid) p[23] = 1.0f;  // the previous output used FidelityFX's history
     Transition(in.res.Get(), in.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(out.res.Get(), out.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    static const std::string kMs = std::string("#define DEPTH_MS 1\n") + kTaaHlsl;
-    static const std::string kSingle = std::string("#define DEPTH_MS 0\n") + kTaaHlsl;
-    const bool ms = ds.res->GetDesc().SampleDesc.Count > 1;
-    ID3D12Resource* srcs[3] = {color, in.res.Get(), ds.res.Get()};
-    DXGI_FORMAT fmts[3] = {t.fmt, t.fmt, kDepthRead};
-    PassN((ms ? kMs : kSingle).c_str(), "taa", t.fmt, Cpu(rtv_heap_.Get(), kTaaRtv + taa_.next, rtv_inc_), t.w, t.h,
-          srcs, fmts, p, 32, -1, motion ? motion_.Get() : nullptr, kMotionFormat);
+    ID3D12Resource* srcs[3] = {color, in.res.Get(), dense.res.Get()};
+    const DXGI_FORMAT fmts[3] = {t.fmt, t.fmt, kMotionFormat};
+    if (!PassN(kResolve.c_str(), "taa", t.fmt, Cpu(rtv_heap_.Get(), kTaaRtv + taa_.next, rtv_inc_), t.w, t.h,
+               srcs, fmts, p, 32, -1, metadata.res.Get(), kTemporalMetadataFormat)) return nullptr;
     Transition(out.res.Get(), out.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     taa_.next ^= 1;
-    taa_.valid = true;
+    taa_.valid = camera_valid;
     taa_.camera = cam;
     return out.res.Get();
 }
@@ -6589,6 +7432,54 @@ void D3D12Backend::ReleaseOldTextures() {
     }
 }
 
+void D3D12Backend::InitFsr3Profile() {
+    if (!std::getenv("TCNYC_PROFILE_FSR3")) return;
+    const D3D12_QUERY_HEAP_DESC queries{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kFrames * kFsrProfileQueries, 0};
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+    const auto buffer = BufferDesc(uint64_t(queries.Count) * sizeof(uint64_t));
+    if (FAILED(queue_->GetTimestampFrequency(&fsr_profile_frequency_)) || !fsr_profile_frequency_ ||
+        FAILED(dev_->CreateQueryHeap(&queries, IID_PPV_ARGS(&fsr_profile_queries_))) ||
+        FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                                             nullptr, IID_PPV_ARGS(&fsr_profile_readback_)))) {
+        fsr_profile_queries_.Reset();
+        LOGR("d3d12: FSR GPU timestamp profiling unavailable");
+    }
+}
+
+void D3D12Backend::CollectFsr3Profile(Frame& frame) {
+    if (!frame.fsr_profile[0]) return;
+    const auto mode = std::exchange(frame.fsr_profile, {});
+    if (mode != fsr_profile_mode_) {
+        fsr_profile_mode_ = mode;
+        fsr_profile_warmup_ = 30;
+        fsr_profile_count_ = 0;
+        fsr_profile_frame_ms_ = fsr_profile_pass_ms_ = 0;
+    }
+    if (fsr_profile_warmup_) {
+        --fsr_profile_warmup_;
+        return;
+    }
+    const size_t offset = (frame_ % kFrames) * kFsrProfileQueries * sizeof(uint64_t);
+    const D3D12_RANGE range{offset, offset + kFsrProfileQueries * sizeof(uint64_t)};
+    void* mapped = nullptr;
+    if (FAILED(fsr_profile_readback_->Map(0, &range, &mapped))) return;
+    uint64_t ticks[kFsrProfileQueries];
+    std::memcpy(ticks, static_cast<const uint8_t*>(mapped) + offset, sizeof(ticks));
+    const D3D12_RANGE written{0, 0};
+    fsr_profile_readback_->Unmap(0, &written);
+    if (!(ticks[0] <= ticks[1] && ticks[1] <= ticks[2] && ticks[2] <= ticks[3]) || ticks[0] == ticks[3]) return;
+    const double ms_per_tick = 1000.0 / double(fsr_profile_frequency_);
+    fsr_profile_frame_ms_ += double(ticks[3] - ticks[0]) * ms_per_tick;
+    fsr_profile_pass_ms_ += double(ticks[2] - ticks[1]) * ms_per_tick;
+    if (++fsr_profile_count_ == 120) {
+        LOGR("FSR GPU profile: %u%% %ux%u -> %ux%u | 120 frames | queue span %.3f ms | temporal passes %.3f ms",
+             mode[0], mode[1], mode[2], mode[3], mode[4],
+             fsr_profile_frame_ms_ / 120.0, fsr_profile_pass_ms_ / 120.0);
+        fsr_profile_count_ = 0;
+        fsr_profile_frame_ms_ = fsr_profile_pass_ms_ = 0;
+    }
+}
+
 void D3D12Backend::ResetFrame() {
     Frame& f = CurrentFrame();
     if (f.fence && fence_->GetCompletedValue() < f.fence) {
@@ -6599,6 +7490,7 @@ void D3D12Backend::ResetFrame() {
             kernel::Shutdown(1);
         }
     }
+    if (fsr_profile_queries_) CollectFsr3Profile(f);
     RecycleFrameViews(f, uint32_t(frame_ % kFrames));
     f.alloc->Reset();
     f.garbage.clear();
@@ -6719,10 +7611,45 @@ void D3D12Backend::Present(const Surface& front) {
     }
 
     // TAA replaces SMAA on the 3D scene when it is on; movies and pictures keep SMAA
-    ID3D12Resource* aa = t && render_.taa && t->scene_frame == frame_ ? ApplyTaa(*t) : nullptr;
+    const uint32_t profile_slot = uint32_t(frame_ % kFrames) * kFsrProfileQueries;
+    if (fsr_profile_queries_)
+        cl_->EndQuery(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, profile_slot + 1);
+    ID3D12Resource* aa = t && TemporalEnabled() && t->scene_frame == frame_ ? ApplyTaa(*t) : nullptr;
+    const bool profile_fsr = fsr_profile_queries_ && aa && aa == fsr3_.output.res.Get();
+#if defined(TCNYC_HAVE_DLSS)
+    const bool profile_dlss = fsr_profile_queries_ && aa && aa == dlss_.output.res.Get();
+#else
+    const bool profile_dlss = false;
+#endif
+    if (profile_fsr || profile_dlss)
+        cl_->EndQuery(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, profile_slot + 2);
+#if defined(TCNYC_HAVE_DLSS)
+    if (!aa || (aa != fsr3_.output.res.Get() && aa != dlss_.output.res.Get())) {
+        fsr3_.valid = false;
+        dlss_.valid = false;
+    }
+#else
+    if (!aa || aa != fsr3_.output.res.Get()) fsr3_.valid = false;
+#endif
+    if (!aa) {
+        ResetTemporalHistory();
+        motion_now_.clear();
+        road_projection_now_ = {};
+    }
     if (!aa && t && render_.smaa) aa = ApplySmaa(*t);
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi, aa);
+    if (profile_fsr || profile_dlss) {
+        cl_->EndQuery(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, profile_slot + 3);
+        cl_->ResolveQueryData(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, profile_slot, kFsrProfileQueries,
+                              fsr_profile_readback_.Get(), uint64_t(profile_slot) * sizeof(uint64_t));
+#if defined(TCNYC_HAVE_DLSS)
+        if (profile_dlss)
+            CurrentFrame().fsr_profile = {render_.render_percent, dlss_.w, dlss_.h, dlss_.out_w, dlss_.out_h};
+        else
+#endif
+            CurrentFrame().fsr_profile = {render_.render_percent, fsr3_.w, fsr3_.h, fsr3_.out_w, fsr3_.out_h};
+    }
     if (!motion_trace_.empty() && frame_ % 120 == 0) {
         std::string line;
         for (const auto& [k, v] : motion_trace_) line += " | " + k + " " + std::to_string(v / 120);
@@ -6732,6 +7659,8 @@ void D3D12Backend::Present(const Surface& front) {
     // TAA object motion: this frame's draws are the next frame's previous ones
     motion_was_ = std::move(motion_now_);
     motion_now_.clear();
+    road_projection_was_ = road_projection_now_;
+    road_projection_now_ = {};
     motion_rt_ = nullptr;
     scene_depth_.clear();
     dof_depth_ = nullptr;
@@ -6758,26 +7687,32 @@ void D3D12Backend::Present(const Surface& front) {
     ReleaseOldTextures();
     if (frame_ % 60 == 0) SweepTargets();
     SavePipelineLibrary(false);
+    render_ = app::Snapshot();
+    LoadFsr3();
+    LoadDlss();
     // the next frame's TAA jitter: an 8-step Halton (2, 3) pattern within the pixel
-    if (render_.taa) {
+    if (TemporalEnabled()) {
         auto halton = [](uint32_t i, uint32_t b) {
             float f = 1, r = 0;
             for (; i; i /= b) r += (f /= float(b)) * float(i % b);
             return r;
         };
-        const uint32_t i = uint32_t(frame_ % 8) + 1;
+        const uint32_t phases = Fsr3Enabled() && render_.render_percent == 67 ? 18 : 8;
+        const uint32_t i = uint32_t(frame_ % phases) + 1;
         taa_jitter_[0] = halton(i, 2) - 0.5f;
         taa_jitter_[1] = halton(i, 3) - 0.5f;
     } else {
         taa_jitter_[0] = taa_jitter_[1] = 0;
-        taa_.valid = false;
+        ResetTemporalHistory();
     }
     WaitFrameLatency();
     ResetFrame();
     CountFps();
     if (diag::Perf()) LogPerf();
-    render_ = app::Snapshot();
     ApplySettings();  // reads render_
+    if (fsr_profile_queries_)
+        cl_->EndQuery(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                      uint32_t(frame_ % kFrames) * kFsrProfileQueries);
 }
 
 void D3D12Backend::SetFrameLatency(bool low) {
@@ -6852,6 +7787,9 @@ void D3D12Backend::ApplySettings() {
     }
     bool remake = ext_ && ext_->Settings();
     if (std::fabs(want - scale_) > 1e-4f || std::fabs(want_stretch - stretch_) > 1e-4f || want_msaa != msaa_ || remake) {
+        ResetTemporalHistory();
+        motion_was_.clear();
+        road_projection_was_ = {};
         Flush();
         scene_depth_.clear();
         if (remake) {

@@ -88,6 +88,7 @@ struct CameraFrame {
     float xs = 0, ys = 0;  // clip x = view x * xs / view z, likewise y
     float near_z = 0, far_z = 0;  // the projection's planes in view units (far 0: infinite)
     uint64_t serial = 0;   // the game's frame it was written in, 0 before any
+    uint32_t world_generation = 0;
 };
 inline std::mutex g_camera_mutex;
 inline CameraFrame g_camera_now;            // under g_camera_mutex
@@ -103,5 +104,10 @@ inline CameraFrame CameraOf(uint64_t present) {
 
 // lut.cube (a colour grading table) was found and loaded; the Graphics menu shows its strength row
 inline std::atomic<bool> g_lut_loaded{false};
+
+// DLSS availability, published by the D3D12 backend after its NGX probe. The menu reads it without
+// calling into the renderer; Unknown means the probe has not run yet.
+enum class DlssState : uint32_t { Unknown, Available, Unavailable, NotBuilt };
+inline std::atomic<DlssState> g_dlss_state{DlssState::Unknown};
 
 }  // namespace gpu
