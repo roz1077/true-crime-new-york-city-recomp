@@ -1188,15 +1188,6 @@ private:
     bool EnsureBloom(uint32_t src_w, uint32_t src_h);
     void DestroyBloomTargets();
     VkImageView BuildBloom(VkImageView src, uint32_t w, uint32_t h);
-    // the colour grading table (post_fx.h): lut.cube beside the executable, else a 2x2x2 identity
-    struct GradeLut {
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-        uint32_t size = 2;
-        bool loaded = false, tried = false;
-    } grade_;
-    void EnsureGradeLut();
     // FSR 1 (post_fx.h): easu is output sized, rcas whichever size it sharpened; both in the scene's format
     struct FsrState {
         SmaaImage easu, rcas;
@@ -1275,7 +1266,7 @@ private:
     };
     RoadProjection road_projection_now_, road_projection_was_;
     std::map<std::string, uint32_t> motion_trace_;
-    std::map<std::string, uint32_t> pass_reasons_;
+    std::map<std::string, uint32_t> pass_reasons_;  // TCNYC_PERF: why each new scene pass started
     // draw sets already written this frame, by the buffers, image views, layouts and samplers they name (the
     // constants are dynamic offsets): most draws reuse one instead of writing 11 descriptors
     std::unordered_map<uint64_t, VkDescriptorSet> draw_set_cache_;
@@ -1286,7 +1277,7 @@ private:
         uint32_t count = 0, bytes = 0, w = 0, h = 0, format = 0;
         const char* why = "";
     };
-    std::unordered_map<uint32_t, UploadStat> upload_stats_;  // TCNYC_PERF_SPLITS: texture uploads by address  // TCNYC_PERF: why each new scene pass started
+    std::unordered_map<uint32_t, UploadStat> upload_stats_;  // TCNYC_PERF_SPLITS: texture uploads by address
     const VertexConstants* MatchPrevious(uint64_t id, uint32_t ordinal, const State& s);
     const VertexConstants* PreviousRoadConstants(const VertexConstants& current);
     // the resolve: dense motion and metadata, then the history blend into history[next]
@@ -1461,7 +1452,7 @@ private:
     bool dump_targets_ = false;
     bool dump_now_ = false;
     uint32_t dump_frame_ = 0;
-    std::string dump_prefix_ = "target";  // TEMP: mid-frame dumps name themselves
+    std::string dump_prefix_ = "target";  // mid-frame dumps name themselves
     std::vector<uint32_t> dump_tex_list_;
     std::unordered_set<uint32_t> frame_tex_;
     std::string frame_trace_;
@@ -3105,8 +3096,8 @@ bool VulkanBackend::CreatePresent() {
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
     if (vkCreateSampler(device_, &si, nullptr, &present_point_sampler_) != VK_SUCCESS) return false;
 
-    // 0 frame, 1 gamma ramp, 2 depth, 3 and 4 samplers, 5 the bloom chain, 6 the colour grading table
-    VkDescriptorSetLayoutBinding bind[7]{};
+    // 0 frame, 1 gamma ramp, 2 depth, 3 and 4 samplers, 5 the bloom chain
+    VkDescriptorSetLayoutBinding bind[6]{};
     for (int i = 0; i < 3; i++) {
         bind[i].binding = uint32_t(i);
         bind[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -3123,14 +3114,12 @@ bool VulkanBackend::CreatePresent() {
     bind[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     bind[5].descriptorCount = 1;
     bind[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    bind[6] = bind[5];
-    bind[6].binding = 6;
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 7;
+    li.bindingCount = 6;
     li.pBindings = bind;
     if (vkCreateDescriptorSetLayout(device_, &li, nullptr, &present_set_layout_) != VK_SUCCESS) return false;
 
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 5},
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4},
                                      {VK_DESCRIPTOR_TYPE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 1;
@@ -3146,7 +3135,7 @@ bool VulkanBackend::CreatePresent() {
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &present_set_layout_;
-    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 20};  // contrast, bloom, dof, source size, near/far, HDR, source rect, grading
+    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 16};  // contrast, bloom, dof, source size, near/far, HDR, source rect
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &push;
     if (vkCreatePipelineLayout(device_, &pl, nullptr, &present_pipeline_layout_) != VK_SUCCESS) return false;
@@ -3158,10 +3147,8 @@ bool VulkanBackend::CreatePresent() {
 [[vk::binding(3, 0)]] SamplerState frameSampler;
 [[vk::binding(4, 0)]] SamplerState depthSampler;
 [[vk::binding(5, 0)]] Texture2D<float4> bloomTex;
-[[vk::binding(6, 0)]] Texture3D<float4> gradeTex;
 // chain: the bloom chain is bound (bloomTex); without it BloomAt taps the frame
-// grade: x the grading table's entries a side, y its strength (0 off)
-struct PC { float pc; float bloom; float dof; float chain; float2 src; float2 zrange; float4 hdr; float4 rect; float4 grade; };
+struct PC { float pc; float bloom; float dof; float chain; float2 src; float2 zrange; float4 hdr; float4 rect; };
 [[vk::push_constant]] ConstantBuffer<PC> pc;
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
@@ -3265,12 +3252,6 @@ float3 DistanceBlur(float2 uv, float3 color) {
     return count > 0 ? sum / count : color;
 }
 
-float3 Grade(float3 c) {
-    if (pc.grade.y <= 0.0) return c;
-    float3 uvw = saturate(c) * ((pc.grade.x - 1) / pc.grade.x) + 0.5 / pc.grade.x;
-    return lerp(c, gradeTex.SampleLevel(frameSampler, uvw, 0).rgb, pc.grade.y);
-}
-
 // Match the PC release's tone on the finished frame (same curve as the D3D12 backend).
 float3 PcContrast(float3 c) {
     const float3 L = float3(0.2126, 0.7152, 0.0722);
@@ -3302,7 +3283,6 @@ float4 psmain(O i) : SV_Target {
         float3 b = pc.bloom > 0.0 ? BloomAt(i.uv) * (1.2 * pc.bloom) : 0;
         g += b;
         if (pc.pc > 0.0) g = lerp(g, PcContrast(g), pc.pc);
-        g = Grade(g);
         float3 over = max(c.rgb + b - 1.0, 0.0);
         float3 lin = SrgbToLinear(saturate(g));
         lin = HdrHighlights(lin, pc.hdr.y, pc.hdr.z, pc.hdr.w) + over * (2.4 * pc.hdr.w);
@@ -3313,8 +3293,7 @@ float4 psmain(O i) : SV_Target {
     }
     if (pc.bloom > 0.0) c.rgb += BloomAt(i.uv) * (1.2 * pc.bloom);
     if (pc.pc > 0.0) c.rgb = PcContrast(c.rgb);
-    c.rgb = Grade(c.rgb);
-    if (pc.pc > 0.0 || pc.grade.y > 0.0) {
+    if (pc.pc > 0.0) {
         static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
         int2 dp = int2(i.pos.xy) % 4;
         float d = (kDither[dp.y * 4 + dp.x] + 0.5) / 16.0 - 0.5;
@@ -3503,13 +3482,12 @@ void VulkanBackend::ResetFrame() {
         LOGR("draw splits: %.2f ms per frame, %.0f draws%s", total, splits_draws_ / 120.0, line.c_str());
         splits_draws_ = 0;
         std::vector<std::pair<uint32_t, uint32_t>> top;
-        uint64_t total_bytes = 0, total_count = 0, hashed = 0;
+        uint64_t total_bytes = 0, total_count = 0;
         for (const auto& [addr, u] : upload_stats_) {
             top.push_back({u.count, addr});
             total_bytes += uint64_t(u.bytes) * u.count;
             total_count += u.count;
         }
-        (void)hashed;
         std::sort(top.rbegin(), top.rend());
         std::string tl;
         for (size_t i = 0; i < top.size() && i < 6; i++) {
@@ -3519,13 +3497,13 @@ void VulkanBackend::ResetFrame() {
                           u.bytes, u.count, u.why);
             tl += part;
         }
-{
+        {
             std::string sl;
             for (const auto& [k, v] : submit_where_) sl += " | " + k + " " + std::to_string(v / 120.0).substr(0, 5);
             LOGR("submits: per frame%s", sl.c_str());
             submit_where_.clear();
         }
-                LOGR("texture uploads: %.1f per frame, %.0f KB per frame%s", total_count / 120.0,
+        LOGR("texture uploads: %.1f per frame, %.0f KB per frame%s", total_count / 120.0,
              total_bytes / 120.0 / 1024.0, tl.c_str());
         upload_stats_.clear();
         splits_ms_.clear();
@@ -8569,80 +8547,6 @@ VkImageView VulkanBackend::BuildBloom(VkImageView src, uint32_t w, uint32_t h) {
     return bloom_.up[0].view;
 }
 
-// The grading table as a 3D image, made and uploaded once on the frame's command buffer (as SMAA's lookups are).
-void VulkanBackend::EnsureGradeLut() {
-    if (grade_.tried) return;
-    grade_.tried = true;
-    const ColourLut table = LoadCubeLut(app::ExeDir() / "lut.cube");
-    const uint32_t n = table.size;
-    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    info.imageType = VK_IMAGE_TYPE_3D;
-    info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-    info.extent = {n, n, n};
-    info.mipLevels = 1;
-    info.arrayLayers = 1;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
-    info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    auto fail = [&](const char* what) {
-        LOGE("vulkan: the colour grading table %s", what);
-        g_lut_loaded.store(false, std::memory_order_relaxed);
-    };
-    if (vkCreateImage(device_, &info, nullptr, &grade_.image) != VK_SUCCESS) return fail("image could not be made");
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(device_, grade_.image, &req);
-    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    alloc.allocationSize = req.size;
-    bool found = false;
-    for (uint32_t i = 0; i < mem_props_.memoryTypeCount && !found; i++)
-        if ((req.memoryTypeBits & (1u << i)) &&
-            (mem_props_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-            alloc.memoryTypeIndex = i;
-            found = true;
-        }
-    if (!found || vkAllocateMemory(device_, &alloc, nullptr, &grade_.memory) != VK_SUCCESS)
-        return fail("has no memory");
-    vkBindImageMemory(device_, grade_.image, grade_.memory, 0);
-    void* cpu = nullptr;
-    const uint64_t bytes = uint64_t(n) * n * n * 16;
-    const UploadAlloc up = AllocUpload(bytes, 16, &cpu);
-    if (!cpu) return fail("could not be uploaded");
-    std::memcpy(cpu, table.rgba.data(), bytes);
-    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = grade_.image;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &b);
-    VkBufferImageCopy copy{};
-    copy.bufferOffset = up.offset;
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {n, n, n};
-    vkCmdCopyBufferToImage(cmd_, up.buffer, grade_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &b);
-    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    view.image = grade_.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_3D;
-    view.format = info.format;
-    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(device_, &view, nullptr, &grade_.view) != VK_SUCCESS) {
-        grade_.view = VK_NULL_HANDLE;
-        return fail("view could not be made");
-    }
-    grade_.size = n;
-    grade_.loaded = table.loaded;
-    g_lut_loaded.store(table.loaded, std::memory_order_relaxed);
-    if (table.loaded) LOGR("vulkan: colour grading table lut.cube, %u entries a side", n);
-}
-
 // The game's colour shadow image, as d3d12.cpp NoteShadowImage finds it: a small colour target never drawn with a
 // depth buffer, read by a depth-tested draw into the frame; a same-sized target the blur draws into from one joins
 // it. True when this read is the scene's (the one Shadow softness applies to). The draw's targets are not bound
@@ -9926,7 +9830,6 @@ void VulkanBackend::Present(const Surface& front) {
         gamma_dirty_ = false;
     }
 
-    EnsureGradeLut();  // the colour grading table, uploaded on this command buffer the first time
 
     // TAA replaces SMAA on the 3D scene when it is on (movies and still pictures keep SMAA)
     VkImageView taa_view = VK_NULL_HANDLE;
@@ -10062,22 +9965,13 @@ void VulkanBackend::Present(const Surface& front) {
     VkDescriptorImageInfo bloom_info{};
     bloom_info.imageView = bloom_view ? bloom_view : white_view_;
     bloom_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet writes[7]{};
+    VkWriteDescriptorSet writes[6]{};
     writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[5].dstSet = present_set_;
     writes[5].dstBinding = 5;
     writes[5].descriptorCount = 1;
     writes[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     writes[5].pImageInfo = &bloom_info;
-    VkDescriptorImageInfo grade_info{};
-    grade_info.imageView = grade_.view;
-    grade_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[6].dstSet = present_set_;
-    writes[6].dstBinding = 6;
-    writes[6].descriptorCount = 1;
-    writes[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    writes[6].pImageInfo = &grade_info;
     for (int i = 0; i < 3; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = present_set_;
@@ -10094,7 +9988,7 @@ void VulkanBackend::Present(const Surface& front) {
         writes[3 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         writes[3 + i].pImageInfo = &samplers[i];
     }
-    vkUpdateDescriptorSets(device_, grade_.view ? 7 : 6, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device_, 6, writes, 0, nullptr);
 
     const bool hdr = hdr_output_ != HdrOutput::Off;
     const uint32_t reported_peak = display_peak_nits_ ? display_peak_nits_ : 1000;
@@ -10183,16 +10077,14 @@ void VulkanBackend::Present(const Surface& front) {
     }
     vkCmdSetViewport(cmd_, 0, 1, &frame_viewport);
     const bool picture = front.picture != gpu::Picture::Unknown;
-    float present_pc[20] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? float(snapshot.bloom_strength) / 100.0f : 0.0f,
+    float present_pc[16] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? float(snapshot.bloom_strength) / 100.0f : 0.0f,
                             dof_on ? 1.0f : 0.0f, bloom_view ? 1.0f : 0.0f,
                             bloom_w ? 1.0f / float(bloom_w) : 0.0f,
                             bloom_h ? 1.0f / float(bloom_h) : 0.0f,
                             dof ? dof->near_w : 0.1f, dof ? dof->far_w : 1000.0f,
                             hdr_mode, hdr_paper, hdr_peak, hdr_strength,
                             picture ? layout.uv[0] : 0.0f, picture ? layout.uv[1] : 0.0f,
-                            picture ? layout.uv[2] : 1.0f, picture ? layout.uv[3] : 1.0f,
-                            float(grade_.size),
-                            !picture && grade_.loaded ? float(snapshot.lut_strength) / 100.0f : 0.0f, 0.0f, 0.0f};
+                            picture ? layout.uv[2] : 1.0f, picture ? layout.uv[3] : 1.0f};
     vkCmdPushConstants(cmd_, present_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(present_pc),
                        present_pc);
     vkCmdDraw(cmd_, 3, 1, 0, 0);

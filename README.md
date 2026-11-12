@@ -98,7 +98,6 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Bloom strength | 50% to 400% of the original bloom, which is very subtle at 100% (the default). |
 | Shadow quality | Original (follows render scale), High (1024x1024) or Ultra (2048x2048) shadow image. Original by default. |
 | Shadow softness | Off, Soft or Softer shadow edges. Off by default. |
-| Colour grading | Strength (0% to 100%) of a `lut.cube` colour grading table placed beside the executable; unavailable without one. |
 | Depth of field | Distance blur for 3D scenes. On by default. |
 | Ambient occlusion | GTAO contact shadows in corners and under objects, applied to world geometry only so lights, fog and effects keep their brightness. Off, Half or Full resolution. Off by default. Windows (D3D12) and Linux (Vulkan). |
 | Building seam fix | Experimental: gives detailed buildings priority over simplified city meshes. On by default. |

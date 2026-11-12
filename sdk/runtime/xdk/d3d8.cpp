@@ -1137,7 +1137,7 @@ HLE_STDCALL(D3DDevice_SetIndices, 2) {
 
 // shaders
 
-// TODO(pre-beta): a shader that fails validation still fails the create. A basic logged fallback program would let the
+// TODO(post-beta): a shader that fails validation still fails the create. A basic logged fallback program would let the
 // draw through white instead of disappearing; changing program matching is too invasive for this pass.
 HLE_STDCALL(D3DDevice_CreateVertexShader, 4) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);

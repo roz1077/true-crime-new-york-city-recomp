@@ -36,6 +36,7 @@ enum class Option {
     Anisotropic,
     Msaa,
     Smaa,
+    Taa,
     Bloom,
     BloomStrength,
     DepthOfField,
@@ -65,7 +66,7 @@ inline constexpr Option kMainOptions[] = {
     Option::DisplayMode, Option::Resolution,       Option::Aspect,          Option::RenderScale,
     Option::Upscaler,    Option::Sharpening,
     Option::FieldOfView, Option::ObjectDetail,     Option::Anisotropic,     Option::Msaa,
-    Option::Smaa,        Option::Bloom,            Option::BloomStrength,
+    Option::Smaa,        Option::Taa,              Option::Bloom,            Option::BloomStrength,
     Option::DepthOfField,    Option::AmbientOcclusion, Option::ShadowQuality, Option::ShadowSoftness,
     Option::BuildingSeamFix, Option::PcContrast,   Option::VSync,
 #ifdef _WIN32
@@ -111,8 +112,12 @@ struct Values {
     uint32_t hdr_paper_white = 200, hdr_peak = 0, hdr_highlights = 40;  // app::Settings defaults
     uint32_t display_peak = 0; // the HDR display's reported peak in nits, 0 when unknown (read only)
     uint32_t upscaler = 0, sharpening = 0, bloom_strength = 100, shadow_resolution = 0, shadow_softness = 0;  // app::Settings defaults
-    bool low_latency = false;
+    bool low_latency = false, taa = false;
+    // the upscalers' availability (read only): gpu::FsrState and gpu::DlssState as numbers, 0 not known yet
+    uint32_t fsr_state = 0, dlss_state = 0;
 };
+inline constexpr uint32_t kFsrNo4 = 2, kFsrNoDll = 3;              // gpu::FsrState
+inline constexpr uint32_t kDlssUnavailable = 2, kDlssNotBuilt = 3; // gpu::DlssState
 
 inline bool DisplayPending(const Values &v) { return v.size != v.applied || v.mode != v.applied_mode; }
 
@@ -262,6 +267,9 @@ inline void Change(Values &v, Option option, int direction, std::span<const uint
     case Option::Smaa:
         v.smaa = !v.smaa;
         break;
+    case Option::Taa:
+        v.taa = !v.taa;
+        break;
     case Option::Bloom:
         v.bloom = !v.bloom;
         break;
@@ -354,11 +362,22 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
             static const char *const kPresets[] = {"PERFORMANCE", "BALANCED", "QUALITY", "NATIVE AA"};
             const int preset = v.render_percent == 50 ? 0 : v.render_percent == 58 ? 1 : v.render_percent == 67 ? 2
                                : v.render_percent == 100 ? 3 : -1;
-            if (preset < 0)
+            const bool fsr = v.upscaler != choices::kDlss;
+            if (fsr && v.fsr_state == kFsrNoDll)
+                std::snprintf(text, kTextBytes, "UPSCALER %s (AMD DLLS MISSING)", name);
+            else if (!fsr && v.dlss_state == kDlssNotBuilt)
+                std::snprintf(text, kTextBytes, "UPSCALER DLSS (NOT BUILT)");
+            else if (!fsr && v.dlss_state == kDlssUnavailable)
+                std::snprintf(text, kTextBytes, "UPSCALER DLSS (UNAVAILABLE)");
+            else if (preset < 0)
                 std::snprintf(text, kTextBytes, "UPSCALER %s NEEDS 50/58/67/100%%", name);
+            else if (v.upscaler == choices::kFsr4 && v.fsr_state == kFsrNo4)
+                std::snprintf(text, kTextBytes, "UPSCALER FSR 4.1 %s (USING 3.1)", kPresets[preset]);
             else
                 std::snprintf(text, kTextBytes, "UPSCALER %s %s", name, kPresets[preset]);
         }
+        else if (v.render_percent >= 100)
+            std::snprintf(text, kTextBytes, "UPSCALER %s (OFF AT 100%%)", v.upscaler == 1 ? "FSR 1" : "BILINEAR");
         else
             std::snprintf(text, kTextBytes, "UPSCALER %s", v.upscaler == 1 ? "FSR 1" : "BILINEAR");
         break;
@@ -393,6 +412,9 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
         break;
     case Option::Smaa:
         std::snprintf(text, kTextBytes, "SMAA %s", OnOff(v.smaa));
+        break;
+    case Option::Taa:
+        std::snprintf(text, kTextBytes, "TAA %s", OnOff(v.taa));
         break;
     case Option::Bloom:
         std::snprintf(text, kTextBytes, "BLOOM %s", OnOff(v.bloom));

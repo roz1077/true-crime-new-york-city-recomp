@@ -152,10 +152,11 @@ float4 taa(O i) : SV_Target {
     const int2 last = int2(round(1.0 / px.zw)) - 1;
     [unroll] for (int y = -1; y <= 1; y++)
         [unroll] for (int x = -1; x <= 1; x++) {
-            float3 n = ToYCoCg(cur.Load(int3(ip + int2(x, y), 0)).rgb);
+            // clamped to the image: a read past the edge is 0 on D3D12 and undefined on Vulkan
+            int2 at = clamp(ip + int2(x, y), 0, last);
+            float3 n = ToYCoCg(cur.Load(int3(at, 0)).rgb);
             sum1 += n;
             sum2 += n * n;
-            int2 at = clamp(ip + int2(x, y), 0, last);
             float2 info = motionMetadata.Load(int3(at, 0));
             if (info.x > near_depth) {
                 near_depth = info.x;

@@ -397,12 +397,10 @@ bool CaptureOn() {
 }
 
 const char* kBlitHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; float4 hdr; float4 grade; };
+cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; float4 hdr; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
 Texture2D bloomTex : register(t2);
-// colour grading (post_fx.h ColourLut): grade.x entries a side, grade.y strength, 0 off
-Texture3D gradeTex : register(t4);
 // the scene depth for distance blur: multisampled with MSAA, a plain texture without (DEPTH_SINGLE)
 #ifdef DEPTH_SINGLE
 Texture2D<float> depthTex : register(t3);
@@ -531,12 +529,6 @@ float3 DistanceBlur(float2 uv, float3 color) {
     return count > 0 ? sum / count : color;
 }
 
-float3 Grade(float3 c) {
-    if (grade.y <= 0) return c;
-    float3 uvw = saturate(c) * ((grade.x - 1) / grade.x) + 0.5 / grade.x;
-    return lerp(c, gradeTex.SampleLevel(ls, uvw, 0).rgb, grade.y);
-}
-
 // Match the PC release's tone on the finished frame.
 float3 PcContrast(float3 c) {
     const float3 L = float3(0.2126, 0.7152, 0.0722);
@@ -585,7 +577,6 @@ float4 psmain(O i) : SV_Target {
         float3 b = post.y > 0 ? Bloom(i.uv) * (1.2 * post.y) : 0;
         g += b;
         if (post.x > 0) g = lerp(g, PcContrast(g), post.x);
-        g = Grade(g);
         float3 over = max(c.rgb + b - 1.0, 0.0);
         float3 lin = SrgbToLinear(saturate(g));
         lin = HdrHighlights(lin, hdr.y, hdr.z, hdr.w) + over * (2.4 * hdr.w);
@@ -596,8 +587,7 @@ float4 psmain(O i) : SV_Target {
     }
     if (post.y > 0) c.rgb += Bloom(i.uv) * (1.2 * post.y);
     if (post.x > 0) c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
-    c.rgb = Grade(c.rgb);
-    if (post.x > 0 || grade.y > 0) {
+    if (post.x > 0) {
         // The contrast curve stretches the darkest 8-bit steps; an ordered dither breaks them up
         // before the back buffer quantises the result again.
         static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
@@ -921,7 +911,6 @@ struct BlitOptions {
     float paper_white = 200;  // SDR white in nits
     float peak = 1000;        // highlight peak in nits
     float highlights = 0.4f;  // inverse tone map strength, 0..1 (app::Settings::hdr_highlights / 100)
-    float grade = 0;          // colour grading strength, 0..1, 0 off
 };
 
 // Shrink's settings past the source and the size
@@ -1472,11 +1461,6 @@ private:
     };
     std::vector<CapTex> cap_tex_;
     ComPtr<ID3D12Resource> lut_;
-    // the colour grading table (post_fx.h): lut.cube beside the executable, else a 2x2x2 identity
-    ComPtr<ID3D12Resource> grade_lut_;
-    uint32_t grade_size_ = 2;
-    bool grade_loaded_ = false;
-    void CreateGradeLut();
     struct SmaaTexture {
         ComPtr<ID3D12Resource> res;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -1634,7 +1618,7 @@ private:
         }
     } motion_now_, motion_was_;
     VertexConstants motion_match_{};
-    // The road programs build static world positions from streamed strips, then project with c92â€“c95.
+    // The road programs build static world positions from streamed strips, then project with c92-c95.
     static constexpr size_t kRoadProjection = 188;  // guest constant 92 is host constant 188
     struct RoadProjection {
         std::array<VertexConstants::value_type, 4> rows{};
@@ -1796,7 +1780,6 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
 #endif
     LoadDlss();
     Begin();
-    CreateGradeLut();
     InitFsr3Profile();
     if (fsr_profile_queries_) cl_->EndQuery(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
@@ -2112,45 +2095,6 @@ void D3D12Backend::CreateGammaLut() {
     D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_B8G8R8A8_UNORM, 256, 1);
     dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                   IID_PPV_ARGS(&lut_));
-}
-
-// The grading table as a 3D texture, uploaded on the open command list at init.
-void D3D12Backend::CreateGradeLut() {
-    const ColourLut table = LoadCubeLut(app::ExeDir() / "lut.cube");
-    grade_size_ = table.size;
-    grade_loaded_ = table.loaded;
-    g_lut_loaded.store(table.loaded, std::memory_order_relaxed);
-    if (table.loaded) LOGR("d3d12: colour grading table lut.cube, %u entries a side", table.size);
-    const uint32_t n = table.size;
-    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC td{};
-    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-    td.Width = n;
-    td.Height = n;
-    td.DepthOrArraySize = UINT16(n);
-    td.MipLevels = 1;
-    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-    td.SampleDesc.Count = 1;
-    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&grade_lut_)))) {
-        LOGE("d3d12: the colour grading table could not be created");
-        grade_loaded_ = false;
-        g_lut_loaded.store(false, std::memory_order_relaxed);
-        return;
-    }
-    const uint32_t row = n * 16, pitch = UploadPitch(row);
-    Alloc a = Upload(uint64_t(pitch) * n * n, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-    if (!a.res) return;
-    for (uint32_t z = 0; z < n; z++)
-        for (uint32_t y = 0; y < n; y++)
-            std::memcpy(a.cpu + (size_t(z) * n + y) * pitch, &table.rgba[(size_t(z) * n + y) * n * 4], row);
-    D3D12_TEXTURE_COPY_LOCATION dl{grade_lut_.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    D3D12_TEXTURE_COPY_LOCATION sl{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    sl.PlacedFootprint.Offset = a.off;
-    sl.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, n, n, n, pitch};
-    cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
-    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
-    Transition(grade_lut_.Get(), state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 void D3D12Backend::LoadSettings() {
@@ -2804,7 +2748,7 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     // DEPTH_SINGLE variant's Texture2D view
     ID3D12Resource* depth = o.depth;
     const bool depth_single = depth && depth->GetDesc().SampleDesc.Count == 1;
-    uint32_t slot = AllocSrvSlots(5);  // t0-t3, then the grading table
+    uint32_t slot = AllocSrvSlots(4);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -2821,24 +2765,14 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     if (depth_single) sv.Texture2D.MipLevels = 1;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     dev_->CreateShaderResourceView(depth, &sv, Cpu(srv_heap_.Get(), slot + 3, srv_inc_));
-    // the grading table at t4, the root slot AO's occlusion uses during the scene (the deferred flush sets it again)
-    const uint32_t grade_slot = slot + 4;
-    sv = {};
-    sv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-    sv.Texture3D.MipLevels = 1;
-    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    dev_->CreateShaderResourceView(grade_lut_.Get(), &sv, Cpu(srv_heap_.Get(), grade_slot, srv_inc_));
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
     if (!cb.res) return;
-    Cmd()->SetGraphicsRootDescriptorTable(4, Gpu(srv_heap_.Get(), grade_slot, srv_inc_));
-    float c[24] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
+    float c[20] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                    o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
                    o.post, o.bloom, depth ? o.dof : 0.0f, o.bloom_tex ? (BloomView() ? 2.0f : 1.0f) : 0.0f,
                    o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z,
-                   o.hdr_mode, o.paper_white, o.peak, o.highlights,
-                   float(grade_size_), o.grade, 0.0f, 0.0f};
+                   o.hdr_mode, o.paper_white, o.peak, o.highlights};
     std::memcpy(cb.cpu, c, sizeof(c));
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples, depth_single), cb.gpu, slot, si);
 }
@@ -5248,10 +5182,9 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // geometry, counted while the title runs a visibility test
     if (prev_consts) {  // the matched draw's previous constants at b2 for the motion variant
         Alloc pc = Upload(sizeof(VertexConstants), 256);
-        if (pc.res) {
-            std::memcpy(pc.cpu, prev_consts->data(), sizeof(VertexConstants));
-            Cmd()->SetGraphicsRootConstantBufferView(5, pc.gpu);
-        }
+        if (pc.res) std::memcpy(pc.cpu, prev_consts->data(), sizeof(VertexConstants));
+        // without room for them the draw's own constants stand in: no motion, never an unset buffer
+        Cmd()->SetGraphicsRootConstantBufferView(5, pc.res ? pc.gpu : last_vsc_gpu_);
     }
     uint32_t query = BeginCountedDraw(s);
     if (defer_now) bundle_desc_.drew = true;
@@ -6147,10 +6080,8 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     const float post = !t.picture && render_.pc_contrast ? 1.0f : 0.0f;
     const float bloom = scene && render_.bloom ? float(render_.bloom_strength) / 100.0f : 0.0f;
     const float dof = scene && render_.dof && dof_depth_ ? 1.0f : 0.0f;
-    const float grade = !t.picture && grade_loaded_ ? float(render_.lut_strength) / 100.0f : 0.0f;
     BlitOptions o{.gamma = gamma_, .rtv = SwapFormat(), .post = post, .bloom = bloom, .src_w = float(t.w),
-                  .src_h = float(t.h), .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_,
-                  .grade = grade};
+                  .src_h = float(t.h), .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_};
 
     // the image the blit reads: SMAA's output, else the target (resolved with MSAA)
     ID3D12Resource* color = aa;

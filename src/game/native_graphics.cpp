@@ -116,9 +116,24 @@ void PostRestoreDisplayChoice() {
     g_display_request = request;
 }
 
+// Exit Game: save the settings, then ask the host to close. While a display change is still waiting for
+// the window thread's answer, the exit waits for it (PollDisplayApply) so the answer is saved too.
+bool g_quit_pending = false;
+void RequestGameExit(const char* where) {
+    if (g_display_request || g_restore_pending) {
+        if (!g_quit_pending) LOGR("%s: exit waits for the display change in progress", where);
+        g_quit_pending = true;
+        return;
+    }
+    g_quit_pending = false;
+    FlushSettings();
+    if (!app::RequestQuit()) LOGE("%s: could not request game exit", where);
+}
+
 // the window thread's answer to the display change in flight: keep and save it, or put the
 // previous mode back
 void PollDisplayApply() {
+    if (g_quit_pending && !g_display_request && !g_restore_pending) RequestGameExit("Display tab");
     if (!g_display_request) {
         if (g_restore_pending) {
             g_restore_pending = false;
@@ -140,6 +155,7 @@ void PollDisplayApply() {
     }
     g_save_dirty.store(true, std::memory_order_release);
     FlushSettings();
+    if (g_quit_pending) RequestGameExit("Display tab");
 }
 
 void MaybeSave() {
@@ -150,6 +166,11 @@ void MaybeSave() {
 bool OnDisplayRows(uint8_t* base, uint32_t self) {
     return X86_MEM32(self + kPage) == kDisplayPage && X86_MEM32(self + kFocus) == kRowListFocus;
 }
+
+static_assert(kFsrNo4 == uint32_t(gpu::FsrState::No4) && kFsrNoDll == uint32_t(gpu::FsrState::NoDll) &&
+                  kDlssUnavailable == uint32_t(gpu::DlssState::Unavailable) &&
+                  kDlssNotBuilt == uint32_t(gpu::DlssState::NotBuilt),
+              "display_rows.h mirrors the upscaler states");
 
 Values Current() {
     app::SettingsLock lock;
@@ -180,6 +201,9 @@ Values Current() {
     v.shadow_softness = s.shadow_softness;
     v.sharpening = s.sharpening;
     v.low_latency = s.low_latency;
+    v.taa = s.taa;
+    v.fsr_state = uint32_t(gpu::g_fsr_state.load(std::memory_order_relaxed));
+    v.dlss_state = uint32_t(gpu::g_dlss_state.load(std::memory_order_relaxed));
     v.display_peak = gpu::g_hdr_display_peak_nits.load(std::memory_order_relaxed);
     return v;
 }
@@ -213,6 +237,7 @@ void Apply(const Values &v) {
     s.shadow_softness = v.shadow_softness;
     s.sharpening = v.sharpening;
     s.low_latency = v.low_latency;
+    s.taa = v.taa;
     game::SetShowFps(v.show_fps);
     MarkSave();
 }
@@ -295,6 +320,7 @@ X86_EXTERN_FUNC(__imp__sub_000AD5C0);
 X86_FUNC(sub_000AD5C0) {
     const uint32_t self = ctx.ecx, out = X86_MEM32(ctx.esp + 4), port = X86_MEM32(ctx.esp + 8);
     const bool confirming = self && g_shell_exit_owner == self;
+    if (confirming) PollDisplayApply();  // a pending Exit Game waits for a display change's answer
     if (out && self && !X86_MEM8(self + kShellDemo)) {
         if (port == kShellCount) {
             X86_MEM32(out) = confirming ? RowCount(Page::Exit) : kShellExitRow + 1;
@@ -337,7 +363,7 @@ X86_FUNC(sub_000B6400) {
                 g_shell_exit_owner = 0;
                 X86_MEM32(self + kShellRow) = kShellExitRow;
             }
-            if (step.quit && !app::RequestQuit()) LOGE("Main menu: could not request game exit");
+            if (step.quit) RequestGameExit("Main menu");
             ::kernel::Return(ctx, 0, 3);
             return;
         }
@@ -460,10 +486,7 @@ X86_FUNC(sub_000CB400) {
             const Step step = Input(Page::Exit, X86_MEM32(self + kRow), input);
             X86_MEM32(self + kRow) = step.row;
             if (step.page != Page::Exit) X86_MEM32(self + kFocus) = kTopBarFocus;
-            if (step.quit && !g_display_request) {
-                FlushSettings();
-                if (!app::RequestQuit()) LOGE("Pause menu: could not request game exit");
-            }
+            if (step.quit) RequestGameExit("Pause menu");
             ::kernel::Return(ctx, 0, 3);
             return;
         }

@@ -31,13 +31,11 @@
   are smoothed like geometry edges. This applies only to the main picture.
 - Texture packs: generated mipmaps average in linear light (distant bright detail no longer
   darkens) and keep the coverage of cut-out textures, so fences and leaves do not thin out.
-- Colour grading: a `lut.cube` table beside the executable grades the 3D frame; its strength is in
-  F10 (Colour grading).
 - Depth of field no longer smears sharp nearer objects into the blurred background behind them.
 - AMD FSR 1 upscaling (Upscaler: Bilinear or AMD FSR 1) when Render scale is below 100%, and
   RCAS sharpening (Sharpening: Off to 100%) of the 3D frame at any render scale. The HUD,
   movies and still pictures are not sharpened. Windows and Linux.
-- TAA (Windows, F10): temporal anti-aliasing in place of SMAA, using the game camera and per-object motion
+- TAA (F10 and the Display tab): temporal anti-aliasing in place of SMAA, using the game camera and per-object motion
   for cars, people and the road. Needs no extra DLLs. Off by default.
 - FSR 3.1, FSR 4.1 and DLSS offer Performance (50%) and Balanced (58%) presets beside Quality and
   Native AA; the jitter pattern lengthens at lower scales. The F10 Upscaler row says when AMD's DLLs
@@ -52,6 +50,19 @@
   temporal colour, reversed depth, motion and jitter inputs, and keeps the HUD preserved. RTX
   native validation is still pending; the AMD/OptiScaler path is a developer test only.
 - F10: the Depth of field help no longer says it needs MSAA.
+
+### Performance
+- The renderers do less CPU work per draw on both backends. Vulkan resolves each texture and
+  target once a frame, reuses draw descriptor sets and records large deferred scene batches on
+  two threads (above); D3D12 repacks unaligned vertex streams instead of converting every
+  element, tracks vertex-constant changes on the render thread instead of comparing 3 KB per
+  draw, and caches guest allocation sizes per thread until the memory layout changes. Linux and
+  Windows.
+
+### Menus
+- A native Exit Game row in the main menu and the pause menu, with a confirmation step. It asks
+  saves the Display tab's settings, then closes the window (an SDL quit event on Linux). An exit
+  chosen while a display mode change is still being applied waits for it to finish.
 
 ## 0.9.1.0 — Beta 2 (2026-11-11)
 

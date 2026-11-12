@@ -155,6 +155,15 @@ X86_FUNC(sub_00143650) {
     static bool have_lamp = false, lamp_dropped = false;
     static Light lamp{};
     static float drop_distance = 0;
+    // a new level starts without the previous level's light
+    static uint32_t generation = game::LevelGeneration();
+    if (const uint32_t now_generation = game::LevelGeneration(); now_generation != generation) {
+        generation = now_generation;
+        have_lamp = lamp_dropped = false;
+        g_have = false;
+        g_away_frames = g_none_frames = 0;
+        g_candidate_count = 0;
+    }
     float w;
     std::memcpy(&w, now.vec + 12, 4);
     const float cam_distance = CameraDistance(base, X86_MEM32(ctx.esp + 4), lamp);

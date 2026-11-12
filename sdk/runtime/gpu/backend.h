@@ -102,8 +102,6 @@ inline CameraFrame CameraOf(uint64_t present) {
     return g_camera_frames[present % 8];
 }
 
-// lut.cube (a colour grading table) was found and loaded; the Graphics menu shows its strength row
-inline std::atomic<bool> g_lut_loaded{false};
 
 // DLSS availability, published by the D3D12 backend after its NGX probe. The menu reads it without
 // calling into the renderer; Unknown means the probe has not run yet.

@@ -78,7 +78,9 @@ void Load() {
     s.vsync = t["vsync"].value_or(s.vsync);
     s.low_latency = t["low_latency"].value_or(s.low_latency);
     s.taa = t["taa"].value_or(s.taa);
-    s.upscaler = uint32_t(std::clamp<int64_t>(t["upscaler"].value_or(int64_t(s.upscaler)), 0, 3));
+    // 0 bilinear, 1 FSR 1, 2 FSR 3.1, 3 DLSS; FSR 4.1 (4, Windows only) from a copied settings file is FSR 3.1 here
+    s.upscaler = uint32_t(std::clamp<int64_t>(t["upscaler"].value_or(int64_t(s.upscaler)), 0, 4));
+    if (s.upscaler == 4) s.upscaler = 2;
     s.sharpening = uint32_t(std::clamp<int64_t>(t["sharpening"].value_or(int64_t(s.sharpening)), 0, 100));
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     // as settings.cpp: a file without the key keeps the built-in default (Settings::msaa); older
@@ -95,7 +97,6 @@ void Load() {
     s.bloom_strength = uint32_t(std::clamp<int64_t>(t["bloom_strength"].value_or(int64_t(s.bloom_strength)), 50, 400));
     s.shadow_resolution = uint32_t(std::clamp<int64_t>(t["shadow_resolution"].value_or(int64_t(s.shadow_resolution)), 0, 2));
     s.shadow_softness = uint32_t(std::clamp<int64_t>(t["shadow_softness"].value_or(int64_t(s.shadow_softness)), 0, 2));
-    s.lut_strength = uint32_t(std::clamp<int64_t>(t["lut_strength"].value_or(int64_t(s.lut_strength)), 0, 100));
     s.dof = t["dof"].value_or(s.dof);
     if (t["ao"].is_boolean()) {
         s.ao = t["ao"].value_or(false) ? 2u : 0u;  // older settings stored a boolean
@@ -150,7 +151,6 @@ toml::table Table() {
                   {"bloom_strength", int64_t(s.bloom_strength)},
                   {"shadow_resolution", int64_t(s.shadow_resolution)},
                   {"shadow_softness", int64_t(s.shadow_softness)},
-                  {"lut_strength", int64_t(s.lut_strength)},
                   {"dof", s.dof},
                   {"ao", int64_t(s.ao)},
                   {"building_seam_fix", s.building_seam_fix},
