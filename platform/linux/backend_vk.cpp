@@ -90,8 +90,10 @@ constexpr uint32_t kBaseWidth = 640;
 constexpr uint32_t kBaseHeight = 480;
 constexpr uint64_t kUploadSize = 64ull << 20;
 
+// readback: the CPU reads the buffer, so host-cached memory is preferred (an uncached read of a full FP16 frame
+// took over a second on the Deck)
 std::vector<uint8_t> StagingBuffer(VkDevice dev, VkPhysicalDeviceMemoryProperties& props, VkDeviceSize size,
-                                   VkBuffer& buffer, VkDeviceMemory& memory, void** map);
+                                   VkBuffer& buffer, VkDeviceMemory& memory, void** map, bool readback = false);
 
 float Bits(uint32_t v) {
     float f;
@@ -1519,15 +1521,47 @@ float HalfToFloat(uint16_t h) {
     return sign ? -v : v;
 }
 
+// every half-float bit pattern as the 8-bit value it rounds to: a full-frame FP16 read-back converts
+// 8 million values, which took about 1.6 s on the Deck through HalfToFloat one at a time
+static const std::array<uint8_t, 65536>& HalfToUnorm8() {
+    static const std::array<uint8_t, 65536> table = [] {
+        std::array<uint8_t, 65536> t{};
+        for (uint32_t h = 0; h < 65536; ++h) {
+            const float v = HalfToFloat(uint16_t(h));
+            t[h] = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+        }
+        return t;
+    }();
+    return table;
+}
+
+// an RGBA16F image as BGRA8
 static std::vector<uint8_t> SceneToBgra(const void* pixels, uint32_t w, uint32_t h) {
     const auto* src = static_cast<const uint16_t*>(pixels);
-    std::vector<uint8_t> result(size_t(w) * h * 4);
-    constexpr uint32_t bgra[4] = {2, 1, 0, 3};
-    for (size_t i = 0; i < result.size(); ++i) {
-        const float v = HalfToFloat(src[(i & ~size_t(3)) + bgra[i % 4]]);
-        result[i] = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+    const auto& unorm = HalfToUnorm8();
+    const size_t n = size_t(w) * h;
+    std::vector<uint8_t> result(n * 4);
+    uint8_t* dst = result.data();
+    for (size_t i = 0; i < n; ++i, src += 4, dst += 4) {
+        dst[0] = unorm[src[2]];
+        dst[1] = unorm[src[1]];
+        dst[2] = unorm[src[0]];
+        dst[3] = unorm[src[3]];
     }
     return result;
+}
+
+// every 8-bit value as the half-float bits of value / 255 (BGRA8 guest pixels into an RGBA16F target)
+static const std::array<uint16_t, 256>& Unorm8ToHalf() {
+    static const std::array<uint16_t, 256> table = [] {
+        std::array<uint16_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            const _Float16 f = static_cast<_Float16>(float(i) / 255.0f);
+            std::memcpy(&t[i], &f, sizeof(f));
+        }
+        return t;
+    }();
+    return table;
 }
 
 float PqDecode(float e) {
@@ -4653,7 +4687,7 @@ void VulkanBackend::DumpAoProbe(AoImage& image) {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* map = nullptr;
-    StagingBuffer(device_, mem_props_, bytes, buffer, memory, &map);
+    StagingBuffer(device_, mem_props_, bytes, buffer, memory, &map, true);
     if (!map) {
         BeginRecord();
         return;
@@ -5502,7 +5536,7 @@ void InverseTranspose3x3(const float* wv, float* n) {
 }
 
 std::vector<uint8_t> StagingBuffer(VkDevice dev, VkPhysicalDeviceMemoryProperties& props, VkDeviceSize size,
-                                    VkBuffer& buffer, VkDeviceMemory& memory, void** map) {
+                                    VkBuffer& buffer, VkDeviceMemory& memory, void** map, bool readback) {
     *map = nullptr;
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = size;
@@ -5513,13 +5547,15 @@ std::vector<uint8_t> StagingBuffer(VkDevice dev, VkPhysicalDeviceMemoryPropertie
     VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     alloc.allocationSize = req.size;
     bool found = false;
-    for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
-        const auto flags = props.memoryTypes[i].propertyFlags;
-        if ((req.memoryTypeBits & (1u << i)) && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-            (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-            alloc.memoryTypeIndex = i;
-            found = true;
-            break;
+    constexpr VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (int pass = readback ? 0 : 1; pass < 2 && !found; pass++) {
+        const VkMemoryPropertyFlags want = pass == 0 ? kHost | VK_MEMORY_PROPERTY_HOST_CACHED_BIT : kHost;
+        for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
+            if ((req.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want) {
+                alloc.memoryTypeIndex = i;
+                found = true;
+                break;
+            }
         }
     }
     if (!found || vkAllocateMemory(dev, &alloc, nullptr, &memory) != VK_SUCCESS) {
@@ -6047,10 +6083,14 @@ bool VulkanBackend::UploadTarget(Target* t) {
     StagingBuffer(device_, mem_props_, size_t(t->w) * t->h * SwapBytesPerPixel(t->format), buffer, memory, &map);
     if (!map) return false;
     if (fp16) {
-        auto* rgba = static_cast<_Float16*>(map);
-        constexpr uint32_t bgra[4] = {2, 1, 0, 3};
-        for (size_t i = 0; i < px.size(); ++i)
-            rgba[i] = static_cast<_Float16>(float(px[(i & ~size_t(3)) + bgra[i % 4]]) / 255.0f);
+        auto* rgba = static_cast<uint16_t*>(map);
+        const auto& half = Unorm8ToHalf();
+        for (size_t i = 0; i + 3 < px.size(); i += 4) {
+            rgba[i] = half[px[i + 2]];
+            rgba[i + 1] = half[px[i + 1]];
+            rgba[i + 2] = half[px[i]];
+            rgba[i + 3] = half[px[i + 3]];
+        }
     } else {
         std::memcpy(map, px.data(), px.size());
     }
@@ -6082,7 +6122,7 @@ bool VulkanBackend::ReadTarget(Target* t) {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* map = nullptr;
-    StagingBuffer(device_, mem_props_, size_t(t->w) * t->h * SwapBytesPerPixel(t->format), buffer, memory, &map);
+    StagingBuffer(device_, mem_props_, size_t(t->w) * t->h * SwapBytesPerPixel(t->format), buffer, memory, &map, true);
     if (!map) return false;
     EndRecord(true);
     BeginRecord();
@@ -8111,7 +8151,7 @@ void VulkanBackend::RecordLate(uint32_t data) {
         s = LateSlot{};
     }
     if (!s.buffer) {
-        StagingBuffer(device_, mem_props_, uint64_t(pitch) * t->h, s.buffer, s.memory, &s.map);
+        StagingBuffer(device_, mem_props_, uint64_t(pitch) * t->h, s.buffer, s.memory, &s.map, true);
         if (!s.map) return;
         s.w = t->w;
         s.h = t->h;
