@@ -46,8 +46,6 @@
 #include "../../third_party/smaa/SearchTex.h"
 #include "../../third_party/fsr3/api/include/dx12/ffx_api_dx12.h"
 #include "../../third_party/fsr3/upscalers/include/ffx_upscale.h"
-#include "../../third_party/fsr3/framegeneration/include/ffx_framegeneration.h"
-#include "../../third_party/fsr3/framegeneration/include/dx12/ffx_api_framegeneration_dx12.h"
 #if defined(TCNYC_HAVE_DLSS)
 // The NGX headers are proprietary and are not vendored: TCNYC_DLSS_SDK points at a local
 // NVIDIA/DLSS checkout. The loader is header-only, so the game has no link-time nvngx dependency.
@@ -1217,21 +1215,6 @@ private:
     ComPtr<ID3D12Device> dev_;
     ComPtr<ID3D12CommandQueue> queue_;
     ComPtr<IDXGISwapChain3> swap_;
-    struct FrameGeneration {
-        HMODULE loader = nullptr;
-        PfnFfxCreateContext create = nullptr;
-        PfnFfxDestroyContext destroy = nullptr;
-        PfnFfxConfigure configure = nullptr;
-        PfnFfxDispatch dispatch = nullptr;
-        ffxContext swapchain = nullptr, context = nullptr;
-        uint32_t w = 0, h = 0, out_w = 0, out_h = 0;
-        bool infinite = false, failed = false, prepared = false, enabled = false;
-        std::chrono::steady_clock::time_point last;
-    } fg_;
-    bool CreateFrameGenerationSwap(HWND hwnd, DXGI_SWAP_CHAIN_DESC1& desc, ComPtr<IDXGISwapChain1>& swap);
-    void ReleaseFrameGeneration(bool release_swapchain);
-    bool ConfigureFrameGeneration(bool enabled);
-    void PrepareFrameGeneration(const CameraFrame& cam, bool reset);
     ComPtr<ID3D12Resource> bb_[kFrames];
     // HDR overlays render into this BGRA8 target, then composite into the HDR back buffer.
     ComPtr<ID3D12Resource> ui_target_;
@@ -1756,7 +1739,6 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     bb_w_ = std::max<LONG>(rc.right - rc.left, 1);
     bb_h_ = std::max<LONG>(rc.bottom - rc.top, 1);
-    ReleaseFrameGeneration(true);
     for (auto& buffer : bb_) buffer.Reset();
     swap_.Reset();
     hdr_output_ = HdrOutput::Off;
@@ -1797,9 +1779,7 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         sd.Flags = SwapFlags();
         ComPtr<IDXGISwapChain1> sc1;
-        HRESULT hr = S_OK;
-        if (mode != HdrOutput::Off || !CreateFrameGenerationSwap(hwnd, sd, sc1))
-            hr = factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1);
+        HRESULT hr = factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1);
         if (FAILED(hr)) {
             if (mode != HdrOutput::Off)
                 LOGR("d3d12: %s swap chain rejected (0x%08lX), trying the next format",
@@ -5872,7 +5852,6 @@ bool D3D12Backend::ResizeSwap() {
             return false;
         }
     }
-    ReleaseFrameGeneration(false);
     for (auto& b : bb_) b.Reset();
     if (chain_change) {
         // HDR was toggled or the window moved to another monitor: the swapchain format and
@@ -6085,41 +6064,20 @@ void D3D12Backend::RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE target) {
     if (app::kGame.ui) app::kGame.ui(fps_);
     ImGui::Render();
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
-    ImDrawData* draw_data = ImGui::GetDrawData();
-    const auto draw_direct = [&] {
-        cl_->OMSetRenderTargets(1, &target, FALSE, nullptr);
-        cl_->SetDescriptorHeaps(1, uh);
-        ImGui_ImplDX12_RenderDrawData(draw_data, cl_);
-    };
-    const auto register_ui = [&](ID3D12Resource* resource) {
-        ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 ui{};
-        ui.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12;
-        if (resource) {
-            ui.uiResource = ffxApiGetResourceDX12(resource, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-            ui.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA |
-                       FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
-        }
-        return fg_.configure(&fg_.swapchain, &ui.header) == FFX_API_RETURN_OK;
-    };
 
-    const bool fg_ui = fg_.prepared && draw_data && draw_data->CmdListsCount;
-    if (fg_.swapchain && !fg_ui && !register_ui(nullptr)) fg_.prepared = false;
-    if (hdr_output_ == HdrOutput::Off && !fg_ui) {
-        draw_direct();
+    // SDR: ImGui writes straight into the BGRA8 back buffer, exactly as before.
+    if (hdr_output_ == HdrOutput::Off) {
+        cl_->SetDescriptorHeaps(1, uh);
+        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_);
         return;
     }
 
     // HDR: render the overlay into BGRA8 first, then composite it at paper white. This keeps
     // ImGui initialised for BGRA8 and out of the HDR swap-chain format entirely. With nothing on
     // screen (no menu, no FPS counter) the clear and the full-screen composite are skipped.
+    const ImDrawData* draw_data = ImGui::GetDrawData();
     if (!draw_data || !draw_data->CmdListsCount) return;
     if (!EnsureHdrUiTarget()) {
-        if (fg_ui) {
-            fg_.prepared = false;
-            register_ui(nullptr);
-            draw_direct();
-            return;
-        }
         if (!hdr_ui_failed_logged_) {
             LOGE("d3d12: HDR overlay target could not be created; the overlay is hidden");
             hdr_ui_failed_logged_ = true;
@@ -6128,12 +6086,6 @@ void D3D12Backend::RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE target) {
     }
     const uint32_t scratch = ScratchRtv();
     if (scratch == UINT32_MAX) {
-        if (fg_ui) {
-            fg_.prepared = false;
-            register_ui(nullptr);
-            draw_direct();
-            return;
-        }
         if (!hdr_ui_failed_logged_) {
             LOGE("d3d12: HDR overlay has no scratch RTV; the overlay is hidden");
             hdr_ui_failed_logged_ = true;
@@ -6150,15 +6102,6 @@ void D3D12Backend::RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE target) {
     binds_ = {};
     cl_->SetDescriptorHeaps(1, uh);
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_);
-    if (fg_ui) {
-        Transition(ui_target_.Get(), ui_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        if (register_ui(ui_target_.Get())) return;
-        fg_.prepared = false;
-        register_ui(nullptr);
-        draw_direct();
-        return;
-    }
     Transition(ui_target_.Get(), ui_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     // descriptors, samplers and constants first: a full ring submits and starts a new command
@@ -6597,162 +6540,12 @@ bool Invert4(const float* m, float* out) {
 }
 
 D3D12Backend::~D3D12Backend() {
-    ReleaseFrameGeneration(true);
-    if (fg_.loader) FreeLibrary(fg_.loader);
     ReleaseDlss();
     if (fsr3_.context) {
         WaitFence(fence_value_);
         fsr3_.destroy(&fsr3_.context, nullptr);
     }
     if (fsr3_.module) FreeLibrary(fsr3_.module);
-}
-
-bool D3D12Backend::CreateFrameGenerationSwap(HWND hwnd, DXGI_SWAP_CHAIN_DESC1& desc,
-                                             ComPtr<IDXGISwapChain1>& swap) {
-    if (!EnvFlag("TCNYC_FRAME_GENERATION") || fg_.failed) return false;
-    if (!fg_.loader) {
-        const auto path = app::ExeDir() / "amd_fidelityfx_loader_dx12.dll";
-        fg_.loader = LoadLibraryExW(path.c_str(), nullptr,
-                                   LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-        if (fg_.loader) {
-            fg_.create = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(fg_.loader, "ffxCreateContext"));
-            fg_.destroy = reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(fg_.loader, "ffxDestroyContext"));
-            fg_.configure = reinterpret_cast<PfnFfxConfigure>(GetProcAddress(fg_.loader, "ffxConfigure"));
-            fg_.dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(fg_.loader, "ffxDispatch"));
-        }
-        if (!fg_.create || !fg_.destroy || !fg_.configure || !fg_.dispatch) {
-            LOGR("d3d12: frame generation loader unavailable");
-            fg_.failed = true;
-            return false;
-        }
-    }
-    ComPtr<IDXGISwapChain4> wrapped;
-    ffxCreateContextDescFrameGenerationSwapChainVersionDX12 version{
-        {FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_DX12, nullptr},
-        FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION};
-    auto requested = desc;
-    ffxCreateContextDescFrameGenerationSwapChainForHwndDX12 create{
-        {FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12, &version.header},
-        wrapped.GetAddressOf(), hwnd, &requested, nullptr, factory_.Get(), queue_.Get()};
-    const auto result = fg_.create(&fg_.swapchain, &create.header, nullptr);
-    if (result != FFX_API_RETURN_OK || !wrapped || FAILED(wrapped.As(&swap))) {
-        LOGR("d3d12: frame generation swap chain unavailable (%u), using DXGI", unsigned(result));
-        wrapped.Reset();
-        ReleaseFrameGeneration(true);
-        fg_.failed = true;
-        return false;
-    }
-    LOGR("d3d12: experimental frame generation swap chain ready");
-    return true;
-}
-
-void D3D12Backend::ReleaseFrameGeneration(bool release_swapchain) {
-    if (fg_.swapchain) {
-        ffxDispatchDescFrameGenerationSwapChainWaitForPresentsDX12 wait{
-            {FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12, nullptr}};
-        fg_.dispatch(&fg_.swapchain, &wait.header);
-    }
-    if (fg_.context) {
-        WaitFence(fence_value_);
-        if (fg_.enabled) ConfigureFrameGeneration(false);
-        fg_.destroy(&fg_.context, nullptr);
-        fg_.context = nullptr;
-    }
-    if (release_swapchain && fg_.swapchain) {
-        // The SDK 2.4 loader invalidates this proxy when its context is destroyed.
-        for (auto& buffer : bb_) buffer.Reset();
-        swap_.Reset();
-        fg_.destroy(&fg_.swapchain, nullptr);
-        fg_.swapchain = nullptr;
-    }
-    fg_.prepared = fg_.enabled = false;
-}
-
-bool D3D12Backend::ConfigureFrameGeneration(bool enabled) {
-    ffxConfigureDescFrameGeneration config{};
-    config.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
-    config.swapChain = swap_.Get();
-    config.frameGenerationEnabled = enabled;
-    config.frameID = presents_;
-    config.generationRect = {0, 0, int32_t(bb_w_), int32_t(bb_h_)};
-    if (enabled) {
-        config.frameGenerationCallbackUserContext = this;
-        config.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* desc, void* user) {
-            auto& fg = static_cast<D3D12Backend*>(user)->fg_;
-            return fg.dispatch(&fg.context, &desc->header);
-        };
-    }
-    const auto result = fg_.configure(&fg_.context, &config.header);
-    if (result != FFX_API_RETURN_OK) {
-        LOG_FIRST(4, "d3d12: frame generation configuration failed (%u)", unsigned(result));
-        return false;
-    }
-    fg_.enabled = enabled;
-    return true;
-}
-
-void D3D12Backend::PrepareFrameGeneration(const CameraFrame& cam, bool reset) {
-    if (!fg_.swapchain || fg_.failed || presented_ != Picture::Unknown || TaaView() != 0) return;
-    // Match the motion field to the full output. Letterboxed and pillarboxed scenes retain normal presentation.
-    const auto error = int64_t(taa_.w) * bb_h_ - int64_t(taa_.h) * bb_w_;
-    if (std::abs(error) > int64_t(std::max(bb_w_, bb_h_)) * 2) return;
-    if (!fg_.context || fg_.w != taa_.w || fg_.h != taa_.h || fg_.out_w != bb_w_ || fg_.out_h != bb_h_ ||
-        fg_.infinite != fsr3_.infinite_depth) {
-        ReleaseFrameGeneration(false);
-        ffxCreateContextDescFrameGenerationVersion version{
-            {FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION, nullptr}, FFX_FRAMEGENERATION_VERSION};
-        ffxCreateBackendDX12Desc backend{{FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12, &version.header}, dev_.Get()};
-        ffxCreateContextDescFrameGeneration create{};
-        create.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION, &backend.header};
-        create.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
-        if (fsr3_.infinite_depth) create.flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
-        create.displaySize = {bb_w_, bb_h_};
-        create.maxRenderSize = {taa_.w, taa_.h};
-        create.backBufferFormat = ffxApiGetSurfaceFormatDX12(SwapFormat());
-        const auto result = fg_.create(&fg_.context, &create.header, nullptr);
-        if (result != FFX_API_RETURN_OK) {
-            fg_.failed = true;
-            LOGR("d3d12: frame generation context unavailable (%u)", unsigned(result));
-            return;
-        }
-        fg_.w = taa_.w;
-        fg_.h = taa_.h;
-        fg_.out_w = bb_w_;
-        fg_.out_h = bb_h_;
-        fg_.infinite = fsr3_.infinite_depth;
-        LOGR("d3d12: experimental frame generation context %ux%u -> %ux%u", fg_.w, fg_.h, fg_.out_w, fg_.out_h);
-    }
-    float inverse[16];
-    if (!Invert4(cam.view, inverse)) return;
-    const bool restart = reset || !fg_.enabled;
-    if (!ConfigureFrameGeneration(true)) return;
-    ffxDispatchDescFrameGenerationPrepareV2 prepare{};
-    prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
-    prepare.frameID = presents_;
-    prepare.commandList = cl_;
-    prepare.renderSize = {taa_.w, taa_.h};
-    prepare.jitterOffset = {taa_jitter_[0], taa_jitter_[1]};
-    prepare.motionVectorScale = {float(taa_.w), float(taa_.h)};
-    const auto now = PerfClock::now();
-    prepare.frameTimeDelta = restart ? 1000.0f / 60.0f :
-        std::clamp(std::chrono::duration<float, std::milli>(now - fg_.last).count(), 1.0f, 1000.0f);
-    prepare.reset = restart;
-    prepare.cameraNear = fg_.infinite ? FLT_MAX : std::max(cam.far_z, 1e-3f);
-    if (!fg_.infinite && cam.far_z <= 0) prepare.cameraNear = 1e7f;
-    prepare.cameraFar = cam.near_z;
-    prepare.cameraFovAngleVertical = 2.0f * std::atan(1.0f / cam.ys);
-    prepare.viewSpaceToMetersFactor = 1.0f;
-    prepare.depth = ffxApiGetResourceDX12(fsr3_.depth.res.Get());
-    prepare.motionVectors = ffxApiGetResourceDX12(taa_.dense_motion.res.Get());
-    std::copy_n(inverse, 3, prepare.cameraRight);
-    std::copy_n(inverse + 4, 3, prepare.cameraUp);
-    std::copy_n(inverse + 8, 3, prepare.cameraForward);
-    std::copy_n(inverse + 12, 3, prepare.cameraPosition);
-    const auto result = fg_.dispatch(&fg_.context, &prepare.header);
-    Begin();  // the SDK binds its own descriptors
-    fg_.prepared = result == FFX_API_RETURN_OK;
-    if (fg_.prepared) fg_.last = now;
-    else LOG_FIRST(4, "d3d12: frame generation preparation failed (%u)", unsigned(result));
 }
 
 void D3D12Backend::LoadFsr3() {
@@ -7297,7 +7090,6 @@ ID3D12Resource* D3D12Backend::DispatchFsr3(ID3D12Resource* color, D3D12_RESOURCE
     dispatch.flags = fsr3_.provider_four ? FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB : 0;
     const auto result = fsr3_.dispatch(&fsr3_.context, &dispatch.header);
     Begin();  // FidelityFX binds its own descriptor heap.
-    if (result == FFX_API_RETURN_OK) PrepareFrameGeneration(camera, dispatch.reset);
     Transition(color, color_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(dense.res.Get(), dense.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (result != FFX_API_RETURN_OK) {
@@ -7772,7 +7564,6 @@ void LogPerf() {
 
 void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
-    fg_.prepared = false;
     if (defer_scene_) FlushDeferredScene();
     // Diagnostic: TCNYC_CAPTURE_AT=<frame> starts an F3-style capture without input.
     static const long capture_at = [] {
@@ -7837,7 +7628,6 @@ void D3D12Backend::Present(const Surface& front) {
     if (!aa && t && render_.smaa) aa = ApplySmaa(*t);
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi, aa);
-    if (fg_.enabled && !fg_.prepared) ConfigureFrameGeneration(false);
     if (profile_fsr || profile_dlss) {
         cl_->EndQuery(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, profile_slot + 3);
         cl_->ResolveQueryData(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, profile_slot, kFsrProfileQueries,
@@ -7919,7 +7709,7 @@ void D3D12Backend::Present(const Surface& front) {
 }
 
 void D3D12Backend::SetFrameLatency(bool low) {
-    const uint32_t want = low || fg_.swapchain ? 1 : 3;
+    const uint32_t want = low ? 1 : 3;
     if (!swap_ || want == max_latency_) return;
     if (FAILED(swap_->SetMaximumFrameLatency(want))) return;
     if (max_latency_) LOGR("d3d12: low latency %s (%u queued frame%s)", low ? "on" : "off", want, want == 1 ? "" : "s");

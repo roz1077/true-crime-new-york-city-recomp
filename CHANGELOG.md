@@ -12,8 +12,6 @@
 - Linux Vulkan records large deferred scene batches on two threads by default.
   Set `TCNYC_DRAW_WORKER=0` to disable parallel recording.
 - Experimental FP16 scene colour on D3D12 and Vulkan. Set `TCNYC_SCENE_FP16=1` before launch.
-- Experimental AMD Frame Generation on D3D12. Set `TCNYC_FRAME_GENERATION=1` before launch and select
-  FSR in the Graphics menu. This path uses the signed AMD frame-generation runtime and an SDR swapchain.
 - Pipelines are kept between runs: the driver's compiled pipelines are saved beside the
   shader cache (`shader-cache/.../pipelines.bin` on Windows, `~/.cache/TrueCrimeNYC/pipelines.bin`
   on Linux) a few seconds after the last new one, so effects and areas seen before no longer
