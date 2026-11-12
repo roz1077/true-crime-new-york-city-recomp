@@ -997,6 +997,10 @@ private:
     // every draw
     uint64_t targets_gen_ = 1, target_index_gen_ = 0;
     std::unordered_map<uint64_t, Target*> target_index_;
+    // textures already found and change-checked this frame (not targets, not paletted), by their description:
+    // a later draw binding the same texture skips the commit checks, the target and palette lookups and the key
+    std::unordered_map<uint64_t, Tex*> tex_this_frame_;
+    uint64_t tex_this_frame_at_ = ~0ull, tex_this_frame_targets_ = 0;
     Target* SampledTarget(uint32_t data, bool depth, uint32_t w, uint32_t h);
     std::unordered_map<Target*, SceneDepth> scene_depth_;
     bool scene_dof_ = false;
@@ -5813,6 +5817,21 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
         tex_reason_ = "bytes uncommitted";
         return nullptr;
     }
+    // the fast path: this description was resolved to a guest texture earlier this frame
+    if (tex_this_frame_at_ != frames_ || tex_this_frame_targets_ != targets_gen_) {
+        tex_this_frame_.clear();
+        tex_this_frame_at_ = frames_;
+        tex_this_frame_targets_ = targets_gen_;
+    }
+    uint64_t fast_key = Hash(&d.data, sizeof(d.data));
+    for (uint32_t v : {d.format, d.width, d.height, d.depth, d.levels, d.pitch, uint32_t(d.cube) | uint32_t(d.linear) << 1})
+        fast_key = Hash(&v, sizeof(v), fast_key);
+    if (auto hit = tex_this_frame_.find(fast_key); hit != tex_this_frame_.end()) {
+        Tex* t = hit->second;
+        if (t->pack_gen != texturedumper::Generation()) LatchPackKey(*t, d, Format(d.format), nullptr);
+        if (t->pack_key) LatchPackImage(*t);
+        return t;
+    }
     const bool depth_tex = Format(d.format).depth;
     // D3D12 only samples a target for a 2D, one-level, uncompressed texture; a cube, volume or
     // compressed texture that happens to sit at a target's address is guest data, not the target.
@@ -5979,6 +5998,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
     if (t->pack_gen != texturedumper::Generation())
         LatchPackKey(*t, d, fi, palette_va ? colours : nullptr);
     if (t->pack_key) LatchPackImage(*t);
+    if (!palette_va && prompt_style == input::PromptStyle::Original) tex_this_frame_[fast_key] = t;
     return t;
 }
 

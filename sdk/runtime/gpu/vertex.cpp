@@ -695,12 +695,19 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
 
     // every element read by the converted path, and the whole stride the raw path copies, must be in the buffer
     bool converted_ok = true, raw_ok = true;
+    // each stream's buffer looked up once (several elements share a stream; the lookup finds its allocation)
+    GuestBuffer stream_buffers[16];
+    uint16_t looked_up = 0;
     for (int k = 0; k < nregs; k++) {
         const auto& in = layout->inputs[size_t(regs[k])];
         const auto& st = s.streams[size_t(in.stream)];
         const uint64_t stride = StrideOf(s, *layout, in);
         const uint64_t elem = TypeBytes(in.type);
-        const GuestBuffer buffer = BufferOf(st.vb);
+        if (!(looked_up & (1u << in.stream))) {
+            stream_buffers[in.stream] = BufferOf(st.vb);
+            looked_up |= uint16_t(1u << in.stream);
+        }
+        const GuestBuffer& buffer = stream_buffers[in.stream];
         if (!stride || in.offset > stride || elem > stride - in.offset || !buffer.va || !d.span ||
             uint64_t(d.first_vertex) > kMaxBufferBytes || uint64_t(d.span) > kMaxBufferBytes) {
             converted_ok = raw_ok = false;
