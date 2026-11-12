@@ -28,10 +28,14 @@
 - AMD FSR 1 upscaling (Upscaler: Bilinear or AMD FSR 1) when Render scale is below 100%, and
   RCAS sharpening (Sharpening: Off to 100%) of the 3D frame at any render scale. The HUD,
   movies and still pictures are not sharpened. Windows and Linux.
+- FSR 3.1, FSR 4.1 and DLSS offer Performance (50%) and Balanced (58%) presets beside Quality and
+  Native AA; the jitter pattern lengthens at lower scales. The F10 Upscaler row says when AMD's DLLs
+  are missing or only FSR 3.1 is offered. Sharpening now also applies to DLSS output. Brief far-plane
+  changes around camera cuts no longer restart FSR's history.
 - Experimental FSR 4.1 upscaling on Windows through AMD's FidelityFX SDK 2.4 loader/upscaler DLLs,
-  using the same temporal inputs as FSR 3.1. Quality at 67% and Native AA at 100% are available;
+  using the same temporal inputs as FSR 3.1. Performance (50%), Balanced (58%), Quality (67%) and Native AA (100%) are available;
   it falls back to FSR 3.1 when the FSR 4 provider is unavailable. Dispatches logged successfully
-  with provider 4.1.2 on the RX 7900 XTX; visual verification is still in progress.
+  with provider 4.1.2 on the RX 7900 XTX and checked in game at every preset.
 - Experimental DLSS Super Resolution on Windows when the optional NVIDIA DLSS SDK is configured
   (`TCNYC_DLSS_SDK`) and NVIDIA's `nvngx_dlss.dll` sits beside the executable. It reuses the
   temporal colour, reversed depth, motion and jitter inputs, and keeps the HUD preserved. RTX

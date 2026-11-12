@@ -86,7 +86,7 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Apply display changes | Applies the display mode and resolution. A change that fails puts the previous mode back. |
 | Aspect ratio | Auto, 4:3, 16:10, 16:9, 21:9 or 32:9. The 3D view widens; HUD and menus stay 16:9 in the middle, and the intro movies stretch to fill the screen. 4:3 and the wide shapes take effect after a restart. |
 | Render scale | 25% to 200% of the output height. |
-| Upscaler | Bilinear or AMD FSR 1 below 100% Render scale. Windows also offers experimental FSR 3.1, FSR 4.1 and DLSS Quality at 67% Render scale and Native AA at 100%. FSR 4.1 needs AMD's SDK 2.x loader/upscaler DLLs and uses FSR 3.1 when the driver exposes only 3.1; DLSS needs an NVIDIA RTX adapter and NVIDIA's `nvngx_dlss.dll`. |
+| Upscaler | Bilinear or AMD FSR 1 below 100% Render scale. Windows also offers experimental FSR 3.1, FSR 4.1 and DLSS at Render scale 50% (Performance), 58% (Balanced), 67% (Quality) and 100% (Native AA). FSR 4.1 needs AMD's SDK 2.x loader/upscaler DLLs and uses FSR 3.1 when the driver exposes only 3.1; DLSS needs an NVIDIA RTX adapter and NVIDIA's `nvngx_dlss.dll`. |
 | Sharpening | Off to 100%: AMD FidelityFX RCAS sharpening of the 3D frame, at any render scale. The HUD is not sharpened. Off by default. |
 | Field of view | 80% to 150% of the game's view, gameplay camera only; aiming still zooms. |
 | Object detail | Original, High, Very high or Maximum: how far buildings and props keep their detailed models. Vehicles keep the game's own detail level. Maximum is much slower. |

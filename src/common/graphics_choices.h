@@ -9,19 +9,35 @@
 
 namespace game::choices {
 
-inline constexpr uint32_t kRenderPercents[] = {25, 50, 67, 75, 100, 125, 150, 175, 200};
+inline constexpr uint32_t kRenderPercents[] = {25, 50, 58, 67, 75, 100, 125, 150, 175, 200};
 inline constexpr uint32_t kMinRenderPercent = 20, kMaxRenderPercent = 200;
 inline constexpr uint32_t kAnisoLevels[] = {0, 2, 4, 8, 16}; // 0: as the game asks
 inline constexpr uint32_t kMsaaSamples[] = {0, 2, 4, 8};     // 0: off
 inline constexpr uint32_t kAoModes[] = {0, 1, 2};            // off, half resolution, full resolution
 inline constexpr uint32_t kFsr3 = 2;
-inline constexpr bool Fsr3Scale(uint32_t percent) { return percent == 67 || percent == 100; }
 // DLSS is a Windows/D3D12 backend. The value exists on every build so an old settings file can be
 // read, but the row only offers it when the backend was compiled in.
 inline constexpr uint32_t kDlss = 3;
-inline constexpr bool DlssScale(uint32_t percent) { return percent == 67 || percent == 100; }
 inline constexpr uint32_t kFsr4 = 4;
-inline constexpr bool Fsr4Scale(uint32_t percent) { return percent == 67 || percent == 100; }
+// The temporal upscalers (FSR 3.1, FSR 4.1, DLSS) run at their standard presets' render scales only.
+inline constexpr bool TemporalScale(uint32_t percent) {
+    return percent == 50 || percent == 58 || percent == 67 || percent == 100;
+}
+// "Quality" and so on for a temporal render scale, nullptr for others
+inline constexpr const char *TemporalPresetName(uint32_t percent) {
+    switch (percent) {
+    case 50:
+        return "Performance";
+    case 58:
+        return "Balanced";
+    case 67:
+        return "Quality";
+    case 100:
+        return "Native AA";
+    default:
+        return nullptr;
+    }
+}
 #if defined(_WIN32) && defined(TCNYC_HAVE_DLSS)
 inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kDlss, kFsr4};
 #elif defined(_WIN32)

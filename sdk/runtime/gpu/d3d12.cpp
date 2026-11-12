@@ -5962,6 +5962,10 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     if (bloom > 0) o.bloom_tex = BuildBloom(color, color_fmt, uint32_t(o.src_w), uint32_t(o.src_h));
     if (scene && !temporal_output)
         UpscaleAndSharpen(color, color_fmt, t.w, t.h, uint32_t(std::lround(vw)), uint32_t(std::lround(vh)));
+    // FSR sharpens inside its dispatch; DLSS has no usable sharpening of its own, so RCAS runs on its output
+    if (scene && dlss_output && render_.sharpening)
+        UpscaleAndSharpen(color, color_fmt, uint32_t(o.src_w), uint32_t(o.src_h), uint32_t(o.src_w),
+                          uint32_t(o.src_h));
 
     cl_->OMSetRenderTargets(1, &frame_rtv_, FALSE, nullptr);
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
@@ -6662,6 +6666,7 @@ void D3D12Backend::LoadFsr3() {
         fsr3_.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(fsr3_.module, "ffxQuery"));
     }
     fsr3_.failed = !fsr3_.create || !fsr3_.destroy || !fsr3_.dispatch || !fsr3_.query;
+    if (fsr3_.failed) g_fsr_state.store(FsrState::NoDll, std::memory_order_relaxed);
     if (fsr3_.failed)
         LOGR("d3d12: FSR needs AMD's amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll "
              "(SDK 2.x), or the older amd_fidelityfx_dx12.dll, beside the game");
@@ -6671,7 +6676,7 @@ void D3D12Backend::LoadFsr3() {
 
 #if defined(TCNYC_HAVE_DLSS)
 void D3D12Backend::LoadDlss() {
-    if (render_.upscaler != game::choices::kDlss || !game::choices::DlssScale(render_.render_percent)) return;
+    if (render_.upscaler != game::choices::kDlss || !game::choices::TemporalScale(render_.render_percent)) return;
     if (dlss_.module || dlss_.failed) return;
     dlss_.forced = EnvFlag("TCNYC_DLSS_FORCE");
     const bool trace = EnvFlag("TCNYC_TRACE_DLSS");
@@ -6761,23 +6766,23 @@ void D3D12Backend::LoadDlss() {}
 #endif
 
 bool D3D12Backend::FsrSelected() const {
-    return (render_.upscaler == game::choices::kFsr3 && game::choices::Fsr3Scale(render_.render_percent)) ||
-           (render_.upscaler == game::choices::kFsr4 && game::choices::Fsr4Scale(render_.render_percent));
+    return (render_.upscaler == game::choices::kFsr3 && game::choices::TemporalScale(render_.render_percent)) ||
+           (render_.upscaler == game::choices::kFsr4 && game::choices::TemporalScale(render_.render_percent));
 }
 
 bool D3D12Backend::Fsr3Enabled() const {
-    return render_.upscaler == game::choices::kFsr3 && game::choices::Fsr3Scale(render_.render_percent) &&
+    return render_.upscaler == game::choices::kFsr3 && game::choices::TemporalScale(render_.render_percent) &&
            fsr3_.dispatch && !fsr3_.failed;
 }
 
 bool D3D12Backend::Fsr4Enabled() const {
-    return render_.upscaler == game::choices::kFsr4 && game::choices::Fsr4Scale(render_.render_percent) &&
+    return render_.upscaler == game::choices::kFsr4 && game::choices::TemporalScale(render_.render_percent) &&
            fsr3_.dispatch && !fsr3_.failed;
 }
 
 bool D3D12Backend::DlssEnabled() const {
 #if defined(TCNYC_HAVE_DLSS)
-    return render_.upscaler == game::choices::kDlss && game::choices::DlssScale(render_.render_percent) &&
+    return render_.upscaler == game::choices::kDlss && game::choices::TemporalScale(render_.render_percent) &&
            dlss_.loaded && !dlss_.failed && (dlss_.available || dlss_.forced);
 #else
     return false;
@@ -6831,8 +6836,10 @@ bool D3D12Backend::EnsureDlss(uint32_t w, uint32_t h, uint32_t out_w, uint32_t o
     dlss_.out_h = out_h;
 
     const int flags = NVSDK_NGX_DLSS_Feature_Flags_DepthInverted | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
-    const int quality = render_.render_percent >= 100 ? NVSDK_NGX_PerfQuality_Value_DLAA
-                                                      : NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    const int quality = render_.render_percent >= 100  ? NVSDK_NGX_PerfQuality_Value_DLAA
+                        : render_.render_percent >= 67 ? NVSDK_NGX_PerfQuality_Value_MaxQuality
+                        : render_.render_percent >= 58 ? NVSDK_NGX_PerfQuality_Value_Balanced
+                                                       : NVSDK_NGX_PerfQuality_Value_MaxPerf;
     dlss_.params->Reset();
     dlss_.params->Set(NVSDK_NGX_Parameter_Width, w);
     dlss_.params->Set(NVSDK_NGX_Parameter_Height, h);
@@ -6871,7 +6878,7 @@ bool D3D12Backend::EnsureDlss(uint32_t w, uint32_t h, uint32_t out_w, uint32_t o
     dlss_.available = true;
     g_dlss_state.store(DlssState::Available, std::memory_order_relaxed);
     LOGR("d3d12: DLSS %ux%u -> %ux%u, %s, flags 0x%X", w, h, out_w, out_h,
-         render_.render_percent >= 100 ? "Native AA" : "Quality", flags);
+         game::choices::TemporalPresetName(render_.render_percent), flags);
     return true;
 }
 
@@ -6960,7 +6967,7 @@ ID3D12Resource* D3D12Backend::DispatchDlss(ID3D12Resource* color, D3D12_RESOURCE
     Transition(output.res.Get(), output.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (!dlss_.logged_dispatch) {
         dlss_.logged_dispatch = true;
-        LOGR("d3d12: DLSS %s dispatch succeeded", render_.render_percent == 100 ? "Native AA" : "Quality");
+        LOGR("d3d12: DLSS %s dispatch succeeded", game::choices::TemporalPresetName(render_.render_percent));
     }
     dlss_.valid = true;
     dlss_.last_eval = now;
@@ -7046,6 +7053,9 @@ bool D3D12Backend::EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t o
     const bool want_four = render_.upscaler == game::choices::kFsr4;
     uint64_t provider = 0;
     if (fsr3_.query(nullptr, &versions.header) == FFX_API_RETURN_OK) {
+        bool has_four = false;
+        for (size_t i = 0; i < names.size(); ++i) has_four |= names[i] && std::strncmp(names[i], "4.", 2) == 0;
+        g_fsr_state.store(has_four ? FsrState::Available : FsrState::No4, std::memory_order_relaxed);
         provider = want_four ? pick("4.") : pick("3.1.");
         if (!provider) {
             const char* fallback = want_four ? "3.1." : "4.";
@@ -7190,7 +7200,7 @@ ID3D12Resource* D3D12Backend::DispatchFsr3(ID3D12Resource* color, D3D12_RESOURCE
     Transition(output.res.Get(), output.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (!fsr3_.valid)
         LOGR("d3d12: %s %s dispatch succeeded", fsr3_.provider_four ? "FSR 4.1" : "FSR 3.1",
-             render_.render_percent == 100 ? "Native AA" : "Quality");
+             game::choices::TemporalPresetName(render_.render_percent));
     fsr3_.valid = true;
     fsr3_.last_dispatch = now;
     return output.res.Get();
@@ -7769,7 +7779,11 @@ void D3D12Backend::Present(const Surface& front) {
             for (; i; i /= b) r += (f /= float(b)) * float(i % b);
             return r;
         };
-        const uint32_t phases = FsrEnabled() && render_.render_percent == 67 ? 18 : 8;
+        // AMD's guidance: 8 x (output / render size)^2 phases when upscaling, so each output pixel is covered
+        const float ratio = 100.0f / float(std::max(render_.render_percent, 1u));
+        const uint32_t phases = (FsrEnabled() || DlssEnabled()) && render_.render_percent < 100
+                                    ? uint32_t(std::lround(8.0f * ratio * ratio))
+                                    : 8;
         const uint32_t i = uint32_t(frame_ % phases) + 1;
         taa_jitter_[0] = halton(i, 2) - 0.5f;
         taa_jitter_[1] = halton(i, 3) - 0.5f;

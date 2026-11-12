@@ -110,4 +110,9 @@ inline std::atomic<bool> g_lut_loaded{false};
 enum class DlssState : uint32_t { Unknown, Available, Unavailable, NotBuilt };
 inline std::atomic<DlssState> g_dlss_state{DlssState::Unknown};
 
+// AMD FSR 3.1 / 4.1 availability, published by the D3D12 backend when it loads FidelityFX and enumerates its
+// providers. NoDll: no FidelityFX DLL beside the game. No4: the DLLs or driver offer only FSR 3.1.
+enum class FsrState : uint32_t { Unknown, Available, No4, NoDll };
+inline std::atomic<FsrState> g_fsr_state{FsrState::Unknown};
+
 }  // namespace gpu

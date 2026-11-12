@@ -547,8 +547,8 @@ const char *Help(Row row) {
         return "How bright the bloom glow is. 100% is the original, very subtle look.";
     case Row::Upscaler:
 #ifdef _WIN32
-        return "FSR 1 sharpens when scaling up. Experimental FSR 3.1 and FSR 4.1 run in Quality at 67% Render "
-               "scale and Native AA at 100%. FSR 4.1 needs AMD's SDK 2.x loader and upscaler DLLs beside the "
+        return "FSR 1 sharpens when scaling up. Experimental FSR 3.1, FSR 4.1 and DLSS run at Render scale "
+               "50% (Performance), 58% (Balanced), 67% (Quality) or 100% (Native AA). FSR 4.1 needs AMD's SDK 2.x loader and upscaler DLLs beside the "
                "game; it uses FSR 3.1 when the driver exposes only 3.1. DLSS is experimental and needs an "
                "NVIDIA RTX adapter and NVIDIA's nvngx_dlss.dll beside the game.";
 #else
@@ -689,15 +689,15 @@ std::string Value(Row row) {
         return text;
     case Row::Upscaler:
 #ifdef _WIN32
-        if (s.upscaler == choices::kFsr3) {
-            if (s.render_percent == 67) return "FSR 3.1 Quality";
-            if (s.render_percent == 100) return "FSR 3.1 Native AA";
-            return "FSR 3.1 requires 67% or 100%";
-        }
-        if (s.upscaler == choices::kFsr4) {
-            if (s.render_percent == 67) return "FSR 4.1 Quality";
-            if (s.render_percent == 100) return "FSR 4.1 Native AA";
-            return "FSR 4.1 requires 67% or 100%";
+        if (s.upscaler == choices::kFsr3 || s.upscaler == choices::kFsr4) {
+            const char* name = s.upscaler == choices::kFsr4 ? "FSR 4.1" : "FSR 3.1";
+            const gpu::FsrState state = gpu::g_fsr_state.load(std::memory_order_relaxed);
+            if (state == gpu::FsrState::NoDll) return std::string(name) + " (AMD DLLs missing)";
+            const char* preset = choices::TemporalPresetName(s.render_percent);
+            if (!preset) return std::string(name) + " needs 50, 58, 67 or 100%";
+            std::string label = std::string(name) + " " + preset;
+            if (s.upscaler == choices::kFsr4 && state == gpu::FsrState::No4) label += " (using 3.1)";
+            return label;
         }
 #if defined(TCNYC_HAVE_DLSS)
         if (s.upscaler == choices::kDlss) {
@@ -709,9 +709,9 @@ std::string Value(Row row) {
             if (state == gpu::DlssState::NotBuilt) return "DLSS (not built)";
             if (state == gpu::DlssState::Unavailable && !forced) return "DLSS (unavailable)";
             const char* suffix = state == gpu::DlssState::Unavailable ? " (forced test)" : "";
-            if (s.render_percent == 67) return std::string("DLSS Quality") + suffix;
-            if (s.render_percent == 100) return std::string("DLSS Native AA") + suffix;
-            return "DLSS requires 67% or 100%";
+            const char* preset = choices::TemporalPresetName(s.render_percent);
+            if (!preset) return "DLSS needs 50, 58, 67 or 100%";
+            return std::string("DLSS ") + preset + suffix;
         }
 #endif
         if (s.render_percent == 100) return s.upscaler == 1 ? "AMD FSR 1 (inactive)" : "Bilinear";
