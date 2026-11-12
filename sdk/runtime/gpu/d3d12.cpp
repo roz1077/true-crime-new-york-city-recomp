@@ -1364,7 +1364,8 @@ private:
         uint32_t w = 0, h = 0;
         uint32_t out_w = 0, out_h = 0;
         bool infinite_depth = false;
-        bool sdk2 = false;          // loader + upscaler DLLs from FidelityFX SDK 2.x
+        int depth_mode_frames = 0;  // frames the camera has wanted the other depth mode in a row
+        bool sdk2 = false;         // loader + upscaler DLLs from FidelityFX SDK 2.x
         bool provider_four = false; // the active context selected FSR 4.x
         int provider_choice = -1;   // the Upscaler value the context was made for
         std::string provider_name;
@@ -7109,7 +7110,18 @@ ID3D12Resource* D3D12Backend::DispatchFsr3(ID3D12Resource* color, D3D12_RESOURCE
         out_h = uint32_t(std::lround(width / aspect));
         if (out_w < taa_.w || out_h < taa_.h) return nullptr;
     }
-    if (!EnsureFsr3(taa_.w, taa_.h, out_w, out_h, camera.far_z <= 0)) return nullptr;
+    // The far plane flips between finite and infinite around some camera changes, sometimes for a few frames.
+    // Recreating the context for each flip stalls and drops history, so keep the context's depth mode until
+    // the other one has lasted kDepthModeSettle frames; meanwhile the planes passed follow the context's mode.
+    constexpr int kDepthModeSettle = 30;
+    bool infinite = camera.far_z <= 0;
+    if (fsr3_.context && infinite != fsr3_.infinite_depth) {
+        if (++fsr3_.depth_mode_frames < kDepthModeSettle) infinite = fsr3_.infinite_depth;
+    } else {
+        fsr3_.depth_mode_frames = 0;
+    }
+    if (!EnsureFsr3(taa_.w, taa_.h, out_w, out_h, infinite)) return nullptr;
+    if (infinite == fsr3_.infinite_depth) fsr3_.depth_mode_frames = 0;
     static const std::string shader = std::string("#define TAA_RESOLVE 1\n") + kTaaHlsl;
     static const std::string ms_inputs = std::string("#define DEPTH_MS 1\n") + kTaaHlsl;
     ID3D12Resource* inputs[3] = {nullptr, taa_.metadata.res.Get(), nullptr};
@@ -7154,7 +7166,7 @@ ID3D12Resource* D3D12Backend::DispatchFsr3(ID3D12Resource* color, D3D12_RESOURCE
         std::clamp(std::chrono::duration<float, std::milli>(now - fsr3_.last_dispatch).count(), 1.0f, 1000.0f);
     dispatch.preExposure = 1.0f;
     // FidelityFX names the planes by depth-buffer endpoint for reversed Z.
-    dispatch.cameraNear = camera.far_z > 0 ? camera.far_z : FLT_MAX;
+    dispatch.cameraNear = fsr3_.infinite_depth ? FLT_MAX : camera.far_z > 0 ? camera.far_z : 1e7f;
     dispatch.cameraFar = camera.near_z;
     dispatch.cameraFovAngleVertical = 2.0f * std::atan(1.0f / camera.ys);
     dispatch.viewSpaceToMetersFactor = 1.0f;
