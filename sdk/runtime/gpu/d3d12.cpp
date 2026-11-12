@@ -5445,7 +5445,7 @@ bool D3D12Backend::DeferredBarrier(const char* why) {
     }
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 40)
-        LOGR("d3d12: deferred barrier frame %llu: %s", static_cast<unsigned long long>(frame_), why);
+        LOGI("d3d12: deferred barrier frame %llu: %s", static_cast<unsigned long long>(frame_), why);
     FlushDeferredScene();
     return true;
 }
