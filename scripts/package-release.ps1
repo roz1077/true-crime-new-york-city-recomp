@@ -225,6 +225,10 @@ try {
         Add-ReleaseFile (Join-Path $root 'LICENSE') 'LICENSES/Project-LICENSE.txt'
         if ($bundleFfx) {
             foreach ($name in $ffxFiles) { Add-ReleaseFile (Join-Path $ffxBin $name) $name }
+            $frameGen = 'amd_fidelityfx_framegeneration_dx12.dll'
+            if (Test-Path -LiteralPath (Join-Path $ffxBin $frameGen) -PathType Leaf) {
+                Add-ReleaseFile (Join-Path $ffxBin $frameGen) $frameGen
+            }
             Add-ReleaseFile $ffxLicence 'LICENSES/AMD-FidelityFX-SDK.md'
         }
         if ($bundleDlss) {

@@ -888,6 +888,7 @@ private:
                     const std::array<Tex*, 4>& tex, const Target* rt) const;
 
     uint32_t width_ = 0, height_ = 0;
+    VkSampleCountFlags scene_fp16_samples_ = 0;
     float scale_ = 1.0f, stretch_ = 1.0f;
     // Depth targets the title samples as shadow maps (smaller than the frame, so never the scene's depth), by
     // guest address: Shadow quality makes them a fixed size, one sample (as d3d12.cpp WantScale).
@@ -1512,6 +1513,17 @@ float HalfToFloat(uint16_t h) {
     return sign ? -v : v;
 }
 
+static std::vector<uint8_t> SceneToBgra(const void* pixels, uint32_t w, uint32_t h) {
+    const auto* src = static_cast<const uint16_t*>(pixels);
+    std::vector<uint8_t> result(size_t(w) * h * 4);
+    constexpr uint32_t bgra[4] = {2, 1, 0, 3};
+    for (size_t i = 0; i < result.size(); ++i) {
+        const float v = HalfToFloat(src[(i & ~size_t(3)) + bgra[i % 4]]);
+        result[i] = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+    }
+    return result;
+}
+
 float PqDecode(float e) {
     const float m1 = 2610.0f / 16384.0f;
     const float m2 = 2523.0f / 4096.0f * 128.0f;
@@ -1816,6 +1828,24 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
         if ((ao_color_samples_ & VK_SAMPLE_COUNT_1_BIT) == 0) ao_color_samples_ = VK_SAMPLE_COUNT_1_BIT;
     }
     if (!CreateSwapchain() || !CreateCommands() || !CreateUpload()) return false;
+    if (const char* enabled = std::getenv("TCNYC_SCENE_FP16"); enabled && std::atoi(enabled) != 0) {
+        constexpr auto format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(physical_, format, &properties);
+        constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                                   VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        VkImageFormatProperties attachment{}, resolved{};
+        constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if ((properties.optimalTilingFeatures & required) == required &&
+            vkGetPhysicalDeviceImageFormatProperties(physical_, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                     usage, 0, &attachment) == VK_SUCCESS &&
+            vkGetPhysicalDeviceImageFormatProperties(physical_, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                     usage | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, &resolved) == VK_SUCCESS &&
+            (resolved.sampleCounts & VK_SAMPLE_COUNT_1_BIT))
+            scene_fp16_samples_ = attachment.sampleCounts;
+        LOGR("vulkan: FP16 scene colour %s", scene_fp16_samples_ ? "enabled" : "unavailable");
+    }
     const char* defer_override = std::getenv("TCNYC_DEFER_SCENE");
     defer_forced_ = defer_override ? std::atoi(defer_override) != 0 : draw_worker_.joinable();
     defer_scene_ = defer_forced_ || ao_mode_ != 0;
@@ -5812,6 +5842,9 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
                 }
             }
             t->samples = WantSamples(d.data);
+            if (!depth && t->gw == width_ && t->gh == height_ && !ShadowSized(d.data))
+                t->format = (scene_fp16_samples_ & t->samples) ? VK_FORMAT_R16G16B16A16_SFLOAT
+                                                              : VK_FORMAT_B8G8R8A8_UNORM;
             t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
             t->resolved_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             t->fb_layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -5867,6 +5900,10 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     t->format = depth ? depth_format_ : VK_FORMAT_B8G8R8A8_UNORM;
 
     t->samples = WantSamples(d.data);
+    if (!depth && t->gw == width_ && t->gh == height_ && !ShadowSized(d.data) && (scene_fp16_samples_ & t->samples)) {
+        t->format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        LOG_FIRST(2, "vulkan: FP16 scene target %ux%u, %ux samples", t->w, t->h, t->samples);
+    }
     if (!CreateTargetImages(*t)) {
         delete t;
         return nullptr;
@@ -6012,9 +6049,17 @@ bool VulkanBackend::UploadTarget(Target* t) {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* map = nullptr;
-    StagingBuffer(device_, mem_props_, row * t->h, buffer, memory, &map);
+    const bool fp16 = t->format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    StagingBuffer(device_, mem_props_, size_t(t->w) * t->h * SwapBytesPerPixel(t->format), buffer, memory, &map);
     if (!map) return false;
-    std::memcpy(map, px.data(), px.size());
+    if (fp16) {
+        auto* rgba = static_cast<_Float16*>(map);
+        constexpr uint32_t bgra[4] = {2, 1, 0, 3};
+        for (size_t i = 0; i < px.size(); ++i)
+            rgba[i] = static_cast<_Float16>(float(px[(i & ~size_t(3)) + bgra[i % 4]]) / 255.0f);
+    } else {
+        std::memcpy(map, px.data(), px.size());
+    }
     if (!recording_) BeginRecord();
     VkImage upload_image = t->image;
     VkImageLayout& upload_layout = t->layout;
@@ -6043,7 +6088,7 @@ bool VulkanBackend::ReadTarget(Target* t) {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* map = nullptr;
-    StagingBuffer(device_, mem_props_, row * t->h, buffer, memory, &map);
+    StagingBuffer(device_, mem_props_, size_t(t->w) * t->h * SwapBytesPerPixel(t->format), buffer, memory, &map);
     if (!map) return false;
     EndRecord(true);
     BeginRecord();
@@ -6055,20 +6100,22 @@ bool VulkanBackend::ReadTarget(Target* t) {
     copy.imageExtent = {t->w, t->h, 1};
     vkCmdCopyImageToBuffer(cmd_, read_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
     EndRecord(true);
+    const bool fp16 = t->format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    const auto converted = fp16 ? SceneToBgra(map, t->w, t->h) : std::vector<uint8_t>{};
+    const auto* pixels = fp16 ? converted.data() : static_cast<const uint8_t*>(map);
     if (dump_targets_ && dump_now_ && !t->depth) {
         std::error_code ec;
         std::filesystem::create_directories(app::ExeDir() / "logs", ec);
         char name[64];
         std::snprintf(name, sizeof(name), "%s_%u_%08X.tga", dump_prefix_.c_str(), dump_frame_, t->data);
         // keep alpha: the light/reflection composites blend by the scene's destination alpha
-        if (t->format == VK_FORMAT_B8G8R8A8_UNORM)
-            WriteRgbaTga((app::ExeDir() / "logs" / name).string().c_str(), static_cast<const uint8_t*>(map), t->w,
-                         t->h, t->w * 4);
+        if (fp16 || t->format == VK_FORMAT_B8G8R8A8_UNORM)
+            WriteRgbaTga((app::ExeDir() / "logs" / name).string().c_str(), pixels, t->w, t->h, row);
         else
             WriteSwapTga((app::ExeDir() / "logs" / name).string().c_str(), static_cast<const uint8_t*>(map), t->w,
                          t->h, t->format, HdrOutput::Off, 200.0f);
     }
-    WriteGuestPixels(t, static_cast<const uint8_t*>(map), t->w, t->h, row);
+    WriteGuestPixels(t, pixels, t->w, t->h, row);
     vkUnmapMemory(device_, memory);
     vkDestroyBuffer(device_, buffer, nullptr);
     vkFreeMemory(device_, memory, nullptr);
@@ -7934,10 +7981,11 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
     const uint32_t src_data = virtual_data(src), dst_data = virtual_data(dst);
     Target* src_t = TargetAt(src_data, false, true);
     Target* dst_t = TargetAt(dst_data, false, true);
-    for (Target* t : {src_t, dst_t})
-        if (t && DirtyEpoch(t->data) == t->epoch) ReadTarget(t);
-    if (!gpu::CopySurfaceMemory(src, dst, count, rects, points))
-        reference::Copy(src, dst, count, rects, points);
+    const bool read_source = src_t && DirtyEpoch(src_t->data) == src_t->epoch && ReadTarget(src_t);
+    if (dst_t && dst_t != src_t && DirtyEpoch(dst_t->data) == dst_t->epoch) ReadTarget(dst_t);
+    const bool copied = gpu::CopySurfaceMemory(src, dst, count, rects, points);
+    if (!copied) reference::Copy(src, dst, count, rects, points);
+    bool copied_fp16 = false;
     // Carry the 3D scene's depth association across a full-frame scene->front copy, as the D3D12
     // backend does. Without this the present pass cannot find the scene depth and DOF stays off.
     if (dst_t) scene_depth_.erase(dst_t);
@@ -7962,9 +8010,26 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
             if (auto depth = scene_depth_.find(src_t); depth != scene_depth_.end())
                 scene_depth_.insert_or_assign(dst_t, depth->second);
         }
+            // Keep the precision of a full scene copy on the GPU while also updating guest memory above.
+            if (copied && read_source && src_t->guest_format == dst_t->guest_format &&
+                src_t->format == VK_FORMAT_R16G16B16A16_SFLOAT && dst_t->format == src_t->format &&
+                dst_t->samples == 1 && src_t->w == dst_t->w && src_t->h == dst_t->h) {
+                BeginRecord();
+                Transition(dst_t->image, dst_t->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dst_t->format);
+                VkImageCopy copy{};
+                copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.extent = {src_t->w, src_t->h, 1};
+                vkCmdCopyImage(cmd_, src_t->samples > 1 ? src_t->resolved_image : src_t->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_t->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                dst_t->epoch = DirtyEpoch(dst_t->data);
+                dst_t->drawn = true;
+                dst_t->upload_pending = false;
+                copied_fp16 = true;
+            }
     }
     for (auto& [key, t] : targets_)
-        if (!t->depth && t->data == dst_data) t->upload_pending = true;
+        if (!t->depth && t->data == dst_data && !(copied_fp16 && t == dst_t)) t->upload_pending = true;
 }
 
 void VulkanBackend::Sync(uint32_t data, uint32_t size) {
@@ -8004,7 +8069,10 @@ bool VulkanBackend::DeliverLate(uint32_t data) {
     }
     if (best < 0) return false;
     const LateSlot& s = l.slot[best];
-    WriteGuestSurface(l.data, l.size, static_cast<const uint8_t*>(s.map), s.w, s.h, s.pitch, l.gw, l.gh, l.pitch,
+    const bool fp16 = s.pitch == s.w * 8;
+    const auto converted = fp16 ? SceneToBgra(s.map, s.w, s.h) : std::vector<uint8_t>{};
+    const auto* pixels = fp16 ? converted.data() : static_cast<const uint8_t*>(s.map);
+    WriteGuestSurface(l.data, l.size, pixels, s.w, s.h, s.w * 4, l.gw, l.gh, l.pitch,
                       l.swizzled, l.bytes);
     l.delivered = s.serial;
     LOG_FIRST(4, "vulkan: NOOVERWRITE lock %08X delivered from a finished copy", data);
@@ -8043,8 +8111,8 @@ void VulkanBackend::RecordLate(uint32_t data) {
     const uint32_t slot = l.next;
     LateSlot& s = l.slot[slot];
     if (s.used && s.serial > completed_serial_.load()) return;  // the ring is a whole submission behind
-    const uint32_t pitch = t->w * 4;
-    if (s.buffer && (s.w != t->w || s.h != t->h)) {
+    const uint32_t pitch = t->w * SwapBytesPerPixel(t->format);
+    if (s.buffer && (s.w != t->w || s.h != t->h || s.pitch != pitch)) {
         late_retired_.push_back({s.buffer, s.memory});
         s = LateSlot{};
     }

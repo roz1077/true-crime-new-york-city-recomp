@@ -113,6 +113,14 @@ MSAA is off by default because it is the most demanding option; depth of field w
 
 Most of these also appear in the game's own **Options > Display** tab, with HDR on its own HDR SETTINGS page. Back cancels and A confirms there, as with the game's options; a display change is saved only once it has been applied.
 
+Set `TCNYC_SCENE_FP16=1` before launch to test higher-precision scene colour on D3D12 or Vulkan.
+Guest surfaces retain their original formats.
+
+To test experimental AMD Frame Generation on Windows, place `amd_fidelityfx_framegeneration_dx12.dll`
+from the AMD SDK's signed binaries beside the loader and upscaler DLLs. Set `TCNYC_FRAME_GENERATION=1`
+before launch and select an FSR temporal preset in F10. The prototype runs in SDR when the scene fills
+the output. The game's HUD is currently part of the interpolated image.
+
 </details>
 
 <details>
