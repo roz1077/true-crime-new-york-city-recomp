@@ -187,15 +187,20 @@ uint64_t g_pcs[kMax], g_callers[kMax];
 std::atomic<size_t> g_count{0};
 uintptr_t g_base = 0;
 uint64_t g_frames = 0;
+uint64_t g_stack_lo = 0, g_stack_hi = 0;  // the sampled thread's stack mapping
 // the sampled instruction, and its caller through the frame pointer where one is kept (build with
-// -fno-omit-frame-pointer for callers); a frame pointer outside the stack near the stack pointer is ignored
+// -fno-omit-frame-pointer for callers). Without frame pointers RBP holds anything, so it is followed only
+// when the caller slot lies inside the thread's own stack mapping: just above the stack is thread-local
+// storage and then an unmapped page, which a read crashed on.
 void OnTick(int, siginfo_t*, void* ctx) {
     const size_t i = g_count.fetch_add(1, std::memory_order_relaxed);
     if (i >= kMax) return;
     const auto& r = static_cast<ucontext_t*>(ctx)->uc_mcontext.gregs;
     g_pcs[i] = uint64_t(r[REG_RIP]);
     const uint64_t rbp = uint64_t(r[REG_RBP]), rsp = uint64_t(r[REG_RSP]);
-    g_callers[i] = rbp >= rsp && rbp < rsp + (1u << 20) && !(rbp & 7) ? *reinterpret_cast<const uint64_t*>(rbp + 8) : 0;
+    g_callers[i] = rbp >= rsp && rbp >= g_stack_lo && rbp + 16 <= g_stack_hi && !(rbp & 7)
+                       ? *reinterpret_cast<const uint64_t*>(rbp + 8)
+                       : 0;
 }
 int FindBase(dl_phdr_info* info, size_t, void*) {
     if (!g_base) g_base = info->dlpi_addr;  // the first object is the executable
@@ -207,6 +212,16 @@ void Start() {
     if (started || !std::getenv("TCNYC_SAMPLE")) return;
     started = true;
     dl_iterate_phdr(FindBase, nullptr);
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        void* lo = nullptr;
+        size_t size = 0;
+        if (pthread_attr_getstack(&attr, &lo, &size) == 0) {
+            g_stack_lo = uint64_t(reinterpret_cast<uintptr_t>(lo));
+            g_stack_hi = g_stack_lo + size;
+        }
+        pthread_attr_destroy(&attr);
+    }
     struct sigaction sa {};
     sa.sa_sigaction = OnTick;
     sa.sa_flags = SA_SIGINFO | SA_RESTART;
