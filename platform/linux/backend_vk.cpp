@@ -949,10 +949,41 @@ private:
     // Pipelines kept on disk between runs ($XDG_CACHE_HOME/TrueCrimeNYC/pipelines.bin), so a pipeline the game
     // needed before does not stall a frame the first time again. Every pipeline is made through it.
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
-    uint32_t pipeline_cache_new_ = 0;          // pipelines made since the last save
+    std::atomic<uint32_t> pipeline_cache_new_{0};  // pipelines made since the last save (warm threads too)
     uint64_t pipeline_cache_quiet_since_ = 0;  // frames_ at the last one
     void OpenPipelineCache();
     void SavePipelineCache(bool force);
+    // The draw pipeline keys of earlier runs ($XDG_CACHE_HOME/TrueCrimeNYC/pipelines.keys), each with the SPIR-V
+    // cache names of its shaders, in first-use order. At start the warm threads build each one through the
+    // pipeline cache, so the first draw that needs it takes it ready instead of stalling. The keys survive a
+    // driver update that makes pipelines.bin stale.
+    struct SavedPipeline {
+        PsoKey key;
+        uint64_t vs_spv = 0, ps_spv = 0;  // CompileShader's cache keys
+    };
+    std::unordered_map<VkShaderModule, uint64_t> spv_keys_;  // every module CompileShader made
+    std::vector<SavedPipeline> saved_pipelines_;
+    std::unordered_set<PsoKey, PsoKeyHash> saved_pipeline_set_;
+    size_t saved_pipelines_written_ = 0;
+    struct WarmJob {
+        SavedPipeline p;
+        VkRenderPass pass;  // made on the render thread before the warm threads start
+    };
+    std::vector<WarmJob> warm_jobs_;  // read only while the warm threads run
+    std::atomic<size_t> warm_next_{0};
+    std::atomic<uint32_t> warm_running_{0};
+    std::atomic<uint32_t> warm_built_{0};
+    std::atomic<bool> warm_stop_{false};
+    std::vector<std::thread> warm_threads_;
+    std::mutex warm_mutex_;
+    std::unordered_map<PsoKey, VkPipeline, PsoKeyHash> warm_pipelines_;  // built, not yet drawn with
+    void LoadSavedPipelines();
+    void SaveSavedPipelines(bool force);
+    void RecordPipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps);
+    void StartPipelineWarm();
+    void StopPipelineWarm();
+    void WarmPipelines();
+    VkPipeline TakeWarmPipeline(const PsoKey& k);
     VkResult CreatePipelines(uint32_t count, const VkGraphicsPipelineCreateInfo* info,
                              const VkAllocationCallbacks* alloc, VkPipeline* out);
     VkQueue queue_ = VK_NULL_HANDLE, present_queue_ = VK_NULL_HANDLE;
@@ -1669,13 +1700,16 @@ struct PipelineFileHeader {
 };
 }  // namespace
 
+thread_local bool t_warm_thread = false;  // a pipeline warm thread, which leaves the render thread's state alone
+
 VkResult VulkanBackend::CreatePipelines(uint32_t count, const VkGraphicsPipelineCreateInfo* info,
                                         const VkAllocationCallbacks* alloc, VkPipeline* out) {
+    // the pipeline cache synchronises itself, so the warm threads share it with the render thread
     const VkResult r = vkCreateGraphicsPipelines(device_, pipeline_cache_, count, info, alloc, out);
     if (r == VK_SUCCESS && pipeline_cache_) {
         // Vulkan does not say whether the cache already had it; a save with nothing new is only a rewrite
         ++pipeline_cache_new_;
-        pipeline_cache_quiet_since_ = frames_;
+        if (!t_warm_thread) pipeline_cache_quiet_since_ = frames_;
     }
     return r;
 }
@@ -1737,6 +1771,7 @@ void VulkanBackend::OpenPipelineCache() {
 void VulkanBackend::SavePipelineCache(bool force) {
     if (!pipeline_cache_ || !pipeline_cache_new_) return;
     if (!force && frames_ - pipeline_cache_quiet_since_ < 300) return;  // 5 s at 60 FPS
+    if (!force && warm_running_.load()) return;  // the warm threads are still adding; save once they finish
     const std::filesystem::path root = CacheRoot();
     if (root.empty()) return;
     size_t size = 0;
@@ -1761,6 +1796,156 @@ void VulkanBackend::SavePipelineCache(bool force) {
         return;
     }
     std::remove(temp.c_str());
+}
+
+namespace {
+constexpr uint64_t kPipelineKeysMagic = 0x315359454B4F5350ull;  // "PSOKEYS1"
+constexpr size_t kMaxSavedPipelines = 8192;  // kept on disk
+constexpr size_t kMaxWarmPipelines = 4096;   // built at start, the oldest first
+struct PipelineKeysHeader {
+    uint64_t magic, entry, size, checksum;  // entry: the record size, so another layout's file is ignored
+};
+}  // namespace
+
+void VulkanBackend::LoadSavedPipelines() {
+    const std::filesystem::path root = CacheRoot();
+    if (root.empty()) return;
+    std::ifstream in(root / "pipelines.keys", std::ios::binary | std::ios::ate);
+    if (!in) return;
+    const std::streamoff length = in.tellg();
+    PipelineKeysHeader header{};
+    if (length <= std::streamoff(sizeof(header)) ||
+        length > std::streamoff(sizeof(header) + kMaxSavedPipelines * sizeof(SavedPipeline))) return;
+    in.seekg(0);
+    if (!in.read(reinterpret_cast<char*>(&header), sizeof(header)) || header.magic != kPipelineKeysMagic ||
+        header.entry != sizeof(SavedPipeline) || header.size != uint64_t(length) - sizeof(header) ||
+        header.size % sizeof(SavedPipeline)) return;
+    std::vector<SavedPipeline> saved(size_t(header.size / sizeof(SavedPipeline)));
+    if (!in.read(reinterpret_cast<char*>(saved.data()), std::streamsize(header.size)) ||
+        Hash(saved.data(), size_t(header.size)) != header.checksum) return;
+    for (const SavedPipeline& p : saved)
+        if (saved_pipeline_set_.insert(p.key).second) saved_pipelines_.push_back(p);
+    saved_pipelines_written_ = saved_pipelines_.size();
+}
+
+void VulkanBackend::RecordPipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps) {
+    const auto v = spv_keys_.find(vs), p = spv_keys_.find(ps);
+    if (v == spv_keys_.end() || p == spv_keys_.end() || !saved_pipeline_set_.insert(k).second) return;
+    saved_pipelines_.push_back({k, v->second, p->second});
+}
+
+// Written once a few seconds pass with no new pipeline, like the cache; past the cap the oldest go
+void VulkanBackend::SaveSavedPipelines(bool force) {
+    if (saved_pipelines_.size() == saved_pipelines_written_) return;
+    if (!force && (frames_ - pipeline_cache_quiet_since_ < 300 || warm_running_.load())) return;
+    const std::filesystem::path root = CacheRoot();
+    if (root.empty()) return;
+    if (saved_pipelines_.size() > kMaxSavedPipelines) {
+        const size_t drop = saved_pipelines_.size() - kMaxSavedPipelines;
+        for (size_t i = 0; i < drop; i++) saved_pipeline_set_.erase(saved_pipelines_[i].key);
+        saved_pipelines_.erase(saved_pipelines_.begin(), saved_pipelines_.begin() + ptrdiff_t(drop));
+    }
+    saved_pipelines_written_ = saved_pipelines_.size();
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    const std::string file = (root / "pipelines.keys").string();
+    const std::string temp = file + ".tmp." + std::to_string(::getpid());
+    const size_t bytes = saved_pipelines_.size() * sizeof(SavedPipeline);
+    const PipelineKeysHeader header{kPipelineKeysMagic, sizeof(SavedPipeline), bytes,
+                                    Hash(saved_pipelines_.data(), bytes)};
+    FILE* f = std::fopen(temp.c_str(), "wb");
+    if (!f) return;
+    const bool ok = std::fwrite(&header, sizeof(header), 1, f) == 1 &&
+                    std::fwrite(saved_pipelines_.data(), 1, bytes, f) == bytes;
+    if (std::fclose(f) == 0 && ok && std::rename(temp.c_str(), file.c_str()) == 0) return;
+    std::remove(temp.c_str());
+}
+
+// TCNYC_PIPELINE_WARM=0 turns it off. The render passes are made here, on the render thread; CreatePipeline
+// then needs nothing else of its state for the triangle pipelines the threads build.
+void VulkanBackend::StartPipelineWarm() {
+    LoadSavedPipelines();
+    if (const char* e = std::getenv("TCNYC_PIPELINE_WARM"); e && std::strcmp(e, "0") == 0) return;
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(physical_, &props);
+    const VkSampleCountFlags ms_ok =
+        props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts;
+    for (const SavedPipeline& p : saved_pipelines_) {
+        const PsoKey& k = p.key;
+        if (k.topo == 0 || k.topo == 1) continue;  // points and lines add a geometry shader, made on demand
+        if (k.samples > 1 && !(ms_ok & k.samples)) continue;
+        const VkRenderPass pass = k.samples > 1 ? RenderPassForMs(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.samples,
+                                                                  k.motion != 0)
+                                                : RenderPassFor(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.motion != 0);
+        if (!pass) continue;
+        warm_jobs_.push_back({p, pass});
+        if (warm_jobs_.size() == kMaxWarmPipelines) break;
+    }
+    if (warm_jobs_.empty()) return;
+    const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t threads = uint32_t(std::clamp<unsigned>(cores > 2 ? cores - 2 : 1, 1, 4));
+    LOGR("vulkan: building %zu saved pipelines on %u threads", warm_jobs_.size(), threads);
+    warm_running_ = threads;
+    for (uint32_t i = 0; i < threads; i++) warm_threads_.emplace_back([this] { WarmPipelines(); });
+}
+
+void VulkanBackend::StopPipelineWarm() {
+    warm_stop_ = true;
+    for (auto& t : warm_threads_)
+        if (t.joinable()) t.join();
+    warm_threads_.clear();
+}
+
+namespace {
+VkShaderModule LoadSpirv(VkDevice device, const std::filesystem::path& root, uint64_t key) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "%016llx.spv", static_cast<unsigned long long>(key));
+    std::ifstream in(root / "shaders" / name, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
+    if (bytes.size() < 4 || bytes.size() % 4) return VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = bytes.size();
+    info.pCode = reinterpret_cast<const uint32_t*>(bytes.data());
+    VkShaderModule module = VK_NULL_HANDLE;
+    return vkCreateShaderModule(device, &info, nullptr, &module) == VK_SUCCESS ? module : VK_NULL_HANDLE;
+}
+}  // namespace
+
+// One warm thread: the shaders come from the SPIR-V cache into modules of its own, freed once the pipeline is made
+void VulkanBackend::WarmPipelines() {
+    t_warm_thread = true;
+    const std::filesystem::path root = CacheRoot();
+    const auto started = std::chrono::steady_clock::now();
+    while (!warm_stop_.load(std::memory_order_relaxed)) {
+        const size_t i = warm_next_.fetch_add(1);
+        if (i >= warm_jobs_.size()) break;
+        const WarmJob& job = warm_jobs_[i];
+        VkShaderModule vs = LoadSpirv(device_, root, job.p.vs_spv);
+        VkShaderModule ps = vs ? LoadSpirv(device_, root, job.p.ps_spv) : VK_NULL_HANDLE;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        if (vs && ps && CreatePipeline(job.p.key, vs, ps, pipe, job.pass)) {
+            ++warm_built_;
+            std::lock_guard lock(warm_mutex_);
+            if (!warm_pipelines_.emplace(job.p.key, pipe).second) vkDestroyPipeline(device_, pipe, nullptr);
+        }
+        if (vs) vkDestroyShaderModule(device_, vs, nullptr);
+        if (ps) vkDestroyShaderModule(device_, ps, nullptr);
+    }
+    if (warm_running_.fetch_sub(1) == 1 && !warm_stop_) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+        LOGR("vulkan: %u of %zu saved pipelines ready in %lld ms", warm_built_.load(), warm_jobs_.size(),
+             static_cast<long long>(ms.count()));
+    }
+}
+
+VkPipeline VulkanBackend::TakeWarmPipeline(const PsoKey& k) {
+    if (warm_jobs_.empty()) return VK_NULL_HANDLE;
+    std::lock_guard lock(warm_mutex_);
+    const auto it = warm_pipelines_.find(k);
+    if (it == warm_pipelines_.end()) return VK_NULL_HANDLE;
+    const VkPipeline pipe = it->second;
+    warm_pipelines_.erase(it);
+    return pipe;
 }
 
 bool VulkanBackend::Init(uint32_t width, uint32_t height) {
@@ -2033,6 +2218,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
 
     // the AO pools are made on first AO use (EnsureAoPools): with AO off they are never needed
     if (!CreatePresent()) return false;
+    StartPipelineWarm();  // needs the pipeline layout and the depth format
 
     LOGR("vulkan: %s, %ux%u swapchain, GPU draws", device_name_.c_str(), extent_.width, extent_.height);
     return true;
@@ -3342,6 +3528,7 @@ float4 psmain(O i) : SV_Target {
 }
 
 void VulkanBackend::Shutdown() {
+    StopPipelineWarm();
     if (draw_worker_.joinable()) {
         draw_job_ = {};
         draw_job_ready_.release();
@@ -3404,7 +3591,11 @@ void VulkanBackend::Shutdown() {
         if (ao_occ_pool_) vkDestroyDescriptorPool(device_, ao_occ_pool_, nullptr);
         if (ao_pipeline_layout_) vkDestroyPipelineLayout(device_, ao_pipeline_layout_, nullptr);
         if (ao_set_layout_) vkDestroyDescriptorSetLayout(device_, ao_set_layout_, nullptr);
+        for (auto& [key, pipe] : warm_pipelines_)
+            if (pipe) vkDestroyPipeline(device_, pipe, nullptr);
+        warm_pipelines_.clear();
         SavePipelineCache(true);
+        SaveSavedPipelines(true);
         if (pipeline_cache_) vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
         vkDestroyDevice(device_, nullptr);
     }
@@ -4753,8 +4944,10 @@ VkPipeline VulkanBackend::PlainPipeline(DeferredPlain p) {
     if (!ps || !p.vs) return VK_NULL_HANDLE;
     p.key.ps = pkey;
     if (auto it = pipelines_.find(p.key); it != pipelines_.end()) return it->second;
-    VkPipeline pipe = VK_NULL_HANDLE;
+    VkPipeline pipe = TakeWarmPipeline(p.key);
+    if (pipe) return pipelines_[p.key] = pipe;
     if (!CreatePipeline(p.key, p.vs, ps, pipe)) return VK_NULL_HANDLE;
+    RecordPipeline(p.key, p.vs, ps);
     pipelines_[p.key] = pipe;
     return pipe;
 }
@@ -5214,7 +5407,10 @@ VkShaderModule VulkanBackend::CompileShader(const std::string& src, shaderc_shad
             info.codeSize = bytes.size();
             info.pCode = reinterpret_cast<const uint32_t*>(bytes.data());
             VkShaderModule module = VK_NULL_HANDLE;
-            if (vkCreateShaderModule(device_, &info, nullptr, &module) == VK_SUCCESS) return module;
+            if (vkCreateShaderModule(device_, &info, nullptr, &module) == VK_SUCCESS) {
+                spv_keys_[module] = cache_key;
+                return module;
+            }
         }
     }
 
@@ -5255,6 +5451,7 @@ VkShaderModule VulkanBackend::CompileShader(const std::string& src, shaderc_shad
         LOGE("vulkan: vkCreateShaderModule failed: %s", VkError(r));
         return VK_NULL_HANDLE;
     }
+    spv_keys_[module] = cache_key;
     return module;
 }
 
@@ -7693,9 +7890,12 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     VkPipeline pipe = VK_NULL_HANDLE;
     if (auto it = pipelines_.find(k); it != pipelines_.end()) {
         pipe = it->second;
+    } else if ((pipe = TakeWarmPipeline(k))) {
+        pipelines_[k] = pipe;
     } else {
         if (!CreatePipeline(k, vs, ps, pipe)) return;
         pipelines_[k] = pipe;
+        RecordPipeline(k, vs, ps);
     }
 
     splits.At("pipeline key and lookup");
@@ -10235,6 +10435,7 @@ void VulkanBackend::Present(const Surface& front) {
     if (sampler::g_base) sampler::g_frames++;
     if (frames_ % 600 == 0) sampler::Dump();
     SavePipelineCache(false);
+    SaveSavedPipelines(false);
     if (frames_ % 60 == 0) {
         if (perf_) {
             const auto now = std::chrono::steady_clock::now();

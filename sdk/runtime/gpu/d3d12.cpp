@@ -360,6 +360,7 @@ struct Perf {
     uint64_t psos = 0;
     uint64_t pso_loads = 0;   // pipelines read from the saved library
     uint64_t pso_misses = 0;  // looked up there and not found
+    uint64_t pso_warm = 0;    // taken from the pipelines built at start (StartPipelineWarm)
     uint64_t shaders = 0;
     uint64_t shader_hits = 0;
     uint64_t raw = 0;
@@ -1409,10 +1410,31 @@ private:
     // The library reads from pso_lib_blob_ for as long as it exists.
     ComPtr<ID3D12PipelineLibrary> pso_lib_;
     std::vector<uint8_t> pso_lib_blob_;
-    uint32_t pso_lib_new_ = 0;           // pipelines stored since the last save
+    std::atomic<uint32_t> pso_lib_new_{0};  // pipelines stored since the last save (warm threads store too)
     uint64_t pso_lib_quiet_since_ = 0;   // present count of the last store
     void OpenPipelineLibrary();
     void SavePipelineLibrary(bool force);
+    // The draw pipeline keys of earlier runs (shader-cache/.../pipelines.keys), in first-use order. At start the
+    // warm threads build each one from the saved shaders, through the library, so the first draw that needs it
+    // takes it ready instead of stalling. The keys survive a driver update that makes the library stale.
+    std::vector<PsoKey> pso_keys_;
+    std::unordered_set<uint64_t> pso_key_set_;
+    size_t pso_keys_saved_ = 0;
+    std::vector<PsoKey> warm_keys_;  // read only while the warm threads run
+    std::atomic<size_t> warm_next_{0};
+    std::atomic<uint32_t> warm_running_{0};
+    std::atomic<uint32_t> warm_built_{0};
+    std::atomic<bool> warm_stop_{false};
+    std::vector<std::thread> warm_threads_;
+    std::mutex warm_mutex_;
+    std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> warm_psos_;  // built, not yet drawn with
+    void LoadPipelineKeys();
+    void SavePipelineKeys(bool force);
+    void RecordPipelineKey(const PsoKey& k, uint64_t h);
+    void StartPipelineWarm();
+    void StopPipelineWarm();
+    void WarmPipelines();
+    ComPtr<ID3D12PipelineState> TakeWarmPipeline(uint64_t h);
     // sampler descriptors are rewritten per frame like the SRV ring; a descriptor set from an
     // earlier frame may still be referenced by in-flight GPU work until its fence completes.
     static constexpr uint32_t kSamplersPerFrame = (kSamplerCount / kFrames) & ~3u;
@@ -1770,6 +1792,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     if (!CreateHeaps()) return false;
     if (!CreateBackBufferViews()) return false;
     if (!CreateRootSignature()) return false;
+    StartPipelineWarm();  // needs the root signature
     if (!CreateFrames()) return false;
     CreateGammaLut();
     ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
@@ -3391,7 +3414,8 @@ void D3D12Backend::SavePipelineLibrary(bool force) {
     if (!size || size > kPipelineCacheMaxBytes) return;
     std::vector<uint8_t> bytes(size);
     if (FAILED(pso_lib_->Serialize(bytes.data(), size))) return;
-    const uint32_t added = std::exchange(pso_lib_new_, 0);
+    if (!force && warm_running_.load()) return;  // the warm threads are still adding; save once they finish
+    const uint32_t added = pso_lib_new_.exchange(0);
     const auto file = ShaderCacheDirectory() / "pipelines.bin";
     // the write is off the render thread; the bytes are a copy, independent of the library
     std::thread([file, bytes = std::move(bytes), added] {
@@ -3419,6 +3443,11 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
     uint64_t h = Hash(&k, sizeof(k));
     auto it = psos_.find(h);
     if (it != psos_.end()) return it->second.Get();
+    if (ComPtr<ID3D12PipelineState> warm = TakeWarmPipeline(h)) {
+        ++g_perf.pso_warm;
+        psos_[h] = warm;
+        return warm.Get();
+    }
     D3D12_INPUT_ELEMENT_DESC el[16];
     uint32_t n = FillInputLayout(k, el);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
@@ -3442,7 +3471,166 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
                   d.DepthStencilState.StencilEnable, d.DepthStencilState.FrontFace.StencilFunc);
     }
     psos_[h] = pso;
+    if (pso) RecordPipelineKey(k, h);
     return pso.Get();
+}
+
+namespace {
+constexpr uint64_t kPipelineKeysMagic = 0x315359454B4F5350ull;  // "PSOKEYS1"
+constexpr size_t kMaxPipelineKeys = 8192;  // kept on disk
+constexpr size_t kMaxWarmPipelines = 4096;  // built at start, the oldest first
+std::filesystem::path PipelineKeysFile() { return ShaderCacheDirectory() / "pipelines.keys"; }
+std::filesystem::path DxbcFile(uint64_t hash) {
+    char name[24];
+    std::snprintf(name, sizeof(name), "%016llX.dxbc", static_cast<unsigned long long>(hash));
+    return ShaderCacheDirectory() / name;
+}
+}  // namespace
+
+// The header's key is sizeof(PsoKey), so a file from a build with another key layout is ignored
+void D3D12Backend::LoadPipelineKeys() {
+    if (ShaderCacheDirectory().empty()) return;
+    std::ifstream in(PipelineKeysFile(), std::ios::binary | std::ios::ate);
+    if (!in) return;
+    const std::streamoff length = in.tellg();
+    ShaderCacheHeader header{};
+    if (length <= std::streamoff(sizeof(header)) ||
+        length > std::streamoff(sizeof(header) + kMaxPipelineKeys * sizeof(PsoKey))) return;
+    in.seekg(0);
+    if (!in.read(reinterpret_cast<char*>(&header), sizeof(header)) || header.magic != kPipelineKeysMagic ||
+        header.key != sizeof(PsoKey) || header.size != uint64_t(length) - sizeof(header) ||
+        header.size % sizeof(PsoKey)) return;
+    std::vector<PsoKey> keys(size_t(header.size / sizeof(PsoKey)));
+    if (!in.read(reinterpret_cast<char*>(keys.data()), std::streamsize(header.size)) ||
+        Hash(keys.data(), size_t(header.size)) != header.checksum) return;
+    for (const PsoKey& k : keys)
+        if (pso_key_set_.insert(Hash(&k, sizeof(k))).second) pso_keys_.push_back(k);
+    pso_keys_saved_ = pso_keys_.size();
+}
+
+void D3D12Backend::RecordPipelineKey(const PsoKey& k, uint64_t h) {
+    if (ShaderCacheDirectory().empty() || !pso_key_set_.insert(h).second) return;
+    pso_keys_.push_back(k);
+    pso_lib_quiet_since_ = presents_;
+}
+
+// Written like the library, after a quiet spell, off the render thread; past the cap the oldest keys go
+void D3D12Backend::SavePipelineKeys(bool force) {
+    if (pso_keys_.size() == pso_keys_saved_) return;
+    if (!force && (presents_ - pso_lib_quiet_since_ < 300 || warm_running_.load())) return;
+    if (pso_keys_.size() > kMaxPipelineKeys) {
+        const size_t drop = pso_keys_.size() - kMaxPipelineKeys;
+        for (size_t i = 0; i < drop; i++) pso_key_set_.erase(Hash(&pso_keys_[i], sizeof(PsoKey)));
+        pso_keys_.erase(pso_keys_.begin(), pso_keys_.begin() + ptrdiff_t(drop));
+    }
+    pso_keys_saved_ = pso_keys_.size();
+    std::thread([file = PipelineKeysFile(), keys = pso_keys_] {
+        std::error_code ec;
+        std::filesystem::create_directories(file.parent_path(), ec);
+        auto temporary = file;
+        temporary += "." + std::to_string(GetCurrentProcessId()) + ".tmp";
+        const size_t bytes = keys.size() * sizeof(PsoKey);
+        ShaderCacheHeader header{kPipelineKeysMagic, sizeof(PsoKey), bytes, Hash(keys.data(), bytes)};
+        {
+            std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+            if (!out) return;
+            out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+            out.write(reinterpret_cast<const char*>(keys.data()), std::streamsize(bytes));
+            out.close();
+            if (out && MoveFileExW(temporary.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING)) return;
+        }
+        std::filesystem::remove(temporary, ec);
+    }).detach();
+}
+
+// TCNYC_PIPELINE_WARM=0 turns it off
+void D3D12Backend::StartPipelineWarm() {
+    LoadPipelineKeys();
+    if (const char* e = std::getenv("TCNYC_PIPELINE_WARM"); e && std::strcmp(e, "0") == 0) return;
+    for (const PsoKey& k : pso_keys_) {
+        // points and lines add a geometry shader through Compile, which is the render thread's alone
+        if (k.topo == uint32_t(Topology::Points) || k.topo == uint32_t(Topology::Lines)) continue;
+        if (k.samples > 1) {  // the MSAA setting may have changed since the key was kept
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{DXGI_FORMAT(k.rtfmt), k.samples};
+            if (k.has_rt && (FAILED(dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q,
+                                                               sizeof(q))) || !q.NumQualityLevels)) continue;
+        }
+        warm_keys_.push_back(k);
+        if (warm_keys_.size() == kMaxWarmPipelines) break;
+    }
+    if (warm_keys_.empty()) return;
+    const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t threads = uint32_t(std::clamp<unsigned>(cores > 2 ? cores - 2 : 1, 1, 4));
+    LOGR("d3d12: building %zu saved pipelines on %u threads", warm_keys_.size(), threads);
+    warm_running_ = threads;
+    for (uint32_t i = 0; i < threads; i++) warm_threads_.emplace_back([this] { WarmPipelines(); });
+}
+
+void D3D12Backend::StopPipelineWarm() {
+    warm_stop_ = true;
+    for (auto& t : warm_threads_)
+        if (t.joinable()) t.join();
+    warm_threads_.clear();
+}
+
+// One warm thread: the device, the pipeline library and FillPipelineDesc are safe to use from several threads;
+// the shaders come from the disk cache, never through Compile
+void D3D12Backend::WarmPipelines() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    const auto started = std::chrono::steady_clock::now();
+    while (!warm_stop_.load(std::memory_order_relaxed)) {
+        const size_t i = warm_next_.fetch_add(1);
+        if (i >= warm_keys_.size()) break;
+        const PsoKey& k = warm_keys_[i];
+        const uint64_t h = Hash(&k, sizeof(k));
+        {
+            std::lock_guard lock(warm_mutex_);
+            if (warm_psos_.count(h)) continue;
+        }
+        const auto vs_bytes = ReadShaderCache(DxbcFile(k.vs), k.vs);
+        const auto ps_bytes = ReadShaderCache(DxbcFile(k.ps), k.ps);
+        ComPtr<ID3DBlob> vs, ps;
+        if (vs_bytes.empty() || ps_bytes.empty() || FAILED(D3DCreateBlob(vs_bytes.size(), &vs)) ||
+            FAILED(D3DCreateBlob(ps_bytes.size(), &ps))) continue;
+        std::memcpy(vs->GetBufferPointer(), vs_bytes.data(), vs_bytes.size());
+        std::memcpy(ps->GetBufferPointer(), ps_bytes.data(), ps_bytes.size());
+        D3D12_INPUT_ELEMENT_DESC el[16];
+        const uint32_t n = FillInputLayout(k, el);
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+        d.InputLayout = {el, n};
+        FillPipelineDesc(k, vs.Get(), ps.Get(), d);
+        ComPtr<ID3D12PipelineState> pso;
+        if (pso_lib_) {
+            const std::wstring name = PipelineName(d);
+            if (FAILED(pso_lib_->LoadGraphicsPipeline(name.c_str(), &d, IID_PPV_ARGS(&pso)))) {
+                pso.Reset();
+                if (SUCCEEDED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso))) &&
+                    SUCCEEDED(pso_lib_->StorePipeline(name.c_str(), pso.Get())))
+                    ++pso_lib_new_;
+            }
+        } else if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
+            pso.Reset();
+        }
+        if (!pso) continue;
+        ++warm_built_;
+        std::lock_guard lock(warm_mutex_);
+        warm_psos_.emplace(h, std::move(pso));
+    }
+    if (warm_running_.fetch_sub(1) == 1 && !warm_stop_) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+        LOGR("d3d12: %u of %zu saved pipelines ready in %lld ms", warm_built_.load(), warm_keys_.size(),
+             static_cast<long long>(ms.count()));
+    }
+}
+
+ComPtr<ID3D12PipelineState> D3D12Backend::TakeWarmPipeline(uint64_t h) {
+    if (warm_keys_.empty()) return {};
+    std::lock_guard lock(warm_mutex_);
+    auto it = warm_psos_.find(h);
+    if (it == warm_psos_.end()) return {};
+    ComPtr<ID3D12PipelineState> pso = std::move(it->second);
+    warm_psos_.erase(it);
+    return pso;
 }
 
 TexKind TextureKind(const TextureDesc& d) {
@@ -6633,6 +6821,7 @@ bool Invert4(const float* m, float* out) {
 }
 
 D3D12Backend::~D3D12Backend() {
+    StopPipelineWarm();
     ReleaseDlss();
     if (fsr3_.context) {
         WaitFence(fence_value_);
@@ -7646,9 +7835,10 @@ void LogPerf() {
              p.sig_bytes / n / 1048576.0, p.texups / n, p.texup_bytes / n / 1048576.0, p.newtex / n,
              p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
              (unsigned long long)p.shaders, (unsigned long long)p.psos, (unsigned long long)p.shader_hits);
-        LOGI("perf: pipeline creation %.3f ms/frame, %llu built, %llu from the saved library (%llu not in it)",
+        LOGI("perf: pipeline creation %.3f ms/frame, %llu built, %llu from the saved library (%llu not in it), "
+             "%llu pre-built at start",
              p.pipeline / n, (unsigned long long)p.psos, (unsigned long long)p.pso_loads,
-             (unsigned long long)p.pso_misses);
+             (unsigned long long)p.pso_misses, (unsigned long long)p.pso_warm);
         g_perf = Perf{};
         perf_start = PerfClock::now();
         perf_frames = 0;
@@ -7769,6 +7959,7 @@ void D3D12Backend::Present(const Surface& front) {
     ReleaseOldTextures();
     if (frame_ % 60 == 0) SweepTargets();
     SavePipelineLibrary(false);
+    SavePipelineKeys(false);
     render_ = app::Snapshot();
     LoadFsr3();
     LoadDlss();
