@@ -235,6 +235,8 @@ FILE* OpenHostFile(const std::filesystem::path& path, const char* mode);
 bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::filesystem::path& game_dir,
           const std::filesystem::path& data_dir);
 [[noreturn]] void Shutdown(int code);
+// Run by Shutdown before the process ends (it runs no destructors): the GPU backend writes its pipeline caches
+void SetExitSave(void (*save)());
 // the executable recompiled from an Xbox image path (D:\\default.xbe), null when there is none
 const char* ImageExe(std::string xbe_path);
 [[noreturn]] void Relaunch(const char* exe);

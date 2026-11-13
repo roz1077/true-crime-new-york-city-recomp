@@ -962,6 +962,7 @@ private:
         uint64_t vs_spv = 0, ps_spv = 0;  // CompileShader's cache keys
     };
     std::unordered_map<VkShaderModule, uint64_t> spv_keys_;  // every module CompileShader made
+    std::mutex saved_mutex_;  // the list below: kernel::Shutdown saves it from the thread that ends the game
     std::vector<SavedPipeline> saved_pipelines_;
     std::unordered_set<PsoKey, PsoKeyHash> saved_pipeline_set_;
     size_t saved_pipelines_written_ = 0;
@@ -1700,6 +1701,7 @@ struct PipelineFileHeader {
 };
 }  // namespace
 
+std::atomic<VulkanBackend*> g_exit_backend{nullptr};  // for kernel::SetExitSave
 thread_local bool t_warm_thread = false;  // a pipeline warm thread, which leaves the render thread's state alone
 
 VkResult VulkanBackend::CreatePipelines(uint32_t count, const VkGraphicsPipelineCreateInfo* info,
@@ -1769,6 +1771,8 @@ void VulkanBackend::OpenPipelineCache() {
 // Writes the cache once a few seconds pass with no new pipeline (they come in bursts, at level loads and new
 // effects), so the copy does not land in the middle of one. force writes any change (at shutdown).
 void VulkanBackend::SavePipelineCache(bool force) {
+    static std::mutex writing;  // the render thread and kernel::Shutdown's save share the temporary file
+    std::lock_guard lock(writing);
     if (!pipeline_cache_ || !pipeline_cache_new_) return;
     if (!force && frames_ - pipeline_cache_quiet_since_ < 300) return;  // 5 s at 60 FPS
     if (!force && warm_running_.load()) return;  // the warm threads are still adding; save once they finish
@@ -1830,12 +1834,15 @@ void VulkanBackend::LoadSavedPipelines() {
 
 void VulkanBackend::RecordPipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps) {
     const auto v = spv_keys_.find(vs), p = spv_keys_.find(ps);
-    if (v == spv_keys_.end() || p == spv_keys_.end() || !saved_pipeline_set_.insert(k).second) return;
+    if (v == spv_keys_.end() || p == spv_keys_.end()) return;
+    std::lock_guard lock(saved_mutex_);
+    if (!saved_pipeline_set_.insert(k).second) return;
     saved_pipelines_.push_back({k, v->second, p->second});
 }
 
 // Written once a few seconds pass with no new pipeline, like the cache; past the cap the oldest go
 void VulkanBackend::SaveSavedPipelines(bool force) {
+    std::lock_guard lock(saved_mutex_);
     if (saved_pipelines_.size() == saved_pipelines_written_) return;
     if (!force && (frames_ - pipeline_cache_quiet_since_ < 300 || warm_running_.load())) return;
     const std::filesystem::path root = CacheRoot();
@@ -2219,6 +2226,14 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     // the AO pools are made on first AO use (EnsureAoPools): with AO off they are never needed
     if (!CreatePresent()) return false;
     StartPipelineWarm();  // needs the pipeline layout and the depth format
+    // the game ends through kernel::Shutdown, which skips Shutdown() here: save the caches there
+    g_exit_backend = this;
+    kernel::SetExitSave([] {
+        if (VulkanBackend* b = g_exit_backend.load()) {
+            b->SavePipelineCache(true);
+            b->SaveSavedPipelines(true);
+        }
+    });
 
     LOGR("vulkan: %s, %ux%u swapchain, GPU draws", device_name_.c_str(), extent_.width, extent_.height);
     return true;
@@ -3528,6 +3543,7 @@ float4 psmain(O i) : SV_Target {
 }
 
 void VulkanBackend::Shutdown() {
+    g_exit_backend = nullptr;
     StopPipelineWarm();
     if (draw_worker_.joinable()) {
         draw_job_ = {};

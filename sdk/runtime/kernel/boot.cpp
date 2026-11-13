@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
@@ -270,8 +271,15 @@ void Relaunch(const char* exe) {
 #endif
 }
 
+namespace {
+std::atomic<void (*)()> g_exit_save{nullptr};
+}
+
+void SetExitSave(void (*save)()) { g_exit_save = save; }
+
 void Shutdown(int code) {
     FlushOpenFiles();
+    if (auto save = g_exit_save.exchange(nullptr)) save();
     LOGR("Exit (%d)", code);
     logx::Flush();
     std::_Exit(code);

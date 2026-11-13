@@ -1417,6 +1417,7 @@ private:
     // The draw pipeline keys of earlier runs (shader-cache/.../pipelines.keys), in first-use order. At start the
     // warm threads build each one from the saved shaders, through the library, so the first draw that needs it
     // takes it ready instead of stalling. The keys survive a driver update that makes the library stale.
+    std::mutex pso_keys_mutex_;  // the list below: kernel::Shutdown saves it from the thread that ends the game
     std::vector<PsoKey> pso_keys_;
     std::unordered_set<uint64_t> pso_key_set_;
     size_t pso_keys_saved_ = 0;
@@ -1765,6 +1766,8 @@ private:
     uint64_t fps_n_ = 0;
 };
 
+std::atomic<D3D12Backend*> g_exit_backend{nullptr};  // for kernel::SetExitSave
+
 bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     render_ = app::Snapshot();
     LoadFsr3();
@@ -1793,6 +1796,14 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     if (!CreateBackBufferViews()) return false;
     if (!CreateRootSignature()) return false;
     StartPipelineWarm();  // needs the root signature
+    // the game ends through kernel::Shutdown, which runs no destructors: save the pipelines there
+    g_exit_backend = this;
+    kernel::SetExitSave([] {
+        if (D3D12Backend* b = g_exit_backend.load()) {
+            b->SavePipelineLibrary(true);
+            b->SavePipelineKeys(true);
+        }
+    });
     if (!CreateFrames()) return false;
     CreateGammaLut();
     ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
@@ -3355,6 +3366,11 @@ HRESULT D3D12Backend::CreatePipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d
 }
 
 namespace {
+// a temporary file name of its own per write: a background write and the exit save can overlap
+uint64_t NextTempId() {
+    static std::atomic<uint64_t> next{0};
+    return next++;
+}
 constexpr uint64_t kPipelineCacheMagic = 0x3142494C4F535058ull;  // "XPSOLIB1"
 constexpr uint64_t kPipelineCacheMaxBytes = 512ull << 20;
 }  // namespace
@@ -3410,19 +3426,20 @@ void D3D12Backend::OpenPipelineLibrary() {
 void D3D12Backend::SavePipelineLibrary(bool force) {
     if (!pso_lib_ || !pso_lib_new_) return;
     if (!force && presents_ - pso_lib_quiet_since_ < 300) return;  // 5 s at 60 FPS
+    if (!force && warm_running_.load()) return;  // the warm threads are still adding; save once they finish
     const size_t size = pso_lib_->GetSerializedSize();
     if (!size || size > kPipelineCacheMaxBytes) return;
     std::vector<uint8_t> bytes(size);
     if (FAILED(pso_lib_->Serialize(bytes.data(), size))) return;
-    if (!force && warm_running_.load()) return;  // the warm threads are still adding; save once they finish
     const uint32_t added = pso_lib_new_.exchange(0);
     const auto file = ShaderCacheDirectory() / "pipelines.bin";
-    // the write is off the render thread; the bytes are a copy, independent of the library
-    std::thread([file, bytes = std::move(bytes), added] {
+    // the write is off the render thread (the bytes are a copy, independent of the library), except a forced
+    // save at exit, which must finish before the process ends
+    auto write = [file, bytes = std::move(bytes), added] {
         std::error_code ec;
         std::filesystem::create_directories(file.parent_path(), ec);
         auto temporary = file;
-        temporary += "." + std::to_string(GetCurrentProcessId()) + ".tmp";
+        temporary += "." + std::to_string(GetCurrentProcessId()) + "." + std::to_string(NextTempId()) + ".tmp";
         ShaderCacheHeader header{kPipelineCacheMagic, 0, bytes.size(), Hash(bytes.data(), bytes.size())};
         {
             std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
@@ -3436,7 +3453,9 @@ void D3D12Backend::SavePipelineLibrary(bool force) {
             }
         }
         std::filesystem::remove(temporary, ec);
-    }).detach();
+    };
+    if (force) write();
+    else std::thread(std::move(write)).detach();
 }
 
 ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps) {
@@ -3509,13 +3528,16 @@ void D3D12Backend::LoadPipelineKeys() {
 }
 
 void D3D12Backend::RecordPipelineKey(const PsoKey& k, uint64_t h) {
-    if (ShaderCacheDirectory().empty() || !pso_key_set_.insert(h).second) return;
+    if (ShaderCacheDirectory().empty()) return;
+    std::lock_guard lock(pso_keys_mutex_);
+    if (!pso_key_set_.insert(h).second) return;
     pso_keys_.push_back(k);
     pso_lib_quiet_since_ = presents_;
 }
 
 // Written like the library, after a quiet spell, off the render thread; past the cap the oldest keys go
 void D3D12Backend::SavePipelineKeys(bool force) {
+    std::lock_guard lock(pso_keys_mutex_);
     if (pso_keys_.size() == pso_keys_saved_) return;
     if (!force && (presents_ - pso_lib_quiet_since_ < 300 || warm_running_.load())) return;
     if (pso_keys_.size() > kMaxPipelineKeys) {
@@ -3524,11 +3546,11 @@ void D3D12Backend::SavePipelineKeys(bool force) {
         pso_keys_.erase(pso_keys_.begin(), pso_keys_.begin() + ptrdiff_t(drop));
     }
     pso_keys_saved_ = pso_keys_.size();
-    std::thread([file = PipelineKeysFile(), keys = pso_keys_] {
+    auto write = [file = PipelineKeysFile(), keys = pso_keys_] {
         std::error_code ec;
         std::filesystem::create_directories(file.parent_path(), ec);
         auto temporary = file;
-        temporary += "." + std::to_string(GetCurrentProcessId()) + ".tmp";
+        temporary += "." + std::to_string(GetCurrentProcessId()) + "." + std::to_string(NextTempId()) + ".tmp";
         const size_t bytes = keys.size() * sizeof(PsoKey);
         ShaderCacheHeader header{kPipelineKeysMagic, sizeof(PsoKey), bytes, Hash(keys.data(), bytes)};
         {
@@ -3540,7 +3562,9 @@ void D3D12Backend::SavePipelineKeys(bool force) {
             if (out && MoveFileExW(temporary.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING)) return;
         }
         std::filesystem::remove(temporary, ec);
-    }).detach();
+    };
+    if (force) write();  // at exit: finish before the process ends
+    else std::thread(std::move(write)).detach();
 }
 
 // TCNYC_PIPELINE_WARM=0 turns it off
@@ -6821,6 +6845,7 @@ bool Invert4(const float* m, float* out) {
 }
 
 D3D12Backend::~D3D12Backend() {
+    g_exit_backend = nullptr;
     StopPipelineWarm();
     ReleaseDlss();
     if (fsr3_.context) {
