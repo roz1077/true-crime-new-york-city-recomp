@@ -45,12 +45,16 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 ## Highlights
 
 - **Native renderers** — Direct3D 12 on Windows, Vulkan on Linux; no emulator and no Proton.
-- **Modern graphics** — render scale with AMD FSR 1 upscaling and sharpening, aspect ratio, field of view, object detail, MSAA, SMAA, bloom, depth of field and GTAO ambient occlusion on both platforms.
+- **Almost no loading screens** — the game reads its data straight from your drive instead of a DVD, so loading screens are gone or flash past in a moment. How fast depends on your hardware, mainly the drive the game is installed on.
+- **Modern graphics** — render scale, aspect ratio, field of view, object detail, MSAA, SMAA, bloom, depth of field and GTAO ambient occlusion on both platforms, plus sharper and softer shadows.
+- **TAA and upscaling** — temporal anti-aliasing with per-object motion, AMD FSR 1 and FSR 3.1 on both platforms, FSR 4.1 on Windows with a supported AMD GPU, and RCAS sharpening.
+- **Steam Deck and handhelds** — a native SteamOS build with Deck button prompts, tested on a Radeon 890M handheld. See the [Linux / SteamOS guide](README-LINUX.md) for setup on SteamOS.
+- **Fewer stutters** — compiled pipelines are kept between runs and pre-built in the background at start, so effects the game has used before do not hitch the first time they appear.
 - **HDR output** — optional HDR on Windows (scRGB or HDR10) and Linux (HDR10 or extended sRGB), with paper white, peak brightness and highlight strength settings.
 - **Widescreen** — up to 32:9 for the 3D view, with the HUD and menus kept in the middle and the intro movies stretched to fill the screen.
 - **Controller and mouse** — Xbox, PlayStation and Switch controllers with hot-plug, rumble and matching button prompts, including Steam Deck glyphs and Xbox prompts for the ROG Ally and Legion Go under Steam Input. Raw mouse aim works in precision aim and snaps onto a lock-on target; keyboard prompts switch to the pedal keys in a car.
 - **Texture tools** — dump textures and load PNG/DDS replacement packs shared between Windows and Linux.
-- **Graphics menus** — the F10 overlay (keyboard, mouse or controller) and the game's own **Options > Display** tab, where display changes are applied and confirmed before they are saved.
+- **Graphics menus** — the F10 overlay (keyboard, mouse or controller) and the game's own **Options > Display** tab, where display changes are applied and confirmed before they are saved. An **Exit Game** option in the main and pause menus closes the game and saves your settings.
 - **Copland traffic fix** — restores normal civilian traffic after scripted and random-crime vehicle passes, without reducing police or wanted-level spawns.
 - **Car-scrape damage cap** — a passing car can no longer deal thousands of impact damage per second (most noticeable while you enter or exit a vehicle); impact damage to the player is limited to 15% of max health per second.
 - **Voice-volume 0 phone-call fix** — phone calls still start (silently) when voice volume is 0, so informant missions and precinct-cleanup messages are not lost.
@@ -58,15 +62,6 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 - **Keyboard driving** — full steering stays available while accelerating.
 - **Visual fixes** — no ghost copy or dark band from the glow along the frame's edges, building windows show their lit interiors as on the Xbox, and no white flashes in the intro cutscene.
 - **Quality of life** — 30/60 FPS limiter, saves written safely at shutdown, Unicode and long-path support, and controllers that can be unplugged and plugged back in at any time.
-
-<details>
-<summary><strong>Copland traffic fix</strong></summary>
-
-The scripted/random-crime vehicle queue reserves traffic model records at weight 0. That can drop civilian categories from the availability mask and leave only police spawning — the “Copland” glitch. The port repairs the zero weight from the matching traffic reference and clears the idle bit after the queue call, while still allowing the queue’s own vehicle to spawn.
-
-This repair only restores queue-zeroed model weights; police selection and wanted-level response are untouched.
-
-</details>
 
 ## Graphics menu
 
@@ -200,8 +195,7 @@ The extracted game files are used when both an ISO and extracted files are prese
 The presets use `clang`, `clang++` and `llvm-rc` from PATH. Release builds need the MSVC-target clang (Visual Studio's or `C:\Program Files\LLVM\bin`); a MinGW-target clang such as llvm-mingw first on PATH stops the Release configure. For a local MinGW build anyway, configure with `-DTCNYC_ALLOW_MINGW_RELEASE=ON`; release packages still refuse it.
 
 - **Release package:** `release.bat` builds `TrueCrimeNYC.zip` from `out\build\release`, with the Visual C++ runtime and the bundled compiler.
-- **Developer build:** `cmake --preset dev` then `cmake --build out\build\dev` adds an F9 debug menu (mission and stage jumps, player cheats, game speed, time of day, log, script trace). It is never part of a release; release packaging refuses a dev build.
-- **DLSS (developer, optional):** configure with `-DTCNYC_DLSS_SDK=<NVIDIA/DLSS checkout>` and put NVIDIA's release `nvngx_dlss.dll` beside the executable. The SDK headers are not vendored; see `docs/dlss-plan.md` for the AMD/OptiScaler test path and the native RTX gate.
+- **Developer build and experimental DLSS:** `build-dev.bat` (optionally with an NVIDIA DLSS SDK path) builds into `out\build\dev`; it is never used for releases. See [DEVELOPER.md](DEVELOPER.md) for the `dev` build with the F9 debug menu, building DLSS with NVIDIA's SDK on Windows or Linux, and the switches that help with testing.
 
 ### Linux
 
@@ -231,6 +225,7 @@ Ubuntu 24.04 has no `libsdl3-dev`; build SDL 3.4.16 (`release-3.4.16`) from sour
 - The first launch compiles game code; later launches reuse the shader cache.
 - If the game reports missing assets, check that `assets/default.xbe` and its data folders are present and match this build.
 - Logs are written to `logs/` beside the executable. Windows settings are in `settings.toml` beside the executable; Linux paths are in the [Linux guide](README-LINUX.md#paths).
+- [DEVELOPER.md](DEVELOPER.md) lists what to include in a report and switches for more detailed logs.
 - When reporting a visual problem on Linux, the [Linux troubleshooting section](README-LINUX.md#troubleshooting) explains the F3 trace files to include.
 
 ## Credits
@@ -241,7 +236,7 @@ Ubuntu 24.04 has no `libsdl3-dev`; build SDL 3.4.16 (`release-3.4.16`) from sour
 - [toml++](https://github.com/marzer/tomlplusplus), [Dear ImGui](https://github.com/ocornut/imgui), [SDL](https://github.com/libsdl-org/SDL) and [SMAA](https://github.com/iryoku/smaa) — configuration, overlay, window/input and anti-aliasing.
 - [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT) — upscaling and sharpening.
 - [AMD FidelityFX SDK 2.4](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0) — optional FSR 3.1 and FSR 4.1 on D3D12. Windows packages built with the AMD SDK inputs carry both signed DLLs and the [SDK licence](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.4.0/docs/license.md). For a manual install, place the signed loader and upscaler DLLs beside `TrueCrimeNYC.exe`. The older combined `amd_fidelityfx_dx12.dll` also supports FSR 3.1.
-- [NVIDIA DLSS](https://github.com/NVIDIA/DLSS) (NVIDIA proprietary, redistributable runtime) — optional experimental DLSS on D3D12 for RTX adapters; the release `nvngx_dlss.dll` is placed beside `TrueCrimeNYC.exe`.
+- [NVIDIA DLSS](https://github.com/NVIDIA/DLSS) (NVIDIA proprietary) — optional experimental DLSS in developer builds made with NVIDIA's SDK. Release packages do not include it.
 - [LLVM / Clang](https://llvm.org/) — the compiler bundled with the Windows release to build the game code on first launch.
 - [shaderc](https://github.com/google/shaderc) / [glslang](https://github.com/KhronosGroup/glslang) and [stb](https://github.com/nothings/stb) — run-time shader compilation and texture image loading on Linux.
 - Ambient occlusion follows GTAO (Jimenez et al., "Practical Real-Time Strategies for Accurate Indirect Occlusion", 2016) and Intel's [XeGTAO](https://github.com/GameTechDev/XeGTAO).

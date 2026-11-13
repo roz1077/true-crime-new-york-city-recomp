@@ -64,11 +64,6 @@ FSR 3.1 supports Performance (50%), Balanced (58%), Quality (67%) and Native AA
 (100%). It restores marked HUD pixels after upscaling and uses a reactive mask
 for translucent effects. Supported GPUs use the FP16 and wave64 shader variants.
 
-On a Steam Deck–class handheld (tested on a Radeon 890M), prefer TAA at 100%.
-FSR 3.1's own pass costs about 2.2–2.5 ms of GPU time there. Rendering at a lower
-resolution does not save that much, so FSR Quality and Performance give no GPU
-saving over TAA.
-
 Experimental Vulkan DLSS is available in builds configured with
 `-DTCNYC_DLSS_SDK=/path/to/NVIDIA/DLSS`. It uses the same render scales and
 requires an NVIDIA RTX GPU and the NGX runtime. Native RTX rendering still

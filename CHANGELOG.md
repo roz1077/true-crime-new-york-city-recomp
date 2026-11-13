@@ -64,7 +64,7 @@
   game exits. `TCNYC_PIPELINE_WARM=0` turns the pre-build off. Linux and Windows.
 
 ### Menus
-- A native Exit Game row in the main menu and the pause menu, with a confirmation step. It asks
+- A native Exit Game row in the main menu and the pause menu, with a confirmation step. It
   saves the Display tab's settings, then closes the window (an SDL quit event on Linux). An exit
   chosen while a display mode change is still being applied waits for it to finish.
 
