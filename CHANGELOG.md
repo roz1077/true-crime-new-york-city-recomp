@@ -58,6 +58,10 @@
   element, tracks vertex-constant changes on the render thread instead of comparing 3 KB per
   draw, and caches guest allocation sizes per thread until the memory layout changes. Linux and
   Windows.
+- Fewer first-time stutters: the draw pipelines a run uses are listed beside the pipeline cache,
+  and the next start builds them on background threads before the game needs them. The list
+  survives a driver update that empties the driver's own cache, and both are now saved when the
+  game exits. `TCNYC_PIPELINE_WARM=0` turns the pre-build off. Linux and Windows.
 
 ### Menus
 - A native Exit Game row in the main menu and the pause menu, with a confirmation step. It asks

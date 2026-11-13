@@ -1411,6 +1411,9 @@ private:
     ComPtr<ID3D12PipelineLibrary> pso_lib_;
     std::vector<uint8_t> pso_lib_blob_;
     std::atomic<uint32_t> pso_lib_new_{0};  // pipelines stored since the last save (warm threads store too)
+    // the library's own calls: D3D12 leaves two threads loading the same pipeline, and Serialize beside a
+    // store, to the caller (the render thread, the warm threads and the exit save all use it)
+    std::mutex pso_lib_mutex_;
     uint64_t pso_lib_quiet_since_ = 0;   // present count of the last store
     void OpenPipelineLibrary();
     void SavePipelineLibrary(bool force);
@@ -3348,6 +3351,7 @@ HRESULT D3D12Backend::CreatePipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d
     std::wstring name;
     if (pso_lib_) {
         name = PipelineName(desc);
+        std::unique_lock lock(pso_lib_mutex_);
         if (SUCCEEDED(pso_lib_->LoadGraphicsPipeline(name.c_str(), &desc, IID_PPV_ARGS(&pso)))) {
             ++g_perf.pso_loads;
             return S_OK;
@@ -3358,6 +3362,8 @@ HRESULT D3D12Backend::CreatePipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d
     const HRESULT hr = dev_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
     // E_INVALIDARG from StorePipeline: the name is already there (a different description under the same
     // name, which a 64 bit hash makes very unlikely); the pipeline is still used, just not kept
+    std::unique_lock lock(pso_lib_mutex_, std::defer_lock);
+    if (pso_lib_) lock.lock();
     if (SUCCEEDED(hr) && pso_lib_ && SUCCEEDED(pso_lib_->StorePipeline(name.c_str(), pso.Get()))) {
         ++pso_lib_new_;
         pso_lib_quiet_since_ = presents_;
@@ -3427,10 +3433,14 @@ void D3D12Backend::SavePipelineLibrary(bool force) {
     if (!pso_lib_ || !pso_lib_new_) return;
     if (!force && presents_ - pso_lib_quiet_since_ < 300) return;  // 5 s at 60 FPS
     if (!force && warm_running_.load()) return;  // the warm threads are still adding; save once they finish
-    const size_t size = pso_lib_->GetSerializedSize();
-    if (!size || size > kPipelineCacheMaxBytes) return;
-    std::vector<uint8_t> bytes(size);
-    if (FAILED(pso_lib_->Serialize(bytes.data(), size))) return;
+    std::vector<uint8_t> bytes;
+    {
+        std::lock_guard lock(pso_lib_mutex_);
+        const size_t size = pso_lib_->GetSerializedSize();
+        if (!size || size > kPipelineCacheMaxBytes) return;
+        bytes.resize(size);
+        if (FAILED(pso_lib_->Serialize(bytes.data(), size))) return;
+    }
     const uint32_t added = pso_lib_new_.exchange(0);
     const auto file = ShaderCacheDirectory() / "pipelines.bin";
     // the write is off the render thread (the bytes are a copy, independent of the library), except a forced
@@ -3626,11 +3636,17 @@ void D3D12Backend::WarmPipelines() {
         ComPtr<ID3D12PipelineState> pso;
         if (pso_lib_) {
             const std::wstring name = PipelineName(d);
-            if (FAILED(pso_lib_->LoadGraphicsPipeline(name.c_str(), &d, IID_PPV_ARGS(&pso)))) {
+            bool loaded;
+            {
+                std::lock_guard lock(pso_lib_mutex_);
+                loaded = SUCCEEDED(pso_lib_->LoadGraphicsPipeline(name.c_str(), &d, IID_PPV_ARGS(&pso)));
+            }
+            if (!loaded) {
                 pso.Reset();
-                if (SUCCEEDED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso))) &&
-                    SUCCEEDED(pso_lib_->StorePipeline(name.c_str(), pso.Get())))
-                    ++pso_lib_new_;
+                if (SUCCEEDED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
+                    std::lock_guard lock(pso_lib_mutex_);
+                    if (SUCCEEDED(pso_lib_->StorePipeline(name.c_str(), pso.Get()))) ++pso_lib_new_;
+                }
             }
         } else if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
             pso.Reset();
