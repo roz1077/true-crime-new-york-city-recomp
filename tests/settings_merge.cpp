@@ -16,11 +16,11 @@ int main() {
     int result = 1;
     // language names round-trip to the console's codes; an unknown name is rejected
     for (uint32_t code = 1; code < std::size(kLanguages); code++)
-        if (LanguageCode(LanguageName(code)) != code) {
+        if (*kLanguages[code] && LanguageCode(LanguageName(code)) != code) {
             std::cerr << "language " << code << " does not round-trip\n";
             return 1;
         }
-    if (LanguageCode("klingon") || LanguageCode("spanish") != 5 || std::string(LanguageName(0)) != "english") {
+    if (LanguageCode("klingon") || LanguageCode("german") || LanguageCode("") || LanguageCode("spanish") != 5 || std::string(LanguageName(0)) != "english") {
         std::cerr << "language lookup is wrong\n";
         return 1;
     }

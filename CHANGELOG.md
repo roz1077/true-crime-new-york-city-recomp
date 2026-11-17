@@ -2,10 +2,10 @@
 
 ## 0.9.2.4.1 - Beta 4.1 (2026-11-17)
 
-- Choose the game's language under Language in the launcher, or with `language` in the settings file
-  (`english`, `german`, `french`, `spanish` or `italian`). The port reports it to the game as the console's
-  language setting, so a disc that carries that language plays in it: the European French/Spanish/Italian disc
-  can now play in Spanish, French or Italian instead of always English. English is the default.
+- The European French/Spanish/Italian disc can show its text and subtitles in French, Spanish or Italian:
+  choose under Language in the launcher, or set `language` (`english`, `french`, `spanish` or `italian`) in
+  `settings-pal.toml`. Voices stay in English. English is the default; the US and other European PAL discs
+  have English text only, so the choice is not offered for them.
 
 ## 0.9.2.4 - Beta 4 (2026-11-16)
 

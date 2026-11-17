@@ -106,6 +106,7 @@ struct Graphics {
     SDL_Window *window = nullptr;
     Picker music_picker;  // the custom music folder
     std::vector<app::Mode> resolutions{{0, 0}};
+    bool languages = false;  // the Fr/Es/It disc is selected: the only one with other text languages
 
     void Save() {
         if (edits.empty()) return;
@@ -311,10 +312,10 @@ struct Graphics {
             ImGui::EndTable();
         }
 
-        // the console language the game reads; only discs that carry that language's text use it
-        if (Section("LANGUAGE")) {
-            static constexpr std::array<uint32_t, 5> kLanguageCodes{1, 3, 4, 5, 6};
-            if (Choice("Game language", "language", settings.language, kLanguageCodes, [](uint32_t v) {
+        // text and subtitles only, voices stay English; the Fr/Es/It disc is the only one with other languages
+        if (languages && Section("LANGUAGE")) {
+            static constexpr std::array<uint32_t, 4> kLanguageCodes{1, 4, 5, 6};
+            if (Choice("Text and subtitles", "language", settings.language, kLanguageCodes, [](uint32_t v) {
                     std::string name = app::LanguageName(v);
                     name[0] = char(std::toupper(static_cast<unsigned char>(name[0])));
                     return name;
@@ -877,6 +878,7 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
     app::SelectGameSettings(editing_region);
     app::Load();
     Graphics graphics{app::Snapshot()};
+    graphics.languages = editing_region == app::GameRegion::Pal;
     graphics.window = window;
     graphics.FindResolutions(window);
 
@@ -1142,6 +1144,7 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
                     graphics.Save();
                     editing_region = next.region;
                     app::SelectGameSettings(editing_region);
+                    graphics.languages = editing_region == app::GameRegion::Pal;
                     app::Get() = app::Settings{};
                     for (const auto& option : app::kGame.options) {
                         if (option.flag) *option.flag = defaults[option.key].value_or(*option.flag);
