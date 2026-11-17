@@ -25,6 +25,7 @@ struct Settings {
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
     uint32_t render_percent = 100;   // of the displayed frame's height
     uint32_t aspect = 0;             // the frame's shape, width / height x 1000; 0 the output's
+    uint32_t language = 1;           // the console language the game reads: 1 English, 3 German, 4 French, 5 Spanish, 6 Italian
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;
     bool low_latency = false;        // one frame queued ahead of the display instead of three (Windows)
@@ -65,6 +66,14 @@ struct Settings {
 };
 
 Settings& Get();
+// the settings file's language names, indexed by the console's language code (XC_LANGUAGE)
+inline constexpr const char* kLanguages[] = {"", "english", "japanese", "german", "french", "spanish", "italian"};
+inline uint32_t LanguageCode(const std::string& name) {  // 0 when unknown
+    for (uint32_t i = 1; i < std::size(kLanguages); i++)
+        if (name == kLanguages[i]) return i;
+    return 0;
+}
+inline const char* LanguageName(uint32_t code) { return code && code < std::size(kLanguages) ? kLanguages[code] : "english"; }
 // a coherent copy for the window and render threads, which share these fields with the menus
 Settings Snapshot();
 // serialises multi-field settings reads and writes; recursive so a locked menu can save

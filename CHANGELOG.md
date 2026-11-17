@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Choose the game's language under Language in the launcher, or with `language` in the settings file
+  (`english`, `german`, `french`, `spanish` or `italian`). The port reports it to the game as the console's
+  language setting, so a disc that carries that language plays in it: the European French/Spanish/Italian disc
+  can now play in Spanish, French or Italian instead of always English. English is the default.
+
 ## 0.9.2.4 - Beta 4 (2026-11-16)
 
 - One launcher detects the supported US NTSC and both European PAL disc builds. Each has its own saves and settings.

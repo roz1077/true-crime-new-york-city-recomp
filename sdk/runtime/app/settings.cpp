@@ -66,6 +66,7 @@ Settings Snapshot() {
     s.height = g.height;
     s.render_percent = g.render_percent;
     s.aspect = g.aspect;
+    s.language = g.language;
     s.vsync = g.vsync;
     s.low_latency = g.low_latency;
     s.taa = g.taa;
@@ -135,6 +136,7 @@ void Load() {
     if (s.width > 16384 || s.height > 16384 || !s.width || !s.height) s.width = s.height = 0;
     s.render_percent = std::clamp(s.render_percent, 25u, 200u);
     if (s.aspect && (s.aspect < 500 || s.aspect > 8000)) s.aspect = 0;
+    if (uint32_t code = LanguageCode(t["language"].value_or(std::string(LanguageName(s.language))))) s.language = code;
 
     SetFrameCap(t["fps_cap"].value_or(FrameCap()));
     s.vsync = t["vsync"].value_or(s.vsync);
@@ -221,6 +223,7 @@ toml::table Table() {
                   {"height", int64_t(s.height)},
                   {"render_percent", int64_t(s.render_percent)},
                   {"aspect_ratio", int64_t(s.aspect)},
+                  {"language", LanguageName(s.language)},
                   {"fps_cap", int64_t(FrameCap())},
                   {"vsync", s.vsync},
                   {"low_latency", s.low_latency},

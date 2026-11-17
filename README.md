@@ -208,6 +208,8 @@ Delete the file to return to the defaults.
 
 Browse to an ISO or enter the path to an extracted game folder. The launcher shows which region it detected. For automatic discovery, use `assets/` for an extracted US copy, `assets-pal/` for European Fr/Es/It, and `assets-pal-eu/` for the other European PAL disc. You can also put the ISOs in `assets/`. Use **Prefer PAL from local assets** to switch when both are available. The PAL builds use separate settings and saves. The Fr/Es/It build uses `settings-pal.toml` and `hdd-pal/`. The other European build uses `settings-pal-eu.toml` and `hdd-pal-eu/`. To reuse saves from a separate PAL installation, copy that installation's `hdd/` into `hdd-pal/` in the new installation.
 
+To play a European disc in another language it carries, pick it under **Language** in the launcher (or set `language = "spanish"`, `"french"`, `"italian"`, `"german"` or `"english"` in that disc's settings file). The Fr/Es/It disc has Spanish, French and Italian; the default is English.
+
 Both European PAL versions are **experimental** in Beta 4: they have had less testing than the US version, so please report any problem with the log from `logs/`.
 
 Always start `TrueCrimeNYC.exe` (`./TrueCrimeNYC` on Linux), whichever disc you have. The two PAL game executables are in the `regions` folder; the launcher starts the one that matches your disc, so you never need to run them yourself.

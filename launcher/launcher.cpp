@@ -310,6 +310,18 @@ struct Graphics {
             ImGui::EndDisabled();
             ImGui::EndTable();
         }
+
+        // the console language the game reads; only discs that carry that language's text use it
+        if (Section("LANGUAGE")) {
+            static constexpr std::array<uint32_t, 5> kLanguageCodes{1, 3, 4, 5, 6};
+            if (Choice("Game language", "language", settings.language, kLanguageCodes, [](uint32_t v) {
+                    std::string name = app::LanguageName(v);
+                    name[0] = char(std::toupper(static_cast<unsigned char>(name[0])));
+                    return name;
+                }))
+                edits.insert_or_assign("language", std::string(app::LanguageName(settings.language)));
+            ImGui::EndTable();
+        }
     }
 
     // The Music tab: where replacement and extra songs come from.

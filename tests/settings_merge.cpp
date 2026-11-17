@@ -14,6 +14,16 @@ int main() {
     const auto dir = fs::current_path() / ("settings-test-" + std::to_string(tag));
     const auto file = dir / "settings.toml";
     int result = 1;
+    // language names round-trip to the console's codes; an unknown name is rejected
+    for (uint32_t code = 1; code < std::size(kLanguages); code++)
+        if (LanguageCode(LanguageName(code)) != code) {
+            std::cerr << "language " << code << " does not round-trip\n";
+            return 1;
+        }
+    if (LanguageCode("klingon") || LanguageCode("spanish") != 5 || std::string(LanguageName(0)) != "english") {
+        std::cerr << "language lookup is wrong\n";
+        return 1;
+    }
     try {
         const toml::table initial{{"ao", 0}, {"external", true},
             {"controls", toml::table{{"keyboard", toml::table{{"use", toml::array{"E"}},
