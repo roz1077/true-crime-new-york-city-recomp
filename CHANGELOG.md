@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.2.4.1 - Beta 4.1 (2026-11-17)
 
 - Choose the game's language under Language in the launcher, or with `language` in the settings file
   (`english`, `german`, `french`, `spanish` or `italian`). The port reports it to the game as the console's
