@@ -54,6 +54,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 - **Widescreen** — up to 32:9 for the 3D view, with the HUD and menus kept in the middle and the intro movies stretched to fill the screen.
 - **Controller and mouse** — Xbox, PlayStation and Switch controllers with hot-plug, rumble and matching button prompts, including Steam Deck glyphs and Xbox prompts for the ROG Ally and Legion Go under Steam Input. Raw mouse aim works in precision aim and snaps onto a lock-on target; keyboard prompts switch to the pedal keys in a car.
 - **European PAL support (experimental)** — the US NTSC disc and both European PAL discs play from the same download; the launcher recognises your disc and starts the right version, with separate saves and settings for each region.
+- **Text and subtitles in French, Spanish or Italian** — with the European Fr/Es/It disc, pick the language in the launcher. Voices stay in English.
 - **Rebind everything** — keyboard, mouse and controller bindings from the launcher or the F10 menu, with button prompts that follow your choices.
 - **Smoother controller aim** — one dead zone for the whole right stick and a gentler curve, with controller and mouse sensitivity in the launcher, F10 and the game's Options > Controller tab.
 - **Custom music** — put MP3, OGG, FLAC or WAV songs in the `music` folder to replace the Music Player's songs or add new ones.
@@ -186,6 +187,7 @@ Everything in the F10 menu is saved to `settings.toml`: beside the executable on
 | `controller_aim_sensitivity_percent` | `100` | Controller turn speed after the curve, 100 to 400 (refined response only). |
 | `direct_mouse_aim` | `true` | The mouse turns the camera directly; `false` feeds it to the right stick instead. |
 | `music_folder` | `""` | Folder of custom songs (see Customization); empty uses `music` beside the executable, relative paths start there too. |
+| `language` | `"english"` | Text and subtitles on the European Fr/Es/It disc: `"english"`, `"french"`, `"spanish"` or `"italian"`. Set it in `settings-pal.toml`; voices are always English, and the other discs ignore it. |
 | `prompt_style` | `0` | Button prompts: 0 automatic, 1 original Xbox, 2 Xbox, 3 PlayStation, 4 Steam Deck. |
 | `[controls.keyboard]` | today's layout | Keys per action, e.g. `jump = ["Space", "G"]`; mouse buttons are `MouseLeft`, `MouseMiddle`, `MouseRight`, `Mouse4`, `Mouse5`. |
 | `[controls.controller]` | standard layout | The physical button for each console input, e.g. `A = "a"` (SDL names). |
