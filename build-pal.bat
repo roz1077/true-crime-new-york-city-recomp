@@ -14,6 +14,11 @@ if /i "%~1"=="eu" (
     set "PAL_ASSETS=assets-pal-eu"
     set "GAME_EXE=TrueCrimeNYCPALEU.exe"
 )
+if /i "%~1"=="eu-dev" (
+    set "PRESET=pal-eu-dev"
+    set "PAL_ASSETS=assets-pal-eu"
+    set "GAME_EXE=TrueCrimeNYCPALEU.exe"
+)
 set "OUT=%CD%\out\build\%PRESET%"
 
 if not exist "%PAL_ASSETS%\default.xbe" (

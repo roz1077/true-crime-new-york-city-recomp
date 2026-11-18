@@ -295,3 +295,8 @@ at = 0x00293CB1
 # 0x2938A6.
 [[function]]
 at = 0x00293DDD
+
+# By hand. The USA skin pass at 0x240003 is its own function; the PAL image decodes the same code at
+# 0x240643 inside 0x2405E0. Force the entry so head_skin.cpp can hook it.
+[[function]]
+at = 0x00240643

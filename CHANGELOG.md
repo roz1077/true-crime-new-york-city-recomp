@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Club Tadow no longer crashes when Hamilton's head is drawn. His head mesh is a single skinned
+  record whose skin buffer the game leaves uninitialised, so the four bone indices were garbage
+  and the skin pass read far outside the 23-bone palette. The port now gives an invalid head
+  record its declared bone before the pass. The head still falls off at the start of the mission,
+  as scripted.
+
 ## 0.9.2.4.2 - Beta 4.2 (2026-11-18)
 
 - Escape Crazy now keeps its 60 FPS gameplay: Zeke walks to his waiting spot instead of going out

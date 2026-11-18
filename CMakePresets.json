@@ -31,7 +31,9 @@
         {"name": "pal-eu", "displayName": "PAL (second European disc)", "inherits": "base",
          "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "TCNYC_PAL_EU": "ON"}},
         {"name": "pal-dev", "displayName": "PAL Dev (debug tools)", "inherits": "base",
-         "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo", "TCNYC_PAL": "ON", "TCNYC_DEV_TOOLS": "ON"}}
+         "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo", "TCNYC_PAL": "ON", "TCNYC_DEV_TOOLS": "ON"}},
+        {"name": "pal-eu-dev", "displayName": "PAL EU Dev (debug tools)", "inherits": "base",
+         "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo", "TCNYC_PAL_EU": "ON", "TCNYC_DEV_TOOLS": "ON"}}
     ],
     "buildPresets": [
         {"name": "debug", "configurePreset": "debug"},
@@ -41,6 +43,7 @@
         {"name": "dev", "configurePreset": "dev"},
         {"name": "pal", "configurePreset": "pal"},
         {"name": "pal-eu", "configurePreset": "pal-eu"},
-        {"name": "pal-dev", "configurePreset": "pal-dev"}
+        {"name": "pal-dev", "configurePreset": "pal-dev"},
+        {"name": "pal-eu-dev", "configurePreset": "pal-eu-dev"}
     ]
 }
