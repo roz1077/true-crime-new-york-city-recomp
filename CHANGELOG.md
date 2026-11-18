@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.2.4.2 - Beta 4.2 (2026-11-18)
+
+- Escape Crazy now keeps its 60 FPS gameplay: Zeke walks to his waiting spot instead of going out
+  through the window, the four shower doors unlock reliably once the last shower enemy is defeated,
+  and the lower-corridor patrol reaches its waypoint instead of turning on the spot.
+- The fixes apply to the US disc and both European PAL discs.
+
 ## 0.9.2.4.1 - Beta 4.1 (2026-11-17)
 
 - The European French/Spanish/Italian disc can show its text and subtitles in French, Spanish or Italian:
