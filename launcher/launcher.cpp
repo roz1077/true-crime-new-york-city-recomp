@@ -398,6 +398,7 @@ struct Graphics {
     void DrawAudio() {
         constexpr const char *mode_names[] = {"Mono", "Stereo", "Dolby Pro Logic II"};
         if (Section("OUTPUT")) {
+#ifdef _WIN32
             ImGui::TableNextColumn();
             ImGui::Checkbox("Force stereo output (2 ch, 48 kHz)", &settings.force_stereo_output);
             if (ImGui::IsItemEdited()) edits.insert_or_assign("force_stereo_output", settings.force_stereo_output);
@@ -405,6 +406,7 @@ struct Graphics {
             ImGui::TextWrapped("If audio is very quiet or cuts out on a TV or soundbar, leave this on and choose "
                                "Stereo. Turn it off to let the TV or receiver handle Dolby.");
             ImGui::TableNextRow();
+#endif
             ImGui::TableNextColumn();
             ImGui::TextDisabled("Output mode");
             ImGui::SetNextItemWidth(-1);

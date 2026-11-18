@@ -55,6 +55,14 @@ std::filesystem::path SettingsPath() {
     return ConfigDir() / SettingsFile();
 }
 
+uint32_t AudioMode() {
+    return std::atomic_ref(Get().audio_mode).load(std::memory_order_relaxed);
+}
+
+bool ForceStereoOutput() {
+    return std::atomic_ref(Get().force_stereo_output).load(std::memory_order_relaxed);
+}
+
 void LogSystem() {
     LOGR("Linux: SDL3 host");
 }
@@ -81,6 +89,19 @@ void Load() {
     s.render_percent = std::clamp(s.render_percent, 25u, 200u);
     if (s.aspect && (s.aspect < 500 || s.aspect > 8000)) s.aspect = 0;
     if (uint32_t code = LanguageCode(t["language"].value_or(std::string(LanguageName(s.language))))) s.language = code;
+
+    s.audio_mode = uint32_t(std::clamp<int64_t>(t["audio_mode"].value_or(int64_t(s.audio_mode)), 0, 2));
+    s.force_stereo_output = t["force_stereo_output"].value_or(s.force_stereo_output);
+    s.force_volume_mix = t["force_volume_mix"].value_or(s.force_volume_mix);
+    const auto volume = [&](const char* key, uint32_t value) {
+        return uint32_t(std::clamp<int64_t>(t[key].value_or(int64_t(value)), 0, 100));
+    };
+    s.sound_volume = volume("sound_volume", s.sound_volume);
+    s.music_volume = volume("music_volume", s.music_volume);
+    s.sfx_volume = volume("sfx_volume", s.sfx_volume);
+    s.ambient_volume = volume("ambient_volume", s.ambient_volume);
+    s.voice_volume = volume("voice_volume", s.voice_volume);
+    s.cinema_volume = volume("cinema_volume", s.cinema_volume);
 
     SetFrameCap(t["fps_cap"].value_or(FrameCap()));
     s.vsync = t["vsync"].value_or(s.vsync);
@@ -170,6 +191,15 @@ toml::table Table() {
                   {"render_percent", int64_t(s.render_percent)},
                   {"aspect_ratio", int64_t(s.aspect)},
                   {"language", LanguageName(s.language)},
+                  {"audio_mode", int64_t(s.audio_mode)},
+                  {"force_stereo_output", s.force_stereo_output},
+                  {"force_volume_mix", s.force_volume_mix},
+                  {"sound_volume", int64_t(s.sound_volume)},
+                  {"music_volume", int64_t(s.music_volume)},
+                  {"sfx_volume", int64_t(s.sfx_volume)},
+                  {"ambient_volume", int64_t(s.ambient_volume)},
+                  {"voice_volume", int64_t(s.voice_volume)},
+                  {"cinema_volume", int64_t(s.cinema_volume)},
                   {"fps_cap", int64_t(FrameCap())},
                   {"vsync", s.vsync},
                   {"low_latency", s.low_latency},
