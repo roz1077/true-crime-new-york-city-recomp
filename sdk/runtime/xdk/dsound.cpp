@@ -13,6 +13,7 @@
 #include <span>
 #include <vector>
 
+#include "app/app.h"
 #include "audio/audio.h"
 #include "xbe/xbe.h"
 #include "xdk/hle.h"
@@ -733,10 +734,26 @@ void Render(float* out, uint32_t frames) {
         MixVoice(v, bins.data(), frames);
     }
     if (dsp::Loaded()) dsp::Run(bins.data(), frames);
+    const uint32_t audio_mode = app::AudioMode();
     for (uint32_t i = 0; i < frames; i++) {
         const float* b = &bins[size_t(i) * kBins];
-        out[i * 2] = std::clamp(b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft]), -1.0f, 1.0f);
-        out[i * 2 + 1] = std::clamp(b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight]), -1.0f, 1.0f);
+        float left, right;
+        if (audio_mode == 0) {
+            // Mono: the same stereo fold, then one channel on both outputs.
+            const float l = b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft]);
+            const float r = b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight]);
+            left = right = std::clamp(0.5f * (l + r), -1.0f, 1.0f);
+        } else if (audio_mode == 2) {
+            // Dolby Pro Logic II: Lt/Rt with the surround pair in anti-phase.
+            const float surround = 0.5f * (b[kBackLeft] + b[kBackRight]);
+            left = std::clamp(b[kFrontLeft] + kFold * b[kCentre] - kFold * surround, -1.0f, 1.0f);
+            right = std::clamp(b[kFrontRight] + kFold * b[kCentre] + kFold * surround, -1.0f, 1.0f);
+        } else {
+            left = std::clamp(b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft]), -1.0f, 1.0f);
+            right = std::clamp(b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight]), -1.0f, 1.0f);
+        }
+        out[i * 2] = left;
+        out[i * 2 + 1] = right;
     }
 }
 

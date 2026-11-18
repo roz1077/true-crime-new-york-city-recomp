@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "app/app.h"
 #include "audio/audio.h"
 #include "core/log.h"
 
@@ -114,7 +115,16 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
                 }
                 if (SUCCEEDED(hr)) {
                     operation = "open default output";
-                    hr = output.engine->CreateMasteringVoice(&output.master);
+                    // The mixer always renders stereo 48 kHz. Some HDMI/TV
+                    // endpoints renegotiate and invalidate a non-stereo
+                    // mastering voice continuously, making audio cut in and
+                    // out; the launcher option asks for stereo in that case.
+                    // Otherwise use the endpoint's own format so a TV or
+                    // receiver can take over Dolby processing.
+                    if (app::ForceStereoOutput())
+                        hr = output.engine->CreateMasteringVoice(&output.master, 2, kRate);
+                    else
+                        hr = output.engine->CreateMasteringVoice(&output.master);
                 }
                 if (SUCCEEDED(hr)) {
                     operation = "create source voice";

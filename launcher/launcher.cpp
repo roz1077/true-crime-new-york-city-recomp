@@ -380,6 +380,65 @@ struct Graphics {
         ImGui::EndDisabled();
         ImGui::TextDisabled(custom ? "Using your own folder." : "Using the music folder beside the game.");
     }
+
+    void Volume(const char *label, const char *key, uint32_t &value) {
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", label);
+        ImGui::SetNextItemWidth(-1);
+        ImGui::PushID(key);
+        int percent = int(value);
+        if (ImGui::SliderInt("##volume", &percent, 0, 100, "%d%%")) {
+            value = uint32_t(percent);
+            edits.insert_or_assign(key, value);
+        }
+        ImGui::PopID();
+    }
+
+    // The Audio tab: the host's output mix and the game's volume categories.
+    void DrawAudio() {
+        constexpr const char *mode_names[] = {"Mono", "Stereo", "Dolby Pro Logic II"};
+        if (Section("OUTPUT")) {
+            ImGui::TableNextColumn();
+            ImGui::Checkbox("Force stereo output (2 ch, 48 kHz)", &settings.force_stereo_output);
+            if (ImGui::IsItemEdited()) edits.insert_or_assign("force_stereo_output", settings.force_stereo_output);
+            ImGui::TableNextColumn();
+            ImGui::TextWrapped("If audio is very quiet or cuts out on a TV or soundbar, leave this on and choose "
+                               "Stereo. Turn it off to let the TV or receiver handle Dolby.");
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("Output mode");
+            ImGui::SetNextItemWidth(-1);
+            int mode = int(settings.audio_mode);
+            if (ImGui::Combo("##audio_mode", &mode, mode_names, int(std::size(mode_names)))) {
+                settings.audio_mode = uint32_t(mode);
+                edits.insert_or_assign("audio_mode", mode);
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextWrapped("Mono and Dolby Pro Logic II are encoded by the port from the game's 5.1 mix. "
+                               "Dolby output needs a Pro Logic II decoder on the TV, soundbar or receiver.");
+            ImGui::EndTable();
+        }
+
+        if (Section("VOLUME MIX")) {
+            ImGui::TableNextColumn();
+            ImGui::Checkbox("Force this mix", &settings.force_volume_mix);
+            if (ImGui::IsItemEdited()) edits.insert_or_assign("force_volume_mix", settings.force_volume_mix);
+            ImGui::TableNextColumn();
+            ImGui::TextWrapped("Replaces the volume settings in the game's Audio menu. 100%% is full volume.");
+            ImGui::EndTable();
+        }
+
+        if (Section("CATEGORIES")) {
+            Volume("Master", "sound_volume", settings.sound_volume);
+            Volume("Music", "music_volume", settings.music_volume);
+            Volume("SFX", "sfx_volume", settings.sfx_volume);
+            Volume("Ambient", "ambient_volume", settings.ambient_volume);
+            Volume("Voice", "voice_volume", settings.voice_volume);
+            Volume("Cinema", "cinema_volume", settings.cinema_volume);
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("These values are applied when the game starts.");
+    }
 };
 
 // The Controls tab: keyboard and controller bindings, captured by pressing the new key or button.
@@ -1089,6 +1148,15 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
                 graphics_tab = true;
                 ImGui::BeginChild("music scroll", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
                 graphics.DrawMusic();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("  AUDIO  ")) {
+                ImGui::Spacing();
+                Headline("THE MIX: AUDIO");
+                graphics_tab = true;
+                ImGui::BeginChild("audio scroll", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+                graphics.DrawAudio();
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }

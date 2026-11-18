@@ -15,10 +15,12 @@
 // The stream can then start silently, run its completion callback, and
 // become audible if the mix-bin gain is restored during playback.
 
+#include "app/app.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
 #include "xdk/hle.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -32,7 +34,28 @@
 namespace {
 constexpr double kSilentButPlaying = 1.0e-6;
 constexpr uint32_t kMusicBin = 1;
+constexpr uint32_t kVolumeTable = TCNYC_PAL_EU ? 0x337D00u : TCNYC_PAL ? 0x337E00u : 0x337640u;
 thread_local int t_stream_start = 0;  // inside 0x25DA90 on this thread
+
+// The launcher's forced mix writes the game's volume table directly. The
+// music bin is held back while a music fade is active, so radio ducking and
+// fades still work.
+void ApplyForcedVolumes(bool music) {
+    const app::Settings& s = app::Get();
+    if (!s.force_volume_mix) return;
+    const float master = float(std::clamp<uint32_t>(s.sound_volume, 0, 100)) / 100.0f;
+    const auto set = [&](uint32_t bin, uint32_t percent) {
+        const float value = master * float(std::clamp<uint32_t>(percent, 0, 100)) / 100.0f;
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        kernel::W32(kVolumeTable + bin * 4, bits);
+    };
+    set(0, s.sfx_volume);
+    set(2, s.ambient_volume);
+    set(3, s.voice_volume);
+    set(4, s.cinema_volume);
+    if (music) set(kMusicBin, s.music_volume);
+}
 } // namespace
 
 #if TCNYC_DEV_TOOLS
@@ -191,8 +214,13 @@ X86_FUNC(sub_00250580) {
     constexpr uint32_t kUpdate = 0;  // event 0 in both XBE jump tables
     constexpr uint32_t kAudioManager = TCNYC_PAL_EU ? 0x0041F0C0u : TCNYC_PAL ? 0x41F1C0u : 0x41E8F0u;
     const uint32_t fade = ctx.ecx;
-    if (X86_MEM32(ctx.esp + 4) != kUpdate || !X86_MEM8(fade + 0x28)) {
+    if (X86_MEM32(ctx.esp + 4) != kUpdate) {
         __imp__sub_00250580(ctx, base);
+        return;
+    }
+    if (!X86_MEM8(fade + 0x28)) {
+        __imp__sub_00250580(ctx, base);
+        ApplyForcedVolumes(true);
         return;
     }
 
@@ -212,6 +240,7 @@ X86_FUNC(sub_00250580) {
     X86_PUSH32(TCNYC_PAL_EU ? 0x00250CCEu : TCNYC_PAL ? 0x250D6Eu : 0x25069Eu);  // return address after the guest setter call
     ctx.ecx = kAudioManager;
     __imp__sub_00229120(ctx, base);
+    ApplyForcedVolumes(false);  // leave the fade's music level alone
     ctx.eax = 0;
     ctx.esp += 16;  // ret 0x0C
 }

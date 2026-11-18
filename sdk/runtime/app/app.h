@@ -26,6 +26,15 @@ struct Settings {
     uint32_t render_percent = 100;   // of the displayed frame's height
     uint32_t aspect = 0;             // the frame's shape, width / height x 1000; 0 the output's
     uint32_t language = 1;           // the console language for text and subtitles (Fr/Es/It disc only): 1 English, 4 French, 5 Spanish, 6 Italian
+    uint32_t audio_mode = 1;         // output mix: 0 mono, 1 stereo, 2 Dolby Pro Logic II
+    bool force_stereo_output = true; // open the device as 2 ch 48 kHz (quiet TV/soundbar workaround)
+    bool force_volume_mix = false;   // the launcher's volume mix replaces the game's own mix
+    uint32_t sound_volume = 100;     // forced mix, percent
+    uint32_t music_volume = 100;
+    uint32_t sfx_volume = 100;
+    uint32_t ambient_volume = 100;
+    uint32_t voice_volume = 100;
+    uint32_t cinema_volume = 100;
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;
     bool low_latency = false;        // one frame queued ahead of the display instead of three (Windows)
@@ -87,6 +96,8 @@ public:
 };
 uint32_t FrameCap();
 void SetFrameCap(uint32_t cap);
+uint32_t AudioMode();  // audio thread, the launcher's output mix
+bool ForceStereoOutput();  // audio thread, open the device as stereo 48 kHz
 uint32_t MsaaSamples();
 void SetMsaaSamples(uint32_t samples);
 std::filesystem::path SettingsPath();
