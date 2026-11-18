@@ -33,6 +33,10 @@ Pass a folder or image on the command line to start directly. Use
 The launcher detects the US NTSC and both supported European PAL discs by their XBE.
 Each region has its own saves and settings.
 
+The launcher's **Audio** tab sets Mono, Stereo or Dolby Pro Logic II output and an optional
+master/music/SFX/ambient/voice/cinema volume mix. Linux always opens a stereo 48 kHz stream, so the
+Windows-only **Force stereo output** option is not shown.
+
 The package also contains:
 
 - `TrueCrimeNYC`: the launcher and NTSC executable.

@@ -1,12 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.9.2.4.3 - Beta 4.3 (2026-11-19)
 
 - Club Tadow no longer crashes when Hamilton's head is drawn. His head mesh is a single skinned
   record whose skin buffer the game leaves uninitialised, so the four bone indices were garbage
   and the skin pass read far outside the 23-bone palette. The port now gives an invalid head
   record its declared bone before the pass. The head still falls off at the start of the mission,
   as scripted.
+- A new Audio tab in the launcher chooses the output mix (Mono, Stereo or Dolby Pro Logic II) and
+  can force a stereo 48 kHz output for TVs and soundbars that cut out or play quietly (Windows).
+  It can also force a master, music, SFX, ambient, voice and cinema volume mix in place of the
+  game's Audio menu levels; music ducking and fades still work. The mix applies to the US and both
+  European PAL discs, on Windows and Linux.
 
 ## 0.9.2.4.2 - Beta 4.2 (2026-11-18)
 

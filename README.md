@@ -7,14 +7,14 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/tag/v0.9.2-beta.4.2"><img alt="Beta 4.2 release" src="https://img.shields.io/badge/release-v0.9.2--beta.4.2-blue"></a>
+  <a href="../../releases/tag/v0.9.2-beta.4.3"><img alt="Beta 4.3 release" src="https://img.shields.io/badge/release-v0.9.2--beta.4.3-blue"></a>
   <img alt="Windows and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-2ea44f">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green"></a>
   <img alt="Beta" src="https://img.shields.io/badge/status-beta-orange">
 </p>
 
 <p align="center">
-  <a href="../../releases/tag/v0.9.2-beta.4.2"><strong>Download</strong></a> ·
+  <a href="../../releases/tag/v0.9.2-beta.4.3"><strong>Download</strong></a> ·
   <a href="README-LINUX.md">Linux / SteamOS guide</a> ·
   <a href="#building-from-source">Build from source</a> ·
   <a href="../../issues">Report an issue</a>
@@ -33,7 +33,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 
 | | Windows | Linux / SteamOS |
 |---|---|---|
-| **Download** | [TrueCrimeNYC.zip](../../releases/tag/v0.9.2-beta.4.2) | [TrueCrimeNYC-linux-x86_64.tar.gz](../../releases/tag/v0.9.2-beta.4.2) |
+| **Download** | [TrueCrimeNYC.zip](../../releases/tag/v0.9.2-beta.4.3) | [TrueCrimeNYC-linux-x86_64.tar.gz](../../releases/tag/v0.9.2-beta.4.3) |
 | **Install** | Extract, then put your game files in `assets/` | Extract, then put your game files in `assets/` |
 | **Run** | `TrueCrimeNYC.exe` | `./TrueCrimeNYC` |
 | **Renderer** | Direct3D 12 | Vulkan (leave Proton **off** in Steam) |
@@ -58,6 +58,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 - **Rebind everything** — keyboard, mouse and controller bindings from the launcher or the F10 menu, with button prompts that follow your choices.
 - **Smoother controller aim** — one dead zone for the whole right stick and a gentler curve, with controller and mouse sensitivity in the launcher, F10 and the game's Options > Controller tab.
 - **Custom music** — put MP3, OGG, FLAC or WAV songs in the `music` folder to replace the Music Player's songs or add new ones.
+- **Audio controls** — pick Mono, Stereo or Dolby Pro Logic II output, force stereo 48 kHz for TVs and soundbars that cut out, and set a master, music, SFX, ambient, voice and cinema volume mix in the launcher.
 - **Busier streets** — pedestrian detail, pedestrian limit, crowd density, traffic density and traffic distance settings.
 - **Launcher with updates** — a redesigned launcher that checks GitHub for new releases and installs them, keeping your settings, saves and music.
 - **Texture tools** — dump textures and load PNG/DDS replacement packs shared between Windows and Linux.
@@ -187,6 +188,15 @@ Everything in the F10 menu is saved to `settings.toml`: beside the executable on
 | `controller_aim_sensitivity_percent` | `100` | Controller turn speed after the curve, 100 to 400 (refined response only). |
 | `direct_mouse_aim` | `true` | The mouse turns the camera directly; `false` feeds it to the right stick instead. |
 | `music_folder` | `""` | Folder of custom songs (see Customization); empty uses `music` beside the executable, relative paths start there too. |
+| `audio_mode` | `1` | Output mix: `0` mono, `1` stereo, `2` Dolby Pro Logic II. |
+| `force_stereo_output` | `true` | Windows: open the output device as stereo 48 kHz for TVs and soundbars that cut out or play quietly; off lets the TV or receiver handle Dolby. |
+| `force_volume_mix` | `false` | Use the six volumes below instead of the game's Audio menu levels. |
+| `sound_volume` | `100` | Forced mix master volume, 0 to 100; scales the categories below. |
+| `music_volume` | `100` | Forced mix music volume, 0 to 100. |
+| `sfx_volume` | `100` | Forced mix sound-effects volume, 0 to 100. |
+| `ambient_volume` | `100` | Forced mix ambient-sound volume, 0 to 100. |
+| `voice_volume` | `100` | Forced mix voice volume, 0 to 100. |
+| `cinema_volume` | `100` | Forced mix cinema and cutscene volume, 0 to 100. |
 | `language` | `"english"` | Text and subtitles on the European Fr/Es/It disc: `"english"`, `"french"`, `"spanish"` or `"italian"`. Set it in `settings-pal.toml`; voices are always English, and the other discs ignore it. |
 | `prompt_style` | `0` | Button prompts: 0 automatic, 1 original Xbox, 2 Xbox, 3 PlayStation, 4 Steam Deck. |
 | `[controls.keyboard]` | today's layout | Keys per action, e.g. `jump = ["Space", "G"]`; mouse buttons are `MouseLeft`, `MouseMiddle`, `MouseRight`, `Mouse4`, `Mouse5`. |
