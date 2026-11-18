@@ -152,10 +152,15 @@ void RequestState(uint32_t instance, uint32_t state_hash) {
 
 } // namespace dev
 
+namespace game {
+void BeforeScriptUpdate(uint8_t *base, uint32_t instance); // timing.cpp
+}
+
 // 0xFD220: one script instance's update (thiscall, ecx = instance)
 X86_EXTERN_FUNC(__imp__sub_000FD220);
 X86_FUNC(sub_000FD220) {
     const uint32_t instance = ctx.ecx;
+    game::BeforeScriptUpdate(base, instance);
     {
         std::lock_guard guard(g_lock);
         // the stack starts at -1; 0xFCFA0 reads slot [depth] for depth >= 0

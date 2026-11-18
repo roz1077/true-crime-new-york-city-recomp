@@ -409,8 +409,15 @@ constexpr uint32_t TC_ADDR(uint32_t usa) {
 #define __imp__sub_0014B390 __imp__sub_0014BA80
 #define sub_0014F460 sub_0014FB50
 #define __imp__sub_0014F460 __imp__sub_0014FB50
+#define sub_001785A0 sub_00178C80
+#define __imp__sub_001785A0 __imp__sub_00178C80
+#define __imp__sub_001785D0 __imp__sub_00178CB0
+#define sub_001806B0 sub_00180D80
+#define __imp__sub_001806B0 __imp__sub_00180D80
 #define sub_0017FA70 sub_00180140
 #define __imp__sub_0017FA70 __imp__sub_00180140
+#define sub_00182830 sub_00182F00
+#define __imp__sub_00182830 __imp__sub_00182F00
 #define sub_001828C0 sub_00182F90
 #define __imp__sub_001828C0 __imp__sub_00182F90
 #define sub_00185D80 sub_00186450

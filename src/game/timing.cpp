@@ -32,14 +32,15 @@
 #include <vector>
 
 #include "app/app.h"
+#include "common/guest_values.h"
 #include "common/graphics_choices.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
+#include "kernel/memory.h"
 #include "xdk/hle.h"
 #if TCNYC_DEV_TOOLS
 #include "core/input.h"
 #include "dev/dev.h"
-#include "kernel/memory.h"
 #endif
 
 namespace {
@@ -49,6 +50,21 @@ constexpr uint32_t kSimTicks = TC_ADDR(0x363D0C);
 constexpr uint32_t kLastVblank = TC_ADDR(0x363D38);
 constexpr uint32_t kVblank = TC_ADDR(0x420468);
 constexpr uint32_t kAudioClockMode = TC_ADDR(0x360E0C);
+constexpr uint32_t kGameSession = TC_ADDR(0x360E00);
+// The mission setter (US 0x7F160) stores the current 32-byte LevelInfo
+// mission entry here. The first word of the entry is its name hash.
+constexpr uint32_t kCurrentMissionEntry = 0x2A94;
+constexpr uint32_t kEscapeCrazy = guest::Crc32("BC3_M6");
+constexpr uint32_t kScriptOwnerDepth = TC_ADDR(0x2E78C0);
+constexpr uint32_t kScriptOwnerStack = TC_ADDR(0x37BE28);
+constexpr uint32_t kScriptState = 0x424;
+constexpr uint32_t kCallingMarcus = guest::Crc32("callingMarcus");
+constexpr uint32_t kShowerOrderlyId = 777;
+constexpr uint32_t kUnlockShower = guest::Crc32("UnlockShower!");
+constexpr uint32_t kUnlockingShower = guest::Crc32("unlockingShower");
+constexpr uint32_t kObjectId = 0x1C;         // int16, the ID QueryID looks up (0x21FB20)
+constexpr uint32_t kRequestedState = 0x490;  // written by SetState (0xFC090)
+constexpr uint32_t kStateTable = 0x478;      // tag node: u16 count, u16 flags, 16-byte entries (name +4)
 #if !TCNYC_PAL
 constexpr uint32_t kPreviousAudioClockMode = TC_ADDR(0x360DE0);
 constexpr uint32_t kCutsceneClockStart = TC_ADDR(0x360DD0);
@@ -174,8 +190,14 @@ thread_local bool fast_present = false;
 thread_local uint32_t guest_renders = 0;
 thread_local uint32_t guest_swaps = 0;
 
+bool IsEscapeCrazy(uint8_t *base) {
+    const uint32_t session = X86_MEM32(kGameSession);
+    if (!session || !mem::IsCommitted(session + kCurrentMissionEntry + 3)) return false;
+    const uint32_t mission = X86_MEM32(session + kCurrentMissionEntry);
+    return mission && mem::IsCommitted(mission + 3) && X86_MEM32(mission) == kEscapeCrazy;
+}
+
 #if TCNYC_DEV_TOOLS
-constexpr uint32_t kGameSession = TC_ADDR(0x360E00);
 constexpr uint32_t kSessionMenuActive = 0x2A54; // also checked by the guest render path
 constexpr uint32_t kExperimentalRenderCap = 120;
 constexpr uint32_t kRenderBeginFromMainRender = TC_ADDR(0xA75DD);
@@ -433,6 +455,127 @@ void PrepareGameplayTiming(uint8_t *base) {
     }
 }
 } // namespace
+
+namespace {
+bool HasState(uint8_t *base, uint32_t script, uint32_t state) {
+    const uint32_t table = X86_MEM32(script + kStateTable);
+    if (!table || !mem::IsCommitted(table + 3)) return false;
+    const uint32_t count = std::min<uint32_t>(X86_MEM16(table), 256);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t entry = table + 4 + i * 16;
+        if (!mem::IsCommitted(entry + 7)) return false;
+        if (X86_MEM32(entry + 4) == state) return true;
+    }
+    return false;
+}
+
+// The object of the character whose scripts are running (0xFCFD0 reads it
+// the same way): the owner stack's top slot holds the owner, +0 its object.
+uint32_t ScriptObject(uint8_t *base) {
+    const int32_t depth = int32_t(X86_MEM32(kScriptOwnerDepth));
+    const uint32_t owner = depth >= 0 && depth < 8 ? X86_MEM32(kScriptOwnerStack + uint32_t(depth) * 4) : 0;
+    return owner ? X86_MEM32(owner) : 0;
+}
+
+// Zeke: the object whose script has a callingMarcus state, and that script's state.
+thread_local uint32_t zeke_object = 0;
+thread_local uint32_t zeke_state = 0;
+// Set while a FollowWaypoints script instance updates during Escape Crazy.
+thread_local bool in_follow_waypoints = false;
+constexpr uint32_t kFollowState = guest::Crc32("follow");
+} // namespace
+
+// Obstacle navigation can steer Zeke through the window at 60 FPS. His
+// starting position and waiting waypoint are on the same side, so he can use
+// the normal movement controller directly for this leg.
+X86_EXTERN_FUNC(__imp__sub_001785A0); // EnableObstacleNav
+X86_EXTERN_FUNC(__imp__sub_001785D0); // DisableObstacleNav
+X86_FUNC(sub_001785A0) {
+    if (fast_gameplay && zeke_object && zeke_state == kCallingMarcus && ScriptObject(base) == zeke_object)
+        return __imp__sub_001785D0(ctx, base);
+    __imp__sub_001785A0(ctx, base);
+}
+
+// The mission sends this query when the last shower enemy is defeated. The
+// orderly's OnQuery answers it with SetState(unlockingShower); that state's
+// init unlocks the four shower doors, walks him through and then chases
+// Marcus. At 60 FPS the request can be lost, leaving the doors locked and the
+// orderly in his previous state. Keep the request pending until his own
+// script has entered the state, so the doors open the way the game does it.
+thread_local bool shower_unlock_pending = false;
+
+X86_EXTERN_FUNC(__imp__sub_00182830); // QueryID
+X86_FUNC(sub_00182830) {
+    const uint32_t vm = X86_MEM32(ctx.esp + 4);
+    if (fast_gameplay && X86_MEM32(vm - 4) == kUnlockShower && X86_MEM32(vm - 8) == kShowerOrderlyId &&
+        IsEscapeCrazy(base))
+        shower_unlock_pending = true;
+    __imp__sub_00182830(ctx, base);
+}
+
+
+// Called before each script instance's update (0xFD220, ecx = instance),
+// whichever character update runs it. Tracks Zeke's state for the nav hook
+// above, and re-issues the orderly's pending state change until his own
+// script has entered it.
+namespace game {
+void BeforeScriptUpdate(uint8_t *base, uint32_t instance) {
+    in_follow_waypoints = false;
+    if (!IsEscapeCrazy(base)) {
+        shower_unlock_pending = false;
+        zeke_object = zeke_state = 0;
+        return;
+    }
+    const uint32_t object = ScriptObject(base);
+    if (!object) return;
+    const uint32_t state = X86_MEM32(instance + kScriptState);
+    // FollowWaypoints (AI_Global) has a single state, follow
+    if (state == kFollowState) {
+        const uint32_t table = X86_MEM32(instance + kStateTable);
+        in_follow_waypoints = table && mem::IsCommitted(table + 1) && X86_MEM16(table) == 1;
+    }
+    if (HasState(base, instance, kCallingMarcus)) {
+        zeke_object = object;
+        zeke_state = state;
+    }
+    if (shower_unlock_pending && int16_t(X86_MEM16(object + kObjectId)) == int16_t(kShowerOrderlyId) &&
+        HasState(base, instance, kUnlockingShower)) {
+        if (state == kUnlockingShower) {
+            shower_unlock_pending = false;
+            return;
+        }
+        if (X86_MEM32(instance + kRequestedState) != kUnlockingShower)
+            LOGR("tcnyc: Escape Crazy shower orderly missed UnlockShower! (state %08X, next %08X)", state,
+                 X86_MEM32(instance + kRequestedState));
+        X86_MEM32(instance + kRequestedState) = kUnlockingShower;
+    }
+}
+} // namespace game
+
+// Distance native (0x1806B0): from the running character to a point, in 3D.
+// FollowWaypoints counts a waypoint as reached within its arrival range. One
+// of Escape Crazy's patrol waypoints sits at the upper floor's height, 1.56 m
+// above the corridor its inmate walks, so he stops under it and turns on the
+// spot for good (on the Xbox too). For FollowWaypoints in this mission,
+// measure on the ground plane so he reaches it and carries on.
+X86_EXTERN_FUNC(__imp__sub_001806B0);
+X86_FUNC(sub_001806B0) {
+    if (in_follow_waypoints) {
+        const uint32_t object = ScriptObject(base);
+        if (object && !X86_MEM32(object + 0x28)) // no parent: +0x70 is the world position
+            X86_MEM32(X86_MEM32(ctx.esp + 4) - 8) = X86_MEM32(object + 0x74); // the point's height
+    }
+    __imp__sub_001806B0(ctx, base);
+}
+
+#if !TCNYC_DEV_TOOLS
+// Developer builds hook this update in dev_scripts.cpp, which calls BeforeScriptUpdate.
+X86_EXTERN_FUNC(__imp__sub_000FD220);
+X86_FUNC(sub_000FD220) {
+    game::BeforeScriptUpdate(base, ctx.ecx);
+    __imp__sub_000FD220(ctx, base);
+}
+#endif
 
 // The main loop's simulation step uses elapsed vblanks in 60 FPS gameplay.
 // Cutscenes keep the clock calculation in their region's guest loop.
