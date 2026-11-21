@@ -259,6 +259,9 @@ constexpr uint32_t kCacheGame = TC_ADDR(0x3F58E0), kSlotBytes = 0x1410, kCacheSl
 uint32_t g_cache = 0;        // guest address: kCacheSlots slots plus one spare
 int32_t g_cache_count = 0;   // game thread only
 bool g_cache_warned = false;
+// each slot's key, contiguous: Find runs per character per frame, and walking the 0x1410-byte slots
+// touches a different page for every entry
+uint32_t g_cache_keys[kCacheSlots];
 
 uint32_t Cache() {
     if (!g_cache) {
@@ -279,7 +282,7 @@ uint32_t Slot(int32_t i) { return g_cache + uint32_t(i) * kSlotBytes; }
 
 int32_t Find(uint8_t *base, uint32_t key) {
     for (int32_t i = 0; i < g_cache_count; ++i)
-        if (X86_MEM32(Slot(i)) == key) return i;
+        if (g_cache_keys[i] == key) return i;
     return -1;
 }
 
@@ -305,7 +308,9 @@ X86_FUNC(sub_0021C570) {
     const uint32_t key = X86_MEM32(ctx.esp + 4);
     uint32_t slot;
     if (g_cache_count < int32_t(kCacheSlots)) {
-        slot = Slot(g_cache_count++);
+        slot = Slot(g_cache_count);
+        g_cache_keys[g_cache_count] = key;
+        ++g_cache_count;
     } else {
         slot = Slot(kCacheSlots);  // the spare: shared, but never past the end
         if (!g_cache_warned) {

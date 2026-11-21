@@ -53,6 +53,8 @@ struct Store {
     int32_t ring_cx = 0, ring_cy = 0;
     bool ring_requested[128] = {};
     int32_t ring_target_x[128] = {}, ring_target_y[128] = {};
+    int ring_pending_idx = -1;  // the cell whose tile load is in flight: no new request until it lands
+    int ring_pending_wait = 0;  // drives spent waiting for it
     int ring_rr = 0;
     // Last tile each of the nine game cells held, kept while the cell still owns its object. A tile is
     // locked to the game through the unload window (tile cleared, object not yet released). Slots and
@@ -587,7 +589,22 @@ void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
     std::memset(g.ring_cell, 0, sizeof(g.ring_cell));
     int driven = 0;
     int new_tiles = 0;
-    constexpr int kNewTilesPerDrive = 8;
+    // One tile load in flight at a time: clear the pending mark once its cell reports loaded, or give up
+    // after a few seconds so a load that never lands cannot stall the ring.
+    if (g.ring_pending_idx >= 0) {
+        const int p = g.ring_pending_idx;
+        const bool valid = p < g.n * g.n && g.ring_init[p];
+        const bool loaded = valid && X86_MEM8(g.cells + uint32_t(p) * kCellBytes + 0x88);
+        if (!valid || loaded || ++g.ring_pending_wait > 180) {
+            g.ring_pending_idx = -1;
+            g.ring_pending_wait = 0;
+        }
+    }
+    // Two new tiles a drive (the drive runs at most once a frame), and only after the previous one has
+    // landed: a recentre used to ask for eight per drive, which filled the ring in ~9 frames but cost a
+    // burst of ~80 MB of reads and construction inside ~150 ms — the hitch when a boundary is crossed or
+    // the draw distance is raised. Slower fill only costs detail on far cells for a second or so.
+    constexpr int kNewTilesPerDrive = 2;
     // Walk the closest shell first. Keep polling already requested tiles even
     // after the new-request budget has been used for this update.
     for (int shell = 2; shell <= radius && driven < drive_limit; ++shell) {
@@ -613,9 +630,11 @@ void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
                 const uint32_t slot = g.slots + uint32_t(idx) * kSlotBytes;
                 const uint32_t cell = g.cells + uint32_t(idx) * kCellBytes;
                 if (!g.ring_requested[idx] || g.ring_target_x[idx] != x || g.ring_target_y[idx] != y) {
-                    if (new_tiles >= kNewTilesPerDrive) continue;
+                    if (new_tiles >= kNewTilesPerDrive || g.ring_pending_idx >= 0) continue;
                     ++new_tiles;
                     g.ring_requested[idx] = true;
+                    g.ring_pending_idx = idx;
+                    g.ring_pending_wait = 0;
                     g.ring_target_x[idx] = x;
                     g.ring_target_y[idx] = y;
                 }
@@ -842,7 +861,10 @@ void MaybeSync(uint8_t *base) {
         ++g.tests;
         MirrorTest(base);
     }
-    if (now - g.last_log >= std::chrono::seconds(5)) {
+    // The 5 s summary scans the whole commit bitmap (mem::Query), so it is diagnostic only: an
+    // unconditional line every 5 s in a release build is a stall nobody asked for.
+    static const bool log_city = DevEnv("XBE_TRACE_CITY") != nullptr;
+    if (log_city && now - g.last_log >= std::chrono::seconds(5)) {
         g.last_log = now;
         const mem::Stats stats = mem::Query();
         {
