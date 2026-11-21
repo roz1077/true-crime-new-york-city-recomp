@@ -1,7 +1,7 @@
 // Portable texture packs and dumps: reads PNG (stb_image) and DDS, writes PNG (stb_image_write)
 // or DDS, and watches textures/replacement with a cheap directory signature poll. The key and
 // the file names match the Windows texturedumper exactly, so the same pack works on both.
-#include "texturedumper_linux.h"
+#include "gpu/texturedumper_vk.h"
 
 #include <algorithm>
 #include <chrono>
@@ -30,7 +30,7 @@
 #include "gpu/mip_filter.h"
 #include "gpu/shaders.h"
 
-namespace gpu::texturedumper {
+namespace gpu::texturedumper_vk {
 
 namespace {
 
@@ -671,4 +671,4 @@ Lookup Take(uint64_t key, Image& out) {
     return Lookup::Loading;
 }
 
-}  // namespace gpu::texturedumper
+}  // namespace gpu::texturedumper_vk

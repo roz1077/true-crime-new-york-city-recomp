@@ -60,7 +60,7 @@ void MissionsTab() {
     if (!gameplay) ImGui::TextColored({1.0f, 0.7f, 0.3f, 1.0f}, "Load a save first: jumps only work in gameplay.");
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##filter", "Filter (title or ID, e.g. Vertigo, BC2, Race)", g_filter, sizeof(g_filter));
-    ImGui::BeginChild("missions", {0, 0}, ImGuiChildFlags_Border);
+    ImGui::BeginChild("missions", {0, 0}, ImGuiChildFlags_Borders);
     for (const Case &c : StoryTable()) {
         const bool case_matches = Matches(c.title) || Matches(c.id);
         bool any = case_matches;
@@ -146,7 +146,7 @@ void StagesTab() {
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##stagefilter", "Filter stages (e.g. Tommy, Fight, Boss)", g_stage_filter,
                              sizeof(g_stage_filter));
-    ImGui::BeginChild("scripts", {0, 0}, ImGuiChildFlags_Border);
+    ImGui::BeginChild("scripts", {0, 0}, ImGuiChildFlags_Borders);
     int shown = 0;
     for (const Script &s : scripts) {
         std::vector<std::string> names;
@@ -326,7 +326,7 @@ void LogTab() {
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##logfilter", "Filter log", g_log_filter, sizeof(g_log_filter));
-    ImGui::BeginChild("log", {0, 0}, ImGuiChildFlags_Border, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::BeginChild("log", {0, 0}, ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
     for (const std::string &line : lines) {
         if (g_log_dev_only && line.find("dev:") == std::string::npos) continue;
         if (g_log_filter[0] && line.find(g_log_filter) == std::string::npos) continue;

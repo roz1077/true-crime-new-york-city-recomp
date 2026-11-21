@@ -464,6 +464,12 @@ int Instance() {
 
 void* Window() { return g_hwnd; }
 
+Mode WindowPixels() {
+    RECT r{};
+    if (!g_hwnd || !GetClientRect(g_hwnd, &r)) return {0, 0};
+    return {uint32_t(std::max<LONG>(0, r.right - r.left)), uint32_t(std::max<LONG>(0, r.bottom - r.top))};
+}
+
 std::recursive_mutex& UiLock() {
     static std::recursive_mutex m;
     return m;

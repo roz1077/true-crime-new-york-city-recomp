@@ -103,8 +103,7 @@ set(HOST
     "${CMAKE_CURRENT_SOURCE_DIR}/settings_linux.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/audio_sdl3.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/backend_sw.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/backend_vk.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/texturedumper_linux.cpp"
+    "${REPO}/sdk/runtime/gpu/vulkan.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/backend_select.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/main_sdl.cpp")
 

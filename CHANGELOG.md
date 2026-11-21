@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Windows Vulkan renderer (experimental).** The Linux Vulkan backend now builds and runs on Windows from the
+  same executable: set `TCNYC_RENDERER=vulkan` to use it instead of Direct3D 12. It brings the per-draw, streaming
+  and FSR work already measured on Linux, with SMAA, TAA, bloom, depth of field, HDR output, MSAA and the ImGui
+  overlay. Vulkan is loaded at run time (no Vulkan SDK needed to play), shaderc builds the same HLSL shaders at
+  build time, and FSR 4.1/3.1 use AMD's signed Vulkan DLLs.
+- FSR 4.1 is now available on Windows Vulkan as well as Direct3D 12 (AMD FSR SDK 2.4; supported AMD GPUs only,
+  falling back to FSR 3.1 elsewhere).
+
 - New **Gamma**, **Brightness**, **Contrast** and **Saturation** display adjustments in the launcher,
   the F10 Graphics menu and Options > Display. All four default to 100%, which leaves the picture
   unchanged; they work in SDR and HDR, and Brightness is a gain so black bars and fades stay black.

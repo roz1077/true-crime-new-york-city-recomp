@@ -1955,8 +1955,16 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     });
     if (!CreateFrames()) return false;
     CreateGammaLut();
-    ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
-                        ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
+    ImGui_ImplDX12_InitInfo ui_init{};
+    ui_init.Device = dev_.Get();
+    ui_init.CommandQueue = queue_.Get();
+    ui_init.NumFramesInFlight = kFrames;
+    ui_init.RTVFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    ui_init.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    ui_init.SrvDescriptorHeap = ui_heap_.Get();
+    ui_init.LegacySingleSrvCpuDescriptor = ui_heap_->GetCPUDescriptorHandleForHeapStart();
+    ui_init.LegacySingleSrvGpuDescriptor = ui_heap_->GetGPUDescriptorHandleForHeapStart();
+    ImGui_ImplDX12_Init(&ui_init);
     LoadSettings();
     PrepareAoPipelines();
     EnsureBlitPipeline(kBgra, false, 1);
@@ -9539,6 +9547,6 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
 
 }  // namespace
 
-std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
+std::unique_ptr<Backend> CreateD3D12Backend() { return std::make_unique<D3D12Backend>(); }
 
 }  // namespace gpu

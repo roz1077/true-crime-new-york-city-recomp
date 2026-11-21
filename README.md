@@ -36,18 +36,19 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 | **Download** | [TrueCrimeNYC.zip](../../releases/tag/v0.9.2-beta.4.3) | [TrueCrimeNYC-linux-x86_64.tar.gz](../../releases/tag/v0.9.2-beta.4.3) |
 | **Install** | Extract, then put your game files in `assets/` | Extract, then put your game files in `assets/` |
 | **Run** | `TrueCrimeNYC.exe` | `./TrueCrimeNYC` |
-| **Renderer** | Direct3D 12 | Vulkan (leave Proton **off** in Steam) |
+| **Renderer** | Direct3D 12 (default) or Vulkan (`TCNYC_RENDERER=vulkan`) | Vulkan (leave Proton **off** in Steam) |
 
 - **Windows and Linux launcher:** browse for your Xbox `.iso`, drop it onto the launcher, or choose **Use local assets** if the game is already in `assets/`. The launcher mounts your ISO from its current location and remembers it for the next launch. Open **Graphics** to set the display mode, resolution, render scale, upscaling and other options before starting.
+- **Windows Vulkan (experimental):** set `TCNYC_RENDERER=vulkan` before starting the game (or in the launcher's environment) to use the Vulkan renderer instead of Direct3D 12. It uses the same FSR 4.1/3.1 DLLs with the `_vk` suffix and needs a Vulkan-capable driver.
 - **Linux:** `--assets <folder>` and `--iso <image>` also work. See the [Linux / SteamOS guide](README-LINUX.md) for SteamOS handheld steps and paths.
 - **First launch compiles the game code** and can take a while. Later launches reuse the cache.
 
 ## Highlights
 
-- **Native renderers** — Direct3D 12 on Windows, Vulkan on Linux; no emulator and no Proton.
+- **Native renderers** - Direct3D 12 on Windows, Vulkan on Linux; no emulator and no Proton. Windows also has an experimental Vulkan renderer (`TCNYC_RENDERER=vulkan`).
 - **Almost no loading screens** — the game reads its data straight from your drive instead of a DVD, so loading screens are gone or flash past in a moment. How fast depends on your hardware, mainly the drive the game is installed on.
 - **Modern graphics** — render scale, aspect ratio, field of view, object detail, MSAA, SMAA, bloom, depth of field and GTAO ambient occlusion on both platforms, plus sharper and softer shadows.
-- **TAA and upscaling** — temporal anti-aliasing with per-object motion, AMD FSR 1 and FSR 3.1 on both platforms, FSR 4.1 on Windows with a supported AMD GPU, and RCAS sharpening.
+- **TAA and upscaling** - temporal anti-aliasing with per-object motion, AMD FSR 1 and FSR 3.1 on both platforms, FSR 4.1 on Windows (Direct3D 12 and Vulkan) with a supported AMD GPU, and RCAS sharpening.
 - **Steam Deck and handhelds** — a native SteamOS build with Deck button prompts, tested on a Radeon 890M handheld. See the [Linux / SteamOS guide](README-LINUX.md) for setup on SteamOS.
 - **Fewer stutters** — compiled pipelines are kept between runs and pre-built in the background at start, so effects the game has used before do not hitch the first time they appear.
 - **HDR output** — optional HDR on Windows (scRGB or HDR10) and Linux (HDR10 or extended sRGB), with paper white, peak brightness and highlight strength settings.
@@ -218,7 +219,7 @@ Delete the file to return to the defaults.
 | | Windows | Linux |
 |---|---|---|
 | **OS** | Windows 10 or 11, 64-bit | 64-bit Linux with glibc 2.38+ (SteamOS 3.6+, Ubuntu 24.04+) |
-| **Graphics** | Direct3D 12 GPU | Vulkan 1.1 GPU/driver. MSAA requires Vulkan 1.2; without it MSAA falls back to one sample. |
+| **Graphics** | Direct3D 12 GPU; Vulkan 1.1 GPU/driver for the Vulkan renderer (`TCNYC_RENDERER=vulkan`) | Vulkan 1.1 GPU/driver. MSAA requires Vulkan 1.2; without it MSAA falls back to one sample. |
 | **HDR (optional)** | An HDR display with Windows HDR on | An HDR display and an HDR-capable session (for example gamescope with HDR enabled) |
 | **Audio** | — | SDL3 + PulseAudio |
 | **Game files** | Your own matching Xbox release, as an ISO or extracted files | Same |
@@ -285,7 +286,7 @@ Ubuntu 24.04 has no `libsdl3-dev`; build SDL 3.4.16 (`release-3.4.16`) from sour
 - [Zydis](https://github.com/zyantific/zydis) — x86 instruction decoding.
 - [toml++](https://github.com/marzer/tomlplusplus), [Dear ImGui](https://github.com/ocornut/imgui), [SDL](https://github.com/libsdl-org/SDL) and [SMAA](https://github.com/iryoku/smaa) — configuration, overlay, window/input and anti-aliasing.
 - [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT) — upscaling and sharpening.
-- [AMD FidelityFX SDK 2.4](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0) — optional FSR 3.1 and FSR 4.1 on D3D12. Windows packages built with the AMD SDK inputs carry both signed DLLs and the [SDK licence](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.4.0/docs/license.md). For a manual install, place the signed loader and upscaler DLLs beside `TrueCrimeNYC.exe`. The older combined `amd_fidelityfx_dx12.dll` also supports FSR 3.1.
+- [AMD FidelityFX SDK 2.4](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0) - optional FSR 3.1 and FSR 4.1 on Direct3D 12 and Vulkan. Windows packages built with the AMD SDK inputs carry both signed DLL pairs and the [SDK licence](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.4.0/docs/license.md). For a manual install, place the signed loader and upscaler DLLs beside `TrueCrimeNYC.exe` (`_dx12` for Direct3D 12, `_vk` for Vulkan). The older combined `amd_fidelityfx_dx12.dll` also supports FSR 3.1 on Direct3D 12.
 - [NVIDIA DLSS](https://github.com/NVIDIA/DLSS) (NVIDIA proprietary) — optional experimental DLSS in developer builds made with NVIDIA's SDK. Release packages do not include it.
 - [LLVM / Clang](https://llvm.org/) — the compiler bundled with the Windows release to build the game code on first launch.
 - [shaderc](https://github.com/google/shaderc) / [glslang](https://github.com/KhronosGroup/glslang) and [stb](https://github.com/nothings/stb) — run-time shader compilation and texture image loading on Linux.

@@ -41,12 +41,10 @@
 #include <utility>
 #include <vector>
 
+#ifndef _WIN32
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <backends/imgui_impl_sdl3.h>
-#include <backends/imgui_impl_vulkan.h>
-#include <imgui.h>
-#include <shaderc/shaderc.h>
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
@@ -55,6 +53,23 @@
 #include <sys/syscall.h>
 #include <link.h>
 #include <vulkan/vulkan.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+// volk declares every Vulkan entry point and loads vulkan-1.dll at runtime; VK_NO_PROTOTYPES comes with it.
+#define VK_USE_PLATFORM_WIN32_KHR
+#include <volk.h>
+#include <vulkan/vulkan_win32.h>
+#include <backends/imgui_impl_win32.h>
+#endif
+#include <backends/imgui_impl_vulkan.h>
+#include <imgui.h>
+#include <shaderc/shaderc.h>
 
 #include "app/app.h"
 #include "common/graphics_menu.h"
@@ -65,9 +80,15 @@
 #include "gpu/post_fx.h"
 #include "gpu/taa.h"
 #include "common/graphics_choices.h"
+#ifndef _WIN32
 // AMD FidelityFX FSR 3.1 (SDK 1.1.4) with its Vulkan backend, built from sdk/third_party/fsr3_vk
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
+#else
+// AMD FSR SDK 2.4: one API for the ML upscaler (4.1.2) and FSR 3.1.6, loaded from AMD's signed DLLs
+#include "ffx_upscale.h"
+#include "vk/ffx_api_vk.h"
+#endif
 #if defined(TCNYC_HAVE_DLSS)
 #include <nvsdk_ngx_helpers_vk.h>
 #endif
@@ -76,14 +97,12 @@
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
+#include "gpu/texturedumper_vk.h"
 #include "reference_renderer.h"
-
 // SMAA 1x: the reference shader and its lookup textures (third_party/smaa, MIT)
 #include "../../sdk/third_party/smaa/AreaTex.h"
 #include "../../sdk/third_party/smaa/SMAAShader.h"
 #include "../../sdk/third_party/smaa/SearchTex.h"
-
-#include "texturedumper_linux.h"
 
 namespace app {
 Mode WindowPixels();
@@ -192,6 +211,14 @@ struct ScopeTimer {
 // every 10 s, for addr2line on an unstripped copy of the same build. Unlike per-step timers it costs a few
 // samples a frame, so it does not distort what it measures.
 namespace sampler {
+#ifdef _WIN32
+// The sampler is the Linux SIGPROF/CPU-clock profiler below; Windows keeps the no-op (the title sampler is
+// Linux-only too).
+uintptr_t g_base = 0;
+uint64_t g_frames = 0;
+void Start() {}
+void Dump() {}
+#else
 constexpr size_t kMax = 1 << 20;
 uint64_t g_pcs[kMax], g_callers[kMax];
 std::atomic<size_t> g_count{0};
@@ -272,6 +299,7 @@ void Dump() {
         std::fclose(f);
     }
 }
+#endif
 }  // namespace sampler
 
 // TCNYC_PERF_SPLITS=1: finer CPU timing of the draw path, by named step, logged every 120 frames
@@ -949,7 +977,7 @@ private:
     // texture packs: the bytes' key, the loaded image, and the shared GPU copies
     void LatchPackKey(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint32_t* colours);
     void LatchPackImage(Tex& tx);
-    bool CreatePackTexture(Tex& r, texturedumper::Image& img);
+    bool CreatePackTexture(Tex& r, texturedumper_vk::Image& img);
     void ReleasePackTextures();
     struct PaletteMemo {
         uint32_t address = 0;
@@ -1530,7 +1558,18 @@ private:
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     } gputime_;
     struct Fsr3Vk {
+#ifdef _WIN32
+        void* context = nullptr;  // ffxContext from AMD's FSR SDK 2.4 upscaler
+        HMODULE module = nullptr;
+        PfnFfxCreateContext create = nullptr;
+        PfnFfxDestroyContext destroy = nullptr;
+        PfnFfxDispatch dispatch = nullptr;
+        PfnFfxQuery query = nullptr;
+        bool provider_four = false;
+        std::string provider_name;
+#else
         std::unique_ptr<FfxFsr3UpscalerContext> context;
+#endif
         std::vector<uint8_t> scratch;
         AoImage output;  // R8G8B8A8, storage + sampled
         AoImage reactive;
@@ -1549,6 +1588,11 @@ private:
     void DestroyFsr3();
     VkImageView DispatchFsr3(Target& ft, VkImageView color, const CameraFrame& cam, bool reset, bool motion,
                             const float* constants);
+#ifdef _WIN32
+    // the FSR SDK 2.4 loader path (FSR 4.1.2 / 3.1.6) used by DispatchFsr3 on Windows
+    VkImageView DispatchFsrApi(Target& ft, VkImageView color, const CameraFrame& cam, bool reset, bool motion,
+                               const float* constants);
+#endif
     VkPipeline TemporalHudPipeline();
     VkPipeline temporal_hud_pipe_ = VK_NULL_HANDLE;
 #if defined(TCNYC_HAVE_DLSS)
@@ -1748,13 +1792,35 @@ static std::vector<uint8_t> SceneToBgra(const void* pixels, uint32_t w, uint32_t
 }
 
 // every 8-bit value as the half-float bits of value / 255 (BGRA8 guest pixels into an RGBA16F target)
+static uint16_t FloatToHalf(float v) {
+    uint32_t x = 0;
+    std::memcpy(&x, &v, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const uint32_t exponent = (x >> 23) & 0xFFu;
+    uint32_t mantissa = x & 0x7FFFFFu;
+    if (exponent == 0xFFu) return uint16_t(sign | 0x7C00u | (mantissa ? 0x200u : 0u));
+    int e = int(exponent) - 127 + 15;
+    if (e >= 0x1F) return uint16_t(sign | 0x7C00u);
+    if (e <= 0) {
+        if (e < -10) return uint16_t(sign);
+        mantissa |= 0x800000u;
+        const uint32_t shift = uint32_t(14 - e);
+        uint32_t h = mantissa >> shift;
+        const uint32_t rest = mantissa & ((1u << shift) - 1);
+        const uint32_t halfway = 1u << (shift - 1);
+        if (rest > halfway || (rest == halfway && (h & 1u))) ++h;
+        return uint16_t(sign | h);
+    }
+    uint32_t h = (uint32_t(e) << 10) | (mantissa >> 13);
+    const uint32_t rest = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (h & 1u))) ++h;
+    return uint16_t(sign | h);
+}
+
 static const std::array<uint16_t, 256>& Unorm8ToHalf() {
     static const std::array<uint16_t, 256> table = [] {
         std::array<uint16_t, 256> t{};
-        for (uint32_t i = 0; i < 256; ++i) {
-            const _Float16 f = static_cast<_Float16>(float(i) / 255.0f);
-            std::memcpy(&t[i], &f, sizeof(f));
-        }
+        for (uint32_t i = 0; i < 256; ++i) t[i] = FloatToHalf(float(i) / 255.0f);
         return t;
     }();
     return table;
@@ -1849,13 +1915,19 @@ bool WriteRgbaTga(const char* path, const uint8_t* px, uint32_t w, uint32_t h, u
 } // namespace
 
 namespace {
-// $XDG_CACHE_HOME/TrueCrimeNYC, or ~/.cache/TrueCrimeNYC; empty when neither is set
+// $XDG_CACHE_HOME/TrueCrimeNYC, or ~/.cache/TrueCrimeNYC; %LOCALAPPDATA%\TrueCrimeNYC on Windows
 std::filesystem::path CacheRoot() {
+#ifdef _WIN32
+    if (const char* local = std::getenv("LOCALAPPDATA"); local && *local)
+        return std::filesystem::path(local) / "TrueCrimeNYC";
+    return app::ExeDir() / "shader-cache";
+#else
     if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
         return std::filesystem::path(xdg) / "TrueCrimeNYC";
     if (const char* home = std::getenv("HOME"); home && *home)
         return std::filesystem::path(home) / ".cache" / "TrueCrimeNYC";
     return {};
+#endif
 }
 
 constexpr uint64_t kPipelineCacheMagic = 0x3142494C4F535058ull;  // "XPSOLIB1"
@@ -1864,14 +1936,11 @@ struct PipelineFileHeader {
     uint64_t magic, size, checksum;
 };
 
-// Compiled SPIR-V persisted between runs: $XDG_CACHE_HOME/TrueCrimeNYC/shaders/<key>.spv
+// Compiled SPIR-V persisted between runs: <cache>/shaders/<key>.spv
 std::filesystem::path SpvCacheDirectory() {
     static const std::filesystem::path directory = [] {
-        if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
-            return std::filesystem::path(xdg) / "TrueCrimeNYC" / "shaders";
-        if (const char* home = std::getenv("HOME"); home && *home)
-            return std::filesystem::path(home) / ".cache" / "TrueCrimeNYC" / "shaders";
-        return std::filesystem::path();
+        const std::filesystem::path root = CacheRoot();
+        return root.empty() ? root : root / "shaders";
     }();
     return directory;
 }
@@ -1884,6 +1953,15 @@ std::filesystem::path SpvCachePath(uint64_t key) {
     return directory / name;
 }
 
+// process id for the cache's temporary file names
+unsigned long HostPid() {
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return static_cast<unsigned long>(::getpid());
+#endif
+}
+
 void WriteSpvCache(const std::filesystem::path& file, const std::vector<uint8_t>& bytes) {
     if (bytes.size() < 4 || bytes.size() % 4) return;
     std::error_code ec;
@@ -1891,12 +1969,12 @@ void WriteSpvCache(const std::filesystem::path& file, const std::vector<uint8_t>
     if (ec) return;
     static std::atomic<uint64_t> next{0};
     auto temporary = file;
-    temporary += ".tmp." + std::to_string(::getpid()) + "." + std::to_string(next.fetch_add(1));
+    temporary += ".tmp." + std::to_string(HostPid()) + "." + std::to_string(next.fetch_add(1));
     FILE* f = std::fopen(temporary.string().c_str(), "wb");
     if (!f) return;
     const bool ok = std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
-    if (std::fclose(f) == 0 && ok && std::rename(temporary.c_str(), file.c_str()) == 0) return;
-    std::remove(temporary.c_str());
+    if (std::fclose(f) == 0 && ok && std::rename(temporary.string().c_str(), file.string().c_str()) == 0) return;
+    std::remove(temporary.string().c_str());
 }
 
 // Shader cache writes run on their own thread, like d3d12.cpp's: a frame that compiles a burst of
@@ -2054,13 +2132,13 @@ bool WritePipelineFile(const std::filesystem::path& file, const Header& header, 
     std::filesystem::create_directories(file.parent_path(), ec);
     if (ec) return false;
     auto temp = file;
-    temp += ".tmp." + std::to_string(::getpid());
-    FILE* out = std::fopen(temp.c_str(), "wb");
+    temp += ".tmp." + std::to_string(HostPid());
+    FILE* out = std::fopen(temp.string().c_str(), "wb");
     if (!out) return false;
     const bool wrote = std::fwrite(&header, sizeof(header), 1, out) == 1 &&
                        std::fwrite(data, 1, size, out) == size;
-    if (std::fclose(out) == 0 && wrote && std::rename(temp.c_str(), file.c_str()) == 0) return true;
-    std::remove(temp.c_str());
+    if (std::fclose(out) == 0 && wrote && std::rename(temp.string().c_str(), file.string().c_str()) == 0) return true;
+    std::remove(temp.string().c_str());
     return false;
 }
 } // namespace
@@ -2220,7 +2298,11 @@ void VulkanBackend::StopPipelineWarm() {
 
 // shuffle the background warm out of the render thread's way (unprivileged: only raise niceness)
 static void LowerThreadPriority() {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#else
     setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 10);
+#endif
 }
 
 namespace {
@@ -2712,6 +2794,16 @@ static bool AppendNgxExtensions(std::vector<const char*>& enabled, std::span<con
 #endif
 
 bool VulkanBackend::CreateInstance() {
+#ifdef _WIN32
+    // vulkan-1.dll: the driver's loader, loaded without an import library (volk).
+    if (volkInitialize() != VK_SUCCESS) {
+        LOGE("vulkan: vulkan-1.dll is missing or too old; install a Vulkan-capable driver");
+        return false;
+    }
+    std::vector<const char*> enabled{VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    const uint32_t loader_version = volkGetInstanceVersion();
+    instance_version_ = std::min(loader_version, uint32_t(VK_API_VERSION_1_3));
+#else
     if (!SDL_Vulkan_LoadLibrary(nullptr)) {
         LOGE("vulkan: SDL could not load the Vulkan loader: %s", SDL_GetError());
         return false;
@@ -2728,6 +2820,7 @@ bool VulkanBackend::CreateInstance() {
             vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion")))
         enumerate_version(&loader_version);
     instance_version_ = std::min(loader_version, uint32_t(VK_API_VERSION_1_3));
+#endif
     // The color-space extension is optional: without it the surface only offers SDR formats.
     uint32_t extension_count = 0;
     if (vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr) == VK_SUCCESS && extension_count) {
@@ -2769,14 +2862,28 @@ bool VulkanBackend::CreateInstance() {
         LOGE("vulkan: vkCreateInstance failed: %s", VkError(r));
         return false;
     }
+#ifdef _WIN32
+    volkLoadInstance(instance_);
+#endif
     return true;
 }
 
 bool VulkanBackend::CreateSurface() {
+#ifdef _WIN32
+    VkWin32SurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    info.hinstance = GetModuleHandleW(nullptr);
+    info.hwnd = static_cast<HWND>(app::Window());
+    const VkResult r = vkCreateWin32SurfaceKHR(instance_, &info, nullptr, &surface_);
+    if (r != VK_SUCCESS) {
+        LOGE("vulkan: vkCreateWin32SurfaceKHR failed: %s", VkError(r));
+        return false;
+    }
+#else
     if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(app::Window()), instance_, nullptr, &surface_)) {
         LOGE("vulkan: SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
         return false;
     }
+#endif
     return true;
 }
 
@@ -2978,6 +3085,9 @@ bool VulkanBackend::CreateDevice() {
         LOGE("vulkan: vkCreateDevice failed: %s", VkError(r));
         return false;
     }
+#ifdef _WIN32
+    volkLoadDevice(device_);
+#endif
     vkGetDeviceQueue(device_, graphics_family_, 0, &queue_);
     vkGetDeviceQueue(device_, present_family_, 0, &present_queue_);
 #if defined(TCNYC_HAVE_DLSS)
@@ -3448,7 +3558,11 @@ void VulkanBackend::RenderUi() {
 
     std::lock_guard<std::recursive_mutex> guard(app::UiLock());
     ImGui_ImplVulkan_NewFrame();
+#ifdef _WIN32
+    ImGui_ImplWin32_NewFrame();
+#else
     ImGui_ImplSDL3_NewFrame();
+#endif
     ImGui::NewFrame();
     if (app::kGame.ui) app::kGame.ui(ui_fps_);
     ImGui::Render();
@@ -4221,7 +4335,7 @@ void VulkanBackend::ResetFrame() {
     road_projection_now_ = {};
     motion_rt_ = nullptr;
     taa_applied_ = false;
-    const bool want_fsr = settings.upscaler == game::choices::kFsr3 &&
+    const bool want_fsr = (settings.upscaler == game::choices::kFsr3 || settings.upscaler == game::choices::kFsr4) &&
                           game::choices::TemporalScale(settings.render_percent) && !fsr3_.failed;
     bool want_dlss = false;
 #if defined(TCNYC_HAVE_DLSS)
@@ -7271,7 +7385,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
     const uint64_t fast_key = Hash(fast_fields, sizeof(fast_fields));
     if (auto hit = tex_this_frame_.find(fast_key); hit != tex_this_frame_.end()) {
         Tex* t = hit->second;
-        if (t->pack_gen != texturedumper::Generation()) LatchPackKey(*t, d, Format(d.format), nullptr);
+        if (t->pack_gen != texturedumper_vk::Generation()) LatchPackKey(*t, d, Format(d.format), nullptr);
         if (t->pack_key) LatchPackImage(*t);
         return t;
     }
@@ -7450,7 +7564,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
         }
     }
     // texture packs: a pack image is drawn in place of the guest bytes once it has loaded
-    if (t->pack_gen != texturedumper::Generation())
+    if (t->pack_gen != texturedumper_vk::Generation())
         LatchPackKey(*t, d, fi, colours);
     if (t->pack_key) LatchPackImage(*t);
     if (!palette_va && !prompt_gen) tex_this_frame_[fast_key] = t;
@@ -7461,12 +7575,12 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
 void VulkanBackend::LatchPackKey(Tex& tx, const TextureDesc& d, const FormatInfo& fi,
                                  const uint32_t* colours) {
     const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
-    tx.pack_gen = texturedumper::Generation();
+    tx.pack_gen = texturedumper_vk::Generation();
     tx.swap = nullptr;
-    const uint64_t key = texturedumper::Key(d, fi, p, colours);
-    texturedumper::Dump(key, d, p, colours);
+    const uint64_t key = texturedumper_vk::Key(d, fi, p, colours);
+    texturedumper_vk::Dump(key, d, p, colours);
     // dumping alone keys the bytes too: the pack image is not drawn then
-    tx.pack_key = texturedumper::Replacing() ? key : 0;
+    tx.pack_key = texturedumper_vk::Replacing() ? key : 0;
 }
 
 // the pack image for tx's bytes once it has loaded; textures with the same bytes share its GPU copy
@@ -7480,10 +7594,10 @@ void VulkanBackend::LatchPackImage(Tex& tx) {
     }
     auto it = pack_textures_.find(tx.pack_key);
     if (it == pack_textures_.end()) {
-        texturedumper::Image img;
-        const texturedumper::Lookup got = texturedumper::Take(tx.pack_key, img);
-        if (got == texturedumper::Lookup::Loading) return;
-        if (got == texturedumper::Lookup::None) {
+        texturedumper_vk::Image img;
+        const texturedumper_vk::Lookup got = texturedumper_vk::Take(tx.pack_key, img);
+        if (got == texturedumper_vk::Lookup::Loading) return;
+        if (got == texturedumper_vk::Lookup::None) {
             tx.pack_key = 0;
             return;
         }
@@ -7500,7 +7614,7 @@ void VulkanBackend::LatchPackImage(Tex& tx) {
 }
 
 // a pack image with all its levels, sampled like a guest texture at any resolution
-bool VulkanBackend::CreatePackTexture(Tex& r, texturedumper::Image& img) {
+bool VulkanBackend::CreatePackTexture(Tex& r, texturedumper_vk::Image& img) {
     if (img.levels.empty() || !img.width || !img.height) return false;
     if (!bc_supported_) {
         Host host = img.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? Host::BC1
@@ -7558,7 +7672,7 @@ bool VulkanBackend::CreatePackTexture(Tex& r, texturedumper::Image& img) {
     if (vkCreateImageView(device_, &view, nullptr, &r.view) != VK_SUCCESS) return false;
 
     VkDeviceSize total = 0;
-    for (const texturedumper::Level& l : img.levels) total += l.px.size();
+    for (const texturedumper_vk::Level& l : img.levels) total += l.px.size();
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* map = nullptr;
@@ -7568,7 +7682,7 @@ bool VulkanBackend::CreatePackTexture(Tex& r, texturedumper::Image& img) {
     copies.reserve(img.levels.size());
     VkDeviceSize at = 0;
     for (uint32_t l = 0; l < img.levels.size(); l++) {
-        const texturedumper::Level& level = img.levels[l];
+        const texturedumper_vk::Level& level = img.levels[l];
         std::memcpy(static_cast<uint8_t*>(map) + at, level.px.data(), level.px.size());
         VkBufferImageCopy copy{};
         copy.bufferOffset = at;
@@ -7714,8 +7828,8 @@ bool VulkanBackend::MakeTexImage(Tex& t) {
     view.format = t.format;
     // Tex::depth is the volume depth, not the format's range: a 2D colour texture always has 1.
     const bool depth_format = Format(t.guest_format).depth;
-    view.subresourceRange = {depth_format ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, t.levels, 0,
-                             volume ? 1 : t.layers};
+    view.subresourceRange = {VkImageAspectFlags(depth_format ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
+                             0, t.levels, 0, volume ? 1 : t.layers};
     if (vkCreateImageView(device_, &view, nullptr, &t.view) != VK_SUCCESS) {
         vkDestroyImage(device_, t.image, nullptr);
         vkFreeMemory(device_, t.memory, nullptr);
@@ -10095,7 +10209,7 @@ VkPipeline VulkanBackend::TemporalHudPipeline() {
     if (!temporal_hud_pipe_) {
         const std::string shader = std::string("#define TAA_RESOLVE 1\n") + kTaaHlsl;
         if (VkShaderModule ps = CompileShader(shader, shaderc_fragment_shader, "fsrHud"))
-            temporal_hud_pipe_ = MakeTaaPipeline(ps, "fsrHud", VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_UNDEFINED);
+            temporal_hud_pipe_ = MakeTaaPipeline(ps, "fsrHud", fsr3_.output.format, VK_FORMAT_UNDEFINED);
     }
     return temporal_hud_pipe_;
 }
@@ -10212,8 +10326,13 @@ bool VulkanBackend::EnsureTaa(uint32_t w, uint32_t h, VkFormat format, bool need
 void VulkanBackend::DestroyFsr3() {
     if (fsr3_.context) {
         vkDeviceWaitIdle(device_);
+#ifdef _WIN32
+        if (fsr3_.destroy) fsr3_.destroy(&fsr3_.context, nullptr);
+        fsr3_.context = nullptr;
+#else
         ffxFsr3UpscalerContextDestroy(fsr3_.context.get());
         fsr3_.context.reset();
+#endif
     }
     if (fsr3_.output.image || fsr3_.reactive.image || fsr3_.shared[0].image) {
         vkDeviceWaitIdle(device_);
@@ -10229,6 +10348,137 @@ void VulkanBackend::DestroyFsr3() {
 }
 
 bool VulkanBackend::EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h, bool infinite) {
+#ifdef _WIN32
+    if (fsr3_.failed) return false;
+    auto fail = [&](const char* why, int code) {
+        fsr3_.failed = true;
+        LOGR("vulkan: FSR %s (%d)", why, code);
+        return false;
+    };
+    if (!fsr3_.module) {
+        std::error_code ec;
+        const auto loader = app::ExeDir() / "amd_fidelityfx_loader_vk.dll";
+        const auto upscaler = app::ExeDir() / "amd_fidelityfx_upscaler_vk.dll";
+        constexpr DWORD kSearch = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+        if (std::filesystem::exists(loader, ec) && std::filesystem::exists(upscaler, ec))
+            fsr3_.module = LoadLibraryExW(loader.c_str(), nullptr, kSearch);
+        if (!fsr3_.module) fsr3_.module = LoadLibraryExW(upscaler.c_str(), nullptr, kSearch);
+        if (fsr3_.module) {
+            fsr3_.create = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(fsr3_.module, "ffxCreateContext"));
+            fsr3_.destroy = reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(fsr3_.module, "ffxDestroyContext"));
+            fsr3_.dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(fsr3_.module, "ffxDispatch"));
+            fsr3_.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(fsr3_.module, "ffxQuery"));
+        }
+        if (!fsr3_.create || !fsr3_.destroy || !fsr3_.dispatch || !fsr3_.query) {
+            fsr3_.failed = true;
+            g_fsr_state.store(::gpu::FsrState::NoDll, std::memory_order_relaxed);
+            LOGR("vulkan: FSR needs AMD's amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll beside the "
+                 "game");
+            return false;
+        }
+    }
+    if (fsr3_.context && fsr3_.w == w && fsr3_.h == h && fsr3_.out_w == out_w && fsr3_.out_h == out_h &&
+        fsr3_.infinite == infinite)
+        return true;
+    DestroyFsr3();
+
+    // Which providers the signed upscaler carries: 4.1.x (ML) and 3.1.x. The setting picks one, the other is
+    // the fallback, and the UI label follows g_fsr_state.
+    uint64_t count = 0;
+    VkDeviceContext query_device{device_, physical_, vkGetDeviceProcAddr};
+    ffxQueryDescGetVersions versions{{FFX_API_QUERY_DESC_TYPE_GET_VERSIONS, nullptr},
+                                     FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, &query_device, &count, nullptr,
+                                     nullptr};
+    if (fsr3_.query(nullptr, &versions.header) != FFX_API_RETURN_OK || !count || count > 64) {
+        fsr3_.failed = true;
+        LOGR("vulkan: FidelityFX upscaler providers could not be enumerated");
+        return false;
+    }
+    std::vector<uint64_t> ids(count);
+    std::vector<const char*> names(count);
+    versions.versionIds = ids.data();
+    versions.versionNames = names.data();
+    if (fsr3_.query(nullptr, &versions.header) != FFX_API_RETURN_OK) {
+        fsr3_.failed = true;
+        LOGR("vulkan: FidelityFX upscaler provider names could not be read");
+        return false;
+    }
+    bool has_four = false;
+    for (const char* name : names) has_four |= name && std::strncmp(name, "4.", 2) == 0;
+    g_fsr_state.store(has_four ? ::gpu::FsrState::Available : ::gpu::FsrState::No4, std::memory_order_relaxed);
+    auto pick = [&](const char* prefix) -> uint64_t {
+        const size_t length = std::strlen(prefix);
+        for (size_t i = 0; i < size_t(count); ++i)
+            if (names[i] && std::strncmp(names[i], prefix, length) == 0) {
+                fsr3_.provider_name = names[i];
+                return ids[i];
+            }
+        return 0;
+    };
+    const bool want_four = app::Snapshot().upscaler == game::choices::kFsr4;
+    uint64_t provider = pick(want_four ? "4." : "3.1.");
+    if (!provider) provider = pick(want_four ? "3.1." : "4.");
+    if (!provider) {
+        fsr3_.failed = true;
+        LOGR("vulkan: no AMD FSR upscaler provider is available");
+        return false;
+    }
+    fsr3_.provider_four = fsr3_.provider_name.rfind("4.", 0) == 0;
+
+    if (!CreateAoImage(fsr3_.output, out_w, out_h, VK_FORMAT_R16G16B16A16_SFLOAT, 1,
+                       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        return fail("output could not be created", 0);
+    if (!CreateAoImage(fsr3_.reactive, w, h, VK_FORMAT_R8_UNORM, 1,
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+        return fail("reactive mask could not be created", 0);
+    fsr3_.output_fb = AoFramebuffer(RenderPassFor(fsr3_.output.format, VK_FORMAT_UNDEFINED), &fsr3_.output, nullptr);
+    fsr3_.reactive_fb =
+        AoFramebuffer(RenderPassFor(fsr3_.reactive.format, VK_FORMAT_UNDEFINED), &fsr3_.reactive, nullptr);
+    if (!fsr3_.output_fb || !fsr3_.reactive_fb) return fail("HUD or reactive framebuffer could not be created", 0);
+    if (!TemporalHudPipeline()) return fail("HUD pipeline could not be created", 0);
+    if (!fsr3_.reactive_pipe[0]) {
+        const std::string ms = std::string("#define MOTION_MS 1\n") + kTaaHlsl;
+        for (size_t i = 0; i < 2; ++i) {
+            const VkShaderModule ps = CompileShader(i ? ms : kTaaHlsl, shaderc_fragment_shader, "fsrReactive");
+            if (ps)
+                fsr3_.reactive_pipe[i] = MakeTaaPipeline(ps, "fsrReactive", fsr3_.reactive.format, VK_FORMAT_UNDEFINED);
+        }
+        if (!fsr3_.reactive_pipe[0] || !fsr3_.reactive_pipe[1])
+            return fail("reactive pipeline could not be created", 0);
+    }
+
+    ffxCreateContextDescUpscaleVersion api_version{};
+    api_version.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION, nullptr};
+    api_version.version = FFX_UPSCALER_VERSION;
+    ffxOverrideVersion version{{FFX_API_DESC_TYPE_OVERRIDE_VERSION, &api_version.header}, provider};
+    VkDeviceContext device_context{device_, physical_, vkGetDeviceProcAddr};
+    ffxCreateBackendVKDesc backend{{FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK, &version.header}, device_context};
+    ffxCreateContextDescUpscale desc{};
+    desc.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, &backend.header};
+    desc.flags = FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
+    if (infinite) desc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
+    if (fsr3_.provider_four)
+        desc.flags |= FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    desc.maxRenderSize = {w, h};
+    desc.maxUpscaleSize = {out_w, out_h};
+    const ffxReturnCode_t created = fsr3_.create(&fsr3_.context, &desc.header, nullptr);
+    if (created != FFX_API_RETURN_OK) {
+        fsr3_.context = nullptr;
+        fsr3_.failed = true;
+        LOGR("vulkan: FSR context creation failed (%u), provider %s", created, fsr3_.provider_name.c_str());
+        return false;
+    }
+    fsr3_.w = w;
+    fsr3_.h = h;
+    fsr3_.out_w = out_w;
+    fsr3_.out_h = out_h;
+    fsr3_.infinite = infinite;
+    fsr3_.valid = false;
+    LOGR("vulkan: FSR %s context %ux%u -> %ux%u%s", fsr3_.provider_name.c_str(), w, h, out_w, out_h,
+         infinite ? ", infinite depth" : "");
+    return true;
+#else
     if (fsr3_.failed) return false;
     if (fsr3_.context && fsr3_.w == w && fsr3_.h == h && fsr3_.out_w == out_w && fsr3_.out_h == out_h &&
         fsr3_.infinite == infinite)
@@ -10297,6 +10547,7 @@ bool VulkanBackend::EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t 
          infinite ? ", infinite depth" : "", fsr_fp16_ ? "FP16 enabled" : "FP32",
          fsr_wave64_ ? "wave64 enabled" : "default subgroup");
     return true;
+#endif
 }
 
 std::pair<uint32_t, uint32_t> VulkanBackend::TemporalOutputSize(const Target& ft, uint32_t scale) const {
@@ -10309,6 +10560,9 @@ std::pair<uint32_t, uint32_t> VulkanBackend::TemporalOutputSize(const Target& ft
 // FSR 3.1 from the frame (ft's colour), the metadata's reversed depth and the dense motion; null on failure
 VkImageView VulkanBackend::DispatchFsr3(Target& ft, VkImageView color_view, const CameraFrame& cam, bool reset,
                                         bool motion, const float* constants) {
+#ifdef _WIN32
+    return DispatchFsrApi(ft, color_view, cam, reset, motion, constants);
+#else
     const app::Settings settings = app::Snapshot();
     const auto [out_w, out_h] = TemporalOutputSize(ft, settings.render_percent);
     if (out_w < ft.w || out_h < ft.h) return VK_NULL_HANDLE;
@@ -10325,7 +10579,7 @@ VkImageView VulkanBackend::DispatchFsr3(Target& ft, VkImageView color_view, cons
     VkImage color = ft.samples > 1 ? ft.resolved_image : ft.image;
     VkImageLayout& color_layout = ft.samples > 1 ? ft.resolved_layout : ft.layout;
     Transition(color, color_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ft.format);
-    Transition(fsr3_.output.image, fsr3_.output.layout, VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM);
+    Transition(fsr3_.output.image, fsr3_.output.layout, VK_IMAGE_LAYOUT_GENERAL, fsr3_.output.format);
 
     auto described = [](VkImage image, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags usage) {
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -10413,7 +10667,7 @@ VkImageView VulkanBackend::DispatchFsr3(Target& ft, VkImageView color_view, cons
                     out_w, out_h);
     }
     Transition(fsr3_.output.image, fsr3_.output.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_FORMAT_R8G8B8A8_UNORM);
+               fsr3_.output.format);
     if (!fsr3_.valid && !fsr3_.logged) {
         LOGR("vulkan: FSR 3.1 %s dispatch succeeded", game::choices::TemporalPresetName(settings.render_percent)
                                                           ? game::choices::TemporalPresetName(settings.render_percent)
@@ -10423,11 +10677,123 @@ VkImageView VulkanBackend::DispatchFsr3(Target& ft, VkImageView color_view, cons
     fsr3_.valid = true;
     fsr3_.last = now;
     return fsr3_.output.view;
+#endif
 }
 
+#ifdef _WIN32
+// FSR SDK 2.4 dispatch (FSR 4.1.2, or 3.1.6 when the GPU/provider falls back): the same inputs as the FSR 3.1
+// source path — colour, the metadata depth, the dense motion and the reactive mask the TAA pass makes — through
+// AMD's generic FfxApiResource descriptors and the signed Vulkan upscaler DLL.
+VkImageView VulkanBackend::DispatchFsrApi(Target& ft, VkImageView color_view, const CameraFrame& cam, bool reset,
+                                          bool motion, const float* constants) {
+    const app::Settings settings = app::Snapshot();
+    const auto [out_w, out_h] = TemporalOutputSize(ft, settings.render_percent);
+    if (out_w < ft.w || out_h < ft.h) return VK_NULL_HANDLE;
+    bool infinite = cam.far_z <= 0;
+    if (fsr3_.context && infinite != fsr3_.infinite) {
+        if (++fsr3_.depth_mode_frames < 30) infinite = fsr3_.infinite;
+    } else {
+        fsr3_.depth_mode_frames = 0;
+    }
+    if (!EnsureFsr3(ft.w, ft.h, out_w, out_h, infinite)) return VK_NULL_HANDLE;
+    if (infinite == fsr3_.infinite) fsr3_.depth_mode_frames = 0;
+
+    VkImage color = ft.samples > 1 ? ft.resolved_image : ft.image;
+    VkImageLayout& color_layout = ft.samples > 1 ? ft.resolved_layout : ft.layout;
+    Transition(color, color_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ft.format);
+    Transition(fsr3_.output.image, fsr3_.output.layout, VK_IMAGE_LAYOUT_GENERAL, fsr3_.output.format);
+
+    bool reactive_ready = false;
+    if (motion) {
+        auto& reactive = fsr3_.reactive;
+        Transition(reactive.image, reactive.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, reactive.format);
+        WriteTaaSet(taa_.sets[2], nullptr, taa_.metadata.view, nullptr, motion_.view,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        DrawTaaPass(fsr3_.reactive_pipe[motion_.samples > 1], taa_.sets[2],
+                    RenderPassFor(reactive.format, VK_FORMAT_UNDEFINED), fsr3_.reactive_fb, ft.w, ft.h, constants);
+        Transition(reactive.image, reactive.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, reactive.format);
+        reactive_ready = true;
+    }
+
+    auto described = [](VkImage image, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags usage) {
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = format;
+        info.extent = {w, h, 1};
+        info.mipLevels = 1;
+        info.arrayLayers = 1;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.usage = usage;
+        return ffxApiGetImageResourceDescriptionVK(image, info, 0);
+    };
+    const auto resource = [&](VkImage image, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags usage,
+                              uint32_t state) {
+        return ffxApiGetResourceVK(reinterpret_cast<void*>(image), described(image, format, w, h, usage), state);
+    };
+
+    ffxDispatchDescUpscale d{};
+    d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+    d.commandList = cmd_;
+    d.color = resource(color, ft.format, ft.w, ft.h, VK_IMAGE_USAGE_SAMPLED_BIT,
+                       FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    d.depth = resource(taa_.metadata.image, kMetadataFormat, ft.w, ft.h, VK_IMAGE_USAGE_SAMPLED_BIT,
+                       FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    d.motionVectors = resource(taa_.dense.image, kDenseFormat, ft.w, ft.h, VK_IMAGE_USAGE_SAMPLED_BIT,
+                               FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    if (reactive_ready)
+        d.reactive = resource(fsr3_.reactive.image, fsr3_.reactive.format, ft.w, ft.h, VK_IMAGE_USAGE_SAMPLED_BIT,
+                              FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    d.output = resource(fsr3_.output.image, fsr3_.output.format, out_w, out_h,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    d.jitterOffset = {taa_jitter_[0], taa_jitter_[1]};
+    d.motionVectorScale = {float(ft.w), float(ft.h)};
+    d.renderSize = {ft.w, ft.h};
+    d.upscaleSize = {out_w, out_h};
+    d.enableSharpening = settings.sharpening > 0;
+    d.sharpness = float(settings.sharpening) / 100.0f;
+    d.reset = reset || !fsr3_.valid;
+    const auto now = std::chrono::steady_clock::now();
+    d.frameTimeDelta = d.reset ? 1000.0f / 60.0f
+                               : std::clamp(std::chrono::duration<float, std::milli>(now - fsr3_.last).count(), 1.0f,
+                                            1000.0f);
+    d.preExposure = 1.0f;
+    d.cameraNear = fsr3_.infinite ? FLT_MAX : cam.far_z > 0 ? cam.far_z : 1e7f;
+    d.cameraFar = cam.near_z;
+    d.cameraFovAngleVertical = 2.0f * std::atan(1.0f / cam.ys);
+    d.viewSpaceToMetersFactor = 1.0f;
+    const ffxReturnCode_t r = fsr3_.dispatch(&fsr3_.context, &d.header);
+    bound_pipe_ = VK_NULL_HANDLE;
+    viewport_valid_ = false;
+    if (r != FFX_API_RETURN_OK) {
+        LOG_FIRST(4, "vulkan: FSR dispatch failed (%u)", r);
+        fsr3_.valid = false;
+        return VK_NULL_HANDLE;
+    }
+    fsr3_.output.layout = VK_IMAGE_LAYOUT_GENERAL;
+    if (motion) {
+        auto& output = fsr3_.output;
+        Transition(output.image, output.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, output.format);
+        WriteTaaSet(taa_.sets[3], color_view, nullptr, nullptr, taa_.metadata.view,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        DrawTaaPass(temporal_hud_pipe_, taa_.sets[3], RenderPassFor(output.format, VK_FORMAT_UNDEFINED),
+                    fsr3_.output_fb, out_w, out_h);
+    }
+    Transition(fsr3_.output.image, fsr3_.output.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               fsr3_.output.format);
+    if (!fsr3_.valid && !fsr3_.logged) {
+        LOGR("vulkan: FSR %s dispatch succeeded", fsr3_.provider_name.c_str());
+        fsr3_.logged = true;
+    }
+    fsr3_.valid = true;
+    fsr3_.last = now;
+    return fsr3_.output.view;
+}
+#endif
+
 #if defined(TCNYC_HAVE_DLSS)
-void VulkanBackend::ProbeDlss() {
-    auto discovery = DlssDiscovery();
+void VulkanBackend::ProbeDlss() {    auto discovery = DlssDiscovery();
     NVSDK_NGX_FeatureRequirement requirement{};
     if (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_GetFeatureRequirements(instance_, physical_, &discovery, &requirement)) ||
         requirement.FeatureSupported != 0) {
@@ -10720,7 +11086,7 @@ void VulkanBackend::Present(const Surface& front) {
     }
     aniso_setting_ = snapshot.aniso;
     aspect_ = app::AspectRatio();
-    if (texturedumper::Update()) ReleasePackTextures();
+    if (texturedumper_vk::Update()) ReleasePackTextures();
     Target* ft = nullptr;
     TextureDesc fd;
     const uint32_t front_data = DescribeSurface(front, fd) ? fd.data : front.data;
@@ -10814,7 +11180,8 @@ void VulkanBackend::Present(const Surface& front) {
             if (every > 0 && frames_ % uint64_t(every) == 0) {
                 std::error_code ec;
                 std::filesystem::create_directories(app::ExeDir() / "cap", ec);
-                reference::WriteTga(front, (app::ExeDir() / ("cap/vk_" + std::to_string(frames_) + ".tga")).c_str());
+                const std::filesystem::path file = app::ExeDir() / ("cap/vk_" + std::to_string(frames_) + ".tga");
+                reference::WriteTga(front, file.string().c_str());
             }
         }
         void* staging = nullptr;

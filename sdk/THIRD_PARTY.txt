@@ -20,7 +20,7 @@ COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER I
 OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
-Dear ImGui v1.93.0 (Linux build; the Windows SDK currently pins v1.91.0) (https://github.com/ocornut/imgui)
+Dear ImGui v1.93.0 (https://github.com/ocornut/imgui)
 
 The MIT License (MIT)
 
@@ -230,3 +230,11 @@ stb_vorbis (stb commit 9600522de53973336fa033a289858a4354cbb04c, https://github.
 
 Public domain or MIT License, at your choice. Copyright (c) 2017 Sean Barrett.
 Vendored at sdk/third_party/audio/stb_vorbis.c; the full statements are at the end of that file.
+
+shaderc v2026.4 (https://github.com/google/shaderc)
+
+Apache License 2.0. Built from source at configure time for the Windows Vulkan renderer; includes glslang (BSD-3-Clause and Apache-2.0), SPIRV-Tools (Apache-2.0) and SPIRV-Headers (MIT).
+
+Vulkan-Headers and volk, vulkan-sdk-1.4.313.0 (https://github.com/KhronosGroup/Vulkan-Headers, https://github.com/zeux/volk)
+
+Vulkan-Headers is Apache License 2.0; volk is MIT License. volk loads the system vulkan-1.dll at run time for the Windows Vulkan renderer.

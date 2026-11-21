@@ -13,7 +13,7 @@ set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(zydis GIT_REPOSITORY https://github.com/zyantific/zydis.git GIT_TAG v4.1.1 GIT_SHALLOW TRUE)
 FetchContent_Declare(tomlplusplus GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git GIT_TAG v3.4.0 GIT_SHALLOW TRUE)
-FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.91.0 GIT_SHALLOW TRUE)
+FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.93.0 GIT_SHALLOW TRUE)
 # SDL3 for controllers, static so it links into the exe
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
@@ -23,6 +23,67 @@ set(SDL_GPU OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3)
+
+# ucrt exports _itoa, not itoa, but SDL's generated config defines HAVE_ITOA because the declaration exists.
+# Patch every generated config after the fetch; the file is regenerated on each configure.
+file(GLOB SDL_CONFIG_FILES "${CMAKE_BINARY_DIR}/_deps/sdl3-build/include-config-*/build_config/SDL_build_config.h")
+foreach(sdl_config IN LISTS SDL_CONFIG_FILES)
+    file(READ "${sdl_config}" sdl_config_text)
+    string(REPLACE "#define HAVE_ITOA 1" "#define HAVE__ITOA 1" sdl_config_text "${sdl_config_text}")
+    file(WRITE "${sdl_config}" "${sdl_config_text}")
+endforeach()
+
+# Windows Vulkan backend: Vulkan headers, volk (loads vulkan-1.dll at run time, no import library) and shaderc.
+# shaderc is the same HLSL front end the Linux backend uses, so shader semantics and auto-mapped locations match.
+if(NOT TCNYC_TESTS_ONLY)
+FetchContent_Declare(vulkan_headers GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+                     GIT_TAG vulkan-sdk-1.4.313.0 GIT_SHALLOW TRUE)
+FetchContent_Declare(volk GIT_REPOSITORY https://github.com/zeux/volk.git GIT_TAG vulkan-sdk-1.4.313.0 GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(vulkan_headers volk)
+if(TARGET volk)
+    target_include_directories(volk PUBLIC "${vulkan_headers_SOURCE_DIR}/include")
+    target_compile_definitions(volk PUBLIC VK_USE_PLATFORM_WIN32_KHR)
+endif()
+
+set(SHADERC_DIR "${CMAKE_BINARY_DIR}/deps/shaderc")
+if(NOT EXISTS "${SHADERC_DIR}/CMakeLists.txt")
+    find_package(Git REQUIRED)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" clone --depth 1 --branch v2026.4
+                            https://github.com/google/shaderc.git "${SHADERC_DIR}" RESULT_VARIABLE shaderc_clone)
+    if(NOT shaderc_clone EQUAL 0)
+        message(FATAL_ERROR "The Vulkan backend needs shaderc; cloning it failed.")
+    endif()
+endif()
+if(NOT EXISTS "${SHADERC_DIR}/third_party/spirv-tools/CMakeLists.txt")
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${SHADERC_DIR}/utils/git-sync-deps"
+                    WORKING_DIRECTORY "${SHADERC_DIR}" RESULT_VARIABLE shaderc_sync)
+    if(NOT shaderc_sync EQUAL 0)
+        message(FATAL_ERROR "shaderc's git-sync-deps failed; the Vulkan backend cannot be built.")
+    endif()
+endif()
+set(SHADERC_SKIP_TESTS ON CACHE BOOL "" FORCE)
+set(SHADERC_SKIP_EXAMPLES ON CACHE BOOL "" FORCE)
+set(SHADERC_SKIP_COPYRIGHT_CHECK ON CACHE BOOL "" FORCE)
+set(SHADERC_ENABLE_WGSL_INSTALL OFF CACHE BOOL "" FORCE)
+add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+add_subdirectory("${SHADERC_DIR}" "${CMAKE_BINARY_DIR}/deps/shaderc-build" EXCLUDE_FROM_ALL)
+
+# AMD FSR SDK 2.4: signed Vulkan loader/upscaler DLLs (FSR 4.1.2, falling back to 3.1.6) and the effect API
+# headers. The DLLs ship beside the executable.
+set(FSR4_DIR "${CMAKE_BINARY_DIR}/fsr_sdk")
+if(NOT EXISTS "${FSR4_DIR}/amd_fidelityfx_upscaler_vk.dll")
+    file(MAKE_DIRECTORY "${FSR4_DIR}/Kits/FidelityFX/api/include/vk" "${FSR4_DIR}/Kits/FidelityFX/upscalers/include")
+    set(FSR4_RAW "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX")
+    file(DOWNLOAD "${FSR4_RAW}/signedbin/amd_fidelityfx_loader_vk.dll" "${FSR4_DIR}/amd_fidelityfx_loader_vk.dll")
+    file(DOWNLOAD "${FSR4_RAW}/signedbin/amd_fidelityfx_upscaler_vk.dll" "${FSR4_DIR}/amd_fidelityfx_upscaler_vk.dll")
+    file(DOWNLOAD "${FSR4_RAW}/api/include/ffx_api.h" "${FSR4_DIR}/Kits/FidelityFX/api/include/ffx_api.h")
+    file(DOWNLOAD "${FSR4_RAW}/api/include/ffx_api_types.h" "${FSR4_DIR}/Kits/FidelityFX/api/include/ffx_api_types.h")
+    file(DOWNLOAD "${FSR4_RAW}/api/include/ffx_api_loader.h" "${FSR4_DIR}/Kits/FidelityFX/api/include/ffx_api_loader.h")
+    file(DOWNLOAD "${FSR4_RAW}/api/include/vk/ffx_api_vk.h" "${FSR4_DIR}/Kits/FidelityFX/api/include/vk/ffx_api_vk.h")
+    file(DOWNLOAD "${FSR4_RAW}/upscalers/include/ffx_upscale.h" "${FSR4_DIR}/Kits/FidelityFX/upscalers/include/ffx_upscale.h")
+endif()
+endif()  # NOT TCNYC_TESTS_ONLY
 
 # What the game needs to build its code on the player's PC (runtime/app/game_code.cpp), beside the executables: the
 # recompiler, clang and lld from the toolchain building this, the game's configs, the XDK layouts they include and the
@@ -78,7 +139,12 @@ set(XBE_IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp)
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+# Volkan is loaded through volk on Windows (no vulkan-1 import library), and the ImGui backend must call through
+# volk's function pointers too, or its vk* calls jump to the pointer values as code.
+set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+                            PROPERTIES COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_USE_VOLK)
 
 file(GLOB XBE_RUNTIME_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/runtime/*/*.cpp)
 # SDL's headers go to the input code alone (it is linked LINK_ONLY)
@@ -133,14 +199,22 @@ function(add_xbe_image target xbe config partitions game_dir)
     file(SHA1 ${xbe_file} xbe_sha1)
     set(XBE_HASH ${CMAKE_CURRENT_BINARY_DIR}/${target}_xbe.cpp)
     file(CONFIGURE OUTPUT ${XBE_HASH} CONTENT "extern const char kImageSha1[] = \"${xbe_sha1}\";\n")
-    add_executable(${target} WIN32 ${XBE_RUNTIME_SOURCES} ${XBE_HOST_SOURCES} ${GAME_SOURCES} ${XBE_IMGUI_SOURCES} ${XBE_HASH})
+    add_executable(${target} WIN32 ${XBE_RUNTIME_SOURCES} ${XBE_HOST_SOURCES} ${GAME_SOURCES} ${XBE_IMGUI_SOURCES}
+                   ${XBE_SDK_DIR}/harness/reference_renderer.cpp ${XBE_HASH})
     add_dependencies(${target} recompile_${target} compiler_files)
     # the import library of what the executable exports to its DLL goes to the compiler folder
     set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON ARCHIVE_OUTPUT_DIRECTORY ${XBE_COMPILER_DIR})
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${XBE_SDK_DIR}/runtime ${GEN})
+    target_include_directories(${target} PRIVATE ${XBE_SDK_DIR}/harness)
     target_include_directories(${target} SYSTEM PRIVATE ${imgui_SOURCE_DIR})
+    # the Windows Vulkan backend: headers, volk and shaderc; stb for the pack/dump reader
+    target_include_directories(${target} PRIVATE
+        "${vulkan_headers_SOURCE_DIR}/include" "${volk_SOURCE_DIR}" "${SHADERC_DIR}/libshaderc/include"
+        "${FSR4_DIR}/Kits/FidelityFX/api/include" "${FSR4_DIR}/Kits/FidelityFX/upscalers/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/platform/linux/third_party")
+    target_link_libraries(${target} PRIVATE Vulkan::Headers volk shaderc)
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
-    target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
     target_compile_definitions(${target} PRIVATE XBE_IMAGE_CONFIG="${config}")
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid d3dcompiler ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
     target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
@@ -148,7 +222,14 @@ function(add_xbe_image target xbe config partitions game_dir)
         # MinGW's driver needs the wide CRT startup for wWinMain; MSVC targets wire it from the entry name.
         target_link_options(${target} PRIVATE -municode)
     endif()
-    target_link_options(${target} PRIVATE -fuse-ld=lld $<$<CONFIG:Debug>:-g> -Wl,/delayload:${target}.dll)
+    target_link_options(${target} PRIVATE -fuse-ld=lld $<$<CONFIG:Debug>:-g> -Wl,/delayload:${target}.dll
+                        -Wl,/alternatename:__imp_itoa=__imp__itoa)
+
+    # AMD's signed FSR Vulkan DLLs are loaded at run time from beside the executable
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FSR4_DIR}/amd_fidelityfx_loader_vk.dll" "${FSR4_DIR}/amd_fidelityfx_upscaler_vk.dll"
+                "$<TARGET_FILE_DIR:${target}>")
 
     # without a C runtime: the executable passes on what the code calls
     add_library(${target}_code SHARED ${GEN_SOURCES})

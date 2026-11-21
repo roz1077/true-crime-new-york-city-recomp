@@ -106,7 +106,12 @@ $ffxBin = Join-Path $ffxSdk 'signedbin'
 if (!(Test-Path -LiteralPath $ffxBin -PathType Container)) {
     $ffxBin = Join-Path $ffxSdk 'Kits/FidelityFX/signedbin'
 }
-$ffxFiles = 'amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll'
+if (!(Test-Path -LiteralPath $ffxBin -PathType Container)) {
+    $ffxBin = Join-Path $BuildDir 'fsr_sdk'
+}
+$ffxFiles = @('amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll',
+              'amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll') |
+    Where-Object { Test-Path -LiteralPath (Join-Path $ffxBin $_) -PathType Leaf }
 $bundleFfx = $env:TCNYC_FIDELITYFX_SDK -or ($ffxFiles | Where-Object {
     Test-Path -LiteralPath (Join-Path $ffxBin $_) -PathType Leaf
 })

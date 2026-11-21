@@ -11,7 +11,7 @@
 // bytes, size and format; an image in textures/replacement beside the executable with that
 // hash in its name is drawn in its place at any resolution, and textures/dumps gets each
 // texture once as a PNG or DDS file to edit or upscale.
-namespace gpu::texturedumper {
+namespace gpu::texturedumper_vk {
 
 // rows tightly packed, block rows for the BC formats
 struct Level {
@@ -48,4 +48,4 @@ void Dump(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32
 // None: replacement off, no pack image for key, or its file did not load
 Lookup Take(uint64_t key, Image& out);
 
-}  // namespace gpu::texturedumper
+}  // namespace gpu::texturedumper_vk
