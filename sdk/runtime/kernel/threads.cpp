@@ -12,6 +12,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sys/resource.h>
 #endif
 
 namespace kernel {
@@ -160,6 +161,27 @@ bool Spawn(std::function<void()> fn) {
 }
 
 }  // namespace
+
+// The title sets its own threads' priorities (0..31, higher wins) and expects them honoured: it lowers
+// its streaming and AI workers so they cannot preempt the frame. Nothing carried that to the host until
+// now, which on a 4-core handheld turns a background load into a dropped frame.
+void SetHostPriority(int guest_priority) {
+#ifdef _WIN32
+    int p = THREAD_PRIORITY_NORMAL;
+    if (guest_priority >= 26) p = THREAD_PRIORITY_HIGHEST;
+    else if (guest_priority >= 20) p = THREAD_PRIORITY_ABOVE_NORMAL;
+    else if (guest_priority >= 12) p = THREAD_PRIORITY_NORMAL;
+    else if (guest_priority >= 6) p = THREAD_PRIORITY_BELOW_NORMAL;
+    else p = THREAD_PRIORITY_LOWEST;
+    ::SetThreadPriority(GetCurrentThread(), p);
+    // the title's priority is a contract; Windows' dynamic boost would quietly undo it
+    ::SetThreadPriorityBoost(GetCurrentThread(), TRUE);
+#else
+    // Nice values only go down without privileges, which is the direction that matters here.
+    const int nice = guest_priority >= 20 ? 0 : guest_priority >= 12 ? 2 : guest_priority >= 6 ? 6 : 10;
+    setpriority(PRIO_PROCESS, 0, nice);
+#endif
+}
 
 Thread* Current() { return t_current.get(); }
 ThreadRef CurrentRef() { return t_current; }
@@ -341,6 +363,7 @@ bool StartThread(ThreadRef t) {
         char name[32];
         std::snprintf(name, sizeof(name), "guest %X", t->id);
         NameHostThread(name);
+        if (t->priority) SetHostPriority(t->priority);
         X86Context ctx;
         InitContext(*t, ctx);
         {

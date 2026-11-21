@@ -194,6 +194,8 @@ void Decommit(uint32_t va, uint32_t size) {
 #endif
     for (uint64_t p = first; p < end; p += kPage)
         std::atomic_ref<uint8_t>(g_committed[size_t(p >> 12)]).store(0, std::memory_order_relaxed);
+    // what a range describes changed: AllocationSize's and the texture descriptor cache's answers are stale
+    LayoutChanged();
 }
 
 bool IsCommitted(uint32_t va) { return InPhysical(va) || CommittedAt(va >> 12) != 0; }
@@ -307,6 +309,9 @@ struct Reservation {
 };
 static std::map<uint32_t, Reservation> g_reserved;
 static Ranges g_user;
+// committed pages over every reservation, maintained with the maps above. mem::Query used to walk a byte
+// per page of the whole user address space (about 1 MB) under the allocator lock.
+static uint64_t g_virtual_committed_pages = 0;
 
 static void EnsureRanges() {
     if (g_ranges_ready) return;
@@ -329,6 +334,9 @@ bool ReserveImage(uint32_t base, uint32_t size) {
     if (!Commit(b, e - b)) return false;
     g_user.Remove(b, e - b);
     Reservation r{e - b, 4, std::vector<uint8_t>((e - b) / kPage, 1)};  // 4 is PAGE_READWRITE
+    if (const auto it = g_reserved.find(b); it != g_reserved.end())
+        g_virtual_committed_pages -= uint64_t(std::count(it->second.commit.begin(), it->second.commit.end(), uint8_t(1)));
+    g_virtual_committed_pages += uint64_t(r.commit.size());  // every page of an image is committed
     g_reserved[b] = std::move(r);
     return true;
 }
@@ -376,7 +384,13 @@ uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t
         const uint64_t end = (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1);
         if (end > uint64_t(start) + r->size || end > 0x100000000ull) return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
         if (!Commit(uint32_t(first), uint32_t(end - first))) return 0xC0000017;  // STATUS_NO_MEMORY
-        for (uint32_t p = uint32_t(first); p < uint32_t(end); p += kPage) r->commit[(p - start) / kPage] = 1;
+        for (uint32_t p = uint32_t(first); p < uint32_t(end); p += kPage) {
+            uint8_t& c = r->commit[(p - start) / kPage];
+            if (!c) {
+                c = 1;
+                ++g_virtual_committed_pages;
+            }
+        }
         base = uint32_t(first);
         size = uint32_t(end - first);
     }
@@ -395,6 +409,7 @@ uint32_t FreeVirtual(uint32_t& base, uint32_t& size, uint32_t type) {
         if (base != start || (size && size != r->size)) return 0xC000000D;  // STATUS_INVALID_PARAMETER
         uint32_t sz = r->size;
         Decommit(start, sz);
+        g_virtual_committed_pages -= uint64_t(std::count(r->commit.begin(), r->commit.end(), uint8_t(1)));
         g_reserved.erase(start);
         g_user.Release(start, sz);
         base = start;
@@ -406,7 +421,13 @@ uint32_t FreeVirtual(uint32_t& base, uint32_t& size, uint32_t type) {
     if (end64 > uint64_t(start) + r->size) return 0xC000000D;
     uint32_t end = uint32_t(end64);
     Decommit(first, end - first);
-    for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 0;
+    for (uint32_t p = first; p < end; p += kPage) {
+        uint8_t& c = r->commit[(p - start) / kPage];
+        if (c) {
+            c = 0;
+            --g_virtual_committed_pages;
+        }
+    }
     base = first;
     size = end - first;
     return 0;
@@ -628,17 +649,29 @@ uint32_t VirtualFromPhysical(uint32_t pa) {
     return pa;
 }
 
+uint64_t LayoutGeneration() { return g_layout.load(std::memory_order_acquire); }
+
 Stats Query() {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+#if TCNYC_DEV_TOOLS
+    // The count is maintained with the maps; a dev build checks it against them and repairs any drift.
+    {
+        uint64_t check = 0;
+        for (auto& [a, r] : g_reserved)
+            for (uint8_t c : r.commit) check += c;
+        if (check != g_virtual_committed_pages) {
+            LOGE("memory: committed page count drifted (%llu, maps say %llu)", (unsigned long long)g_virtual_committed_pages,
+                 (unsigned long long)check);
+            g_virtual_committed_pages = check;
+        }
+    }
+#endif
     Stats s{};
     s.total_pages = kPhysicalSize / kPage;
-    uint64_t vc = 0;
-    for (auto& [a, r] : g_reserved)
-        for (uint8_t c : r.commit) vc += c;
-    s.virtual_committed = uint32_t(vc);
+    s.virtual_committed = uint32_t(g_virtual_committed_pages);
     s.contiguous_used = uint32_t(g_contig.Used() / kPage);
     s.system_used = uint32_t(g_system.Used() / kPage);
-    uint64_t used = vc + s.contiguous_used + s.system_used;
+    uint64_t used = g_virtual_committed_pages + s.contiguous_used + s.system_used;
     s.available_pages = used >= s.total_pages ? 0 : uint32_t(s.total_pages - used);
     return s;
 }

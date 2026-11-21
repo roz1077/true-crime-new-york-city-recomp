@@ -54,6 +54,8 @@ void FreeStack(uint32_t top);
 
 uint32_t PhysicalFromVirtual(uint32_t va);
 uint32_t VirtualFromPhysical(uint32_t pa);
+// bumped by every commit, decommit and allocation: an answer about guest ranges is stale when it moves
+uint64_t LayoutGeneration();
 
 struct Stats {
     uint32_t total_pages, available_pages, virtual_committed, contiguous_used, system_used;

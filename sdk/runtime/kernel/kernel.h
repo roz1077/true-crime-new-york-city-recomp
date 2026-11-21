@@ -143,6 +143,8 @@ std::mutex& DispatchLock();
 void SignalChanged();  // wakes every waiter, caller holds the lock
 void SetSignal(Object& o, int32_t v);
 uint32_t Wait(const std::vector<ObjectRef>& objs, bool wait_all, int64_t timeout_100ns, bool alertable);
+// one object, without the vector: a contended critical section waits this way every time it blocks
+uint32_t WaitOne(const ObjectRef& obj, int64_t timeout_100ns, bool alertable);
 int32_t SetEvent(Object& o);
 int32_t ResetEvent(Object& o);
 int32_t PulseEvent(Object& o);
@@ -219,6 +221,8 @@ void SuspendPoint();           // blocks the current thread while it is suspende
 bool RunApcs(Thread& t);
 void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3);
 std::vector<ThreadRef> Threads();
+// the title's thread priority (0..31, higher wins) on the calling host thread
+void SetHostPriority(int guest_priority);
 
 // files
 void MountDefaults(const std::filesystem::path& game_dir, const std::filesystem::path& data_dir);

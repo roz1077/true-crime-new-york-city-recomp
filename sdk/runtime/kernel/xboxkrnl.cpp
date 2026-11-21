@@ -147,7 +147,7 @@ KERNEL_EXPORT(277, RtlEnterCriticalSection, 1) {
         return 0;
     }
     ObjectRef ev = FromPointer(cs);
-    Wait({ev}, false, INT64_MAX, false);
+    WaitOne(ev, INT64_MAX, false);
     W32(cs + 0x18, me);
     W32(cs + 0x14, 1);
     return 0;
@@ -251,6 +251,8 @@ KERNEL_EXPORT(127, KeQueryPerformanceFrequency, 0) {
 }
 
 KERNEL_EXPORT(151, KeStallExecutionProcessor, 1) {
+    // A spin by contract: the title uses it for hardware-timed delays, so the duration stays exact
+    // rather than becoming a host sleep whose granularity would stretch it.
     auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(a[0]);
     while (std::chrono::steady_clock::now() < until) std::this_thread::yield();
     return 0;
@@ -270,10 +272,15 @@ KERNEL_EXPORT(99, KeDelayExecutionThread, 3) {
         std::this_thread::yield();
         return kSuccess;
     }
+    // Nothing can wake a non-alertable sleep, so slicing it only buys wakeups: one call is enough.
+    if (!alertable) {
+        if (const int64_t left = deadline - now(); left > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(left));
+        return kSuccess;
+    }
     while (now() < deadline) {
         int64_t left = deadline - now();
         std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<int64_t>(left, 2000000)));
-        if (alertable && t && RunApcs(*t)) return kUserApc;
+        if (t && RunApcs(*t)) return kUserApc;
     }
     return kSuccess;
 }
@@ -638,19 +645,19 @@ KERNEL_EXPORT(230, NtSignalAndWaitForSingleObjectEx, 5) {
         default: return kObjectTypeMismatch;
     }
     if (st != kSuccess) return st;
-    return Wait({w}, false, TimeoutArg(a[4]), a[3] & 0xFF);
+    return WaitOne(w, TimeoutArg(a[4]), a[3] & 0xFF);
 }
 
 KERNEL_EXPORT(233, NtWaitForSingleObject, 3) {
     ObjectRef o = FromHandle(a[0]);
     if (!o) return kInvalidHandle;
-    return Wait({o}, false, TimeoutArg(a[2]), a[1] & 0xFF);
+    return WaitOne(o, TimeoutArg(a[2]), a[1] & 0xFF);
 }
 
 KERNEL_EXPORT(234, NtWaitForSingleObjectEx, 4) {
     ObjectRef o = FromHandle(a[0]);
     if (!o) return kInvalidHandle;
-    return Wait({o}, false, TimeoutArg(a[3]), a[2] & 0xFF);
+    return WaitOne(o, TimeoutArg(a[3]), a[2] & 0xFF);
 }
 
 KERNEL_EXPORT(235, NtWaitForMultipleObjectsEx, 6) {
@@ -666,7 +673,7 @@ KERNEL_EXPORT(235, NtWaitForMultipleObjectsEx, 6) {
 
 KERNEL_EXPORT(159, KeWaitForSingleObject, 5) {
     ObjectRef o = FromPointer(a[0]);
-    return Wait({o}, false, TimeoutArg(a[4]), a[3] & 0xFF);
+    return WaitOne(o, TimeoutArg(a[4]), a[3] & 0xFF);
 }
 
 KERNEL_EXPORT(158, KeWaitForMultipleObjects, 8) {
@@ -903,6 +910,9 @@ KERNEL_EXPORT(148, KeSetPriorityThread, 2) {
     if (!t) return 0;
     int old = t->priority;
     t->priority = int32_t(a[1]);
+    // another thread's host priority cannot be changed portably; it takes effect at that thread's next
+    // start, and the common case (a thread lowering or raising itself) applies at once
+    if (t == Current()) SetHostPriority(t->priority);
     return uint32_t(old);
 }
 KERNEL_EXPORT(124, KeQueryBasePriorityThread, 1) {
@@ -917,6 +927,7 @@ KERNEL_EXPORT(143, KeSetBasePriorityThread, 2) {
     auto& t = static_cast<Thread&>(*o);
     int old = t.priority;
     t.priority = int32_t(a[1]);
+    if (&t == Current()) SetHostPriority(t.priority);
     return uint32_t(old);
 }
 

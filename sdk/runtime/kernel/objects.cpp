@@ -1,10 +1,12 @@
 #include <algorithm>
 #include "core/dev_env.h"
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <string>
 #include <map>
 #include <queue>
+#include <span>
 
 #include "core/log.h"
 #include "kernel/kernel.h"
@@ -53,11 +55,11 @@ static void Wake(Object& o) {
 
 // a Wait's place on its objects' waiter lists while it blocks, under the dispatcher lock
 struct Queued {
-    const std::vector<ObjectRef>& objs;
+    std::span<const ObjectRef> objs;
     Waiter w;
     std::vector<uint64_t> pulse_seen;
     bool on = false;
-    explicit Queued(const std::vector<ObjectRef>& o) : objs(o), pulse_seen(o.size()) {
+    explicit Queued(std::span<const ObjectRef> o) : objs(o), pulse_seen(o.size()) {
         for (size_t i = 0; i < o.size(); i++)
             if (o[i]) pulse_seen[i] = o[i]->pulse;
     }
@@ -304,7 +306,7 @@ static bool Pulsed(Object& o, size_t i, const Queued& q, bool consume = true) {
     return true;
 }
 
-static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64_t timeout, bool alertable) {
+static uint32_t WaitFor(std::span<const ObjectRef> objs, bool wait_all, int64_t timeout, bool alertable) {
     using namespace std::chrono;
     Thread* self = Current();
     uint32_t me = Me();
@@ -379,6 +381,14 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
 uint32_t Wait(const std::vector<ObjectRef>& objs, bool wait_all, int64_t timeout, bool alertable) {
     SuspendPoint();
     uint32_t r = WaitFor(objs, wait_all, timeout, alertable);
+    SuspendPoint();
+    return r;
+}
+
+uint32_t WaitOne(const ObjectRef& obj, int64_t timeout, bool alertable) {
+    SuspendPoint();
+    const std::array<ObjectRef, 1> one{obj};
+    uint32_t r = WaitFor(one, false, timeout, alertable);
     SuspendPoint();
     return r;
 }
