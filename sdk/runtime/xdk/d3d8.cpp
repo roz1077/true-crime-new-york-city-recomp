@@ -8,6 +8,7 @@
 #endif
 #include <windows.h>
 #include "core/dev_env.h"
+#include "core/sampler.h"
 
 #include <algorithm>
 #include <atomic>
@@ -791,6 +792,15 @@ bool g_picture_shown = false;  // the last Swap presented a CPU-written buffer (
 uint32_t d3d::PresentCount() { return g_presents.load(); }
 
 HLE_STDCALL(D3DDevice_Swap, 1) {
+    // TCNYC_SAMPLE on Linux: this is the title thread (it runs the game, streaming and the D3D marshalling),
+    // and it has never had a profiler. logs/samples-title.txt keeps the render sampler's file separate.
+    {
+        static const bool once = [] {
+            sampler::StartCurrentThread("title");
+            return true;
+        }();
+        (void)once;
+    }
     // XBE_CAPTURE_AT=<seconds>[,<seconds>...]: frame captures that long after the first present, as F3 takes them;
     // p<number> instead of seconds captures that presented picture (replays line up by picture, not by time)
     {
