@@ -6,6 +6,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+// SDL3's generated build config defines HAVE_ITOA because ucrt declares it, but ucrt exports only _itoa.
+// The config is regenerated on every configure, so map the symbol at link time instead of patching it.
+#pragma comment(linker, "/alternatename:itoa=_itoa")
 #include "core/dev_env.h"
 #include <dbghelp.h>
 #include <timeapi.h>

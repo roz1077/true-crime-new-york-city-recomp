@@ -163,7 +163,10 @@ if(TCNYC_PAL)
 endif()
 # TCNYC_FRAME_POINTERS=ON keeps frame pointers for the sampling profiler's callers (TCNYC_SAMPLE)
 option(TCNYC_FRAME_POINTERS "keep frame pointers (profiling)" OFF)
-target_compile_options(TrueCrimeNYC PRIVATE -march=x86-64-v2 -fno-strict-aliasing -O2 -g "-ffile-prefix-map=${REPO}=."
+# The instruction set the package targets. Deck (Zen 2) and Ally (Zen 4) both support x86-64-v3; keep the
+# default at v2 so a generic archive runs anywhere, and build the handheld archive with -DTCNYC_MARCH=x86-64-v3.
+set(TCNYC_MARCH "x86-64-v2" CACHE STRING "x86-64 microarchitecture level to compile for")
+target_compile_options(TrueCrimeNYC PRIVATE -march=${TCNYC_MARCH} -fno-strict-aliasing -O2 -g "-ffile-prefix-map=${REPO}=."
                        $<$<BOOL:${TCNYC_FRAME_POINTERS}>:-fno-omit-frame-pointer>)
 
 if(TARGET SDL3::SDL3-static)
