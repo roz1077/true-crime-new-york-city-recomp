@@ -59,8 +59,16 @@ extern "C" __attribute__((used)) inline int _fltused = 0;
         X86_MEM32(ctx.esp) = _v; \
     } while (0)
 
-#define X86_SAVE_FLAGS() (ctx.cf = cf, ctx.zf = zf, ctx.sf = sf, ctx.of = of, ctx.pf = pf)
-#define X86_LOAD_FLAGS() uint32_t cf = ctx.cf, zf = ctx.zf, sf = ctx.sf, of = ctx.of, pf = ctx.pf
+// PF is computed where it is read, not on every flag-setting instruction: the emitters leave the result
+// byte in pf_r (pf_result = true) and readers evaluate its parity. fp compares, popfd and lahf give an
+// explicit pf (pf_result = false). Both are function-local, like the other flags.
+#define X86_PARITY_OF_PF() (pf_result ? uint32_t(X86_PARITY(pf_r)) : pf)
+#define X86_READ_PF() X86_PARITY_OF_PF()
+#define X86_SAVE_FLAGS() (ctx.cf = cf, ctx.zf = zf, ctx.sf = sf, ctx.of = of, ctx.pf = X86_PARITY_OF_PF())
+#define X86_LOAD_FLAGS() \
+    uint32_t cf = ctx.cf, zf = ctx.zf, sf = ctx.sf, of = ctx.of, pf = ctx.pf; \
+    uint32_t pf_r = 0;   \
+    bool pf_result = false;
 #define X86_BARRIER() __asm__ volatile("" ::: "memory")
 #define X86_PARITY(r) ((uint32_t)(__builtin_parity((uint32_t)(r)&0xFF) ^ 1))
 

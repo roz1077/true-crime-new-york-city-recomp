@@ -149,7 +149,7 @@ bool CodeGen::EmitX87(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
         case ZYDIS_MNEMONIC_FUCOMI:
         case ZYDIS_MNEMONIC_FUCOMIP: {
             bool pop = m == ZYDIS_MNEMONIC_FCOMIP || m == ZYDIS_MNEMONIC_FUCOMIP;
-            emit(F("double a = X87_ST(0), b = %s; bool u = a != a || b != b; zf = u || a == b; pf = u; cf = u || a < b; of = 0; sf = 0;%s",
+            emit(F("double a = X87_ST(0), b = %s; bool u = a != a || b != b; zf = u || a == b; pf = u; pf_result = false; cf = u || a < b; of = 0; sf = 0;%s",
                    st(StIndex(ops[1])).c_str(), pop ? " x87_pop(ctx);" : ""));
             return true;
         }
@@ -339,7 +339,7 @@ bool CodeGen::EmitSse(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
             return true;
         case ZYDIS_MNEMONIC_COMISS:
         case ZYDIS_MNEMONIC_UCOMISS:
-            emit(F("float a = ctx.xmm[%d].f[0], b = %s; bool u = a != a || b != b; zf = u || a == b; pf = u; cf = u || a < b; of = 0; sf = 0;",
+            emit(F("float a = ctx.xmm[%d].f[0], b = %s; bool u = a != a || b != b; zf = u || a == b; pf = u; pf_result = false; cf = u || a < b; of = 0; sf = 0;",
                    d, srcf0().c_str()));
             return true;
         case ZYDIS_MNEMONIC_CVTSI2SS:

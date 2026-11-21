@@ -25,7 +25,7 @@ static bool FindMem(const ZydisDecodedInstruction& in, const ZydisDecodedOperand
 }
 
 static std::string Szp(unsigned w) {
-    return F("zf = r == 0; sf = (uint32_t)(r >> %u) & 1; pf = X86_PARITY(r);", w - 1);
+    return F("zf = r == 0; sf = (uint32_t)(r >> %u) & 1; pf_r = r; pf_result = true;", w - 1);
 }
 
 static bool IsCmov(ZydisMnemonic m) {
@@ -404,10 +404,10 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
             Line("\tctx.edx = (uint32_t)((int32_t)ctx.eax >> 31);");
             return true;
         case ZYDIS_MNEMONIC_LAHF:
-            Line("\tctx.eax = (ctx.eax & 0xFFFF00FFu) | ((sf << 7 | zf << 6 | pf << 2 | 2u | cf) << 8);");
+            Line("\tctx.eax = (ctx.eax & 0xFFFF00FFu) | ((sf << 7 | zf << 6 | X86_READ_PF() << 2 | 2u | cf) << 8);");
             return true;
         case ZYDIS_MNEMONIC_SAHF:
-            Line("\t{ uint32_t h = (ctx.eax >> 8) & 0xFF; sf = (h >> 7) & 1; zf = (h >> 6) & 1; pf = (h >> 2) & 1; cf = h & 1; }");
+            Line("\t{ uint32_t h = (ctx.eax >> 8) & 0xFF; sf = (h >> 7) & 1; zf = (h >> 6) & 1; pf = (h >> 2) & 1; pf_result = false; cf = h & 1; }");
             return true;
         case ZYDIS_MNEMONIC_CLC: Line("\tcf = 0;"); return true;
         case ZYDIS_MNEMONIC_STC: Line("\tcf = 1;"); return true;
@@ -459,10 +459,10 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
                  "ctx.ebx = X86_MEM32(s + 16); ctx.edx = X86_MEM32(s + 20); ctx.ecx = X86_MEM32(s + 24); ctx.eax = X86_MEM32(s + 28); ctx.esp = s + 32; }");
             return true;
         case ZYDIS_MNEMONIC_PUSHFD:  // bit 1 always reads 1, IF (0x200) always set, AC and ID kept in xflags
-            Line("\tX86_PUSH32(cf | 2u | pf << 2 | zf << 6 | sf << 7 | 0x200u | ctx.df << 10 | of << 11 | ctx.xflags);");
+            Line("\tX86_PUSH32(cf | 2u | X86_READ_PF() << 2 | zf << 6 | sf << 7 | 0x200u | ctx.df << 10 | of << 11 | ctx.xflags);");
             return true;
         case ZYDIS_MNEMONIC_POPFD:
-            Line("\t{ uint32_t f = X86_MEM32(ctx.esp); ctx.esp += 4; cf = f & 1; pf = (f >> 2) & 1; zf = (f >> 6) & 1; sf = (f >> 7) & 1; "
+            Line("\t{ uint32_t f = X86_MEM32(ctx.esp); ctx.esp += 4; cf = f & 1; pf = (f >> 2) & 1; pf_result = false; zf = (f >> 6) & 1; sf = (f >> 7) & 1; "
                  "ctx.df = (f >> 10) & 1; of = (f >> 11) & 1; ctx.xflags = f & 0x240000u; }");
             return true;
         case ZYDIS_MNEMONIC_LEAVE:
@@ -549,7 +549,7 @@ bool CodeGen::EmitString(uint32_t va, const ZydisDecodedInstruction& in, const Z
     std::string step = F("int32_t d = ctx.df ? -%u : %u;", w, w);
     std::string acc = w == 1 ? "(uint8_t)ctx.eax" : w == 2 ? "(uint16_t)ctx.eax" : "ctx.eax";
     std::string cmpflags = F("%s r = (%s)(a - b); cf = a < b; of = (uint32_t)(((a ^ b) & (a ^ r)) >> %u) & 1; "
-                             "zf = r == 0; sf = (uint32_t)(r >> %u) & 1; pf = X86_PARITY(r);",
+                             "zf = r == 0; sf = (uint32_t)(r >> %u) & 1; pf_r = r; pf_result = true;",
                              T.c_str(), T.c_str(), w * 8 - 1, w * 8 - 1);
     std::string s;
     if (!std::strcmp(kind, "movs")) {
