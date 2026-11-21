@@ -206,6 +206,28 @@ function(add_xbe_image target xbe config partitions game_dir)
     set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON ARCHIVE_OUTPUT_DIRECTORY ${XBE_COMPILER_DIR})
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${XBE_SDK_DIR}/runtime ${GEN})
     target_include_directories(${target} PRIVATE ${XBE_SDK_DIR}/harness)
+    # DLSS: the D3D12 backend uses the Windows NGX headers and loads nvngx.dll; the Vulkan backend needs NVIDIA's
+    # Windows NGX SDK (Vulkan headers and its import library), because NGX's Vulkan helper functions call the
+    # vendor library directly.
+    if(TCNYC_DLSS_VK_SDK)
+        get_filename_component(TCNYC_DLSS_VK_SDK_ABS "${TCNYC_DLSS_VK_SDK}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+        set(TCNYC_NGX_VK_LIB "")
+        foreach(candidate "lib/Windows_x86_64/rel/nvsdk_ngx.lib" "lib/Windows_x86_64/rel/nvsdk_ngx_vk.lib")
+            if(EXISTS "${TCNYC_DLSS_VK_SDK_ABS}/${candidate}")
+                set(TCNYC_NGX_VK_LIB "${TCNYC_DLSS_VK_SDK_ABS}/${candidate}")
+                break()
+            endif()
+        endforeach()
+        if(EXISTS "${TCNYC_DLSS_VK_SDK_ABS}/include/nvsdk_ngx_helpers_vk.h" AND TCNYC_NGX_VK_LIB)
+            target_compile_definitions(${target} PRIVATE TCNYC_VK_DLSS=1)
+            target_include_directories(${target} SYSTEM PRIVATE "${TCNYC_DLSS_VK_SDK_ABS}/include")
+            target_link_libraries(${target} PRIVATE "${TCNYC_NGX_VK_LIB}")
+            message(STATUS "Windows Vulkan DLSS enabled from ${TCNYC_DLSS_VK_SDK_ABS}")
+        else()
+            message(WARNING "TCNYC_DLSS_VK_SDK needs include/nvsdk_ngx_helpers_vk.h and "
+                            "lib/Windows_x86_64/rel/nvsdk_ngx.lib; Vulkan DLSS is disabled")
+        endif()
+    endif()
     target_include_directories(${target} SYSTEM PRIVATE ${imgui_SOURCE_DIR})
     # the Windows Vulkan backend: headers, volk and shaderc; stb for the pack/dump reader
     target_include_directories(${target} PRIVATE

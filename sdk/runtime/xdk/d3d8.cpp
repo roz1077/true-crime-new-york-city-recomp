@@ -862,25 +862,20 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         gpu::Surface picture = SurfaceOf(shown);
         // one look at the open files per present, so the offset and the picture kind agree
         const bool movie = !g_frame_draws && kernel::MovieOpen();
-#ifndef _WIN32
-        // The legal screen is written at its buffer's base; the console presents that base.
-        // The Linux surface data field starts 0x54 bytes (its frame header) into that
-        // buffer, so a CPU-written frame (the legal screen) is presented
-        // 0x54 bytes late -- a 21 pixel left shift at 640 pixels wide. The Windows renderer
-        // finds targets by this address, so it moves the legal screen in BlitFrame instead.
         const uint32_t saved_data = picture.header ? R32(picture.header + 4) : 0;
+        // The legal screen is written at its buffer's base; the console presents that base. Vulkan's surface data
+        // field starts 0x54 bytes (its frame header) into that buffer, so a CPU-written still picture is presented
+        // 0x54 bytes late -- a 21 pixel left shift at 640 pixels wide. D3D12 finds targets by this address, so it
+        // moves the legal screen in BlitFrame instead.
         // Bink movie frames are written at the normal position: moving them puts the picture 21 pixels right
-        if (!g_frame_draws && picture.data >= 0x54 && !movie) {
+        if (g_backend->PicturesAtSurfaceBase() && !g_frame_draws && picture.data >= 0x54 && !movie) {
             picture.data -= 0x54;
             if (picture.header) W32(picture.header + 4, picture.data);
         }
-#endif
         // a frame with no draws is a picture the title wrote: a movie frame while a Bink file is open, else a page
         if (!g_frame_draws) picture.picture = movie ? gpu::Picture::Movie : gpu::Picture::Still;
         g_backend->Present(picture);
-#ifndef _WIN32
-        if (saved_data) W32(picture.header + 4, saved_data);
-#endif
+        if (saved_data && g_backend->PicturesAtSurfaceBase()) W32(picture.header + 4, saved_data);
         // a frame with no draws presents a CPU-written buffer (movies, legal screen):
         // wait for the renderer to finish reading it before the title writes the next one
         if (!g_frame_draws) g_backend->WaitPresent();
@@ -916,13 +911,13 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     const uint8_t* rects = a[0] && a[1] ? static_cast<const uint8_t*>(HostPtr(a[1])) : nullptr;
     if (g_backend) g_backend->Clear(g_state, a[0], rects, a[2], a[3], ArgF(a, 4), a[5]);
-#ifndef _WIN32
     // Between CPU-written pictures the title clears each front buffer, then writes the next page over only part of
-    // it (the legal page leaves the bottom rows to the clear). The console's clear writes the buffer's memory; the
-    // Vulkan clear only reaches the GPU image, and a buffer the title never locks keeps the last movie frame in
-    // those rows. Write a full clear of a 32-bit front buffer to memory too while pictures are being shown.
+    // it (the legal page leaves the bottom rows to the clear). The console's clear writes the buffer's memory; a
+    // GPU renderer's clear may only reach its image, and a buffer the title never locks keeps the last movie frame
+    // in those rows. Mirror a full clear of a 32-bit front buffer into memory too while pictures are being shown.
     constexpr uint32_t kClearTarget = 0xF0;
-    if (g_picture_shown && !g_frame_draws && !a[0] && (a[2] & kClearTarget) == kClearTarget) {
+    if (g_backend && g_backend->ClearPicturesInGuestMemory() && g_picture_shown && !g_frame_draws && !a[0] &&
+        (a[2] & kClearTarget) == kClearTarget) {
         gpu::TextureDesc d;
         const uint32_t rt = g_state.rt.header;
         bool front = false;
@@ -933,7 +928,6 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
             std::fill(p, p + size_t(d.pitch / 4) * d.height, a[3]);
         }
     }
-#endif
     return 0;
 }
 

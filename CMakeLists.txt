@@ -109,6 +109,8 @@ endif()
 # local NVIDIA/DLSS checkout (for example tools/DLSS) to compile the DLSS backend. Without it the
 # game builds and behaves exactly as before.
 set(TCNYC_DLSS_SDK "" CACHE PATH "NVIDIA DLSS SDK checkout containing include/nvsdk_ngx.h")
+set(TCNYC_DLSS_VK_SDK "" CACHE PATH
+    "NVIDIA Windows NGX SDK for Vulkan DLSS (include/nvsdk_ngx_helpers_vk.h and lib/Windows_x86_64/rel/nvsdk_ngx.lib)")
 if(TCNYC_DLSS_SDK)
     get_filename_component(TCNYC_DLSS_SDK_ABS "${TCNYC_DLSS_SDK}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
     if(EXISTS "${TCNYC_DLSS_SDK_ABS}/include/nvsdk_ngx.h")

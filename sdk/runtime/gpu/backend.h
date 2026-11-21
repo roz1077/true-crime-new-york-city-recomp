@@ -42,6 +42,13 @@ public:
     virtual void RecordLate(uint32_t) {}
     virtual void Flush() = 0;
     virtual void SetGamma(const uint8_t* ramp /*3 x 256*/) = 0;
+    // The console's clear writes the surface's guest memory, but a GPU renderer's clear may only reach its own
+    // image. The D3D8 layer mirrors full clears of a CPU-written front buffer into guest memory when this is true
+    // (Vulkan), so the legal page's uncovered bottom rows do not keep the previous movie frame.
+    virtual bool ClearPicturesInGuestMemory() const { return false; }
+    // This renderer presents CPU-written still pictures (the legal page) from the surface's base address. D3D12
+    // samples the guest image and compensates for its 0x54-byte header offset in the blit instead.
+    virtual bool PicturesAtSurfaceBase() const { return false; }
     // visibility tests: draws count passing pixels while simple[kMCountEnable / 4] is set, ClearReport zeroes the
     // count, GetReport writes it to a 16 byte report once the GPU is past those draws; without them it stays pending
     virtual void ClearReport() {}

@@ -89,7 +89,7 @@
 #include "ffx_upscale.h"
 #include "vk/ffx_api_vk.h"
 #endif
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
 #include <nvsdk_ngx_helpers_vk.h>
 #endif
 #include "gpu/shaders.h"
@@ -99,6 +99,8 @@
 #include "kernel/memory.h"
 #include "gpu/texturedumper_vk.h"
 #include "reference_renderer.h"
+
+
 // SMAA 1x: the reference shader and its lookup textures (third_party/smaa, MIT)
 #include "../../sdk/third_party/smaa/AreaTex.h"
 #include "../../sdk/third_party/smaa/SMAAShader.h"
@@ -107,7 +109,6 @@
 namespace app {
 Mode WindowPixels();
 }
-
 namespace gpu {
 extern std::map<std::string, double>* g_assemble_splits;  // vertex.cpp, TCNYC_PERF_SPLITS
 
@@ -393,6 +394,7 @@ struct Target {
     uint8_t bytes = 4;
     bool depth = false, swizzled = false, linear = false;
     uint64_t epoch = 0;
+    uint64_t epoch_gen = 0;  // DirtyGeneration() when epoch was last read (skips the map lock)
     bool drawn = false;
     bool upload_pending = false;
     // guest pixels were copied into this target, and the frame a 3D draw last covered it
@@ -420,6 +422,7 @@ struct Tex {
     bool bc_fallback = false;  // decoded BC bytes uploaded as BGRA because the device has no BC
     uint32_t data = 0, guest_format = 0, depth = 1;
     uint64_t epoch = 0, palette = 0;
+    uint64_t epoch_gen = 0, current_gen = 0, current_epoch = 0;  // DirtyGeneration fast paths
     uint64_t sig = 0, frame = 0;  // content signature and the frame it was checked on
     uint64_t sig_epoch = 0;       // the lock epoch with the signature
     uint64_t changed = 0;         // the frame its bytes last changed
@@ -430,6 +433,35 @@ struct Tex {
     uint32_t pack_gen = 0;
     Tex* swap = nullptr;
 };
+
+// DirtyEpoch takes the dirty map's lock and looks the address up. When no resource has been marked dirty
+// since this object last asked, its answer cannot have moved, so the common draw pays a relaxed atomic
+// load instead (the D3D12 backend's LatchCpuWrite does the same).
+template <typename T>
+bool DirtySince(T& t) {
+    const uint64_t generation = DirtyGeneration();
+    if (generation == t.epoch_gen) return false;
+    t.epoch_gen = generation;
+    return DirtyEpoch(t.data) != t.epoch;
+}
+
+// the object's mark epoch now, recorded for later DirtySince tests
+template <typename T>
+void RecordEpoch(T& t) {
+    t.epoch_gen = DirtyGeneration();
+    t.epoch = DirtyEpoch(t.data);
+}
+
+// the object's epoch right now, cached for the current dirty generation
+template <typename T>
+uint64_t CurrentEpoch(T& t) {
+    const uint64_t generation = DirtyGeneration();
+    if (generation != t.current_gen) {
+        t.current_gen = generation;
+        t.current_epoch = DirtyEpoch(t.data);
+    }
+    return t.current_epoch;
+}
 
 // A renderer-owned image: the AO prepass depth/distance, the half/full AO factor and the
 // full-size occlusion target. Unlike Target these are not guest surfaces.
@@ -825,6 +857,9 @@ VkResult ProbeWaitFence(VkDevice device, VkFence fence, FenceSite site) {
 class VulkanBackend final : public Backend {
 public:
     ~VulkanBackend() override { Shutdown(); }
+    // the D3D8 layer's picture corrections (legal page base and in-memory clears) are needed on Vulkan
+    bool ClearPicturesInGuestMemory() const override { return true; }
+    bool PicturesAtSurfaceBase() const override { return true; }
     bool Init(uint32_t width, uint32_t height) override;
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                uint32_t stencil) override;    void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
@@ -1524,7 +1559,7 @@ private:
     void ResetTemporalHistory() {
         taa_.valid = false;
         fsr3_.valid = false;
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
         dlss_.valid = false;
 #endif
     }
@@ -1595,7 +1630,7 @@ private:
 #endif
     VkPipeline TemporalHudPipeline();
     VkPipeline temporal_hud_pipe_ = VK_NULL_HANDLE;
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
     struct DlssVk {
         bool instance_ready = false, initialized = false, available = false, valid = false;
         NVSDK_NGX_Parameter* params = nullptr;
@@ -1931,6 +1966,9 @@ std::filesystem::path CacheRoot() {
 }
 
 constexpr uint64_t kPipelineCacheMagic = 0x3142494C4F535058ull;  // "XPSOLIB1"
+// Bump when the SPIR-V produced for the same source changes (compiler flags/optimisation): the SPIR-V cache is
+// keyed by source, and pipelines.keys stores those cache keys.
+constexpr uint64_t kSpvCacheVersion = 2;
 constexpr uint64_t kPipelineCacheMaxBytes = 512ull << 20;
 struct PipelineFileHeader {
     uint64_t magic, size, checksum;
@@ -2189,7 +2227,7 @@ void VulkanBackend::SavePipelineCache(bool force) {
 }
 
 namespace {
-constexpr uint64_t kPipelineKeysMagic = 0x315359454B4F5350ull;  // "PSOKEYS1"
+constexpr uint64_t kPipelineKeysMagic = 0x325359454B4F5350ull;  // "PSOKEYS2" (2: optimised SPIR-V)
 constexpr size_t kMaxSavedPipelines = 8192;  // kept on disk
 constexpr size_t kMaxWarmPipelines = 4096;   // built at start, the oldest first
 struct PipelineKeysHeader {
@@ -2758,7 +2796,7 @@ bool VulkanBackend::EnsureAoPools() {
     return true;
 }
 
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
 static constexpr char kNgxProject[] = "96db5f8f-31d1-4b6e-93a8-f9e43081780b";
 static constexpr char kNgxEngineVersion[] = "1.0";
 
@@ -2835,14 +2873,15 @@ bool VulkanBackend::CreateInstance() {
                 if (!std::strcmp(property.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
                     enabled.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
             }
-#if defined(TCNYC_HAVE_DLSS)
-            auto discovery = DlssDiscovery();
-            uint32_t required_count = 0;
-            VkExtensionProperties* required = nullptr;
-            const auto result =
-                NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&discovery, &required_count, &required);
-            dlss_.instance_ready = NVSDK_NGX_SUCCEED(result) &&
-                                   AppendNgxExtensions(enabled, properties, {required, required_count}, instance_version_);
+#if defined(TCNYC_VK_DLSS)
+                auto discovery = DlssDiscovery();
+                uint32_t required_count = 0;
+                VkExtensionProperties* required = nullptr;
+                const auto result = NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&discovery,
+                                                                                           &required_count, &required);
+                dlss_.instance_ready = NVSDK_NGX_SUCCEED(result) &&
+                                       AppendNgxExtensions(enabled, properties, {required, required_count},
+                                                          instance_version_);
 #endif
         }
     }
@@ -2953,7 +2992,7 @@ bool VulkanBackend::CreateDevice() {
     VkPhysicalDeviceShaderFloat16Int8Features float16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
     VkPhysicalDeviceSubgroupSizeControlFeatures subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
     void* device_features = nullptr;
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
     VkPhysicalDeviceBufferDeviceAddressFeatures address{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     size_t non_ngx_extensions = 0;
     bool enable_ngx = false;
@@ -3017,10 +3056,10 @@ bool VulkanBackend::CreateDevice() {
                 device_features = &float16;
             }
         }
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
         non_ngx_extensions = extensions.size();
-        if (dlss_.instance_ready && properties.vendorID == 0x10DE && supported.independentBlend &&
-            api >= VK_API_VERSION_1_2) {
+        if (dlss_.instance_ready && properties.vendorID == 0x10DE &&
+            supported.independentBlend && api >= VK_API_VERSION_1_2) {
             VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
             features2.pNext = &address;
             vkGetPhysicalDeviceFeatures2(physical_, &features2);
@@ -3064,7 +3103,7 @@ bool VulkanBackend::CreateDevice() {
     info.ppEnabledExtensionNames = extensions.data();
     info.pEnabledFeatures = &features;
     info.pNext = device_features;
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
     if (enable_ngx) {
         address.bufferDeviceAddressCaptureReplay = address.bufferDeviceAddressMultiDevice = VK_FALSE;
         address.pNext = device_features;
@@ -3072,7 +3111,7 @@ bool VulkanBackend::CreateDevice() {
     }
 #endif
     VkResult r = vkCreateDevice(physical_, &info, nullptr, &device_);
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
     if (r != VK_SUCCESS && enable_ngx) {
         LOGR("vulkan: DLSS device requirements could not be enabled (%s)", VkError(r));
         enable_ngx = false;
@@ -3090,7 +3129,7 @@ bool VulkanBackend::CreateDevice() {
 #endif
     vkGetDeviceQueue(device_, graphics_family_, 0, &queue_);
     vkGetDeviceQueue(device_, present_family_, 0, &present_queue_);
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
     g_dlss_state.store(DlssState::Unavailable, std::memory_order_relaxed);
     if (enable_ngx) ProbeDlss();
     else LOGR("vulkan: experimental DLSS unavailable on this device");
@@ -4083,7 +4122,7 @@ void VulkanBackend::Shutdown() {
         draw_worker_.join();
     }
     if (device_) vkDeviceWaitIdle(device_);
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
     if (dlss_.initialized) {
         DestroyDlssFeature();
         if (dlss_.params) NVSDK_NGX_VULKAN_DestroyParameters(dlss_.params);
@@ -4338,7 +4377,7 @@ void VulkanBackend::ResetFrame() {
     const bool want_fsr = (settings.upscaler == game::choices::kFsr3 || settings.upscaler == game::choices::kFsr4) &&
                           game::choices::TemporalScale(settings.render_percent) && !fsr3_.failed;
     bool want_dlss = false;
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
     want_dlss = settings.upscaler == game::choices::kDlss && game::choices::TemporalScale(settings.render_percent) &&
                 dlss_.available;
 #endif
@@ -5953,6 +5992,9 @@ struct ShaderCompiler {
         shaderc_compile_options_set_source_language(options, shaderc_source_language_hlsl);
         shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
         shaderc_compile_options_set_auto_map_locations(options, true);
+        // D3D12's D3DCOMPILE_OPTIMIZATION_LEVEL3 equivalent: run the SPIR-V optimizer on the result instead of
+        // handing the driver unoptimised code.
+        shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_performance);
     }
     ~ShaderCompiler() {
         if (options) shaderc_compile_options_release(options);
@@ -5989,7 +6031,7 @@ std::string VulkanShaderSource(const std::string& src, shaderc_shader_kind kind,
         injected.replace(mat, motion_uv.size(), "(was - now) * float2(0.5, 0.5)");
     // one source can hold several entry points: the bloom chain's bright, down and up
     cache_key = Hash(entry, std::strlen(entry), Hash(injected.data(), injected.size())) ^
-                (uint64_t(kind) << 56);
+                (uint64_t(kind) << 56) ^ (kSpvCacheVersion * 0x9E3779B97F4A7C15ull);
     return injected;
 }
 } // namespace
@@ -6926,7 +6968,7 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
         // count; its old contents are gone anyway and the title draws/clears it next. A target
         // whose guest bytes are newer this frame skips that restore: UploadTarget needs the
         // single-sample image anyway, so rebuilding to MSAA first is a wasted allocate/free pair.
-        const bool needs_upload = !depth && (DirtyEpoch(t->data) != t->epoch || t->upload_pending);
+        const bool needs_upload = !depth && (DirtySince(*t) || t->upload_pending);
         // a target that fell back to one sample after a failed allocation waits for an MSAA
         // setting change (or a resize, below) instead of retrying on every bind
         const bool restores_samples = t->samples != WantSamples(d.data) && t->fallback_samples != WantSamples(d.data);
@@ -6954,7 +6996,7 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
             t->cpu = false;
             t->upload_pending = false;
             t->scene_frame = ~0ull;
-            t->epoch = DirtyEpoch(t->data);
+            RecordEpoch(*t);
             if (!CreateTargetImages(*t)) {
                 targets_.erase(it);
                 targets_gen_++;
@@ -7031,7 +7073,7 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
             }
         }
     }
-    t->epoch = DirtyEpoch(t->data);
+    RecordEpoch(*t);
     // A multisampled image cannot be a transfer destination. Scene targets are cleared or drawn
     // before they are read; if the title later writes one through guest memory, the reuse path
     // rebuilds it single-sample and uploads the bytes. Uploading here would write only the resolve
@@ -7201,7 +7243,7 @@ bool VulkanBackend::UploadTarget(Target* t) {
     // buffer until the next fence wait; do not submit and stall per upload.
     vkUnmapMemory(device_, memory);
     staging_pending_.emplace_back(buffer, memory);
-    t->epoch = DirtyEpoch(t->data);
+    RecordEpoch(*t);
     t->cpu = true;
     return true;
 }
@@ -7210,7 +7252,7 @@ bool VulkanBackend::ReadTarget(Target* t) {
     if (!t || !t->drawn) return false;
     if (t->depth) {
         t->drawn = false;
-        t->epoch = DirtyEpoch(t->data);
+        RecordEpoch(*t);
         return false;
     }
     const uint32_t row = t->w * 4;
@@ -7252,7 +7294,7 @@ bool VulkanBackend::ReadTarget(Target* t) {
     vkDestroyBuffer(device_, buffer, nullptr);
     vkFreeMemory(device_, memory, nullptr);
     t->drawn = false;
-    t->epoch = DirtyEpoch(t->data);
+    RecordEpoch(*t);
     return true;
 }
 
@@ -7537,7 +7579,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
         // the last second, else every 4th frame (spread over textures by address): hashing every texture up to 64 KB
         // every frame was about a sixth of the Deck's render thread. A silent in-place rewrite of a long-unchanged
         // texture then shows up to 3 frames late.
-        const uint64_t epoch = DirtyEpoch(d.data);
+        const uint64_t epoch = CurrentEpoch(*t);
         const bool hash_now = !same || epoch != t->sig_epoch || palette_changed || frames_ < t->changed + 60 ||
                               ((frames_ + (d.data >> 8)) & 3) == 0;
         const uint64_t sig = hash_now ? MemSig(d.data, TotalSize(d)) ^ epoch ^ palette_hash : t->sig;
@@ -9225,8 +9267,8 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
     const uint32_t src_data = virtual_data(src), dst_data = virtual_data(dst);
     Target* src_t = TargetAt(src_data, false, true);
     Target* dst_t = TargetAt(dst_data, false, true);
-    const bool read_source = src_t && DirtyEpoch(src_t->data) == src_t->epoch && ReadTarget(src_t);
-    if (dst_t && dst_t != src_t && DirtyEpoch(dst_t->data) == dst_t->epoch) ReadTarget(dst_t);
+    const bool read_source = src_t && !DirtySince(*src_t) && ReadTarget(src_t);
+    if (dst_t && dst_t != src_t && !DirtySince(*dst_t)) ReadTarget(dst_t);
     const bool copied = gpu::CopySurfaceMemory(src, dst, count, rects, points);
     if (!copied) reference::Copy(src, dst, count, rects, points);
     bool copied_fp16 = false;
@@ -9266,7 +9308,7 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
                 vkCmdCopyImage(cmd_, src_t->samples > 1 ? src_t->resolved_image : src_t->image,
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_t->image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-                dst_t->epoch = DirtyEpoch(dst_t->data);
+                RecordEpoch(*dst_t);
                 dst_t->drawn = true;
                 dst_t->upload_pending = false;
                 copied_fp16 = true;
@@ -9284,7 +9326,7 @@ void VulkanBackend::Sync(uint32_t data, uint32_t size) {
         if (t->depth) continue;
         if (data == t->data || (data >= t->data && data < t->data + t->size)) {
             // the title wrote guest memory after the last GPU use: do not replace it with stale pixels
-            if (DirtyEpoch(t->data) == t->epoch) ReadTarget(t);
+            if (!DirtySince(*t)) ReadTarget(t);
             return;
         }
     }
@@ -9330,7 +9372,7 @@ void VulkanBackend::RecordLate(uint32_t data) {
     // The copy must see the pending draws that write t, and it leaves t in a transfer layout, which
     // pending draws that sample t cannot replay against: replay first in both cases.
     if (DeferredWrites(t) || (DeferredPending() && deferred_read_targets_.count(t))) FlushDeferredScene();
-    if (DirtyEpoch(t->data) != t->epoch) return;  // guest memory is newer than the image
+    if (DirtySince(*t)) return;  // guest memory is newer than the image
     VkImage image = t->samples > 1 ? t->resolved_image : t->image;
     if (!image || !t->w || !t->h) return;
 
@@ -10792,8 +10834,9 @@ VkImageView VulkanBackend::DispatchFsrApi(Target& ft, VkImageView color_view, co
 }
 #endif
 
-#if defined(TCNYC_HAVE_DLSS)
-void VulkanBackend::ProbeDlss() {    auto discovery = DlssDiscovery();
+#if defined(TCNYC_VK_DLSS)
+void VulkanBackend::ProbeDlss() {
+    auto discovery = DlssDiscovery();
     NVSDK_NGX_FeatureRequirement requirement{};
     if (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_GetFeatureRequirements(instance_, physical_, &discovery, &requirement)) ||
         requirement.FeatureSupported != 0) {
@@ -10814,7 +10857,7 @@ void VulkanBackend::ProbeDlss() {    auto discovery = DlssDiscovery();
     info.PathListInfo.Length = uint32_t(std::size(paths));
     const auto result = NVSDK_NGX_VULKAN_Init_with_ProjectID(
         kNgxProject, NVSDK_NGX_ENGINE_TYPE_CUSTOM, kNgxEngineVersion, exe_path.c_str(), instance_, physical_, device_,
-        vkGetInstanceProcAddr, vkGetDeviceProcAddr, &info);
+        vkGetInstanceProcAddr, vkGetDeviceProcAddr, &info, NVSDK_NGX_Version_API);
     dlss_.initialized = NVSDK_NGX_SUCCEED(result);
     if (!dlss_.initialized) {
         LOGR("vulkan: NGX initialization failed (0x%08X)", unsigned(result));
@@ -11001,7 +11044,7 @@ VkImageView VulkanBackend::ApplyTaa(Target& ft, VkImageView color) {
     if (fsr_on_ || dlss_on_) {
         VkImageView temporal = VK_NULL_HANDLE;
         if (camera_valid) {
-#if defined(TCNYC_HAVE_DLSS)
+#if defined(TCNYC_VK_DLSS)
             if (dlss_on_) temporal = DispatchDlss(ft, color, reset, motion);
             else
 #endif
@@ -11156,7 +11199,7 @@ void VulkanBackend::Present(const Surface& front) {
     // Guest memory newer than the GPU image (a CPU-decoded movie frame, a lock or
     // copy) must win: presenting the old image is the intro/legal-screen flicker.
     const bool capture = DevEnv("TC_VK_CAP") != nullptr;
-    const bool stale = ft && DirtyEpoch(ft->data) != ft->epoch;
+    const bool stale = ft && DirtySince(*ft);
     const bool direct = ft && ft->drawn && !stale && !capture;
     if (perf_) {
         if (direct) perf_direct_++;
@@ -11846,7 +11889,3 @@ void VulkanBackend::Present(const Surface& front) {
 std::unique_ptr<Backend> CreateVulkanBackend() { return std::make_unique<VulkanBackend>(); }
 
 } // namespace gpu
-
-
-
-

@@ -10,6 +10,12 @@
   DLLs.
 - FSR 4.1 is now available on Windows Vulkan as well as Direct3D 12 (AMD FSR SDK 2.4; supported AMD GPUs only,
   falling back to FSR 3.1 elsewhere).
+- Vulkan parity fixes: the legal page no longer keeps a strip of the previous movie frame in its bottom rows on
+  Windows, and it is centred at 4:3 by the renderer rather than by the operating system. Shaders are compiled with
+  optimisation enabled (the counterpart of Direct3D 12's `D3DCOMPILE_OPTIMIZATION_LEVEL3`; caches rebuild once), and
+  per-texture/target dirty checks skip the dirty-map lock when nothing has changed, as Direct3D 12 already did.
+- Windows Vulkan DLSS can be built with `TCNYC_DLSS_VK_SDK` pointed at NVIDIA's NGX SDK (Vulkan headers and
+  `nvsdk_ngx.lib`); it is optional exactly like the Direct3D 12 DLSS build.
 
 - New **Gamma**, **Brightness**, **Contrast** and **Saturation** display adjustments in the launcher,
   the F10 Graphics menu and Options > Display. All four default to 100%, which leaves the picture

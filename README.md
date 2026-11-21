@@ -92,7 +92,7 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Remove cutscene bars | Hides the black bars above and below cutscenes and the title screen, showing the whole 3D picture. Off by default keeps the game's cinematic framing. |
 | Render scale | 25% to 200% of the output height. |
 | TAA | Temporal anti-aliasing in place of SMAA on the 3D scene, with per-object motion for cars and people. Available on D3D12 and on Vulkan devices with independent blending. Selecting a temporal upscaler replaces TAA. Off by default. |
-| Upscaler | Bilinear or AMD FSR 1 below 100% render scale. FSR 3.1 on Windows and Linux, FSR 4.1 on Windows, and optional experimental DLSS use 50% (Performance), 58% (Balanced), 67% (Quality) and 100% (Native AA). Windows FSR uses the AMD SDK loader and upscaler DLLs. DLSS requires an NVIDIA RTX adapter and the platform's NVIDIA runtime. |
+| Upscaler | Bilinear or AMD FSR 1 below 100% render scale. FSR 3.1 on Windows and Linux, FSR 4.1 on Windows, and optional experimental DLSS use 50% (Performance), 58% (Balanced), 67% (Quality) and 100% (Native AA). Windows FSR uses the AMD SDK loader and upscaler DLLs. DLSS requires an NVIDIA RTX adapter and the platform's NVIDIA runtime; the Windows Vulkan renderer needs a build with NVIDIA's NGX SDK (`TCNYC_DLSS_VK_SDK`). |
 | Sharpening | Off to 100%: AMD FidelityFX RCAS sharpening of the 3D frame, at any render scale. The HUD is not sharpened. Off by default. |
 | Field of view | 80% to 150% of the game's view, gameplay camera only; aiming still zooms. |
 | Object detail | Original, High, Very high or Maximum: how far buildings, props and moving cars keep their detailed models. Parked cars keep the game's own detail level. Maximum is much slower. |
