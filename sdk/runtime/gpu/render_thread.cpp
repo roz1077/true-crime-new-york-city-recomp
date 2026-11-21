@@ -408,7 +408,7 @@ private:
         uint8_t now[kHeaderBytes] = {};
         std::memcpy(now, kernel::HostPtr(header), type < 0x20000 || type == 0x30000 ? 12 : kHeaderBytes);
         Recent<HeaderCopy>& r = recent_headers_[(header >> 3) & 63];
-        HeaderCopy& c = r.key == header ? *r.value : headers_[header];
+        HeaderCopy& c = r.key == header ? *r.value : HeaderEntryFor(header);
         r = {header, &c};
         if (c.at && reservation_end_ - c.start <= kHeaderRing &&
             ring_pos_ - c.start < kHeaderRing / 2 && !std::memcmp(c.bytes, now, kHeaderBytes)) {
@@ -634,7 +634,23 @@ private:
         uint64_t start = 0;
         uint8_t bytes[kHeaderBytes];
     };
-    std::unordered_map<uint32_t, HeaderCopy> headers_;
+    // A header is looked up 26 times per draw (textures, palettes, streams, surfaces), so this is a flat
+    // table: no node per distinct header, and one probe. A collision drops the cached copy, which only
+    // costs the copy into the ring again.
+    struct HeaderEntry {
+        uint32_t key = 0;  // 0: empty (a header address is never 0)
+        HeaderCopy copy;
+    };
+    static constexpr size_t kHeaderEntries = 4096;
+    std::array<HeaderEntry, kHeaderEntries> headers_{};
+    HeaderCopy& HeaderEntryFor(uint32_t header) {
+        HeaderEntry& e = headers_[(header >> 4) & (kHeaderEntries - 1)];
+        if (e.key != header) {
+            e.key = header;
+            e.copy = HeaderCopy{};
+        }
+        return e.copy;
+    }
     // the last few lookups, in front of the maps (their elements stay put)
     template <typename T>
     struct Recent {

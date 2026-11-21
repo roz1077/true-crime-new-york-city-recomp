@@ -275,11 +275,34 @@ uint32_t NewSurface(uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
     return hdr;
 }
 
+namespace {
+// what SyncDeferred last took out of the title's state arrays. Those arrays are written inline by the
+// XDK, so they must be polled; comparing against this copy turns the poll into two memcmps for a draw
+// that changed nothing, which is most of them.
+constexpr uint32_t kDeferredRsCount = gpu::kRsComplexFirst - gpu::kRsDeferredFirst;
+uint32_t g_deferred_rs[kDeferredRsCount];
+uint32_t g_deferred_tss[4][gpu::kTssBumpEnvMat00];
+bool g_deferred_shadow = false;
+}  // namespace
+
+void SyncDeferredReset() { g_deferred_shadow = false; }
+
 void SyncDeferred() {
     // deferred states live in the title's memory, the inline SetRenderState and SetTextureStageState write them
-    for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++) g_state.rs[i] = R32(kRenderState + i * 4);
-    for (int s = 0; s < 4; s++)
-        for (uint32_t i = 0; i < gpu::kTssBumpEnvMat00; i++) g_state.tss[s][i] = R32(kTextureState + (s * kStageStates + i) * 4);
+    const auto* rs = reinterpret_cast<const uint32_t*>(HostPtr(kRenderState + gpu::kRsDeferredFirst * 4));
+    if (!g_deferred_shadow || std::memcmp(g_deferred_rs, rs, sizeof(g_deferred_rs))) {
+        std::memcpy(g_deferred_rs, rs, sizeof(g_deferred_rs));
+        std::memcpy(g_state.rs.data() + gpu::kRsDeferredFirst, rs, sizeof(g_deferred_rs));
+    }
+    for (int s = 0; s < 4; s++) {
+        const auto* tss = reinterpret_cast<const uint32_t*>(HostPtr(kTextureState + (s * kStageStates) * 4));
+        uint32_t* shadow = g_deferred_tss[s];
+        if (!g_deferred_shadow || std::memcmp(shadow, tss, sizeof(g_deferred_tss[s]))) {
+            std::memcpy(shadow, tss, sizeof(g_deferred_tss[s]));
+            std::memcpy(g_state.tss[s].data(), tss, sizeof(g_deferred_tss[s]));
+        }
+    }
+    g_deferred_shadow = true;
 }
 
 float ZScale(const gpu::Surface& zs) {
@@ -490,6 +513,7 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     W32(kDevicePtr, kDevice);
     ScratchPush();
     g_state = gpu::State{};
+    SyncDeferredReset();
     gpu::MarkAllSimple();
     gpu::g_simple_tracked = true;
     SetFrameBuffers("CreateDevice", a[4]);
@@ -1255,6 +1279,7 @@ HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
             if (input.stream >= 0 && input.type && input.type != 0x02) continue;
             float value = slot == 3 || slot == 7 ? 1.0f : 0.0f;
             for (float& component : g_state.vdef[slot]) component = value;
+            gpu::g_vdef_dirty = true;
         }
     }
     return 0;
@@ -1521,7 +1546,7 @@ HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
     uint32_t reg = a[0], src = a[1], n = a[2];
     for (uint32_t i = 0; i < n && reg + i < 16; i++) std::memcpy(g_state.psc[reg + i].data(), HostPtr(src + i * 16), 16);
     gpu::ApplyPixelConstants(g_state, reg, n);
-    gpu::MarkAllSimple();  // it writes the combiner constants into simple
+    // each piece it wrote is marked as it is written
     return 0;
 }
 
@@ -1728,8 +1753,12 @@ void EndPrimitive() {
 
 // a begin/end or vertex data method opens, feeds or draws the immediate primitive; false for any other method
 bool ApplyImmediate(uint32_t m, uint32_t v) {
-    // Array draws can have changed the current attributes since the last setter.
-    std::memcpy(g_im_attr, g_state.vdef, sizeof(g_im_attr));
+    // Array draws can have changed the current attributes since the last setter: re-sync then, not on every
+    // component (the setters below keep g_im_attr and vdef in step).
+    if (gpu::g_vdef_dirty) {
+        std::memcpy(g_im_attr, g_state.vdef, sizeof(g_im_attr));
+        gpu::g_vdef_dirty = false;
+    }
     float f;
     float* a = g_im_attr;
     bool last = true;  // the slot's last component
@@ -1966,6 +1995,7 @@ HLE_STDCALL(D3DDevice_Begin, 1) {
     Walk(Dev(kDevPush));
     g_im_prim = a[0];
     std::memcpy(g_im_attr, g_state.vdef, sizeof(g_im_attr));
+    gpu::g_vdef_dirty = false;
     g_im_mask = 0;
     g_im_vertices.clear();
     SetDev(XDK_CDevice_Flags, Dev(XDK_CDevice_Flags) | 0x800);

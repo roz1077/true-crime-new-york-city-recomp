@@ -2,6 +2,7 @@
 #include <map>
 #include <string>
 #include "gpu/vertex.h"
+#include "gpu/simple_dirty.h"
 
 #include <algorithm>
 #include <smmintrin.h>
@@ -482,6 +483,39 @@ int AddRawBuffer(const State& s, const VertexShader& layout, const VertexShader:
     return slot;
 }
 
+// one field of every vertex of a dense range, copied between strided layouts. The size is a template
+// parameter so the inner loop is a load and a store, with no switch per vertex.
+template <uint32_t B>
+void CopyFieldStrided(uint8_t* dst, const uint8_t* src, size_t dst_stride, size_t src_stride, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++, dst += dst_stride, src += src_stride) {
+        if constexpr (B == 2) {
+            uint16_t x;
+            std::memcpy(&x, src, 2);
+            std::memcpy(dst, &x, 2);
+        } else if constexpr (B == 4) {
+            uint32_t x;
+            std::memcpy(&x, src, 4);
+            std::memcpy(dst, &x, 4);
+        } else if constexpr (B == 8) {
+            uint64_t x;
+            std::memcpy(&x, src, 8);
+            std::memcpy(dst, &x, 8);
+        } else if constexpr (B == 12) {
+            uint64_t x;
+            uint32_t y;
+            std::memcpy(&x, src, 8);
+            std::memcpy(&y, src + 8, 4);
+            std::memcpy(dst, &x, 8);
+            std::memcpy(dst + 8, &y, 4);
+        } else if constexpr (B == 16) {
+            const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), x);
+        } else {
+            std::memcpy(dst, src, B);
+        }
+    }
+}
+
 // the stream's elements copied to aligned offsets in a new, dword-strided buffer; offsets gets each element's
 // new offset by register. The bytes a host format reads past the guest element (the w of a 3-component
 // short) are zero, and the decode replaces them.
@@ -525,25 +559,49 @@ int AddRepackedBuffer(const State& s, const Inputs& inputs, int stream, const Dr
     const size_t size = size_t(n) * packed;
     if (nf == 1 && fields[0].dst == 0 && fields[0].bytes == packed) g.resize(size);
     else g.assign(size, 0);
-    for (uint32_t i = 0; i < n; i++) {
-        const int64_t v = dense ? d.first_vertex + i : DrawVertex(s, d, i);
-        if (v < 0) return -1;
-        const uint8_t* src = data + size_t(v) * stride;
-        uint8_t* dst = &g[size_t(i) * packed];
+    if (dense) {
+        // one loop per field: the copy size is dispatched once for the field, not once per vertex
+        const uint8_t* base = data + size_t(d.first_vertex) * stride;
         for (int f = 0; f < nf; f++) {
-            uint8_t* to = dst + fields[f].dst;
-            const uint8_t* from = src + fields[f].src;
-            // fixed sizes inline to a load and a store; a general memcpy call per element cost as much as the copy
-            switch (fields[f].bytes) {
-                case 2: std::memcpy(to, from, 2); break;
-                case 4: std::memcpy(to, from, 4); break;
-                case 6: std::memcpy(to, from, 6); break;
-                case 8: std::memcpy(to, from, 8); break;
-                case 10: std::memcpy(to, from, 10); break;
-                case 12: std::memcpy(to, from, 12); break;
-                case 14: std::memcpy(to, from, 14); break;
-                case 16: std::memcpy(to, from, 16); break;
-                default: std::memcpy(to, from, fields[f].bytes); break;
+            uint8_t* dst = g.data() + fields[f].dst;
+            const uint8_t* src = base + fields[f].src;
+            const uint32_t bytes = fields[f].bytes;
+            switch (bytes) {
+                case 2: CopyFieldStrided<2>(dst, src, packed, stride, n); break;
+                case 4: CopyFieldStrided<4>(dst, src, packed, stride, n); break;
+                case 6: CopyFieldStrided<6>(dst, src, packed, stride, n); break;
+                case 8: CopyFieldStrided<8>(dst, src, packed, stride, n); break;
+                case 10: CopyFieldStrided<10>(dst, src, packed, stride, n); break;
+                case 12: CopyFieldStrided<12>(dst, src, packed, stride, n); break;
+                case 14: CopyFieldStrided<14>(dst, src, packed, stride, n); break;
+                case 16: CopyFieldStrided<16>(dst, src, packed, stride, n); break;
+                default:
+                    for (uint32_t i = 0, o = 0; i < n; i++, o += packed)
+                        std::memcpy(g.data() + o + fields[f].dst, base + size_t(i) * stride + fields[f].src, bytes);
+                    break;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            const int64_t v = DrawVertex(s, d, i);
+            if (v < 0) return -1;
+            const uint8_t* src = data + size_t(v) * stride;
+            uint8_t* dst = &g[size_t(i) * packed];
+            for (int f = 0; f < nf; f++) {
+                uint8_t* to = dst + fields[f].dst;
+                const uint8_t* from = src + fields[f].src;
+                // fixed sizes inline to a load and a store; a general memcpy call per element cost as much as the copy
+                switch (fields[f].bytes) {
+                    case 2: std::memcpy(to, from, 2); break;
+                    case 4: std::memcpy(to, from, 4); break;
+                    case 6: std::memcpy(to, from, 6); break;
+                    case 8: std::memcpy(to, from, 8); break;
+                    case 10: std::memcpy(to, from, 10); break;
+                    case 12: std::memcpy(to, from, 12); break;
+                    case 14: std::memcpy(to, from, 14); break;
+                    case 16: std::memcpy(to, from, 16); break;
+                    default: std::memcpy(to, from, fields[f].bytes); break;
+                }
             }
         }
     }
@@ -737,6 +795,7 @@ void RetainVertexAttributes(State& s, uint32_t start, uint32_t count, const uint
         uint32_t data = mem::VirtualFromPhysical(kernel::R32(stream.vb + kResData));
         const auto* src = static_cast<const uint8_t*>(kernel::HostPtr(data + in.offset));
         Convert(in.type, src + size_t(vertex) * stride, s.vdef[r]);
+        g_vdef_dirty = true;  // the immediate-mode setters must re-sync their copy
     }
 }
 

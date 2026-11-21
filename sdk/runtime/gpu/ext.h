@@ -31,6 +31,7 @@ struct Target {
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     uint32_t data = 0, bytes = 0;
     uint64_t epoch = 0, sig = 0;  // last lock seen, guest memory as last matched
+    uint64_t epoch_gen = 0;       // DirtyGeneration() when epoch was last read (skips the map lookup)
     bool drawn = false;           // the GPU wrote it since the last readback
     bool cpu = false;             // CPU pixels since the last presentation or overwrite
     uint64_t scene_frame = ~0ull; // frame of the last clear or 3D draw

@@ -357,6 +357,18 @@ struct Perf {
     double texup = 0;
     double compile = 0;
     double pipeline = 0;
+    // the per-draw steps this pass needed to see: descriptor parses, constant fill, key hashing
+    double describe = 0;
+    double consts = 0;
+    double key = 0;
+    double geometry = 0;
+    double fill = 0;    // DrawConstants built
+    double views = 0;   // texture views, samplers, descriptor tables
+    double raster = 0;  // viewport, scissor, blend factor, stencil reference
+    double pixelkey = 0;  // MakePixelKey: the ~380-byte key it fills
+    double motion = 0;    // object-motion identity and match against last frame's draws
+    double bindtargets = 0;  // BindTargets: EnsureTarget, LatchCpuWrite, transitions, RTV/DSV
+    double targetcreate = 0;  // CreateTargetResource: the committed allocation
     double clear = 0;
     double copy = 0;
     double present = 0;
@@ -385,6 +397,7 @@ struct Perf {
     uint64_t shader_hits = 0;
     uint64_t raw = 0;
     uint64_t lates = 0;
+    uint64_t target_hits = 0, target_misses = 0;  // EnsureTarget memo
 };
 Perf g_perf;
 struct PerfScope {
@@ -868,6 +881,11 @@ bool Changed(const Target& t) {
 
 // a lock alone proves nothing, reads lock too: only changed bytes mean the CPU wrote it
 bool LatchCpuWrite(Target& t) {
+    // every draw asks this of its target. Nothing marked dirty since the last answer cannot have moved
+    // this target's epoch, so the common frame pays one relaxed load and no lock.
+    const uint64_t gen = gpu::DirtyGeneration();
+    if (gen == t.epoch_gen) return false;
+    t.epoch_gen = gen;
     uint64_t e = DirtyEpoch(t.data);
     if (e <= t.epoch) return false;
     t.epoch = e;
@@ -1547,6 +1565,18 @@ private:
     uint32_t last_sampler_slot_ = UINT32_MAX;
     std::array<std::unordered_map<uint64_t, uint32_t>, kFrames> samplers_;
     std::unordered_map<uint64_t, Target> targets_;
+    // EnsureTarget is asked for the same colour and depth target on every draw. The last answer for each is
+    // kept while no target was destroyed; the hit still runs the same want_* checks as the slow path, so a
+    // target made for another scale or sample count is never handed back.
+    struct TargetMemo {
+        uint32_t data = 0, header = 0;
+        bool depth = false;
+        Target* target = nullptr;
+        uint64_t epoch = 0;
+        bool valid = false;
+    };
+    TargetMemo target_memo_[2];  // [0] colour, [1] depth
+    uint64_t targets_epoch_ = 0;  // bumped whenever a target is destroyed
     std::unordered_map<uint32_t, uint64_t> target_used_;  // target address to the frame it was last used
     std::array<UsedTarget, 4> recent_used_{};
     uint32_t recent_used_next_ = 0;
@@ -2531,6 +2561,7 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator 
     if (it->second.resolved) CurrentFrame().garbage.push_back(it->second.resolved);
     if (it->second.fb) CurrentFrame().garbage.push_back(it->second.fb);
     targets_.erase(it);
+    ++targets_epoch_;  // any memoised Target* is stale from here
 }
 
 // the host texture of a new target, at render scale or the extension's
@@ -2649,7 +2680,10 @@ uint64_t D3D12Backend::SizedTargetKey(uint32_t data, bool depth, uint32_t gw, ui
 D3D12Backend::TargetSlot D3D12Backend::FindTargetSlot(const Surface& s, bool depth, uint64_t alt) {
     TargetSlot slot;
     slot.data = mem::VirtualFromPhysical(s.data);
-    SurfaceSize(s, slot.gw, slot.gh);
+    {
+        PerfScope perf_describe{g_perf.describe};
+        SurfaceSize(s, slot.gw, slot.gh);
+    }
     slot.key = SizedTargetKey(slot.data, depth, slot.gw, slot.gh) | alt;
     slot.it = targets_.find(slot.key);
     slot.sized = slot.it != targets_.end() && slot.it->second.gw == slot.gw && slot.it->second.gh == slot.gh;
@@ -2670,27 +2704,53 @@ Target* D3D12Backend::FindTarget(const Surface& s, bool depth) {
 // the surface's target, made again at its size when that changed
 Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     if (!s.header) return nullptr;
+    // Every draw asks for the same colour and depth target. A memo hit must still satisfy the same
+    // conditions as the slow path (samples, scale, stretch), or the draw would use the wrong resource.
+    const uint32_t data = mem::VirtualFromPhysical(s.data);
+    TargetMemo& memo = target_memo_[depth ? 1 : 0];
+    if (!ext_ && memo.valid && memo.epoch == targets_epoch_ && memo.data == data && memo.depth == depth &&
+        memo.header == s.header) {
+        Target* t = memo.target;
+        if (t->want_samples == msaa_ && t->want_scale == WantScale(data, depth) && t->want_stretch == stretch_) {
+            // the idle sweep must see this target as used this frame, or it may release it while bound
+            UpdateTargetUsed(data);
+            ++g_perf.target_hits;
+            return t;
+        }
+        memo.valid = false;  // stale: fall through and rebuild as the slow path would
+    }
     uint64_t alt = 0;
     if (ext_ && !ext_->TargetKey(s, depth, alt)) return nullptr;
+    ++g_perf.target_misses;
     TargetSlot slot = FindTargetSlot(s, depth, alt);
     UpdateTargetUsed(slot.data);
     if (slot.sized) {
         Target& t = slot.it->second;
         // Targets that are only sampled keep their contents across a settings change; one that is
         // drawn into again is rebuilt when its MSAA/scale no longer match.
-        if (t.want_samples == msaa_ && t.want_scale == WantScale(slot.data, depth) && t.want_stretch == stretch_)
+        if (t.want_samples == msaa_ && t.want_scale == WantScale(slot.data, depth) && t.want_stretch == stretch_) {
+            memo = {slot.data, s.header, depth, &t, targets_epoch_, true};
             return &t;
+        }
         ReleaseTarget(slot.it);
+        memo.valid = false;
     } else if (slot.it != targets_.end()) {
         ReleaseTarget(slot.it);
+        memo.valid = false;
     }
     Target t;
     t.depth = depth;
     t.gw = slot.gw;
     t.gh = slot.gh;
     t.data = slot.data;  // CreateTargetResource picks a shadow map's scale by it
-    if (!CreateTargetResource(t, s)) return nullptr;
-    g_perf.targets++;
+    if (diag::Perf())
+        LOG_FIRST(400, "d3d12: target created %08X %ux%u depth %d sized %d", slot.data, slot.gw, slot.gh, depth ? 1 : 0,
+                  slot.sized ? 1 : 0);
+    {
+        PerfScope perf_targetcreate{g_perf.targetcreate};
+        g_perf.targets++;
+        if (!CreateTargetResource(t, s)) return nullptr;
+    }
     // an empty pool drops the new resource with t
     if (!CreateTargetView(t)) return nullptr;
     t.data = slot.data;
@@ -2704,6 +2764,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     t.epoch = DirtyEpoch(slot.data);
     t.sig = MemSig(slot.data, t.bytes);
     auto& ref = targets_[slot.key] = std::move(t);
+    memo = {slot.data, s.header, depth, &ref, targets_epoch_, true};
     return &ref;
 }
 
@@ -2809,10 +2870,12 @@ bool D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* 
 // a depth buffer drawn as colour into another depth buffer's memory: copied as depth
 bool D3D12Backend::DepthCopy(const State& s) {
     TextureDesc d;
-    if (!s.rt.header || !s.textures[0] || !Describe(s.textures[0], d) || Format(d.format).depth || d.cube ||
-        d.depth != 1) {
-        return false;
+    if (!s.rt.header || !s.textures[0]) return false;
+    {
+        PerfScope perf_describe{g_perf.describe};
+        if (!Describe(s.textures[0], d)) return false;
     }
+    if (Format(d.format).depth || d.cube || d.depth != 1) return false;
     uint32_t gw;
     uint32_t gh;
     SurfaceSize(s.rt, gw, gh);
@@ -2872,7 +2935,11 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
     if (DeferredPendingResource(t.res.Get())) DeferredBarrier("CPU pixels written to a deferred target");
     g_perf.rtups++;
     TextureDesc d;
-    if (!Describe(s.header, d) || Format(d.format).depth) return;
+    {
+        PerfScope perf_describe{g_perf.describe};
+        if (!Describe(s.header, d)) return;
+    }
+    if (Format(d.format).depth) return;
     std::vector<uint8_t> px;
     uint32_t pitch;
     // after a Sync only the pixels the CPU changed go over the picture, which stays at render scale
@@ -3002,7 +3069,10 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
 // The directory fingerprints the compiler DLL, flags and cache format. The file
 // key includes the complete generated source, entry point and shader profile.
 constexpr uint64_t kShaderCacheMagic = 0x3145484341435358ull;
-constexpr uint32_t kShaderCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL1;
+// Level 3 rather than 1: these are the shaders that draw every object, their bytecode is cached on disk,
+// so the only cost is the first compile. The cache key includes this flag (ShaderCompilerFingerprint), so a
+// change rebuilds the cache once instead of reading stale level-1 bytecode.
+constexpr uint32_t kShaderCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 constexpr uint64_t kShaderCacheMaxBytes = 16ull << 20;
 struct ShaderCacheHeader {
     uint64_t magic, key, size, checksum;
@@ -4483,8 +4553,30 @@ void ReadStagePalette(const State& s, int stage, const TextureDesc& d, StagePale
     palette.va = mem::VirtualFromPhysical(kernel::R32(header + kPaletteData));
     uint32_t size_code = kernel::R32(header + kPaletteCommon) >> kPaletteSizeShift;
     size_t bytes = (std::size(palette.colours) >> size_code) * sizeof(uint32_t);
-    std::memcpy(palette.colours, kernel::HostPtr(palette.va), bytes);
+    const auto* colours = reinterpret_cast<const uint32_t*>(kernel::HostPtr(palette.va));
+    // Palettes are re-read for every paletted stage of every draw, and hashing 1 KB is the expensive part.
+    // A copy compared with the guest colours detects a rewritten palette exactly, and costs a memcmp.
+    struct CacheEntry {
+        uint32_t va = 0;
+        uint32_t size_code = 0;
+        uint64_t hash = 0;
+        uint32_t colours[256] = {};
+        bool valid = false;
+    };
+    static thread_local std::array<CacheEntry, 16> cache;
+    CacheEntry& e = cache[(palette.va >> 4) & (cache.size() - 1)];
+    if (e.valid && e.va == palette.va && e.size_code == size_code && !std::memcmp(e.colours, colours, bytes)) {
+        std::memcpy(palette.colours, e.colours, sizeof(palette.colours));
+        palette.hash = e.hash;
+        return;
+    }
+    std::memcpy(palette.colours, colours, bytes);
     palette.hash = Hash(palette.colours, sizeof(palette.colours));
+    e.va = palette.va;
+    e.size_code = size_code;
+    e.hash = palette.hash;
+    std::memcpy(e.colours, palette.colours, sizeof(e.colours));
+    e.valid = true;
 }
 
 // a texture in guest memory: made again when its layout changed, uploaded again when its bytes did
@@ -4613,7 +4705,11 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sv.Texture2D.MipLevels = 1;
     TextureDesc d;
-    if (!s.textures[size_t(stage)] || !Describe(s.textures[size_t(stage)], d)) return nullptr;
+    if (!s.textures[size_t(stage)]) return nullptr;
+    {
+        PerfScope perf_describe{g_perf.describe};
+        if (!Describe(s.textures[size_t(stage)], d)) return nullptr;
+    }
     stages.desc[stage] = d;
     const FormatInfo& fi = Format(d.format);
     info.kind = TextureKind(d);
@@ -5808,7 +5904,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         if (defer_scene_ && !bundle_) FlushDeferredScene();
         Submit(true);
     }
-    if (!BindTargets(s)) return;
+    {
+        PerfScope perf_targets{g_perf.bindtargets};
+        if (!BindTargets(s)) return;
+    }
     if (bound_ds_) bound_ds_->depth_resolved = false;
     if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
 
@@ -5899,6 +5998,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
     if (bound_motion_ && sh.prog && !a.pretransformed && bound_ds_ && s.rs[kRsZEnable] &&
         SimpleState(s, kMZWriteEnable) && solid) {
+        PerfScope perf_motion{g_perf.motion};
         // Captured curved strip, straight strip and explicit-position road programs.
         const bool road = s.vs->hash == 0x4CC5C030CD8CB305ull || s.vs->hash == 0x18591ECD120BF283ull ||
                           s.vs->hash == 0xEE65083728927C2Full;
@@ -5930,7 +6030,11 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             }
         }
     }
-    PixelKey pk = MakePixelKey(s, stages.info);
+    PixelKey pk;
+    {
+        PerfScope perf_pk{g_perf.pixelkey};
+        pk = MakePixelKey(s, stages.info);
+    }
     pk.quad = sh.quad;
     // The guest HUD is composited into the scene before Present. Mark its alpha-blended
     // screen-space draws so Native AA can preserve those pixels from the current frame.
@@ -5954,7 +6058,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // so they keep the direct path (a handful of thin draws is not a compile burst).
     const bool ao_progressive = a.topology != Topology::Points && a.topology != Topology::Lines;
     PsoKey k;
-    BuildPipelineKey(s, a, sh.vh, 0, k);
+    {
+        PerfScope perf_key{g_perf.key};
+        BuildPipelineKey(s, a, sh.vh, 0, k);
+    }
     k.sprite = sh.sprite;
     const uint32_t motion_bound = k.motion;
     k.motion |= pk.motion == 3 ? kReactiveWrite : pk.motion ? kMotionWrite : 0u;
@@ -6014,7 +6121,11 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // the worker builds exactly the keys the next draw will look up.
     if (defer_now && (ao_color_pending || ao_depth_pending))
         ScheduleAoVariants(pk_base, k, sh.vs_code, ao_color_pending, ao_depth_pending);
-    ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
+    ID3D12PipelineState* pso;
+    {
+        PerfScope perf_key{g_perf.key};
+        pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
+    }
     if (!pso) return;
     depth_replay_ = {};
     if (defer_now && opaque && !ao_depth_pending) {
@@ -6041,7 +6152,9 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     GuestExtent size;
     SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
     DrawConstants c{};
-    c.tscale[0] = TargetScale();
+    {
+        PerfScope perf_fill{g_perf.fill};
+        c.tscale[0] = TargetScale();
     c.tscale[1] = TargetScaleY();
     c.tscale[2] = UiSqueeze(s, a, stages);
     c.tscale[3] = ShadowSpacing(render_.shadow_softness);
@@ -6086,7 +6199,11 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         c.ext[0] = 2.0f * taa_jitter_[0] / float(bound_rt_->w);
         c.ext[1] = -2.0f * taa_jitter_[1] / float(bound_rt_->h);
     }
-    if (!UploadConstants(s, sh, k, stages, size, c)) return;
+    }
+    {
+        PerfScope perf_consts{g_perf.consts};
+        if (!UploadConstants(s, sh, k, stages, size, c)) return;
+    }
     if (ext_) binds_ = {};
 
     if (cap_) {
@@ -6103,9 +6220,15 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
 
     // texture views and samplers, viewport and scissor, blend factor and stencil reference
-    SetTextureViewsAndSamplers(s, a, stages);
-    SetViewportScissor(s, size.w, size.h, c.tscale[2]);
-    SetBlendFactorStencilRef(s);
+    {
+        PerfScope perf_views{g_perf.views};
+        SetTextureViewsAndSamplers(s, a, stages);
+    }
+    {
+        PerfScope perf_raster{g_perf.raster};
+        SetViewportScissor(s, size.w, size.h, c.tscale[2]);
+        SetBlendFactorStencilRef(s);
+    }
 
     // geometry, counted while the title runs a visibility test
     if (prev_consts) {  // the matched draw's previous constants at b2 for the motion variant
@@ -6120,7 +6243,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
     uint32_t query = BeginCountedDraw(s);
     if (defer_now) bundle_desc_.drew = true;
-    DrawGeometry(a);
+    {
+        PerfScope perf_geometry{g_perf.geometry};
+        DrawGeometry(a);
+    }
     EndCountedDraw(query);
     if (depth_replay_.pso && bundle_) {
         DepthReplay& d = depth_replay_;
@@ -8651,6 +8777,21 @@ void LogPerf() {
              "%llu pre-built at start",
              p.pipeline / n, (unsigned long long)p.psos, (unsigned long long)p.pso_loads,
              (unsigned long long)p.pso_misses, (unsigned long long)p.pso_warm);
+        {
+            uint64_t hits = 0, misses = 0;
+            gpu::DescribeCacheStats(hits, misses);
+            LOGI("perf: draw steps per frame: assemble %.2f, geometry %.2f, stage textures %.2f, describe %.2f, "
+                 "constants %.2f (fill %.2f), key %.2f, views %.2f, raster %.2f, targets %.2f, pixel key %.2f, "
+                 "motion %.2f ms | describe cache %.0f%% (%llu hit, %llu miss)",
+                 p.assemble / n, p.geometry / n, p.bind / n, p.describe / n, p.consts / n, p.fill / n, p.key / n,
+                 p.views / n, p.raster / n, p.bindtargets / n, p.pixelkey / n, p.motion / n,
+                 hits + misses ? 100.0 * double(hits) / double(hits + misses) : 0.0,
+                 (unsigned long long)hits, (unsigned long long)misses);
+            LOGI("perf: target memo %.0f%% (%llu hit, %llu miss), create %.3f ms/frame",
+                 p.target_hits + p.target_misses
+                     ? 100.0 * double(p.target_hits) / double(p.target_hits + p.target_misses) : 0.0,
+                 (unsigned long long)p.target_hits, (unsigned long long)p.target_misses, p.targetcreate / n);
+        }
         g_perf = Perf{};
         perf_start = PerfClock::now();
         perf_frames = 0;
@@ -8935,6 +9076,9 @@ void D3D12Backend::ApplySettings() {
         ResetTemporalHistory();
         motion_was_.Clear();
         road_projection_was_ = {};
+        // targets made for the old scale or sample count must not come from the memo
+        ++targets_epoch_;
+        target_memo_[0].valid = target_memo_[1].valid = false;
         Flush();
         scene_depth_.clear();
         last_scene_rt_ = nullptr;

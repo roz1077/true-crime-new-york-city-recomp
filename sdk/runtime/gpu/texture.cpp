@@ -1,7 +1,9 @@
 #include "gpu/texture.h"
+#include "gpu/simple_dirty.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <mutex>
@@ -262,6 +264,13 @@ float DepthTexel(uint32_t fmt, const uint8_t* p) {
 std::mutex g_dirty_lock;
 std::unordered_map<uint32_t, uint64_t> g_dirty;
 uint64_t g_epoch = 1;
+// g_epoch as last published, so a reader with no interest in a particular address can tell whether
+// anything was marked dirty at all without taking the lock (DirtyGeneration)
+std::atomic<uint64_t> g_dirty_generation{1};
+
+// Describe's cache, counted for the D3D12 perf line
+std::atomic<uint64_t> g_describe_hits{0};
+std::atomic<uint64_t> g_describe_misses{0};
 
 // sane limits: D3D12's largest 2D side, the Xbox format's four level bits, and a level a host upload can hold
 constexpr uint32_t kMaxTextureSide = 16384;
@@ -345,11 +354,39 @@ bool Describe(uint32_t header, TextureDesc& d) {
     using namespace kernel;
     d = {};
     if (!header) return false;
-    uint32_t common = R32(header);
+    // A draw asks this of each of its four stages, and the fields it parses (the format's level loop
+    // and the readability page walk) cost far more than the answer changes. Key the cache on exactly
+    // what is read — the four header words — plus the memory layout, which is what the range check
+    // depends on. Thread-local: the render thread is the only caller, but a second one costs nothing.
+    struct Entry {
+        uint32_t header = 0;
+        uint32_t words[4] = {};
+        uint64_t layout = 0;
+        bool ok = false;
+        TextureDesc desc;
+    };
+    static thread_local std::array<Entry, 512> cache;
+    const uint64_t layout = mem::LayoutGeneration();
+    const uint32_t words[4] = {R32(header), R32(header + 4), R32(header + 12), R32(header + 16)};
+    Entry& e = cache[(header >> 2) & (cache.size() - 1)];
+    if (e.layout == layout && e.header == header && e.words[0] == words[0] && e.words[1] == words[1] &&
+        e.words[2] == words[2] && e.words[3] == words[3]) {
+        ++g_describe_hits;
+        if (!e.ok) return false;
+        d = e.desc;
+        return true;
+    }
+    ++g_describe_misses;
+    e = Entry{};
+    e.header = header;
+    e.layout = layout;
+    std::memcpy(e.words, words, sizeof(words));
+
+    uint32_t common = words[0];
     uint32_t type = common & 0x70000;  // 0x40000 texture, 0x50000 surface
     if (type != 0x40000 && type != 0x50000) return false;
     // D3DPixelContainer: Common, Data, Lock, Format, Size
-    uint32_t fmt = R32(header + 12), size = R32(header + 16), data = R32(header + 4);
+    uint32_t fmt = words[2], size = words[3], data = words[1];
     if (!data) return false;
     TextureDesc t;
     t.data = mem::VirtualFromPhysical(data);
@@ -389,6 +426,8 @@ bool Describe(uint32_t header, TextureDesc& d) {
         return false;
     }
     d = t;
+    e.ok = true;
+    e.desc = t;
     return true;
 }
 
@@ -550,7 +589,16 @@ void MarkDirty(uint32_t res) {
     if (!res) return;
     uint32_t data = mem::VirtualFromPhysical(kernel::R32(res + 4));
     std::lock_guard<std::mutex> lock(g_dirty_lock);
-    g_dirty[data] = ++g_epoch;
+    const uint64_t epoch = ++g_epoch;
+    g_dirty[data] = epoch;
+    g_dirty_generation.store(epoch, std::memory_order_relaxed);
+}
+
+uint64_t DirtyGeneration() { return g_dirty_generation.load(std::memory_order_relaxed); }
+
+void DescribeCacheStats(uint64_t& hits, uint64_t& misses) {
+    hits = g_describe_hits.load(std::memory_order_relaxed);
+    misses = g_describe_misses.load(std::memory_order_relaxed);
 }
 
 uint64_t DirtyEpoch(uint32_t data) {
@@ -666,6 +714,7 @@ uint32_t PackColor(const std::array<float, 4>& c) {
 
 // PSC0Mapping and PSC1Mapping give each combiner stage the D3D constant its C0 and C1 read,
 // PSFinalCombinerConstants does the same for the final combiner. 0xF leaves the literal in place.
+// Only the pieces actually written are marked, so the render thread's 8 KB compare stays a bit test.
 void ApplyPixelConstants(State& s, uint32_t first, uint32_t count) {
     if (!s.ps) return;
     const uint32_t* d = s.ps->def;
@@ -673,12 +722,24 @@ void ApplyPixelConstants(State& s, uint32_t first, uint32_t count) {
     auto mine = [&](uint32_t m) { return m >= first && m < first + count && m < 8; };
     for (uint32_t i = 0; i < 8; i++) {
         uint32_t m0 = (c0map >> (i * 4)) & 0xF, m1 = (c1map >> (i * 4)) & 0xF;
-        if (mine(m0)) s.simple[(kMPsConstant0 >> 2) + i] = PackColor(s.psc[m0]);
-        if (mine(m1)) s.simple[(kMPsConstant1 >> 2) + i] = PackColor(s.psc[m1]);
+        if (mine(m0)) {
+            s.simple[(kMPsConstant0 >> 2) + i] = PackColor(s.psc[m0]);
+            MarkSimple((kMPsConstant0 >> 2) + i);
+        }
+        if (mine(m1)) {
+            s.simple[(kMPsConstant1 >> 2) + i] = PackColor(s.psc[m1]);
+            MarkSimple((kMPsConstant1 >> 2) + i);
+        }
     }
     uint32_t f0 = fmap & 0xF, f1 = (fmap >> 4) & 0xF;
-    if (mine(f0)) s.simple[kMPsFinalConstant0 >> 2] = PackColor(s.psc[f0]);
-    if (mine(f1)) s.simple[kMPsFinalConstant1 >> 2] = PackColor(s.psc[f1]);
+    if (mine(f0)) {
+        s.simple[kMPsFinalConstant0 >> 2] = PackColor(s.psc[f0]);
+        MarkSimple(kMPsFinalConstant0 >> 2);
+    }
+    if (mine(f1)) {
+        s.simple[kMPsFinalConstant1 >> 2] = PackColor(s.psc[f1]);
+        MarkSimple(kMPsFinalConstant1 >> 2);
+    }
 }
 
 }  // namespace gpu

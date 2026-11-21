@@ -8218,7 +8218,8 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
     const uint32_t th = sized->h;
     const float sx = sized->gw ? float(tw) / float(sized->gw) : 1.0f;
     const float sy = sized->gh ? float(th) / float(sized->gh) : 1.0f;
-    std::vector<VkClearRect> area;
+    std::vector<VkClearRect>& area = clear_area_;
+    area.clear();
     if (count && rects) {
         area.reserve(std::min<uint32_t>(count, 64));
         for (uint32_t i = 0; i < count; i++) {
@@ -8335,6 +8336,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     std::array<Target*, 4> tex_targets{};
     std::array<const char*, 4> tex_reasons{};
     std::array<float, 4> wide{};
+    // the current render target as a target-texture view, asked for by every stage that samples one:
+    // one lookup for the draw instead of one per stage
+    const Target* newest_rt = s.rt.data ? NewestTarget(s.rt.data, false) : nullptr;
     for (int i = 0; i < 4; i++) {
         if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], descs[size_t(i)])) continue;
         const TextureDesc& d = descs[size_t(i)];
@@ -8359,7 +8363,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         // one. A target read through a smaller texture view at 100% scale is not upscaled.
         if (Target* t = is_target ? sampled_target_ : nullptr; t && !t->depth && t->gw) {
             const float k = float(t->w) / float(t->gw);
-            const Target* cur = NewestTarget(s.rt.data, false);
+            const Target* cur = newest_rt;
             if (k > 1.01f && cur && cur != t && (t->gw > cur->gw || t->gh > cur->gh)) {
                 info[size_t(i)].flags |= kTexWide;
                 wide[size_t(i)] = k;
@@ -8740,7 +8744,14 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable) && rt->gw == width_ && rt->gh == height_ &&
         dof_ds->w == rt->w && dof_ds->h == rt->h && s.viewport.w == width_ && s.viewport.h == height_) {
         const WRange r = DrawWRange(s, prog);
-        if (r.near_w > 0 && r.far_w > r.near_w) scene_depth_[rt] = {dof_ds, r.near_w, r.far_w};
+        if (r.near_w > 0 && r.far_w > r.near_w) {
+            // nearly every scene draw carries the same target and projection: skip the map write when the
+            // last one did, as d3d12.cpp does
+            auto it = scene_depth_.find(rt);
+            if (it == scene_depth_.end() || it->second.depth != dof_ds || it->second.near_w != r.near_w ||
+                it->second.far_w != r.far_w)
+                scene_depth_[rt] = {dof_ds, r.near_w, r.far_w};
+        }
     }
     for (int i = 0; i < 4; i++)
         if ((info[size_t(i)].flags & kTexWide) && descs[size_t(i)].width && descs[size_t(i)].height) {

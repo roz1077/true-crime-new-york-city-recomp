@@ -18,4 +18,8 @@ inline void MarkSimple(uint32_t index) {
 
 inline void MarkAllSimple() { g_simple_dirty = {~0ull, ~0ull}; }
 
+// State::vdef (the current vertex attributes) changed outside the immediate-mode component setters, e.g. an
+// array draw retained one. The next pushed component re-syncs its copy (g_im_attr). Title thread only.
+inline bool g_vdef_dirty = true;
+
 }  // namespace gpu

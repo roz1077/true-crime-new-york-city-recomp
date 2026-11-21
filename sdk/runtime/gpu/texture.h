@@ -51,7 +51,12 @@ bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, u
 
 // the title locked a resource, the next bind re-uploads it
 void MarkDirty(uint32_t resource);
+// a resource's last lock, 0 if it was never locked. DirtyGeneration counts the locks of every
+// resource: unchanged since the last check means DirtyEpoch cannot have moved for any address.
 uint64_t DirtyEpoch(uint32_t data_va);
+uint64_t DirtyGeneration();
+// Describe's thread-local cache: how many parses it answered without walking the descriptor
+void DescribeCacheStats(uint64_t& hits, uint64_t& misses);
 
 // vertex declarations and pixel shader constant routing, both follow the XDK's definitions
 void ParseDeclaration(VertexShader& vs);
