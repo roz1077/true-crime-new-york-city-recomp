@@ -1,5 +1,6 @@
 #include "game_addresses.h"
 #include "core/dev_env.h"
+#include "game/matrix_mul.h"
 // City streaming probe (Phase 0 of docs/city-streaming-plan.md).
 //
 // Nothing here changes game behaviour. With XBE_TRACE_CITY=1 it logs, for the nine fixed city tile slots:
@@ -1005,7 +1006,8 @@ X86_FUNC(sub_0021C6D0) {
 X86_EXTERN_FUNC(__imp__sub_0024C6E0);
 X86_FUNC(sub_0024C6E0) {
     const uint32_t arg0 = X86_MEM32(ctx.esp + 4), self = ctx.ecx, ret = X86_MEM32(ctx.esp);
-    __imp__sub_0024C6E0(ctx, base);
+    // the recompiled body ran every SSE op as a four-lane scalar loop: this is the same sequence natively
+    game::MatrixMul4x4(ctx, base);
     if (g_ring_draw_idx >= 0) {
         char tag[96];
         std::snprintf(tag, sizeof tag, "after 0024C6E0 ring %d ecx %08X arg0 %08X ret %08X", g_ring_draw_idx, self, arg0, ret);
