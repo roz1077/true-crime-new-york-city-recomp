@@ -65,6 +65,41 @@ void Apply(const std::string& s, Pad& p) {
 
 }  // namespace
 
+// the mouse-aim hooks read the lock-on button and write its stick; the harness has neither
+bool LockOnHeld() { return false; }
+void SetLockOnStick(int16_t, int16_t) {}
+uint32_t g_prompt_override = 0;
+uint32_t g_controller_aim_response = 0;
+uint32_t g_mouse_sensitivity_percent = 100;
+uint32_t g_mouse_vertical_sensitivity_percent = 100;
+uint32_t g_controller_aim_sensitivity_percent = 100;
+bool g_direct_mouse_aim = false;
+bool Connected(int port) { return port == 0; }
+bool MouseLookStickActive() { return false; }
+bool MouseMovedRecently() { return false; }
+bool DirectAimRecent() { return false; }
+bool KeyboardMouseActive() { return false; }
+bool ConsumeMouseAim(float&, float&) { return false; }
+bool CanBindKey(uint32_t) { return true; }
+void UseDirectMouseAim() {}
+void SetUiActive(bool) {}
+void KeyBindings(KeyBinding (&out)[kKeyBindingCount]) {
+    for (auto& b : out) b = KeyBinding{};
+}
+void DefaultKeys(KeyBinding (&out)[kKeyBindingCount]) { KeyBindings(out); }
+void PadBindings(PadBinding (&out)[kPadBindingCount]) {
+    for (auto& b : out) b = PadBinding{};
+}
+void DefaultPadBindings(PadBinding (&out)[kPadBindingCount]) { PadBindings(out); }
+void SetBindings(const KeyBinding (&)[kKeyBindingCount], const PadBinding (&)[kPadBindingCount]) {}
+void KeyDisplayName(uint32_t, char (&out)[32]) { out[0] = 0; }
+void PadSourceDisplayName(int, char (&out)[32]) { out[0] = 0; }
+void PromptLabel(PadInput, bool, char (&out)[8]) { out[0] = 0; }
+int HeldPadSource() { return 0; }
+bool PadRemapped() { return false; }
+void LoadBindings(const void*) {}
+void SaveBindings(void*) {}
+
 Pad Poll(int port) {
     static const std::vector<Press> script = LoadScript();
     static Press live{-1, "", 0};
