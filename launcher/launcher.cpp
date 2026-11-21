@@ -216,6 +216,7 @@ struct Graphics {
                 const std::string name = AspectName(v);
                 return name.empty() ? std::to_string(v / 1000.0).substr(0, 5) + ":1" : name;
             });
+            Toggle("Remove cutscene bars", "remove_cutscene_bars", settings.remove_cutscene_bars);
             Choice("Frame cap", "fps_cap", settings.fps_cap, kFrameCaps,
                    [](uint32_t v) { return std::to_string(EffectiveFrameCap(v)) + " FPS"; });
             Toggle("VSync", "vsync", settings.vsync);
@@ -264,6 +265,14 @@ struct Graphics {
             Toggle("Bloom", "bloom", settings.bloom);
             Toggle("Depth of field", "dof", settings.dof);
             Toggle("PC contrast", "pc_contrast", settings.pc_contrast);
+            ImGui::EndTable();
+        }
+
+        if (Section("COLOUR")) {
+            Choice("Gamma", "gamma", settings.gamma, kGammaPercents, percent);
+            Choice("Brightness", "brightness", settings.brightness, kBrightnessPercents, percent);
+            Choice("Contrast", "contrast", settings.contrast, kContrastPercents, percent);
+            Choice("Saturation", "saturation", settings.saturation, kSaturationPercents, percent);
             ImGui::EndTable();
         }
 
@@ -894,6 +903,7 @@ void Theme(float scale) {
 }
 
 bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::GameSource& source) {
+    LogLine("launcher: window open (v%s)", Updater::Current());
     const auto preferences = PreferencesPath();
     std::string iso, remembered_iso, notice, skip_version;
     bool error = false, check_updates = true, prefer_pal = false;
@@ -999,7 +1009,10 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
             }
         }
         // Keep the callback state and its parent window alive until the native dialog returns.
-        if (quit && !picking) break;
+        if (quit && !picking) {
+            LogLine("launcher: closed without starting the game");
+            break;
+        }
         if (quit) {
             SDL_Delay(16);
             continue;
@@ -1238,8 +1251,21 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
 #endif
                     if (iso != remembered_iso) save_pref("iso", iso);
                     save_pref("prefer_pal", app::IsPal(detected.region));
-                    source = detected;
-                    play = true;
+                    LogLine("play: region %d, source %s", int(detected.region), Utf8(detected.path).c_str());
+                    bool started = true;
+                    // Start the game before the launcher shuts SDL down. On Windows
+                    // this is a child process; on Linux execv replaces this image.
+                    // Either way, a launcher shutdown fault cannot stop the game.
+                    const bool same_region = app::BuildRegion() == detected.region;
+                    started = same_region ? LaunchGame(detected, app::Instance()) : LaunchPal(detected);
+                    if (!started) {
+                        notice = "Could not start the game. Extract the complete release and try again.";
+                        error = true;
+                    } else {
+                        source = detected;
+                        play = true;
+                        LogLine("play: the game process has started");
+                    }
                 } else if (save) {
                     notice = "Settings saved.";
                     error = false;

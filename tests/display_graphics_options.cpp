@@ -27,7 +27,11 @@ int main() {
         }
         return values.*field == choices.back();
     };
-    if (!check_choice(Option::PedDetail, kPedDetails, &Values::ped_detail) ||
+    if (!check_choice(Option::Gamma, kGammaPercents, &Values::gamma) ||
+        !check_choice(Option::Brightness, kBrightnessPercents, &Values::brightness) ||
+        !check_choice(Option::Contrast, kContrastPercents, &Values::contrast) ||
+        !check_choice(Option::Saturation, kSaturationPercents, &Values::saturation) ||
+        !check_choice(Option::PedDetail, kPedDetails, &Values::ped_detail) ||
         !check_choice(Option::PedLimit, kPedLimits, &Values::ped_limit) ||
         !check_choice(Option::PedDensity, kPedDensities, &Values::ped_density) ||
         !check_choice(Option::TrafficDensity, kTrafficDensities, &Values::traffic_density) ||
@@ -65,4 +69,11 @@ int main() {
             if (!*text || std::strlen(text) > kMaxTextChars || std::strchr(text, '%')) return 9;
         }
     }
+    if (GradeActive(100, 100, 100, 100) || !GradeActive(150, 100, 100, 100) ||
+        !GradeActive(100, 150, 100, 100) || !GradeActive(100, 100, 150, 100) ||
+        !GradeActive(100, 100, 100, 150))
+        return 10;
+    if (GradeGamma(200) != 2.0f || GradeGamma(50) != 0.5f || GradeBrightness(150) != 1.5f ||
+        GradeContrast(50) != 0.5f || GradeSaturation(0) != 0.0f || GradeSaturation(200) != 2.0f)
+        return 11;
 }

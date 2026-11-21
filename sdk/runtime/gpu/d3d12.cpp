@@ -418,7 +418,7 @@ bool CaptureOn() {
 }
 
 const char* kBlitHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; float4 hdr; };
+cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 post; float4 src; float4 hdr; float4 grade; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
 Texture2D bloomTex : register(t2);
@@ -571,6 +571,21 @@ float3 PcContrast(float3 c) {
     return saturate(c);
 }
 
+// Display colour adjustments, after the game's gamma ramp, bloom and PC contrast and before the
+// HDR encode. All four are neutral at (1, 1, 1, 1); the early out keeps the default path identical.
+float3 ColourGrade(float3 c) {
+    if (all(abs(grade - float4(1, 1, 1, 1)) < 1e-4)) return c;
+    c = saturate(c);
+    float g = 1.0 / max(grade.x, 0.01);
+    c = pow(c, float3(g, g, g));
+    c *= grade.y;
+    c = (c - 0.5) * grade.z + 0.5;
+    const float3 luma = float3(0.2126, 0.7152, 0.0722);
+    float l = dot(c, luma);
+    c = l + (c - l) * grade.w;
+    return saturate(c);
+}
+
 O vs(uint id : SV_VertexID) {
     O o;
     float2 t = float2((id << 1) & 2, id & 2);
@@ -598,6 +613,7 @@ float4 psmain(O i) : SV_Target {
         float3 b = post.y > 0 ? Bloom(i.uv) * (1.2 * post.y) : 0;
         g += b;
         if (post.x > 0) g = lerp(g, PcContrast(g), post.x);
+        g = ColourGrade(g);
         float3 over = max(c.rgb + b - 1.0, 0.0);
         float3 lin = SrgbToLinear(saturate(g));
         lin = HdrHighlights(lin, hdr.y, hdr.z, hdr.w) + over * (2.4 * hdr.w);
@@ -608,9 +624,10 @@ float4 psmain(O i) : SV_Target {
     }
     if (post.y > 0) c.rgb += Bloom(i.uv) * (1.2 * post.y);
     if (post.x > 0) c.rgb = lerp(c.rgb, PcContrast(c.rgb), post.x);
-    if (post.x > 0) {
-        // The contrast curve stretches the darkest 8-bit steps; an ordered dither breaks them up
-        // before the back buffer quantises the result again.
+    c.rgb = ColourGrade(c.rgb);
+    if (post.x > 0 || any(abs(grade - float4(1, 1, 1, 1)) >= 1e-4)) {
+        // The contrast and colour controls stretch the darkest 8-bit steps; an ordered dither breaks
+        // them up before the back buffer quantises the result again.
         static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
         int2 dp = int2(i.p.xy) % 4;
         float d = (kDither[dp.y * 4 + dp.x] + 0.5) / 16.0 - 0.5;
@@ -933,6 +950,10 @@ struct BlitOptions {
     float paper_white = 200;  // SDR white in nits
     float peak = 1000;        // highlight peak in nits
     float highlights = 0.4f;  // inverse tone map strength, 0..1 (app::Settings::hdr_highlights / 100)
+    float grade_gamma = 1;       // display gamma, 1 unchanged
+    float grade_brightness = 1;  // display gain, 1 unchanged
+    float grade_contrast = 1;    // display contrast, 1 unchanged
+    float grade_saturation = 1;  // display saturation, 1 unchanged
 };
 
 // Shrink's settings past the source and the size
@@ -2967,11 +2988,12 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
     if (!cb.res) return;
-    float c[20] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
+    float c[24] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                    o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
                    o.post, o.bloom, depth ? o.dof : 0.0f, o.bloom_tex ? (BloomView() ? 2.0f : 1.0f) : 0.0f,
                    o.src_w > 0 ? 1.0f / o.src_w : 0.0f, o.src_h > 0 ? 1.0f / o.src_h : 0.0f, o.near_z, o.far_z,
-                   o.hdr_mode, o.paper_white, o.peak, o.highlights};
+                   o.hdr_mode, o.paper_white, o.peak, o.highlights,
+                   o.grade_gamma, o.grade_brightness, o.grade_contrast, o.grade_saturation};
     std::memcpy(cb.cpu, c, sizeof(c));
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples, depth_single), cb.gpu, slot, si);
 }
@@ -5740,6 +5762,14 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     Assembled& a = asm_;
     if (!AssembleDraw(s, prim, start, count, indices, a)) return;
 
+    // Cutscene bars: the title draws the 3D scene full frame and covers a cinematic crop with two flat quads.
+    // Skipping them shows the whole picture (the option is off by default).
+    if (render_.remove_cutscene_bars && s.rt.data) {
+        uint32_t gw = 0, gh = 0;
+        SurfaceSize(s.rt, gw, gh);
+        if (gw == guest_w_ && gh == guest_h_ && LetterboxBar(a, gw, gh)) return;
+    }
+
     // The full-size scene colour target is the only one whose draws are recorded. Queries,
     // capture and extension draws need the immediate path.
     bool scene_sized = false;
@@ -7031,8 +7061,20 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
     const float post = !t.picture && render_.pc_contrast ? 1.0f : 0.0f;
     const float bloom = scene && render_.bloom ? float(render_.bloom_strength) / 100.0f : 0.0f;
     const float dof = scene && render_.dof && dof_depth_ ? 1.0f : 0.0f;
-    BlitOptions o{.gamma = gamma_, .rtv = SwapFormat(), .post = post, .bloom = bloom, .src_w = float(t.w),
-                  .src_h = float(t.h), .depth = dof_depth_, .dof = dof, .near_z = dof_near_, .far_z = dof_far_};
+    BlitOptions o{.gamma = gamma_,
+                  .rtv = SwapFormat(),
+                  .post = post,
+                  .bloom = bloom,
+                  .src_w = float(t.w),
+                  .src_h = float(t.h),
+                  .depth = dof_depth_,
+                  .dof = dof,
+                  .near_z = dof_near_,
+                  .far_z = dof_far_,
+                  .grade_gamma = game::choices::GradeGamma(render_.gamma),
+                  .grade_brightness = game::choices::GradeBrightness(render_.brightness),
+                  .grade_contrast = game::choices::GradeContrast(render_.contrast),
+                  .grade_saturation = game::choices::GradeSaturation(render_.saturation)};
 
     // the image the blit reads: SMAA's output, else the target (resolved with MSAA)
     ID3D12Resource* color = aa;

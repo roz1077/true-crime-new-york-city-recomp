@@ -213,8 +213,13 @@ Values Current() {
     v.city_range = std::atomic_ref(s.city_range).load(std::memory_order_relaxed);
     v.bloom = s.bloom;
     v.dof = s.dof;
+    v.remove_cutscene_bars = s.remove_cutscene_bars;
     v.building_seam_fix = s.building_seam_fix;
     v.pc_contrast = s.pc_contrast;
+    v.gamma = s.gamma;
+    v.brightness = s.brightness;
+    v.contrast = s.contrast;
+    v.saturation = s.saturation;
     v.hdr = s.hdr;
     v.hdr_paper_white = s.hdr_paper_white;
     v.hdr_peak = s.hdr_peak;
@@ -262,8 +267,13 @@ void Apply(const Values &v) {
     std::atomic_ref(s.city_range).store(v.city_range, std::memory_order_relaxed);  // read by city_grid.cpp
     s.bloom = v.bloom;
     s.dof = v.dof;
+    s.remove_cutscene_bars = v.remove_cutscene_bars;
     s.building_seam_fix = v.building_seam_fix;
     s.pc_contrast = v.pc_contrast;
+    s.gamma = v.gamma;
+    s.brightness = v.brightness;
+    s.contrast = v.contrast;
+    s.saturation = v.saturation;
     s.hdr = v.hdr;
     s.hdr_paper_white = v.hdr_paper_white;
     s.hdr_peak = v.hdr_peak;

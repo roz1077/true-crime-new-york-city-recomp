@@ -2,6 +2,7 @@
 // ImGui dependencies, so a test can compile it alone.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -82,6 +83,19 @@ inline constexpr uint32_t kMouseSensitivities[] = {
 inline constexpr uint32_t kBloomStrengths[] = {50, 100, 150, 200, 300, 400};  // percent of the original
 inline constexpr uint32_t kShadowLevels[] = {0, 1, 2};  // shadow resolution and softness: off or original, then two steps
 inline constexpr uint32_t kSharpenPercents[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+// Display colour adjustments applied after PC contrast and before the HDR encode. 100 is neutral for all
+// four; brightness is a gain so black (letterbox bars, fades) stays black.
+inline constexpr uint32_t kGammaPercents[] = {50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 175, 200, 225, 250};
+inline constexpr uint32_t kBrightnessPercents[] = {50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150};
+inline constexpr uint32_t kContrastPercents[] = {50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150};
+inline constexpr uint32_t kSaturationPercents[] = {0, 25, 50, 75, 100, 125, 150, 175, 200};
+inline float GradeGamma(uint32_t percent) { return float(std::clamp(percent, 50u, 250u)) / 100.0f; }
+inline float GradeBrightness(uint32_t percent) { return float(std::clamp(percent, 50u, 150u)) / 100.0f; }
+inline float GradeContrast(uint32_t percent) { return float(std::clamp(percent, 50u, 150u)) / 100.0f; }
+inline float GradeSaturation(uint32_t percent) { return float(std::min(percent, 200u)) / 100.0f; }
+inline bool GradeActive(uint32_t gamma, uint32_t brightness, uint32_t contrast, uint32_t saturation) {
+    return gamma != 100 || brightness != 100 || contrast != 100 || saturation != 100;
+}
 // The game's Swap limits pacing to 60 / presentation interval (d3d8.cpp), so
 // higher caps have no effect and are not offered.
 inline constexpr uint32_t kFrameCaps[] = {30, 60};

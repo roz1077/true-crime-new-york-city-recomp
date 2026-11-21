@@ -6,9 +6,11 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -834,6 +836,43 @@ bool WaitForParent(uint32_t pid) {
 
 } // namespace
 
+void LogLine(const char* format, ...) {
+    try {
+        // The launcher runs before the game log is open, so it keeps its own short
+        // record of the handoff. It also survives a crash during SDL shutdown.
+        static const auto start = std::chrono::steady_clock::now();
+        char message[1024];
+        va_list args;
+        va_start(args, format);
+        std::vsnprintf(message, sizeof(message), format, args);
+        va_end(args);
+
+        const auto dir = app::InstallRootFor(ExecutablePath().parent_path()) / "logs";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::ofstream out(dir / "launcher.log", std::ios::binary | std::ios::app);
+        if (!out) return;
+
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t time = std::chrono::system_clock::to_time_t(now);
+        std::tm local{};
+#ifdef _WIN32
+        localtime_s(&local, &time);
+#else
+        localtime_r(&time, &local);
+#endif
+        char stamp[32];
+        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &local);
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        char line[1200];
+        std::snprintf(line, sizeof(line), "[%s +%.3fs] %s\n", stamp, elapsed, message);
+        out << line;
+        out.flush();
+    } catch (...) {
+        // A diagnostic must never take the launcher down.
+    }
+}
+
 bool OlderVersion(const std::string& a, const std::string& b) {
     const auto left = ParseVersion(a), right = ParseVersion(b);
     return left && right && OlderVersion(*left, *right);
@@ -1075,6 +1114,7 @@ bool PalInstalled(app::GameRegion region) {
 
 bool LaunchPal(const app::GameSource& source) {
     const auto executable = PalExecutable(source.region);
+    LogLine("handoff: starting the PAL executable (%s)", Utf8(executable).c_str());
 #ifdef _WIN32
     if (Launch(executable, {"--skip-launcher", "--game-source", Utf8(source.path)})) return true;
 #else
@@ -1088,6 +1128,48 @@ bool LaunchPal(const app::GameSource& source) {
 #endif
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "True Crime NYC", "Could not start the PAL game. Extract the complete release and try again.", nullptr);
     return false;
+}
+
+bool LaunchGame(const app::GameSource& source, int instance) {
+    // Run the game in its own process, like the PAL builds. The launcher stops
+    // taking part once the child exists, so a fault while SDL shuts its window
+    // down cannot stop the game from starting.
+    bool started = false;
+    try {
+        const auto executable = ExecutablePath();
+        std::vector<std::string> args{"--skip-launcher"};
+        if (!source.path.empty()) {
+            args.push_back("--game-source");
+            args.push_back(Utf8(source.path));
+        }
+        if (instance > 0) {
+            args.push_back("--instance");
+            args.push_back(std::to_string(instance));
+        }
+        LogLine("handoff: starting %s (%zu arguments)", Utf8(executable).c_str(), args.size());
+#ifdef _WIN32
+        started = Launch(executable, args);
+#else
+        // Keep the process ID for callers such as Steam and command-line wrappers.
+        std::vector<std::string> storage;
+        storage.reserve(args.size() + 1);
+        storage.push_back(executable.native());
+        storage.insert(storage.end(), args.begin(), args.end());
+        std::vector<char*> argv;
+        argv.reserve(storage.size() + 1);
+        for (auto& arg : storage) argv.push_back(arg.data());
+        argv.push_back(nullptr);
+        execv(storage.front().c_str(), argv.data());
+#endif
+    } catch (const std::exception& failure) {
+        LogLine("handoff: could not start the game: %s", failure.what());
+    }
+    if (!started) {
+        LogLine("handoff: the game process did not start");
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "True Crime NYC",
+                                 "Could not start the game. Extract the complete release and try again.", nullptr);
+    }
+    return started;
 }
 
 bool Updater::Relaunch() {
@@ -1110,7 +1192,8 @@ std::shared_ptr<void> Updater::HoldGameFiles() {
         if (fs::exists(CheckTarget(root, "update/active")))
             throw std::runtime_error("An interrupted update needs to be recovered.");
         return lock;
-    } catch (const std::exception&) {
+    } catch (const std::exception& failure) {
+        LogLine("handoff: game files are unavailable: %s", failure.what());
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "True Crime NYC",
                                  "The game files are unavailable. Finish any update from the main launcher and try again.", nullptr);
         return {};

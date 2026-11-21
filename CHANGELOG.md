@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- New **Gamma**, **Brightness**, **Contrast** and **Saturation** display adjustments in the launcher,
+  the F10 Graphics menu and Options > Display. All four default to 100%, which leaves the picture
+  unchanged; they work in SDR and HDR, and Brightness is a gain so black bars and fades stay black.
+- New **Remove cutscene bars** option (F10 and Options > Display, plus the launcher): hides the
+  black bars above and below cutscenes and the title screen and shows the whole 3D picture. Off by
+  default keeps the game's cinematic framing.
+- The launcher starts the game as soon as **HIT THE STREETS** is pressed, before it shuts its own
+  window down (a child process on Windows, execv on Linux). A fault while the launcher closes can
+  no longer leave the game unstarted. The handoff steps are recorded in `logs/launcher.log`.
+
 ## 0.9.2.4.3 - Beta 4.3 (2026-11-19)
 
 - Club Tadow no longer crashes when Hamilton's head is drawn. His head mesh is a single skinned

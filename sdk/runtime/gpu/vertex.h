@@ -66,6 +66,11 @@ inline bool g_component_aligned_vertices = false;
 bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, Assembled& out,
               bool force_converted = false);
 
+// The title's cutscene letterbox: a flat, screen-space quad across the frame's full width, lying entirely in its
+// top or bottom third. The 3D scene is drawn full frame underneath the bars, so skipping the bars shows the whole
+// picture. Full-frame fades and other 2D passes cover the middle and do not match.
+bool LetterboxBar(const Assembled& a, uint32_t frame_w, uint32_t frame_h);
+
 // Retain the last submitted vertex's streamed attributes for subsequent unfed inputs.
 void RetainVertexAttributes(State& s, uint32_t start, uint32_t count, const uint8_t* indices);
 

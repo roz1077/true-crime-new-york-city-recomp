@@ -25,6 +25,7 @@
 
 #include "app/app.h"
 #include "app/game_source.h"
+#include "core/dev_env.h"
 #include "core/input.h"
 #include "core/log.h"
 #include "hook_exports.h"
@@ -925,6 +926,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             g_compiler_bytes = CompilerBytes();
+#if TCNYC_DEV_TOOLS
+            // XBE_DEV_SKIP_LAUNCHER has no launcher and nobody watching the window: go straight in
+            if (DevEnv("XBE_DEV_SKIP_LAUNCHER")) {
+                CloseWindowWith(hwnd, true);
+                return 0;
+            }
+#endif
             FlashWindow(hwnd, TRUE);
             return 0;
     }

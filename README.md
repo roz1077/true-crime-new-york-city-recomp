@@ -88,6 +88,7 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Resolution | Desktop or any mode the monitor lists. |
 | Apply display changes | Applies the display mode and resolution. A change that fails puts the previous mode back. |
 | Aspect ratio | Auto, 4:3, 16:10, 16:9, 21:9 or 32:9. The 3D view widens; HUD and menus stay 16:9 in the middle, and the intro movies stretch to fill the screen. 4:3 and the wide shapes take effect after a restart. |
+| Remove cutscene bars | Hides the black bars above and below cutscenes and the title screen, showing the whole 3D picture. Off by default keeps the game's cinematic framing. |
 | Render scale | 25% to 200% of the output height. |
 | TAA | Temporal anti-aliasing in place of SMAA on the 3D scene, with per-object motion for cars and people. Available on D3D12 and on Vulkan devices with independent blending. Selecting a temporal upscaler replaces TAA. Off by default. |
 | Upscaler | Bilinear or AMD FSR 1 below 100% render scale. FSR 3.1 on Windows and Linux, FSR 4.1 on Windows, and optional experimental DLSS use 50% (Performance), 58% (Balanced), 67% (Quality) and 100% (Native AA). Windows FSR uses the AMD SDK loader and upscaler DLLs. DLSS requires an NVIDIA RTX adapter and the platform's NVIDIA runtime. |
@@ -110,6 +111,10 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Ambient occlusion | GTAO contact shadows in corners and under objects, applied to world geometry only so lights, fog and effects keep their brightness. Off, Half or Full resolution. Off by default. Windows (D3D12) and Linux (Vulkan). |
 | Building seam fix | Experimental: gives detailed buildings priority over simplified city meshes. On by default. |
 | PC contrast | Softer shadow roll-off inspired by the PC version. On by default. |
+| Gamma | 50% to 250%: display gamma for dark scenes. 100% is unchanged and leaves the picture identical. |
+| Brightness | 50% to 150%: scales the whole picture. 100% is unchanged; black stays black, so letterbox bars and fades are not lifted. |
+| Contrast | 50% to 150%: expands or compresses tones around mid-grey. 100% is unchanged and separate from PC contrast. |
+| Saturation | 0% to 200%: colour strength. 100% is unchanged and 0% is greyscale. |
 | HDR | Expands the finished frame's highlights for an HDR display. Off by default, and identical to normal output when off. On Windows it follows the system HDR switch without a restart. |
 | HDR paper white / peak / highlights | Brightness of normal white (nits), the brightest highlights (the display's reported peak, or 1000 nits), and how far lamps, neon and headlights are pushed above white. |
 | V-Sync / Frame limit | V-Sync on/off; 30 or 60 FPS. The game's timing is built for at most 60. |
@@ -199,6 +204,7 @@ Everything in the F10 menu is saved to `settings.toml`: beside the executable on
 | `cinema_volume` | `100` | Forced mix cinema and cutscene volume, 0 to 100. |
 | `language` | `"english"` | Text and subtitles on the European Fr/Es/It disc: `"english"`, `"french"`, `"spanish"` or `"italian"`. Set it in `settings-pal.toml`; voices are always English, and the other discs ignore it. |
 | `prompt_style` | `0` | Button prompts: 0 automatic, 1 original Xbox, 2 Xbox, 3 PlayStation, 4 Steam Deck. |
+| `remove_cutscene_bars` | `false` | `true` hides the black bars above and below cutscenes and the title screen, showing the whole 3D picture. |
 | `[controls.keyboard]` | today's layout | Keys per action, e.g. `jump = ["Space", "G"]`; mouse buttons are `MouseLeft`, `MouseMiddle`, `MouseRight`, `Mouse4`, `Mouse5`. |
 | `[controls.controller]` | standard layout | The physical button for each console input, e.g. `A = "a"` (SDL names). |
 
@@ -268,6 +274,7 @@ Ubuntu 24.04 has no `libsdl3-dev`; build SDL 3.4.16 (`release-3.4.16`) from sour
 - The first launch compiles game code; later launches reuse the shader cache.
 - If the game reports missing assets, check that `assets/default.xbe` and its data folders are present and match this build.
 - Logs are written to `logs/` beside the executable. Windows settings are in `settings.toml` beside the executable; Linux paths are in the [Linux guide](README-LINUX.md#paths).
+- If the game does not start after **HIT THE STREETS**, `logs/launcher.log` records each step of the launcher-to-game handoff.
 - [DEVELOPER.md](DEVELOPER.md) lists what to include in a report and switches for more detailed logs.
 - When reporting a visual problem on Linux, the [Linux troubleshooting section](README-LINUX.md#troubleshooting) explains the F3 trace files to include.
 

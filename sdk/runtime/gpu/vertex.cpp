@@ -852,4 +852,43 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
     }
 }
 
+bool LetterboxBar(const Assembled& a, uint32_t frame_w, uint32_t frame_h) {
+    if (!a.pretransformed || frame_w < 8 || frame_h < 8) return false;
+    // the title's bars are single quads; a larger draw that happens to span the frame is HUD or a pass
+    if (a.vertex_count < 3 || a.vertex_count > 8) return false;
+    float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+    const auto add = [&](float x, float y) {
+        x0 = std::min(x0, x);
+        x1 = std::max(x1, x);
+        y0 = std::min(y0, y);
+        y1 = std::max(y1, y);
+    };
+    if (!a.vertices.empty()) {
+        const uint32_t regs = std::popcount(a.regs);
+        if (!regs || a.vertices.size() < size_t(a.vertex_count) * regs * 4) return false;
+        for (uint32_t v = 0; v < a.vertex_count; ++v) {
+            const size_t at = size_t(v) * regs * 4;
+            add(a.vertices[at], a.vertices[at + 1]);
+        }
+    } else {
+        const VertexElement& e = a.elements[0];
+        if (e.buffer >= a.buffer_count) return false;
+        const VertexBuffer& b = a.buffers[e.buffer];
+        if (!b.src || !b.stride) return false;
+        for (uint32_t v = 0; v < a.vertex_count; ++v) {
+            const size_t at = size_t(v) * b.stride + e.offset;
+            if (at + 8 > b.bytes) return false;
+            float x, y;
+            std::memcpy(&x, b.src + at, 4);
+            std::memcpy(&y, b.src + at + 4, 4);
+            add(x, y);
+        }
+    }
+    // a quad across the whole width, inside the top or bottom third (a 3:1 picture: 1/3 each side)
+    const bool full_width = x0 <= 0.5f && x1 >= float(frame_w) - 0.5f;
+    const float top = float(frame_h) * 0.34f, bottom = float(frame_h) * 0.66f;
+    return full_width &&
+           ((y0 >= -1.0f && y1 <= top) || (y0 >= bottom && y1 <= float(frame_h) + 1.0f));
+}
+
 }  // namespace gpu

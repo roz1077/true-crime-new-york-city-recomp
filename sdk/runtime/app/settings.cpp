@@ -74,6 +74,7 @@ Settings Snapshot() {
     s.height = g.height;
     s.render_percent = g.render_percent;
     s.aspect = g.aspect;
+    s.remove_cutscene_bars = g.remove_cutscene_bars;
     s.language = g.language;
     s.audio_mode = g.audio_mode;
     s.force_stereo_output = g.force_stereo_output;
@@ -110,6 +111,10 @@ Settings Snapshot() {
     s.ped_limit = std::atomic_ref(Get().ped_limit).load(std::memory_order_relaxed);
     s.ped_detail = std::atomic_ref(Get().ped_detail).load(std::memory_order_relaxed);  // stored atomically
     s.pc_contrast = g.pc_contrast;
+    s.gamma = g.gamma;
+    s.brightness = g.brightness;
+    s.contrast = g.contrast;
+    s.saturation = g.saturation;
     s.custom_textures = g.custom_textures;
     s.dump_textures = g.dump_textures;
     s.texture_dump_format = g.texture_dump_format;
@@ -150,6 +155,7 @@ void Load() {
     s.height = t["height"].value_or(s.height);
     s.render_percent = t["render_percent"].value_or(s.render_percent);
     s.aspect = t["aspect_ratio"].value_or(s.aspect);
+    s.remove_cutscene_bars = t["remove_cutscene_bars"].value_or(s.remove_cutscene_bars);
     if (s.width > 16384 || s.height > 16384 || !s.width || !s.height) s.width = s.height = 0;
     s.render_percent = std::clamp(s.render_percent, 25u, 200u);
     if (s.aspect && (s.aspect < 500 || s.aspect > 8000)) s.aspect = 0;
@@ -216,6 +222,10 @@ void Load() {
         .store(uint32_t(std::clamp<int64_t>(t["ped_detail"].value_or(int64_t(s.ped_detail)), 0, 3)),
                std::memory_order_relaxed);
     s.pc_contrast = t["pc_contrast"].value_or(s.pc_contrast);
+    s.gamma = uint32_t(std::clamp<int64_t>(t["gamma"].value_or(int64_t(s.gamma)), 50, 250));
+    s.brightness = uint32_t(std::clamp<int64_t>(t["brightness"].value_or(int64_t(s.brightness)), 50, 150));
+    s.contrast = uint32_t(std::clamp<int64_t>(t["contrast"].value_or(int64_t(s.contrast)), 50, 150));
+    s.saturation = uint32_t(std::clamp<int64_t>(t["saturation"].value_or(int64_t(s.saturation)), 0, 200));
     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
@@ -253,6 +263,7 @@ toml::table Table() {
                   {"height", int64_t(s.height)},
                   {"render_percent", int64_t(s.render_percent)},
                   {"aspect_ratio", int64_t(s.aspect)},
+                  {"remove_cutscene_bars", s.remove_cutscene_bars},
                   {"language", LanguageName(s.language)},
                   {"audio_mode", int64_t(s.audio_mode)},
                   {"force_stereo_output", s.force_stereo_output},
@@ -291,6 +302,10 @@ toml::table Table() {
                   {"ped_limit", int64_t(std::atomic_ref(Get().ped_limit).load(std::memory_order_relaxed))},
                   {"ped_detail", int64_t(std::atomic_ref(Get().ped_detail).load(std::memory_order_relaxed))},
                   {"pc_contrast", s.pc_contrast},
+                  {"gamma", int64_t(s.gamma)},
+                  {"brightness", int64_t(s.brightness)},
+                  {"contrast", int64_t(s.contrast)},
+                  {"saturation", int64_t(s.saturation)},
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},
                   {"texture_dump_format", int64_t(s.texture_dump_format)},

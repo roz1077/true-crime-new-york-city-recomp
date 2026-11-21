@@ -390,6 +390,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
+void InstallCrashHandler() {
+    SetUnhandledExceptionFilter(WriteCrashDump);
+    std::signal(SIGABRT, [](int) { WriteCrashDump(nullptr); });
+}
+
 std::filesystem::path ExeFolder() {
     std::vector<wchar_t> p(MAX_PATH);
     for (;;) {
@@ -564,9 +569,8 @@ void SetStartupGameLocation(std::filesystem::path location) {
 } // namespace app
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
-    SetUnhandledExceptionFilter(app::WriteCrashDump);
+    app::InstallCrashHandler();
     AddVectoredExceptionHandler(1, app::GuestWatchHandler);
-    std::signal(SIGABRT, [](int) { app::WriteCrashDump(nullptr); });
     timeBeginPeriod(1);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     // one log a session: a relaunch into another image carries on its predecessor's

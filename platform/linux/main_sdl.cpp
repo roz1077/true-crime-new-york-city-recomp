@@ -54,17 +54,37 @@ int main(int argc, char** argv) {
 
     app::GameSource source;
     source.path = location;
-    if (!skip_launcher && source.path.empty() && !launcher::Run(source)) return 0;
+    launcher::LogLine("launcher: start (skip=%d source=%s)", skip_launcher ? 1 : 0,
+                      source.path.empty() ? "(local assets)" : source.path.c_str());
+    if (!skip_launcher && source.path.empty()) {
+        launcher::LogLine("launcher: opening the launcher window");
+        if (!launcher::Run(source)) {
+            launcher::LogLine("launcher: closed without starting the game");
+            return 0;
+        }
+        // HIT THE STREETS already handed off. On Linux LaunchGame/LaunchPal use
+        // execv, so this image is normally gone before Run returns; it is only a
+        // guard for a launcher that returns with the game already started.
+        launcher::LogLine("launcher: window closed after starting the game");
+        return 0;
+    }
 #ifndef TCNYC_PAL
     if (source.region == app::GameRegion::Unknown) {
         const auto detected = app::DetectGameSource(source.path);
         if (detected.region != app::GameRegion::Unknown) source = detected;
     }
-    if (app::IsPal(source.region)) return launcher::LaunchPal(source) ? 0 : 1;
+    if (app::IsPal(source.region)) {
+        launcher::LogLine("handoff: PAL disc, starting the region executable");
+        return launcher::LaunchPal(source) ? 0 : 1;
+    }
 #endif
 
+    launcher::LogLine("handoff: holding the game files");
     const auto game_files = launcher::Updater::HoldGameFiles();
-    if (!game_files) return 1;
+    if (!game_files) {
+        launcher::LogLine("handoff: the game files are unavailable");
+        return 1;
+    }
 
     // the settings decide the window, so the log and settings load come first
     std::string log_name = app::kGame.log;

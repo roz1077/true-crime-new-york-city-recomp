@@ -79,6 +79,7 @@ enum class Row {
     Resolution,
     ApplyDisplay,
     AspectRatio,
+    CutsceneBars,
     RenderScale,
     Upscaler,
     Sharpening,
@@ -105,6 +106,10 @@ enum class Row {
     ShadowSoftness,
     BuildingSeamFix,
     PcContrast,
+    Gamma,
+    Brightness,
+    Contrast,
+    Saturation,
     Hdr,
     HdrPaperWhite,
     HdrPeak,
@@ -128,6 +133,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::Resolution,
                          Row::ApplyDisplay,
                          Row::AspectRatio,
+                         Row::CutsceneBars,
                          Row::RenderScale,
                          Row::Upscaler,
                          Row::Sharpening,
@@ -154,6 +160,10 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::ShadowSoftness,
                          Row::BuildingSeamFix,
                          Row::PcContrast,
+                         Row::Gamma,
+                         Row::Brightness,
+                         Row::Contrast,
+                         Row::Saturation,
                          Row::Hdr,
                          Row::HdrPaperWhite,
                          Row::HdrPeak,
@@ -449,6 +459,7 @@ void RestoreGraphicsDefaults() {
     app::Settings &s = app::Get();
     s.render_percent = d.render_percent;
     s.aspect = d.aspect;
+    s.remove_cutscene_bars = d.remove_cutscene_bars;
     app::SetFrameCap(d.fps_cap);
     s.vsync = d.vsync;
     s.low_latency = d.low_latency;
@@ -477,6 +488,10 @@ void RestoreGraphicsDefaults() {
     std::atomic_ref(s.city_inner_detail).store(d.city_inner_detail, std::memory_order_relaxed);
     std::atomic_ref(s.city_outer_detail).store(d.city_outer_detail, std::memory_order_relaxed);
     s.pc_contrast = d.pc_contrast;
+    s.gamma = d.gamma;
+    s.brightness = d.brightness;
+    s.contrast = d.contrast;
+    s.saturation = d.saturation;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
     s.texture_dump_format = d.texture_dump_format;
@@ -532,6 +547,10 @@ Kind KindOf(Row row) {
     case Row::HdrPaperWhite:
     case Row::HdrPeak:
     case Row::HdrHighlights:
+    case Row::Gamma:
+    case Row::Brightness:
+    case Row::Contrast:
+    case Row::Saturation:
     case Row::ControllerAimResponse:
     case Row::ControllerAimSensitivity:
     case Row::MouseSensitivity:
@@ -549,6 +568,7 @@ Kind KindOf(Row row) {
     case Row::ShowFps:
     case Row::TextureReplacement:
     case Row::TextureDumping:
+    case Row::CutsceneBars:
         return Kind::Toggle;
     default:
         return Kind::Action;
@@ -584,6 +604,8 @@ const char *Label(Row row) {
         return "Apply display changes";
     case Row::AspectRatio:
         return "Aspect ratio";
+    case Row::CutsceneBars:
+        return "Remove cutscene bars";
     case Row::RenderScale:
         return "Render scale";
     case Row::FieldOfView:
@@ -626,6 +648,14 @@ const char *Label(Row row) {
         return "Building seam fix (Experimental)";
     case Row::PcContrast:
         return "PC contrast";
+    case Row::Gamma:
+        return "Gamma";
+    case Row::Brightness:
+        return "Brightness";
+    case Row::Contrast:
+        return "Contrast";
+    case Row::Saturation:
+        return "Saturation";
     case Row::Hdr:
         return "HDR";
     case Row::HdrPaperWhite:
@@ -713,6 +743,9 @@ const char *Help(Row row) {
     case Row::AspectRatio:
         return "The picture's shape; Auto matches the display. The 3D view widens to it, while HUD and menus "
                "stay 16:9 in the middle and the intro movies stretch to fill it. 4:3 and the wide shapes switch after a restart.";
+    case Row::CutsceneBars:
+        return "Hides the black bars above and below cutscenes and the title screen, showing the whole 3D picture. "
+               "Off keeps the game's cinematic framing.";
     case Row::RenderScale:
         return "Internal resolution relative to the output height. Above 100% renders more pixels for a "
                "sharper image; below 100% is faster.";
@@ -777,6 +810,16 @@ const char *Help(Row row) {
         return "Experimental: keeps detailed buildings visible where simplified city meshes overlap. Takes effect immediately.";
     case Row::PcContrast:
         return "Applies a PC-inspired contrast curve to the finished 3D frame.";
+    case Row::Gamma:
+        return "Adjusts midtones without moving black or white. 100% is unchanged; raise it if dark areas "
+               "are hard to see.";
+    case Row::Brightness:
+        return "Scales the whole picture. 100% is unchanged; black stays black, so letterbox bars and "
+               "fades are not lifted.";
+    case Row::Contrast:
+        return "Expands or compresses tones around mid-grey. 100% is unchanged and separate from PC contrast.";
+    case Row::Saturation:
+        return "Colour strength. 0% is greyscale, 100% is unchanged and 200% doubles colour.";
     case Row::Hdr:
         return gpu::g_hdr_available.load(std::memory_order_relaxed)
                    ? "Expands the finished frame's highlights for an HDR display. Off is bit-identical to SDR output."
@@ -882,6 +925,8 @@ std::string Value(Row row) {
             std::snprintf(text, sizeof(text), "%.2f:1", float(s.aspect) / 1000.0f);
         }
         return text;
+    case Row::CutsceneBars:
+        return s.remove_cutscene_bars ? "On" : "Off";
     case Row::RenderScale:
         std::snprintf(text, sizeof(text), "%u%% (%up)", s.render_percent,
                       choices::RenderHeight(g_menu.output_height, s.render_percent));
@@ -972,6 +1017,18 @@ std::string Value(Row row) {
         return s.building_seam_fix ? "On" : "Off";
     case Row::PcContrast:
         return s.pc_contrast ? "On" : "Off";
+    case Row::Gamma:
+        std::snprintf(text, sizeof(text), "%u%%", s.gamma);
+        return text;
+    case Row::Brightness:
+        std::snprintf(text, sizeof(text), "%u%%", s.brightness);
+        return text;
+    case Row::Contrast:
+        std::snprintf(text, sizeof(text), "%u%%", s.contrast);
+        return text;
+    case Row::Saturation:
+        std::snprintf(text, sizeof(text), "%u%%", s.saturation);
+        return text;
     case Row::Hdr:
         if (!s.hdr) return "Off";
         return gpu::g_hdr_available.load(std::memory_order_relaxed) ? "On" : "On (no HDR display)";
@@ -1151,6 +1208,18 @@ bool Change(Row row, int direction) {
     case Row::BloomStrength:
         changed = set(s.bloom_strength, choices::Step(choices::kBloomStrengths, s.bloom_strength, direction));
         break;
+    case Row::Gamma:
+        changed = set(s.gamma, choices::Step(choices::kGammaPercents, s.gamma, direction));
+        break;
+    case Row::Brightness:
+        changed = set(s.brightness, choices::Step(choices::kBrightnessPercents, s.brightness, direction));
+        break;
+    case Row::Contrast:
+        changed = set(s.contrast, choices::Step(choices::kContrastPercents, s.contrast, direction));
+        break;
+    case Row::Saturation:
+        changed = set(s.saturation, choices::Step(choices::kSaturationPercents, s.saturation, direction));
+        break;
     case Row::Upscaler:
         changed = set(s.upscaler, choices::Step(choices::kUpscalers, s.upscaler, direction));
         break;
@@ -1268,6 +1337,9 @@ void Activate(Row row) {
             break;
         case Row::PcContrast:
             s.pc_contrast = !s.pc_contrast;
+            break;
+        case Row::CutsceneBars:
+            s.remove_cutscene_bars = !s.remove_cutscene_bars;
             break;
         case Row::Hdr:
             s.hdr = !s.hdr;

@@ -30,6 +30,8 @@ std::vector<app::Mode> DisplayModes() {
 
 void DrawGraphicsMenu(double) {}
 
+void RestoreGraphicsDefaults() {}
+
 void FilterMenuPad(int, input::Pad&) {}
 
 bool GraphicsMenuMessage(void*, uint32_t, uintptr_t, intptr_t, intptr_t*) {

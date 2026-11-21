@@ -1246,7 +1246,9 @@ private:
     uint64_t tex_this_frame_at_ = ~0ull, tex_this_frame_targets_ = 0;
     Target* SampledTarget(uint32_t data, bool depth, uint32_t w, uint32_t h);
     std::unordered_map<Target*, SceneDepth> scene_depth_;
+    std::vector<VkClearRect> clear_area_;  // Clear's rects, reused between calls
     bool scene_dof_ = false;
+    bool remove_cutscene_bars_ = false;  // app::Settings::remove_cutscene_bars for this frame
 
     // NOOVERWRITE locks: a small ring of finished copies, delivered without waiting for the GPU
     struct LateSlot {
@@ -3708,7 +3710,7 @@ bool VulkanBackend::CreatePresent() {
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &present_set_layout_;
-    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 16};  // contrast, bloom, dof, source size, near/far, HDR, source rect
+    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 20};  // contrast, bloom, dof, source size, near/far, HDR, source rect, colour grade
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &push;
     if (vkCreatePipelineLayout(device_, &pl, nullptr, &present_pipeline_layout_) != VK_SUCCESS) return false;
@@ -3721,7 +3723,7 @@ bool VulkanBackend::CreatePresent() {
 [[vk::binding(4, 0)]] SamplerState depthSampler;
 [[vk::binding(5, 0)]] Texture2D<float4> bloomTex;
 // chain: the bloom chain is bound (bloomTex); without it BloomAt taps the frame
-struct PC { float pc; float bloom; float dof; float chain; float2 src; float2 zrange; float4 hdr; float4 rect; };
+struct PC { float pc; float bloom; float dof; float chain; float2 src; float2 zrange; float4 hdr; float4 rect; float4 grade; };
 [[vk::push_constant]] ConstantBuffer<PC> pc;
 struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
@@ -3844,6 +3846,20 @@ float3 PcContrast(float3 c) {
     c *= l2 / max(l, 1e-4);
     return saturate(c);
 }
+// Display colour adjustments, after the game's gamma ramp, bloom and PC contrast and before the
+// HDR encode. All four are neutral at (1, 1, 1, 1); the early out keeps the default path identical.
+float3 ColourGrade(float3 c) {
+    if (all(abs(pc.grade - float4(1, 1, 1, 1)) < 1e-4)) return c;
+    c = saturate(c);
+    float g = 1.0 / max(pc.grade.x, 0.01);
+    c = pow(c, float3(g, g, g));
+    c *= pc.grade.y;
+    c = (c - 0.5) * pc.grade.z + 0.5;
+    const float3 luma = float3(0.2126, 0.7152, 0.0722);
+    float l = dot(c, luma);
+    c = l + (c - l) * pc.grade.w;
+    return saturate(c);
+}
 float4 psmain(O i) : SV_Target {
     i.uv = pc.rect.xy + i.uv * pc.rect.zw;  // the part of the frame shown: all of it, or a movie's picture
     float4 c = frameTex.Sample(frameSampler, i.uv);
@@ -3856,6 +3872,7 @@ float4 psmain(O i) : SV_Target {
         float3 b = pc.bloom > 0.0 ? BloomAt(i.uv) * (1.2 * pc.bloom) : 0;
         g += b;
         if (pc.pc > 0.0) g = lerp(g, PcContrast(g), pc.pc);
+        g = ColourGrade(g);
         float3 over = max(c.rgb + b - 1.0, 0.0);
         float3 lin = SrgbToLinear(saturate(g));
         lin = HdrHighlights(lin, pc.hdr.y, pc.hdr.z, pc.hdr.w) + over * (2.4 * pc.hdr.w);
@@ -3866,7 +3883,8 @@ float4 psmain(O i) : SV_Target {
     }
     if (pc.bloom > 0.0) c.rgb += BloomAt(i.uv) * (1.2 * pc.bloom);
     if (pc.pc > 0.0) c.rgb = PcContrast(c.rgb);
-    if (pc.pc > 0.0) {
+    c.rgb = ColourGrade(c.rgb);
+    if (pc.pc > 0.0 || any(abs(pc.grade - float4(1, 1, 1, 1)) >= 1e-4)) {
         static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
         int2 dp = int2(i.pos.xy) % 4;
         float d = (kDither[dp.y * 4 + dp.x] + 0.5) / 16.0 - 0.5;
@@ -4168,6 +4186,7 @@ void VulkanBackend::ResetFrame() {
     }
     ResetDeferred(settings.ao);
     scene_dof_ = settings.dof;
+    remove_cutscene_bars_ = settings.remove_cutscene_bars;
     scene_depth_.clear();
     // the last frame's GPU work is done (present waited on the fence): pack images and late-lock
     // buffers released earlier can go now
@@ -8291,6 +8310,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     splits.At("assemble");
     if (split_on) splits_draws_++;
 
+    // Cutscene bars: the title draws the 3D scene full frame and covers a cinematic crop with two flat quads.
+    // Skipping them shows the whole picture (the option is off by default).
+    if (remove_cutscene_bars_ && s.rt.data) {
+        const Target* bar_rt = NewestTarget(s.rt.data, false);
+        if (bar_rt && bar_rt->gw == width_ && bar_rt->gh == height_ && LetterboxBar(a, width_, height_)) return;
+    }
+
     // Shaders and textures first: an upload may submit and close any open pass, so
     // the target pass must not be open yet.
     laps.Lap(&perf_vertex_ms_);
@@ -11128,14 +11154,16 @@ void VulkanBackend::Present(const Surface& front) {
     }
     vkCmdSetViewport(cmd_, 0, 1, &frame_viewport);
     const bool picture = front.picture != gpu::Picture::Unknown;
-    float present_pc[16] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? float(snapshot.bloom_strength) / 100.0f : 0.0f,
+    float present_pc[20] = {snapshot.pc_contrast ? 1.0f : 0.0f, bloom_on ? float(snapshot.bloom_strength) / 100.0f : 0.0f,
                             dof_on ? 1.0f : 0.0f, bloom_view ? 1.0f : 0.0f,
                             bloom_w ? 1.0f / float(bloom_w) : 0.0f,
                             bloom_h ? 1.0f / float(bloom_h) : 0.0f,
                             dof ? dof->near_w : 0.1f, dof ? dof->far_w : 1000.0f,
                             hdr_mode, hdr_paper, hdr_peak, hdr_strength,
                             picture ? layout.uv[0] : 0.0f, picture ? layout.uv[1] : 0.0f,
-                            picture ? layout.uv[2] : 1.0f, picture ? layout.uv[3] : 1.0f};
+                            picture ? layout.uv[2] : 1.0f, picture ? layout.uv[3] : 1.0f,
+                            game::choices::GradeGamma(snapshot.gamma), game::choices::GradeBrightness(snapshot.brightness),
+                            game::choices::GradeContrast(snapshot.contrast), game::choices::GradeSaturation(snapshot.saturation)};
     vkCmdPushConstants(cmd_, present_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(present_pc),
                        present_pc);
     vkCmdDraw(cmd_, 3, 1, 0, 0);

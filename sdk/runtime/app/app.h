@@ -25,6 +25,7 @@ struct Settings {
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
     uint32_t render_percent = 100;   // of the displayed frame's height
     uint32_t aspect = 0;             // the frame's shape, width / height x 1000; 0 the output's
+    bool remove_cutscene_bars = false;  // show the full 3D picture behind the title's cutscene letterbox bars
     uint32_t language = 1;           // the console language for text and subtitles (Fr/Es/It disc only): 1 English, 4 French, 5 Spanish, 6 Italian
     uint32_t audio_mode = 1;         // output mix: 0 mono, 1 stereo, 2 Dolby Pro Logic II
     bool force_stereo_output = true; // open the device as 2 ch 48 kHz (quiet TV/soundbar workaround)
@@ -63,6 +64,10 @@ struct Settings {
     uint32_t city_inner_detail = 1;  // inner-grid instance distance multiplier
     uint32_t city_outer_detail = 0;  // outer-ring instance distance multiplier, 0 uses the distant meshes alone
     bool pc_contrast = true;         // PC contrast curve on the finished frame
+    uint32_t gamma = 100;            // display gamma on the finished frame, percent (100 unchanged)
+    uint32_t brightness = 100;       // display gain on the finished frame, percent (100 unchanged)
+    uint32_t contrast = 100;         // display contrast on the finished frame, percent (100 unchanged)
+    uint32_t saturation = 100;       // display colour saturation, percent (100 unchanged)
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
@@ -111,6 +116,9 @@ void FlushSettings();  // waits for the settings publisher (call before exit)
 void FullSettingsTable(toml::table& out);
 void LogSettings();  // every setting, as the settings file has them
 void LogSystem();    // the machine and the settings, at a run's start
+// Installs the unhandled-exception filter that writes CrashDumps. Called before
+// the launcher too, so a crash during the handoff also leaves a dump. Safe to repeat.
+void InstallCrashHandler();
 void ApplyDisplay();  // any thread
 void InvalidateOutputCache();  // a display mode or monitor change
 bool RequestQuit();  // post a close request to the host event loop
@@ -150,6 +158,8 @@ std::string Sha1(const std::vector<uint8_t>& data);  // lower case hex
 // loaded; false after telling the player why the game cannot start, or when they chose not to start it yet
 bool PrepareGameCode(const GameFiles& game);
 int Instance();  // --instance N on the command line, 0 without: a second copy on this PC for system link tests
+// Windows: the launcher's chosen game source for the first FindGame
+void SetStartupGameLocation(std::filesystem::path location);
 void* Window();  // HWND
 // boot splash: GameInfo::splash .bmp or .png beside the exe, up before the game window
 bool OpenSplash();        // window thread, at launch; false without one, and the game window opens at once

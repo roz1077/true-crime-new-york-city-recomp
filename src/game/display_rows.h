@@ -31,6 +31,7 @@ enum class Option {
     DisplayMode,
     Resolution,
     Aspect,
+    CutsceneBars,
     RenderScale,
     Upscaler,
     Sharpening,
@@ -57,6 +58,10 @@ enum class Option {
     ShadowSoftness,
     BuildingSeamFix,
     PcContrast,
+    Gamma,
+    Brightness,
+    Contrast,
+    Saturation,
     VSync,
     LowLatency, // Windows only
     FrameCap,
@@ -79,14 +84,16 @@ enum class Option {
 inline constexpr uint32_t kOptionCount = uint32_t(Option::Count);
 
 inline constexpr Option kMainOptions[] = {
-    Option::DisplayMode, Option::Resolution,       Option::Aspect,          Option::RenderScale,
+    Option::DisplayMode, Option::Resolution,       Option::Aspect,          Option::CutsceneBars,
+    Option::RenderScale,
     Option::Upscaler,    Option::Sharpening,
     Option::FieldOfView, Option::ObjectDetail,    Option::PedDetail,       Option::PedLimit,
     Option::PedDensity, Option::TrafficDensity,  Option::TrafficDistance,
     Option::CityInnerDetail, Option::CityOuterDetail, Option::Anisotropic, Option::Msaa,
     Option::Smaa,        Option::Taa,              Option::Bloom,            Option::BloomStrength,
     Option::DepthOfField,    Option::AmbientOcclusion, Option::AoQuality, Option::ShadowQuality, Option::ShadowSoftness,
-    Option::BuildingSeamFix, Option::PcContrast,   Option::VSync,
+    Option::BuildingSeamFix, Option::PcContrast,   Option::Gamma, Option::Brightness,
+    Option::Contrast, Option::Saturation, Option::VSync,
 #ifdef _WIN32
     Option::LowLatency,
 #endif
@@ -144,6 +151,8 @@ struct Values {
     bool custom_textures = true, dump_textures = false;
     uint32_t texture_dump_format = 0;
     bool bloom = true, dof = true, building_seam_fix = true, pc_contrast = true, hdr = false;
+    uint32_t gamma = 100, brightness = 100, contrast = 100, saturation = 100;  // app::Settings defaults
+    bool remove_cutscene_bars = false;
     uint32_t hdr_paper_white = 200, hdr_peak = 0, hdr_highlights = 40;  // app::Settings defaults
     uint32_t display_peak = 0; // the HDR display's reported peak in nits, 0 when unknown (read only)
     uint32_t upscaler = 0, sharpening = 0, bloom_strength = 100, shadow_resolution = 0, shadow_softness = 0;  // app::Settings defaults
@@ -274,6 +283,9 @@ inline void Change(Values &v, Option option, int direction, std::span<const uint
     case Option::Aspect:
         v.aspect = choices::Step(choices::kAspects, v.aspect, direction);
         break;
+    case Option::CutsceneBars:
+        v.remove_cutscene_bars = !v.remove_cutscene_bars;
+        break;
     case Option::RenderScale:
         v.render_percent =
             choices::ClampRenderPercent(choices::Step(choices::kRenderPercents, v.render_percent, direction));
@@ -359,6 +371,18 @@ inline void Change(Values &v, Option option, int direction, std::span<const uint
     case Option::PcContrast:
         v.pc_contrast = !v.pc_contrast;
         break;
+    case Option::Gamma:
+        v.gamma = choices::Step(choices::kGammaPercents, v.gamma, direction);
+        break;
+    case Option::Brightness:
+        v.brightness = choices::Step(choices::kBrightnessPercents, v.brightness, direction);
+        break;
+    case Option::Contrast:
+        v.contrast = choices::Step(choices::kContrastPercents, v.contrast, direction);
+        break;
+    case Option::Saturation:
+        v.saturation = choices::Step(choices::kSaturationPercents, v.saturation, direction);
+        break;
     case Option::VSync:
         v.vsync = !v.vsync;
         break;
@@ -422,6 +446,9 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
             std::snprintf(text, kTextBytes, "ASPECT %s", choices::AspectName(v.aspect));
         else
             std::snprintf(text, kTextBytes, "ASPECT %u.%02u", v.aspect / 1000, v.aspect % 1000 / 10);
+        break;
+    case Option::CutsceneBars:
+        std::snprintf(text, kTextBytes, "CUTSCENE BARS %s", v.remove_cutscene_bars ? "HIDE" : "SHOW");
         break;
     case Option::RenderScale:
         std::snprintf(text, kTextBytes, "RENDER SCALE %u.%02uX", v.render_percent / 100, v.render_percent % 100);
@@ -559,6 +586,18 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
         break;
     case Option::PcContrast:
         std::snprintf(text, kTextBytes, "PC CONTRAST %s", OnOff(v.pc_contrast));
+        break;
+    case Option::Gamma:
+        std::snprintf(text, kTextBytes, "GAMMA %u", v.gamma);
+        break;
+    case Option::Brightness:
+        std::snprintf(text, kTextBytes, "BRIGHTNESS %u", v.brightness);
+        break;
+    case Option::Contrast:
+        std::snprintf(text, kTextBytes, "CONTRAST %u", v.contrast);
+        break;
+    case Option::Saturation:
+        std::snprintf(text, kTextBytes, "SATURATION %u", v.saturation);
         break;
     case Option::VSync:
         std::snprintf(text, kTextBytes, "V-SYNC %s", OnOff(v.vsync));
