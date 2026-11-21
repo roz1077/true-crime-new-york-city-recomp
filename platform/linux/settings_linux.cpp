@@ -85,6 +85,7 @@ void Load() {
     s.height = t["height"].value_or(s.height);
     s.render_percent = t["render_percent"].value_or(s.render_percent);
     s.aspect = t["aspect_ratio"].value_or(s.aspect);
+    s.renderer = std::min(t["renderer"].value_or(s.renderer), 1u);
     if (s.width > 16384 || s.height > 16384 || !s.width || !s.height) s.width = s.height = 0;
     s.render_percent = std::clamp(s.render_percent, 25u, 200u);
     if (s.aspect && (s.aspect < 500 || s.aspect > 8000)) s.aspect = 0;
@@ -194,6 +195,7 @@ toml::table Table() {
                   {"height", int64_t(s.height)},
                   {"render_percent", int64_t(s.render_percent)},
                   {"aspect_ratio", int64_t(s.aspect)},
+                  {"renderer", int64_t(s.renderer)},
                   {"language", LanguageName(s.language)},
                   {"audio_mode", int64_t(s.audio_mode)},
                   {"force_stereo_output", s.force_stereo_output},

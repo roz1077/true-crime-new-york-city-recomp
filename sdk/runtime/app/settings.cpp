@@ -74,6 +74,7 @@ Settings Snapshot() {
     s.height = g.height;
     s.render_percent = g.render_percent;
     s.aspect = g.aspect;
+    s.renderer = g.renderer;
     s.remove_cutscene_bars = g.remove_cutscene_bars;
     s.language = g.language;
     s.audio_mode = g.audio_mode;
@@ -155,6 +156,7 @@ void Load() {
     s.height = t["height"].value_or(s.height);
     s.render_percent = t["render_percent"].value_or(s.render_percent);
     s.aspect = t["aspect_ratio"].value_or(s.aspect);
+    s.renderer = std::min(t["renderer"].value_or(s.renderer), 1u);
     s.remove_cutscene_bars = t["remove_cutscene_bars"].value_or(s.remove_cutscene_bars);
     if (s.width > 16384 || s.height > 16384 || !s.width || !s.height) s.width = s.height = 0;
     s.render_percent = std::clamp(s.render_percent, 25u, 200u);
@@ -263,6 +265,7 @@ toml::table Table() {
                   {"height", int64_t(s.height)},
                   {"render_percent", int64_t(s.render_percent)},
                   {"aspect_ratio", int64_t(s.aspect)},
+                  {"renderer", int64_t(s.renderer)},
                   {"remove_cutscene_bars", s.remove_cutscene_bars},
                   {"language", LanguageName(s.language)},
                   {"audio_mode", int64_t(s.audio_mode)},

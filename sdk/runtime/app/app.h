@@ -25,6 +25,7 @@ struct Settings {
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
     uint32_t render_percent = 100;   // of the displayed frame's height
     uint32_t aspect = 0;             // the frame's shape, width / height x 1000; 0 the output's
+    uint32_t renderer = 0;           // Windows: 0 Direct3D 12, 1 Vulkan; Linux is always Vulkan
     bool remove_cutscene_bars = false;  // show the full 3D picture behind the title's cutscene letterbox bars
     uint32_t language = 1;           // the console language for text and subtitles (Fr/Es/It disc only): 1 English, 4 French, 5 Spanish, 6 Italian
     uint32_t audio_mode = 1;         // output mix: 0 mono, 1 stereo, 2 Dolby Pro Logic II

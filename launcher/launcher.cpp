@@ -171,6 +171,7 @@ struct Graphics {
         constexpr const char *display_names[] = {"Fullscreen", "Borderless", "Windowed"};
         constexpr const char *display_keys[] = {"fullscreen", "borderless", "windowed"};
         constexpr const char *upscaler_names[] = {"Bilinear", "AMD FSR 1", "AMD FSR 3.1", "NVIDIA DLSS", "AMD FSR 4.1"};
+        constexpr const char *renderer_names[] = {"Direct3D 12", "Vulkan"};
         const auto percent = [](uint32_t v) { return std::to_string(v) + "%"; };
         const auto multiple = [](uint32_t v) { return v ? std::to_string(v) + "x" : std::string("Off"); };
         const auto level = [](uint32_t v) {
@@ -216,6 +217,10 @@ struct Graphics {
                 const std::string name = AspectName(v);
                 return name.empty() ? std::to_string(v / 1000.0).substr(0, 5) + ":1" : name;
             });
+#ifdef _WIN32
+            Choice("Renderer", "renderer", settings.renderer, kRenderers,
+                   [&](uint32_t v) { return std::string(renderer_names[v]); });
+#endif
             Toggle("Remove cutscene bars", "remove_cutscene_bars", settings.remove_cutscene_bars);
             Choice("Frame cap", "fps_cap", settings.fps_cap, kFrameCaps,
                    [](uint32_t v) { return std::to_string(EffectiveFrameCap(v)) + " FPS"; });

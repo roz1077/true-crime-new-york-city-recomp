@@ -213,7 +213,7 @@ function(add_xbe_image target xbe config partitions game_dir)
         "${FSR4_DIR}/Kits/FidelityFX/api/include" "${FSR4_DIR}/Kits/FidelityFX/upscalers/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/platform/linux/third_party")
     target_link_libraries(${target} PRIVATE Vulkan::Headers volk shaderc)
-    target_compile_options(${target} PRIVATE -fno-strict-aliasing)
+    target_compile_options(${target} PRIVATE -fno-strict-aliasing -march=x86-64-v2)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
     target_compile_definitions(${target} PRIVATE XBE_IMAGE_CONFIG="${config}")
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid d3dcompiler ole32 windowscodecs dbghelp winmm dwmapi ws2_32)

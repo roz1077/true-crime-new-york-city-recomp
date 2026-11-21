@@ -39,7 +39,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 | **Renderer** | Direct3D 12 (default) or Vulkan (`TCNYC_RENDERER=vulkan`) | Vulkan (leave Proton **off** in Steam) |
 
 - **Windows and Linux launcher:** browse for your Xbox `.iso`, drop it onto the launcher, or choose **Use local assets** if the game is already in `assets/`. The launcher mounts your ISO from its current location and remembers it for the next launch. Open **Graphics** to set the display mode, resolution, render scale, upscaling and other options before starting.
-- **Windows Vulkan (experimental):** set `TCNYC_RENDERER=vulkan` before starting the game (or in the launcher's environment) to use the Vulkan renderer instead of Direct3D 12. It uses the same FSR 4.1/3.1 DLLs with the `_vk` suffix and needs a Vulkan-capable driver.
+- **Windows Vulkan (experimental):** choose **Vulkan** under **Graphics > Renderer** in the launcher (or set `TCNYC_RENDERER=vulkan`) to use the Vulkan renderer instead of Direct3D 12. It uses the same FSR 4.1/3.1 DLLs with the `_vk` suffix and needs a Vulkan-capable driver.
 - **Linux:** `--assets <folder>` and `--iso <image>` also work. See the [Linux / SteamOS guide](README-LINUX.md) for SteamOS handheld steps and paths.
 - **First launch compiles the game code** and can take a while. Later launches reuse the cache.
 

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <memory>
 
+#include "app/app.h"
 #include "core/log.h"
 #include "gpu/backend.h"
 
@@ -15,11 +16,12 @@ std::unique_ptr<Backend> CreateVulkanBackend();
 
 std::unique_ptr<Backend> CreateBackend() {
     const char* requested = std::getenv("TCNYC_RENDERER");
-    if (requested && !std::strcmp(requested, "vulkan")) {
-        LOGR("renderer: Vulkan (Windows; set TCNYC_RENDERER=d3d12 for D3D12)");
+    const bool vulkan = requested ? !std::strcmp(requested, "vulkan") : app::Get().renderer == 1;
+    if (vulkan) {
+        LOGR("renderer: Vulkan (Windows; choose Direct3D 12 in the launcher to switch back)");
         return CreateVulkanBackend();
     }
-    LOGR("renderer: D3D12 (set TCNYC_RENDERER=vulkan for the Vulkan renderer)");
+    LOGR("renderer: D3D12 (choose Vulkan in the launcher, or set TCNYC_RENDERER=vulkan)");
     return CreateD3D12Backend();
 }
 

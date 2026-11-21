@@ -62,6 +62,8 @@ inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kDlss};
 #else
 inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3};  // FSR 3.1 through AMD's open Vulkan backend
 #endif
+// Windows renderers: Direct3D 12 (the default) and Vulkan; Linux only has Vulkan
+inline constexpr uint32_t kRenderers[] = {0, 1};
 // Controller aim response: 0 is the port's radial dead zone + quadratic curve,
 // 1 keeps the original Xbox per-axis dead zone and cubic.
 inline constexpr uint32_t kControllerAimResponses[] = {0, 1};
