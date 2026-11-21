@@ -8456,7 +8456,15 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
             area.push_back({{left, top, uint32_t(right - left), uint32_t(bottom - top)}, 0, 1});
         }
     } else {
-        area.push_back({{0, 0, tw, th}, 0, 1});
+        // As d3d12.cpp ClearTarget: a clear with no rects clears the current viewport, not the whole target
+        // (HUD panels, letterboxed views and shadow maps all set a smaller viewport).
+        const auto& v = s.viewport;
+        const int32_t left = std::clamp(int32_t(float(v.x) * sx), 0, int32_t(tw));
+        const int32_t top = std::clamp(int32_t(float(v.y) * sy), 0, int32_t(th));
+        const int32_t right = std::clamp(int32_t(float(v.x + v.w) * sx), 0, int32_t(tw));
+        const int32_t bottom = std::clamp(int32_t(float(v.y + v.h) * sy), 0, int32_t(th));
+        if (right > left && bottom > top)
+            area.push_back({{left, top, uint32_t(right - left), uint32_t(bottom - top)}, 0, 1});
     }
     const uint32_t n = uint32_t(area.size());
     if (!n) return;  // every requested rect was empty: the title asked for no clear
@@ -9137,17 +9145,31 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
 
     splits.At("geometry upload");
+    // As d3d12.cpp SetViewportScissor: the host viewport covers the target, because the guest viewport's
+    // transform is already in the shader constants (vsc[58]/[59] in d3d8.cpp). The guest viewport clips when
+    // there is no scissor; an explicit scissor replaces that clip, and an empty rect clips everything (the
+    // phone icon is hidden this way when there is no call).
     VkViewport vp{0, 0, float(host_w), float(host_h), 0, 1};
-    VkRect2D sc{{0, 0}, {host_w, host_h}};
-    if (s.scissor_count) {
-        const float sx = float(host_w) / float(std::max(1u, size.w));
-        const float sy = float(host_h) / float(std::max(1u, size.h));
-        const int32_t l = std::clamp(int32_t(float(s.scissors[0]) * sx), 0, int32_t(host_w));
-        const int32_t t = std::clamp(int32_t(float(s.scissors[1]) * sy), 0, int32_t(host_h));
-        const int32_t r = std::clamp(int32_t(float(s.scissors[2]) * sx), 0, int32_t(host_w));
-        const int32_t b = std::clamp(int32_t(float(s.scissors[3]) * sy), 0, int32_t(host_h));
-        if (r > l && b > t) sc = {{l, t}, {uint32_t(r - l), uint32_t(b - t)}};
+    VkRect2D sc{};
+    const float sx = float(host_w) / float(std::max(1u, size.w));
+    const float sy = float(host_h) / float(std::max(1u, size.h));
+    int32_t x0 = s.scissor_count ? int32_t(float(s.scissors[0]) * sx) : int32_t(float(s.viewport.x) * sx);
+    int32_t y0 = s.scissor_count ? int32_t(float(s.scissors[1]) * sy) : int32_t(float(s.viewport.y) * sy);
+    int32_t x1 = s.scissor_count ? int32_t(float(s.scissors[2]) * sx)
+                                 : int32_t(float(s.viewport.x + s.viewport.w) * sx);
+    int32_t y1 = s.scissor_count ? int32_t(float(s.scissors[3]) * sy)
+                                 : int32_t(float(s.viewport.y + s.viewport.h) * sy);
+    const float squeeze = c.tscale[2];
+    if (squeeze < 1.0f) {
+        const float inset = float(host_w) * (1.0f - squeeze) * 0.5f;
+        x0 = int32_t(std::ceil(inset + float(std::clamp(x0, 0, int32_t(host_w))) * squeeze));
+        x1 = int32_t(std::ceil(inset + float(std::clamp(x1, 0, int32_t(host_w))) * squeeze));
     }
+    x0 = std::clamp(x0, 0, int32_t(host_w));
+    x1 = std::clamp(x1, 0, int32_t(host_w));
+    y0 = std::clamp(y0, 0, int32_t(host_h));
+    y1 = std::clamp(y1, 0, int32_t(host_h));
+    sc = {{x0, y0}, {uint32_t(std::max(0, x1 - x0)), uint32_t(std::max(0, y1 - y0))}};
     float blend_color[4];
     Color(SimpleState(s, kMBlendColor), blend_color);
     const uint32_t stencil_ref = SimpleState(s, kMStencilRef) & 0xFF;

@@ -169,6 +169,9 @@ public:
     }
 
     bool Init(uint32_t width, uint32_t height) override { return ring_ && inner_->Init(width, height); }
+    // the D3D8 picture corrections belong to the backend that presents them
+    bool ClearPicturesInGuestMemory() const override { return inner_->ClearPicturesInGuestMemory(); }
+    bool PicturesAtSurfaceBase() const override { return inner_->PicturesAtSurfaceBase(); }
 
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
         const bool perf = diag::Perf();

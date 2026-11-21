@@ -14,6 +14,11 @@
   Windows, and it is centred at 4:3 by the renderer rather than by the operating system. Shaders are compiled with
   optimisation enabled (the counterpart of Direct3D 12's `D3DCOMPILE_OPTIMIZATION_LEVEL3`; caches rebuild once), and
   per-texture/target dirty checks skip the dirty-map lock when nothing has changed, as Direct3D 12 already did.
+- Vulkan now applies the title's viewport and scissor rectangles to every draw exactly as Direct3D 12 does: the host
+  viewport covers the target (the guest viewport transform is already in the shader constants), an explicit scissor
+  replaces the viewport clip, an empty scissor clips the draw completely, and both follow the ultrawide HUD squeeze.
+  This restores HUD elements the title hides by clipping (the phone icon when there is no call) and keeps the
+  ultrawide HUD centred instead of stretched. A clear with no rectangles also clears only the current viewport.
 - Windows Vulkan DLSS can be built with `TCNYC_DLSS_VK_SDK` pointed at NVIDIA's NGX SDK (Vulkan headers and
   `nvsdk_ngx.lib`); it is optional exactly like the Direct3D 12 DLSS build.
 
