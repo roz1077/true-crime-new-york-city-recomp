@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include "core/dev_env.h"
 #include <cctype>
 #include <cerrno>
@@ -200,6 +201,7 @@ struct File : Object {
     bool listed = false;
     bool delete_on_close = false;
     bool host_decoded = false;  // an MP3, OGG, FLAC or WAV radio replacement: the game's WMA decoder is bypassed
+    uint32_t options = 0;       // the create/open options, for TCNYC_IO_TRACE (sync I/O is 0x30)
 #if TCNYC_DEV_TOOLS
     bool trace_wma = false;
 #endif
@@ -232,6 +234,61 @@ void TraceWmaOpen(File& file) {
     if (file.trace_wma) LOGR("audio trace: opened %s", file.xbox.c_str());
 }
 #endif
+
+namespace {
+// TCNYC_IO_TRACE: file reads that cost long enough to show as a hitch, the options each handle was
+// opened with, and a summary at exit. std::getenv rather than DevEnv, because measuring a release
+// build (the one a handheld runs) is the point, as with TCNYC_SAMPLE.
+bool IoTrace() {
+    static const bool on = std::getenv("TCNYC_IO_TRACE") != nullptr;
+    return on;
+}
+
+struct IoStats {
+    std::atomic<uint64_t> reads{0}, bytes{0}, writes{0}, write_bytes{0};
+    std::atomic<uint64_t> slow{0}, slow_bytes{0}, max_us{0};
+    std::atomic<uint64_t> events{0}, apcs{0}, sync{0};
+};
+IoStats g_io_stats;
+std::atomic<int> g_io_slow_logged{0}, g_io_open_logged{0};
+
+void TraceOpen(const File& f, uint32_t options) {
+    if (!IoTrace() || f.dir) return;
+    if (g_io_open_logged.fetch_add(1, std::memory_order_relaxed) >= 60) return;
+    // LOGR, not LOGI: a release build (NDEBUG) logs only Report and Error, and measuring a release build is
+    // the point of the switch.
+    LOGR("io: open %s options 0x%X", f.xbox.c_str(), options);
+}
+
+void NoteIo(bool write, const std::string& name, uint64_t pos, uint32_t n, uint32_t event, uint32_t apc,
+            uint32_t options, std::chrono::steady_clock::time_point start) {
+    if (!IoTrace()) return;
+    const auto us = uint64_t(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+    if (write) {
+        g_io_stats.writes.fetch_add(1, std::memory_order_relaxed);
+        g_io_stats.write_bytes.fetch_add(n, std::memory_order_relaxed);
+    } else {
+        g_io_stats.reads.fetch_add(1, std::memory_order_relaxed);
+        g_io_stats.bytes.fetch_add(n, std::memory_order_relaxed);
+        if (event) g_io_stats.events.fetch_add(1, std::memory_order_relaxed);
+        if (apc) g_io_stats.apcs.fetch_add(1, std::memory_order_relaxed);
+        if (options & 0x30) g_io_stats.sync.fetch_add(1, std::memory_order_relaxed);
+        if (us >= 3000) {
+            g_io_stats.slow.fetch_add(1, std::memory_order_relaxed);
+            g_io_stats.slow_bytes.fetch_add(n, std::memory_order_relaxed);
+            if (g_io_slow_logged.fetch_add(1, std::memory_order_relaxed) < 40)
+                LOGR("io: read %s %u bytes at %llu in %.1f ms (event %d apc %d sync %d)", name.c_str(), n,
+                     static_cast<unsigned long long>(pos), double(us) / 1000.0, event ? 1 : 0, apc ? 1 : 0,
+                     (options & 0x30) ? 1 : 0);
+        }
+    }
+    uint64_t max_us = g_io_stats.max_us.load(std::memory_order_relaxed);
+    while (us > max_us && !g_io_stats.max_us.compare_exchange_weak(max_us, us, std::memory_order_relaxed)) {
+    }
+}
+}  // namespace
+
 
 struct Link : Object {
     std::string target;
@@ -363,6 +420,18 @@ void Complete(uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
 
 // Best-effort save durability at process exit: commit every writable stream that
 // is still open before _Exit bypasses the File destructors.
+void LogIoStats() {
+    if (!IoTrace()) return;
+    const auto load = [](const std::atomic<uint64_t>& v) { return v.load(std::memory_order_relaxed); };
+    LOGR("io: %llu reads of %.1f MB, %llu slow (%.1f MB); %llu writes of %.1f MB; max %.1f ms; "
+         "event %llu, apc %llu, sync %llu",
+         (unsigned long long)load(g_io_stats.reads), double(load(g_io_stats.bytes)) / 1e6,
+         (unsigned long long)load(g_io_stats.slow), double(load(g_io_stats.slow_bytes)) / 1e6,
+         (unsigned long long)load(g_io_stats.writes), double(load(g_io_stats.write_bytes)) / 1e6,
+         double(load(g_io_stats.max_us)) / 1000.0, (unsigned long long)load(g_io_stats.events),
+         (unsigned long long)load(g_io_stats.apcs), (unsigned long long)load(g_io_stats.sync));
+}
+
 void FlushOpenFiles() {
     std::vector<std::shared_ptr<File>> files;
     {
@@ -524,10 +593,12 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
     f->entry = e;
     f->dir = e->dir;
     f->read_only = true;
+    f->options = options;
 #if TCNYC_DEV_TOOLS
     TraceWmaOpen(*f);
 #endif
     RegisterFile(f);
+    TraceOpen(*f, options);
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, 1);
     LOG_FIRST(400, "open %s", name.c_str());
@@ -798,10 +869,12 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     f->writable = writable && fp != nullptr;
     f->read_only = t.read_only;
     f->delete_on_close = options & 0x1000;  // FILE_DELETE_ON_CLOSE
+    f->options = options;
 #if TCNYC_DEV_TOOLS
     TraceWmaOpen(*f);
 #endif
     RegisterFile(f);
+    TraceOpen(*f, options);
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, info);
     LOG_FIRST(400, "open %s", name.c_str());
@@ -829,6 +902,7 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     f->xbox = Normalize(name);
     f->dir = fs::is_directory(host, ec);
     f->read_only = t.read_only;
+    f->options = options;
     if (!f->dir) {
         const bool read_request = access && (access & 0x40000000u) == 0 && (access & 0x2u) == 0;
         bool write = !t.read_only && !read_request;
@@ -844,14 +918,17 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     TraceWmaOpen(*f);
 #endif
     RegisterFile(f);
+    TraceOpen(*f, options);
     (void)options;
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, 1);
     return kSuccess;
 }
 
+
 // I/O completes before the call returns: the status block is written, then the file object, the event and the
 // APC are signalled (GetOverlappedResult without an event waits on the file handle)
+constexpr uint32_t kIoDeviceError = 0xC0000185;
 static uint32_t Finish(File& f, uint32_t status, uint32_t n, uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
     IoStatus(iosb, status, n);
     SetEvent(f);
@@ -866,11 +943,12 @@ static uint64_t Offset(File& f, uint32_t off) {
 
 // pages is the FILE_SEGMENT_ELEMENT array for scatter and gather, 0 for one buffer
 static uint32_t Transfer(const Args& a, bool write, bool scatter) {
-    constexpr uint32_t kIoDeviceError = 0xC0000185;
     uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], buf = a[5], len = a[6], off = a[7];
     auto f = FileFromHandle(h);
     if (!f || (!f->fp && !f->entry)) return kInvalidHandle;
     if (write && (f->entry || f->read_only)) return kAccessDenied;
+    const bool io_trace = IoTrace();
+    const auto io_start = io_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 #if TCNYC_DEV_TOOLS
     const bool trace_read = f->trace_wma && !write;
     const auto read_start = trace_read ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -898,21 +976,38 @@ static uint32_t Transfer(const Args& a, bool write, bool scatter) {
     }
     const uint64_t pos = Offset(*f, off);
     if (pos > uint64_t(INT64_MAX) - len) return finish(kInvalidParameter);
+    uint32_t n = 0;
+    if (write) {
+        if (f->fp) {
+            std::clearerr(f->fp);
+            if (!Seek(f->fp, pos)) return finish(kIoDeviceError);
+        }
+        while (n < len) {
+            const uint32_t at = scatter ? segments[n / mem::kPage] : buf;
+            const uint32_t chunk = scatter ? std::min(len - n, mem::kPage) : len;
+            const size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
+                                         : std::fwrite(HostPtr(at), 1, chunk, f->fp);
+            n += uint32_t(done);
+            if (done < chunk) break;
+        }
+        f->pos = pos + n;
+        NoteIo(true, f->xbox, pos, n, event, apc, f->options, io_start);
+        return finish(n < len ? (errno == ENOSPC ? kDiskFull : kIoDeviceError) : kSuccess, n);
+    }
     if (f->fp) {
         std::clearerr(f->fp);
         if (!Seek(f->fp, pos)) return finish(kIoDeviceError);
     }
-    uint32_t n = 0;
     while (n < len) {
         const uint32_t at = scatter ? segments[n / mem::kPage] : buf;
         const uint32_t chunk = scatter ? std::min(len - n, mem::kPage) : len;
-        size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
-                      : write  ? std::fwrite(HostPtr(at), 1, chunk, f->fp)
-                               : std::fread(HostPtr(at), 1, chunk, f->fp);
+        const size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
+                                     : std::fread(HostPtr(at), 1, chunk, f->fp);
         n += uint32_t(done);
         if (done < chunk) break;
     }
     f->pos = pos + n;
+    NoteIo(false, f->xbox, pos, n, event, apc, f->options, io_start);
 #if TCNYC_DEV_TOOLS
     if (trace_read) {
         const auto elapsed = std::chrono::steady_clock::now() - read_start;
@@ -921,11 +1016,10 @@ static uint32_t Transfer(const Args& a, bool write, bool scatter) {
                  static_cast<unsigned long long>(pos), std::chrono::duration<double, std::milli>(elapsed).count());
     }
 #endif
-    if (write && n < len) return finish(errno == ENOSPC ? kDiskFull : kIoDeviceError, n);
-    if (!write && ((f->fp && std::ferror(f->fp)) ||
-                   (f->entry && pos < f->entry->size && n < std::min<uint64_t>(len, f->entry->size - pos))))
+    if ((f->fp && std::ferror(f->fp)) ||
+        (f->entry && pos < f->entry->size && n < std::min<uint64_t>(len, f->entry->size - pos)))
         return finish(kIoDeviceError, n);
-    if (!write && len && !n) return finish(kEndOfFile);
+    if (len && !n) return finish(kEndOfFile);
     return finish(kSuccess, n);
 }
 

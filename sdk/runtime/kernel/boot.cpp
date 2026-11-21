@@ -279,6 +279,7 @@ void SetExitSave(void (*save)()) { g_exit_save = save; }
 
 void Shutdown(int code) {
     FlushOpenFiles();
+    LogIoStats();
     if (auto save = g_exit_save.exchange(nullptr)) save();
     LOGR("Exit (%d)", code);
     logx::Flush();

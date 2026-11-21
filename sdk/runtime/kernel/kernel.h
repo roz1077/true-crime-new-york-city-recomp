@@ -227,6 +227,7 @@ void SetHostPriority(int guest_priority);
 // files
 void MountDefaults(const std::filesystem::path& game_dir, const std::filesystem::path& data_dir);
 void FlushOpenFiles();  // commit writable saves before Shutdown's _Exit
+void LogIoStats();      // TCNYC_IO_TRACE: the file read summary at exit
 bool CreateSymbolicLink(const std::string& link, const std::string& target);
 bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);
