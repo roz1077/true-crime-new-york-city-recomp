@@ -751,6 +751,49 @@ uint32_t ElementBytes(uint32_t dxgi) {
 
 } // namespace
 
+namespace {
+// TCNYC_VK_WAIT: how long the render thread blocks on fences, per site, reported once a second. F1's whole
+// value is that time, so measure it before changing the frame loop. LOGR because a release build is what
+// ships and drops Info.
+enum FenceSite { kFenceScene, kFenceSubmit, kFenceSubmitted, kFenceReport, kFencePresent, kFenceSites };
+constexpr const char* kFenceSiteNames[kFenceSites] = {"scene", "submit", "submitted", "report", "present"};
+
+struct FenceWaitProbe {
+    double ms[kFenceSites] = {};
+    int calls[kFenceSites] = {};
+    double max_ms = 0;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+FenceWaitProbe g_fence_wait;
+
+bool FenceWaitProbeOn() {
+    static const bool on = std::getenv("TCNYC_VK_WAIT") != nullptr;
+    return on;
+}
+
+VkResult ProbeWaitFence(VkDevice device, VkFence fence, FenceSite site) {
+    if (!FenceWaitProbeOn()) return vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+    const auto start = std::chrono::steady_clock::now();
+    const VkResult r = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    FenceWaitProbe& p = g_fence_wait;
+    p.ms[site] += ms;
+    ++p.calls[site];
+    p.max_ms = std::max(p.max_ms, ms);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - p.since >= std::chrono::seconds(1)) {
+        LOGR("vulkan: fence waits scene %.1f/%d submit %.1f/%d submitted %.1f/%d report %.1f/%d present %.1f/%d ms, "
+             "max %.2f",
+             p.ms[kFenceScene], p.calls[kFenceScene], p.ms[kFenceSubmit], p.calls[kFenceSubmit],
+             p.ms[kFenceSubmitted], p.calls[kFenceSubmitted], p.ms[kFenceReport], p.calls[kFenceReport],
+             p.ms[kFencePresent], p.calls[kFencePresent], p.max_ms);
+        p = FenceWaitProbe{};
+        p.since = now;
+    }
+    return r;
+}
+} // namespace
+
 class VulkanBackend final : public Backend {
 public:
     ~VulkanBackend() override { Shutdown(); }
@@ -3985,7 +4028,7 @@ void VulkanBackend::Shutdown() {
 
 void VulkanBackend::WaitSubmitted() {
     if (failed_ || completed_serial_.load() >= submit_serial_) return;
-    const VkResult r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    const VkResult r = ProbeWaitFence(device_, fence_, kFenceScene);
     if (r != VK_SUCCESS) {
         Fail("wait for scene", r);
         return;
@@ -4044,7 +4087,7 @@ void VulkanBackend::EndRecord(bool wait, std::source_location where) {
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd_;
-    VkResult r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    VkResult r = ProbeWaitFence(device_, fence_, kFenceSubmit);
     if (r != VK_SUCCESS) {
         Fail("wait for fence", r);
         return;
@@ -4061,7 +4104,7 @@ void VulkanBackend::EndRecord(bool wait, std::source_location where) {
         return;
     }
     if (wait) {
-        r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        r = ProbeWaitFence(device_, fence_, kFenceSubmitted);
         if (r != VK_SUCCESS) {
             Fail("wait for submitted frame", r);
             return;
@@ -4248,7 +4291,7 @@ void VulkanBackend::GetReport(uint32_t report) {
     if (recording_)
         EndRecord(true);
     else {
-        const VkResult r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        const VkResult r = ProbeWaitFence(device_, fence_, kFenceReport);
         if (r != VK_SUCCESS) Fail("wait for report fence", r);
     }
     if (failed_) return;
@@ -11242,7 +11285,7 @@ void VulkanBackend::Present(const Surface& front) {
     bool waited = false;
     {
         const auto wait_at = perf_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const VkResult wait_result = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        const VkResult wait_result = ProbeWaitFence(device_, fence_, kFencePresent);
         if (wait_result != VK_SUCCESS)
             Fail("wait for present fence", wait_result);
         else
