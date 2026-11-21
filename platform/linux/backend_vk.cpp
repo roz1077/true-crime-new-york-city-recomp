@@ -1517,6 +1517,18 @@ private:
         uint32_t count = 0;
         std::chrono::steady_clock::time_point frame_start;
     } profile_;
+    // TCNYC_GPU_TIME: GPU time of each recorded segment of the frame plus the present pass, averaged once a
+    // second. Segment times are summed, so a gap between submissions (the CPU was late) is not counted as GPU
+    // work; that is what tells a GPU-bound frame from a CPU/pacing-bound one.
+    static constexpr uint32_t kGpuSegments = 6;
+    struct GpuTimeProbe {
+        bool on = false, tried = false, reset_done = false;
+        VkQueryPool pool = VK_NULL_HANDLE;
+        float period_ns = 1;
+        uint32_t seg = 0, frames = 0;
+        double scene_ms = 0, present_ms = 0, max_ms = 0;
+        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    } gputime_;
     struct Fsr3Vk {
         std::unique_ptr<FfxFsr3UpscalerContext> context;
         std::vector<uint8_t> scratch;
@@ -3983,6 +3995,7 @@ void VulkanBackend::Shutdown() {
         if (fence_) vkDestroyFence(device_, fence_, nullptr);
         if (present_fence_) vkDestroyFence(device_, present_fence_, nullptr);
         if (query_pool_) vkDestroyQueryPool(device_, query_pool_, nullptr);
+        if (gputime_.pool) vkDestroyQueryPool(device_, gputime_.pool, nullptr);
         if (image_available_) vkDestroySemaphore(device_, image_available_, nullptr);
         for (VkSemaphore s : render_done_)
             if (s) vkDestroySemaphore(device_, s, nullptr);
@@ -4044,6 +4057,13 @@ void VulkanBackend::BeginRecord() {
     VkCommandBufferBeginInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd_, &info);
+    if (gputime_.on && gputime_.seg < kGpuSegments) {
+        if (!gputime_.reset_done) {
+            vkCmdResetQueryPool(cmd_, gputime_.pool, 0, kGpuSegments * 2 + 2);
+            gputime_.reset_done = true;
+        }
+        vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, gputime_.pool, gputime_.seg * 2);
+    }
     if (query_reset_ && query_pool_) {
         vkCmdResetQueryPool(cmd_, query_pool_, 0, kOcclusionQueries);
         query_reset_ = false;
@@ -4082,6 +4102,10 @@ void VulkanBackend::EndRecord(bool wait, std::source_location where) {
     // recorded before the replay would otherwise change what the pending draws read.
     if (!flushing_deferred_ && !skip_deferred_flush_ && DeferredPending()) FlushDeferredScene();
     FlushPass();
+    if (gputime_.on && gputime_.seg < kGpuSegments) {
+        vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gputime_.pool, gputime_.seg * 2 + 1);
+        ++gputime_.seg;
+    }
     vkEndCommandBuffer(cmd_);
     recording_ = false;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -10929,10 +10953,37 @@ void VulkanBackend::Present(const Surface& front) {
     }
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (!gputime_.tried) {
+        gputime_.tried = true;
+        static const bool want = std::getenv("TCNYC_GPU_TIME") != nullptr;
+        if (want) {
+            VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            q.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            q.queryCount = kGpuSegments * 2 + 2;
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(physical_, &props);
+            gputime_.period_ns = props.limits.timestampPeriod;
+            gputime_.on = vkCreateQueryPool(device_, &q, nullptr, &gputime_.pool) == VK_SUCCESS &&
+                           props.limits.timestampComputeAndGraphics != 0;
+            if (!gputime_.on && gputime_.pool) {
+                vkDestroyQueryPool(device_, gputime_.pool, nullptr);
+                gputime_.pool = VK_NULL_HANDLE;
+            }
+            LOGR("vulkan: GPU time probe %s (timestamp period %.3f ns)", gputime_.on ? "on" : "off",
+                 double(gputime_.period_ns));
+        }
+    }
     r = vkBeginCommandBuffer(cmd_, &begin);
     if (r != VK_SUCCESS) {
         Fail("begin command buffer", r);
         return;
+    }
+    if (gputime_.on) {
+        if (!gputime_.reset_done) {
+            vkCmdResetQueryPool(cmd_, gputime_.pool, 0, kGpuSegments * 2 + 2);
+            gputime_.reset_done = true;
+        }
+        vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, gputime_.pool, kGpuSegments * 2);
     }
     bound_pipe_ = VK_NULL_HANDLE;
     viewport_valid_ = false;
@@ -11247,6 +11298,8 @@ void VulkanBackend::Present(const Surface& front) {
                                &copy);
         Transition(swapchain_images_[image], swap_layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, swapchain_format_);
     }
+    if (gputime_.on) vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gputime_.pool,
+                                         kGpuSegments * 2 + 1);
     vkEndCommandBuffer(cmd_);
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -11297,6 +11350,42 @@ void VulkanBackend::Present(const Surface& front) {
         if (perf_)
             perf_wait_ms_ +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_at).count();
+    }
+    if (gputime_.on) {
+        std::array<uint64_t, kGpuSegments * 2> t{};
+        uint64_t present_t[2] = {};
+        // read only the queries this frame wrote: unwritten ones are NOT_READY and fail the whole call
+        const bool segments_read =
+            gputime_.seg == 0 ||
+            vkGetQueryPoolResults(device_, gputime_.pool, 0, gputime_.seg * 2, gputime_.seg * 2 * sizeof(uint64_t),
+                                  t.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
+                VK_SUCCESS;
+        const bool present_read =
+            vkGetQueryPoolResults(device_, gputime_.pool, kGpuSegments * 2, 2, sizeof(present_t), present_t,
+                                  sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS;
+        if (waited && segments_read && present_read) {
+            double scene = 0;
+            for (uint32_t i = 0; i < gputime_.seg; ++i)
+                if (t[i * 2 + 1] >= t[i * 2])
+                    scene += double(t[i * 2 + 1] - t[i * 2]) * gputime_.period_ns / 1e6;
+            const double present_ms =
+                present_t[1] >= present_t[0] ? double(present_t[1] - present_t[0]) * gputime_.period_ns / 1e6 : 0.0;
+            gputime_.scene_ms += scene;
+            gputime_.present_ms += present_ms;
+            gputime_.max_ms = std::max(gputime_.max_ms, scene + present_ms);
+            if (++gputime_.frames >= 60) {
+                const auto now = std::chrono::steady_clock::now();
+                const double span = std::chrono::duration<double, std::milli>(now - gputime_.since).count();
+                LOGR("vulkan: GPU scene+post %.2f ms, present %.2f ms, max %.2f, %.1f fps",
+                     gputime_.scene_ms / gputime_.frames, gputime_.present_ms / gputime_.frames, gputime_.max_ms,
+                     gputime_.frames * 1000.0 / std::max(span, 1.0));
+                gputime_.scene_ms = gputime_.present_ms = gputime_.max_ms = 0;
+                gputime_.frames = 0;
+                gputime_.since = now;
+            }
+        }
+        gputime_.seg = 0;
+        gputime_.reset_done = false;
     }
     if (record_swap_trace && waited) {
         const std::string path = trace_base + "_present.tga";
