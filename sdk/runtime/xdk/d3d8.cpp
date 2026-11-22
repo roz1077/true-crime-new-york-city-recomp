@@ -11,6 +11,8 @@
 #include "core/sampler.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -595,9 +597,39 @@ HLE_STDCALL(D3DResource_BlockUntilNotBusy, 1) {
     gpu::MarkDirty(a[0]);
     return 0;
 }
+#if TCNYC_DEV_TOOLS
+// XBE_TRACE_VB_LOCK=1 (developer builds): log the guest call stack that locked the vertex buffer of each additive
+// quad batch (blend SRC_ALPHA, ONE; glows and flares), to find the code that fills it. Logged once per stack.
+static bool TraceVbLock() {
+    static const bool on = DevEnv("XBE_TRACE_VB_LOCK") != nullptr;
+    return on;
+}
+static std::unordered_map<uint32_t, std::array<uint32_t, 8>> g_vb_lock_callers;
+static void NoteVbLock(X86Context &ctx, uint32_t resource) {
+    uint8_t *base = mem::Base();
+    std::array<uint32_t, 8> s{};
+    s[0] = mem::IsCommitted(ctx.esp) ? X86_MEM32(ctx.esp) : 0;
+    for (uint32_t ebp = ctx.ebp, n = 1; n < s.size(); ++n) {
+        if (ebp < 0x10000u || (ebp & 3u) || !mem::IsCommitted(ebp) || !mem::IsCommitted(ebp + 7)) break;
+        s[n] = X86_MEM32(ebp + 4);
+        const uint32_t next = X86_MEM32(ebp);
+        if (next <= ebp) break;
+        ebp = next;
+    }
+    g_vb_lock_callers[resource] = s;
+}
+static void ReportVbLock(uint32_t prim, uint32_t count, uint32_t vb);
+#endif
+
 // (resource): Lock2 of a vertex buffer or palette. The library waits on GPU time stamps, which the host does not keep
 // (BlockOnTime returns at once), so a title refilling a buffer would overwrite draws not yet taken.
 HLE_STDCALL(D3D_BlockOnNonSurfaceResource, 1) {
+#if TCNYC_DEV_TOOLS
+    if (a[0] && TraceVbLock()) {
+        std::lock_guard<std::recursive_mutex> lock(g_lock);
+        NoteVbLock(ctx, a[0]);
+    }
+#endif
     if (a[0] && g_backend) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
         g_backend->WaitResource(a[0]);
@@ -1585,6 +1617,92 @@ static void NoteDrawCaller(X86Context &ctx) {
     }
 }
 
+#if TCNYC_DEV_TOOLS
+// Logs each additive quad batch once (buffer, texture size, the stack that locked the buffer if it was locked).
+// The first batch with a 64x64 texture (the headlight glows) also gets a hardware write watchpoint on its first
+// vertex, so the instruction that fills it next frame is logged (app/main.cpp GuestWatchHandler).
+static void ReportVbLock(uint32_t prim, uint32_t count, uint32_t vb) {
+    constexpr uint32_t kQuadList = 8, kSrcAlpha = 0x302, kOne = 1;
+    if (prim != kQuadList || count < 8 || !gpu::SimpleState(g_state, gpu::kMBlendEnable) ||
+        gpu::SimpleState(g_state, gpu::kMSrcBlend) != kSrcAlpha || gpu::SimpleState(g_state, gpu::kMDestBlend) != kOne)
+        return;
+    gpu::TextureDesc tex;
+    const bool described = g_state.textures[0] && gpu::Describe(g_state.textures[0], tex);
+    const uint32_t data = vb && mem::IsCommitted(vb + 4) ? mem::VirtualFromPhysical(R32(vb + 4)) : 0;
+    static std::unordered_set<uint64_t> seen;
+    if (seen.size() < 32 && seen.insert(uint64_t(vb) << 32 | g_state.textures[0]).second) {
+        const auto it = g_vb_lock_callers.find(vb);
+        std::array<uint32_t, 8> s{};
+        if (it != g_vb_lock_callers.end()) s = it->second;
+        LOGR("vb trace: additive quads, %u vertices, buffer %08X data %08X, texture %ux%u, locked %s %08X<%08X<%08X<%08X<%08X<%08X",
+             count, vb, data, described ? tex.width : 0, described ? tex.height : 0,
+             it != g_vb_lock_callers.end() ? "from" : "never", s[0], s[1], s[2], s[3], s[4], s[5]);
+    }
+    if (described && tex.width == 64 && tex.height == 64 && data && mem::IsCommitted(data) &&
+        !kernel::GuestWatchActive()) {
+        LOGR("vb trace: watching the glow batch's first vertex at %08X", data);
+        kernel::InstallGuestWatch(data, 4);
+    }
+}
+
+// the guest context of the user-memory draw being made (DrawVerticesUP, EndPush, End), for ReportUpCaller
+static X86Context *g_up_ctx = nullptr;
+// additive quads drawn from user memory: the guest stack that drew them, once per caller
+// a quad of these vertices (x, y first, in screen pixels) more than four times as long as it is wide, or -1
+static int StretchedQuad(const void *vertices, uint32_t count, uint32_t stride, float out[8]) {
+    if (!vertices || stride < 8) return -1;
+    const auto *bytes = static_cast<const uint8_t *>(vertices);
+    for (uint32_t q = 0; q + 4 <= count; q += 4) {
+        float p[8];
+        for (int k = 0; k < 4; k++) std::memcpy(p + k * 2, bytes + size_t(q + k) * stride, 8);
+        const float a = std::hypot(p[2] - p[0], p[3] - p[1]), b = std::hypot(p[4] - p[2], p[5] - p[3]);
+        const float lo = std::min(a, b), hi = std::max(a, b);
+        if (hi > 20 && hi > 4 * lo) {
+            std::memcpy(out, p, sizeof(p));
+            return int(q / 4);
+        }
+    }
+    return -1;
+}
+
+static void ReportUpCaller(uint32_t prim, uint32_t count, const void *vertices, uint32_t stride) {
+    constexpr uint32_t kQuadList = 8, kSrcAlpha = 0x302, kOne = 1;
+    if (prim != kQuadList || count < 4 || !gpu::SimpleState(g_state, gpu::kMBlendEnable) ||
+        gpu::SimpleState(g_state, gpu::kMSrcBlend) != kSrcAlpha || gpu::SimpleState(g_state, gpu::kMDestBlend) != kOne)
+        return;
+    float p[8];
+    const int stretched = StretchedQuad(vertices, count, stride, p);
+    if (stretched >= 0) {
+        static int lines = 0;
+        if (lines++ < 24)
+            LOGR("vb trace: stretched quad %d of %u from %08X: (%.0f %.0f) (%.0f %.0f) (%.0f %.0f) (%.0f %.0f)",
+                 stretched, count / 4, g_up_ctx && mem::IsCommitted(g_up_ctx->esp) ? kernel::R32(g_up_ctx->esp) : 0,
+                 p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    }
+    if (!g_up_ctx) {
+        LOG_FIRST(4, "vb trace: additive quads from user memory, %u vertices, outside a traced call (push walk)", count);
+        return;
+    }
+    uint8_t *base = mem::Base();
+    const X86Context &ctx = *g_up_ctx;
+    uint32_t s[8] = {};
+    s[0] = mem::IsCommitted(ctx.esp) ? X86_MEM32(ctx.esp) : 0;
+    for (uint32_t ebp = ctx.ebp, n = 1; n < 8; ++n) {
+        if (ebp < 0x10000u || (ebp & 3u) || !mem::IsCommitted(ebp) || !mem::IsCommitted(ebp + 7)) break;
+        s[n] = X86_MEM32(ebp + 4);
+        const uint32_t next = X86_MEM32(ebp);
+        if (next <= ebp) break;
+        ebp = next;
+    }
+    static std::unordered_set<uint64_t> seen;
+    if (seen.size() >= 32 || !seen.insert(uint64_t(s[0]) << 32 | s[1]).second) return;
+    gpu::TextureDesc tex;
+    const bool described = g_state.textures[0] && gpu::Describe(g_state.textures[0], tex);
+    LOGR("vb trace: additive quads from user memory, %u vertices, texture %ux%u, drawn from %08X<%08X<%08X<%08X<%08X<%08X<%08X<%08X",
+         count, described ? tex.width : 0, described ? tex.height : 0, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+}
+#endif
+
 // The caller chain is only read by a draw capture. In release the walk is
 // skipped unless a capture is active; developer builds keep it for diagnostics.
 static void NoteDrawCallerIfNeeded(X86Context &ctx) {
@@ -1602,6 +1720,9 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     Walk(Dev(kDevPush));  // a visibility test begun since the last draw counts this one
     SyncDeferred();
     NoteDrawCallerIfNeeded(ctx);
+#if TCNYC_DEV_TOOLS
+    if (TraceVbLock()) ReportVbLock(a[0], a[2], R32(kStreams + XDK_Stream_Buffer));
+#endif
     if (g_backend) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
     g_frame_draws++;
     gpu::RetainVertexAttributes(g_state, a[1], a[2], nullptr);
@@ -1657,6 +1778,9 @@ void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride
         if (!count) return;
     }
     SyncDeferred();
+#if TCNYC_DEV_TOOLS
+    if (TraceVbLock()) ReportUpCaller(prim, count, vertices, stride);
+#endif
     const auto textures = g_state.textures;
     if (const XbeUpDrawFilterFn filter = ::XbeUpDrawFilter()) {
         static thread_local std::vector<uint8_t> copy;
@@ -1884,7 +2008,13 @@ HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
     ::XbeDrawCalls().fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
+#if TCNYC_DEV_TOOLS
+    g_up_ctx = &ctx;
+#endif
     DrawUp(a[0], a[1], HostPtr(a[2]), a[3]);
+#if TCNYC_DEV_TOOLS
+    g_up_ctx = nullptr;
+#endif
     return 0;
 }
 
@@ -1959,7 +2089,13 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
         const uint64_t limit = uint64_t(g_scratch_push) + g_scratch_size;
         if (end < g_push_begin) end = g_push_begin;
         if (end > limit) end = limit;
+#if TCNYC_DEV_TOOLS
+        g_up_ctx = &ctx;
+#endif
         RunCommands(g_push_begin, uint32_t(end));
+#if TCNYC_DEV_TOOLS
+        g_up_ctx = nullptr;
+#endif
     }
     g_push_begin = 0;
     ScratchPush();
@@ -1977,7 +2113,13 @@ HLE_STDCALL(D3DDevice_RunPushBuffer, 2) {
     if (a[1]) LOG_FIRST(1, "d3d: RunPushBuffer fixups are not applied");
     Walk(Dev(kDevPush));
     const uint64_t finish = uint64_t(data) + size;
+#if TCNYC_DEV_TOOLS
+    g_up_ctx = &ctx;
+#endif
     if (size >= 4 && finish <= 0x100000000ull) RunCommands(data, uint32_t(finish - 4));
+#if TCNYC_DEV_TOOLS
+    g_up_ctx = nullptr;
+#endif
     return 0;
 }
 
@@ -2032,7 +2174,13 @@ HLE_STDCALL(D3DDevice_End, 0) {
     XDK_REQUIRE("d3d", XDK_KEY(CDevice_Flags));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
+#if TCNYC_DEV_TOOLS
+    g_up_ctx = &ctx;
+#endif
     EndPrimitive();
+#if TCNYC_DEV_TOOLS
+    g_up_ctx = nullptr;
+#endif
     SetDev(XDK_CDevice_Flags, Dev(XDK_CDevice_Flags) & ~0x1800u);
     return 0;
 }
