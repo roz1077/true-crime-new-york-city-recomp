@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -111,6 +112,31 @@ inline void SnapshotCamera(uint64_t present) {
 inline CameraFrame CameraOf(uint64_t present) {
     std::lock_guard lock(g_camera_mutex);
     return g_camera_frames[present % 8];
+}
+// AO's flat-wall test needs the world's up axis in view space. The camera never rolls, so the
+// view row that maps the world's up axis lies in the view's vertical plane; latch that axis from
+// the first near-level camera rather than assuming the title's world is Y-up. Returns false until
+// a camera has been seen (the caller then falls back to view Y).
+inline bool ViewUpInView(const CameraFrame& cam, int& axis, float (&up)[3]) {
+    if (!cam.serial) return false;
+    if (axis < 0) {
+        float best = 0.8f;
+        for (int k = 0; k < 3; k++) {
+            const float y = std::abs(cam.view[k * 4 + 1]);
+            if (y > best) {
+                best = y;
+                axis = k;
+            }
+        }
+        if (axis < 0) return false;  // the camera is pitched too far to tell, try again next frame
+    }
+    const float x = cam.view[axis * 4], y = cam.view[axis * 4 + 1], z = cam.view[axis * 4 + 2];
+    const float len = std::sqrt(x * x + y * y + z * z);
+    if (!(len > 0.1f)) return false;
+    up[0] = x / len;
+    up[1] = y / len;
+    up[2] = z / len;
+    return true;
 }
 
 

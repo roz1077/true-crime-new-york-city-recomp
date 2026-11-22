@@ -208,9 +208,21 @@ tuning switches need a developer build (`build-dev.bat`); release builds ignore 
 | `TCNYC_SCENE_FP16=0` | The original 8-bit scene colour instead of FP16. |
 | `TCNYC_PIPELINE_CACHE=0` | Do not load or save the pipeline cache. |
 | `TCNYC_PIPELINE_WARM=0` | Do not pre-build saved pipelines at start. |
+| `TCNYC_PIPELINE_ASYNC=0` | Compile a shader or build a pipeline first seen during play in the draw, as before. By default both run on a worker and that one draw is skipped. |
 | `TCNYC_DRAW_WORKER=0` | Linux: record the scene on the render thread only, without the second recording thread. |
 | `TCNYC_TAA_VIEW` | `1` or `2`: show TAA's motion instead of the picture; `3`: where motion is missing (red) and the HUD (green). |
 | `TCNYC_TRACE_TAA=1` | Log TAA's camera and reset decisions. |
+| `TCNYC_AO_VIEW=1` | Show the AO factor as greyscale on receivers; useful for diagnosing AO band edges. |
+| `TCNYC_PROFILE_AO=1` | Windows D3D12: log AO cost every 120 frames that ran AO: frame wall time, the frame's GPU span, GPU ms for the AO prepass, horizon, temporal and resolve passes, flushes per frame and CPU ms in the AO flush path. |
+| `TCNYC_AO_SAMPLES=N` | Force the AO prepass sample count (default 1; higher is the old multisampled prepass). |
+| `TCNYC_AO_BLUR_DEPTH=N` | AO resolve depth tolerance (default 50; lower softens across depth breaks). |
+| `TCNYC_AO_BLUR_TAPS=N` | AO resolve width in texels (default 4 = 5x5; up to 8 = 9x9; wider trades sharpness for banding). |
+| `TCNYC_AO_THIN=1` | Enable the isolated-depth-sample rejection experiment (off by default). |
+| `TCNYC_AO_FLAT=1` | Enable the derivative normal on flat surfaces experiment (off by default). |
+| `TCNYC_AO_RADIUS=N` | AO contact radius (default 0.75; lower keeps bands off flat walls). |
+| `TCNYC_AO_STRENGTH=N` | AO strength (default 1.0; lower reduces band contrast). |
+| `TCNYC_AO_FLATS=0` | Turn off the vertical-surface AO reduction (walls, signs and billboards otherwise keep only `TCNYC_AO_WALL` of their AO). |
+| `TCNYC_AO_WALL=N` | Fraction of AO kept on vertical surfaces (default 0.5; 0 hides it, 1 restores the old look). |
 | `XBE_D3D12_DEBUG=1` | Windows: the Direct3D 12 debug layer (needs the Windows "Graphics Tools" optional feature). |
 
 ## Reporting a problem

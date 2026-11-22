@@ -641,7 +641,7 @@ const char *Label(Row row) {
     case Row::DepthOfField:
         return "Depth of field";
     case Row::AmbientOcclusion:
-        return "Ambient occlusion";
+        return "Ambient occlusion (Experimental)";
     case Row::AoQuality:
         return "Occlusion quality";
     case Row::BuildingSeamFix:
@@ -802,8 +802,9 @@ const char *Help(Row row) {
     case Row::DepthOfField:
         return "Adds distance blur to the finished 3D frame.";
     case Row::AmbientOcclusion:
-        return "Depth-based ambient occlusion. SSAO is a little cheaper but grainier; GTAO is the higher quality. "
-               "Set the resolution with Occlusion quality.";
+        return "Experimental. Depth-based ambient occlusion. SSAO is cheaper but grainier; GTAO is higher quality. "
+               "Walls, signs and billboards keep half their AO, which softens the moving band edge there; floors, "
+               "roads, props and characters keep all of theirs. Set the resolution with Occlusion quality.";
     case Row::AoQuality:
         return "Resolution of the ambient occlusion. Half is cheaper and softer; Full is sharper. Kept while occlusion is off.";
     case Row::BuildingSeamFix:

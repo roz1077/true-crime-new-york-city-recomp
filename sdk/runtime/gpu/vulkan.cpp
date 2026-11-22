@@ -508,6 +508,16 @@ static uint32_t PickSampleCount(uint32_t requested, uint32_t supported_mask) {
     return 1;
 }
 
+// AO is low frequency and its horizon reads one depth sample. A multisampled prepass can put a
+// different triangle's sample-0 depth on either side of a coplanar seam, leaving a dark AO line on
+// a flat wall (worst with MSAA). One sample is enough; TCNYC_AO_SAMPLES=N restores multisampling.
+static uint32_t PickAoSampleCount(uint32_t requested, uint32_t supported_mask) {
+    uint32_t forced = 1;
+    if (const char* e = DevEnv("TCNYC_AO_SAMPLES"); e && *e)
+        forced = std::max(1u, uint32_t(std::strtoul(e, nullptr, 10)));
+    return forced <= 1 ? 1 : PickSampleCount(std::min(requested, forced), supported_mask);
+}
+
 // the projection's near and far clip w, as D3DDevice_SetTransform finds them (mirrors d3d12.cpp)
 struct WRange {
     float near_w;
@@ -963,9 +973,10 @@ private:
     VkShaderModule CompileShader(const std::string& src, shaderc_shader_kind kind, const char* entry);
     VkShaderModule GeometryShaderFor(bool points, bool sprite);
     // prev: TAA's variant that also runs the program on the previous frame's constants (binding 10)
+    // async: a first-seen scene shader may be compiled on the worker; null means the draw waits.
     VkShaderModule VertexShaderFor(const State& s, const Assembled& a, bool prog, bool sprite, uint64_t& key,
-                                   bool prev = false);
-    VkShaderModule PixelShaderFor(const PixelKey& pk, uint64_t& key);
+                                   bool prev = false, bool async = false);
+    VkShaderModule PixelShaderFor(const PixelKey& pk, uint64_t& key, bool async = false);
     bool CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps, VkPipeline& out,
                         VkRenderPass pass_override = VK_NULL_HANDLE);
 
@@ -1127,8 +1138,45 @@ private:
     void RecordPipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps);
     void StartPipelineWarm();
     void StopPipelineWarm();
+    void WaitPipelineWarm();
     void WarmPipelines();
     VkPipeline TakeWarmPipeline(const PsoKey& k);
+    // A draw state first seen during play. Building its pipeline on the render thread is the hitch
+    // this queue exists to avoid: a worker builds it from the already made shader modules and the
+    // draw that needs it is skipped until the next frame. TCNYC_PIPELINE_ASYNC=0 disables it.
+    struct ScenePipelineJob {
+        PsoKey key;
+        VkShaderModule vs = VK_NULL_HANDLE, ps = VK_NULL_HANDLE;
+        VkRenderPass pass = VK_NULL_HANDLE;  // made on the render thread, as in the startup warm
+    };
+    struct SceneShaderJob {
+        std::string source;  // VulkanShaderSource's output, already injected
+        uint64_t spv_key = 0;
+        shaderc_shader_kind kind = shaderc_vertex_shader;
+    };
+    std::deque<ScenePipelineJob> scene_jobs_;       // guarded by scene_mutex_
+    std::deque<SceneShaderJob> scene_shader_jobs_;  // guarded by scene_mutex_
+    std::mutex scene_mutex_;
+    std::condition_variable scene_cv_;
+    std::vector<std::thread> scene_threads_;
+    std::unordered_set<PsoKey, PsoKeyHash> scene_pending_;
+    std::unordered_set<PsoKey, PsoKeyHash> scene_failed_;
+    std::unordered_set<uint64_t> scene_shader_pending_;
+    std::unordered_set<uint64_t> scene_shader_failed_;
+    bool scene_stop_ = false;  // guarded by scene_mutex_
+    bool scene_async_ = true;
+    std::atomic<bool> scene_started_{false};
+    // pixel draw keys the worker is still compiling (render-thread only); a vertex shader has no
+    // fallback path, so its draw simply retries next frame
+    std::unordered_set<uint64_t> pending_scene_ps_;
+    bool ScheduleScenePipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps);
+    bool CompileSceneShaderAsync(const std::string& src, shaderc_shader_kind kind, const char* entry,
+                                 uint64_t& spv_key);
+    bool ScenePixelPending(uint64_t key) const { return pending_scene_ps_.count(key) != 0; }
+    void StartSceneWarm();
+    void StopSceneWarm();
+    void SceneWarmWorker();
+    bool ScenePipelineFailed(const PsoKey& k);
     VkResult CreatePipelines(uint32_t count, const VkGraphicsPipelineCreateInfo* info,
                              const VkAllocationCallbacks* alloc, VkPipeline* out);
     VkQueue queue_ = VK_NULL_HANDLE, present_queue_ = VK_NULL_HANDLE;
@@ -1265,6 +1313,7 @@ private:
     // cache is dropped with the frame and whenever an AO image (and so a view handle) is destroyed.
     std::pair<VkImageView, VkDescriptorSet> ao_occ_cached_[2]{};
     uint32_t ao_mode_ = 0;  // app::Snapshot().ao latched for the frame
+    int ao_up_axis_ = -1;   // the world's up axis, latched for the flat-wall test
     Target* defer_rt_ = nullptr;
     Target* defer_ds_ = nullptr;
     std::vector<DeferredDraw> deferred_;
@@ -1328,7 +1377,8 @@ private:
     void StartAoWarm();
     void StopAoWarm();
     void AoWarmWorker();
-    VkShaderModule AcquireSpvModule(const std::string& source, uint64_t spv_key);
+    VkShaderModule AcquireSpvModule(const std::string& source, uint64_t spv_key,
+                                    shaderc_shader_kind kind = shaderc_fragment_shader);
     PsoKey AoDepthPsoKey(const PsoKey& k, uint64_t ps, uint32_t ao_samples);
 
     std::unordered_map<uint64_t, VkShaderModule> vs_cache_, ps_cache_;
@@ -2229,7 +2279,9 @@ void VulkanBackend::SavePipelineCache(bool force) {
 namespace {
 constexpr uint64_t kPipelineKeysMagic = 0x325359454B4F5350ull;  // "PSOKEYS2" (2: optimised SPIR-V)
 constexpr size_t kMaxSavedPipelines = 8192;  // kept on disk
-constexpr size_t kMaxWarmPipelines = 4096;   // built at start, the oldest first
+// Build every saved key at start. The old 4096 cap left the newest states out, so exactly the
+// effects and late areas a player reaches after the cap were built in a draw on every launch.
+constexpr size_t kMaxWarmPipelines = kMaxSavedPipelines;
 struct PipelineKeysHeader {
     uint64_t magic, entry, size, checksum;  // entry: the record size, so another layout's file is ignored
 };
@@ -2304,13 +2356,22 @@ void VulkanBackend::SaveSavedPipelines(bool force) {
 void VulkanBackend::StartPipelineWarm() {
     LoadSavedPipelines();
     if (const char* e = std::getenv("TCNYC_PIPELINE_WARM"); e && std::strcmp(e, "0") == 0) return;
+    // The point/line geometry shaders are static. Make them here, on the render thread, so the warm
+    // threads only copy the cached handles instead of calling the shader compiler concurrently.
+    if (geometry_) {
+        GeometryShaderFor(true, false);
+        GeometryShaderFor(true, true);
+        GeometryShaderFor(false, false);
+    }
+    // Points and lines cannot be built on a worker if their geometry shader failed to compile.
+    const bool geo_ready = !geometry_ || (geo_point_ && geo_sprite_ && geo_line_);
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(physical_, &props);
     const VkSampleCountFlags ms_ok =
         props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts;
     for (const SavedPipeline& p : saved_pipelines_) {
         const PsoKey& k = p.key;
-        if (k.topo == 0 || k.topo == 1) continue;  // points and lines add a geometry shader, made on demand
+        if (geometry_ && (k.topo == 0 || k.topo == 1) && !geo_ready) continue;
         if (k.samples > 1 && !(ms_ok & k.samples)) continue;
         const VkRenderPass pass = k.samples > 1 ? RenderPassForMs(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.samples,
                                                                   k.motion != 0)
@@ -2327,11 +2388,17 @@ void VulkanBackend::StartPipelineWarm() {
     for (uint32_t i = 0; i < threads; i++) warm_threads_.emplace_back([this] { WarmPipelines(); });
 }
 
-void VulkanBackend::StopPipelineWarm() {
-    warm_stop_ = true;
+// Join the warm threads without asking them to stop: startup uses this to finish the saved set
+// before the game runs. StopPipelineWarm sets the stop flag first, for exit.
+void VulkanBackend::WaitPipelineWarm() {
     for (auto& t : warm_threads_)
         if (t.joinable()) t.join();
     warm_threads_.clear();
+}
+
+void VulkanBackend::StopPipelineWarm() {
+    warm_stop_ = true;
+    WaitPipelineWarm();
 }
 
 // shuffle the background warm out of the render thread's way (unprivileged: only raise niceness)
@@ -2413,6 +2480,163 @@ VkPipeline VulkanBackend::TakeWarmPipeline(const PsoKey& k) {
     return pipe;
 }
 
+// A draw state first seen during play is built here, on a worker, instead of in the draw. The
+// render thread records the key immediately so the next start warms it even if this run ends (or
+// the build fails) before the pipeline is published.
+bool VulkanBackend::ScenePipelineFailed(const PsoKey& k) {
+    std::lock_guard lock(scene_mutex_);
+    return scene_failed_.count(k) != 0;
+}
+
+namespace {
+std::string VulkanShaderSource(const std::string& src, shaderc_shader_kind kind, const char* entry,
+                               uint64_t& cache_key);
+}  // namespace
+
+// A first-seen scene shader is compiled on the worker. false means CompileShader should run on the
+// render thread: async is off, the module or its .spv is already waiting, or the compile failed.
+bool VulkanBackend::CompileSceneShaderAsync(const std::string& src, shaderc_shader_kind kind, const char* entry,
+                                            uint64_t& spv_key) {
+    if (!scene_async_) return false;
+    const std::string source = VulkanShaderSource(src, kind, entry, spv_key);
+    if (PeekWarmModule(spv_key) != VK_NULL_HANDLE) return false;
+    const std::filesystem::path cached = SpvCachePath(spv_key);
+    std::error_code ec;
+    if (!cached.empty() && std::filesystem::is_regular_file(cached, ec)) return false;
+    {
+        std::lock_guard lock(scene_mutex_);
+        if (scene_stop_ || scene_shader_failed_.count(spv_key)) return false;
+        if (!scene_shader_pending_.insert(spv_key).second) return true;  // already queued, or being built
+        if (scene_shader_jobs_.size() + scene_jobs_.size() >= 256) {
+            scene_shader_pending_.erase(spv_key);
+            return false;
+        }
+        SceneShaderJob job;
+        job.source = source;
+        job.spv_key = spv_key;
+        job.kind = kind;
+        scene_shader_jobs_.push_back(std::move(job));
+    }
+    scene_cv_.notify_one();
+    StartSceneWarm();
+    return true;
+}
+
+bool VulkanBackend::ScheduleScenePipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps) {
+    if (!scene_async_) return false;
+    // A worker must not call the shader compiler: the geometry shader for points and lines has to
+    // be ready already, or the draw falls back to the synchronous path.
+    if (geometry_ && (k.topo == 0 || k.topo == 1)) {
+        const VkShaderModule gs = k.topo == 0 ? (k.sprite ? geo_sprite_ : geo_point_) : geo_line_;
+        if (!gs) return false;
+    }
+    // Render passes are made on the render thread, as for the startup warm: RenderPassFor mutates
+    // a shared map that no worker may touch.
+    const VkRenderPass pass =
+        k.samples > 1 ? RenderPassForMs(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.samples, k.motion != 0)
+                      : RenderPassFor(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.motion != 0);
+    if (!pass) return false;
+    {
+        std::lock_guard lock(scene_mutex_);
+        if (scene_stop_ || scene_failed_.count(k)) return false;
+        if (!scene_pending_.insert(k).second) return true;  // already queued, or being built
+        if (scene_jobs_.size() >= 256) {  // do not let a state storm skip the whole world
+            scene_pending_.erase(k);
+            return false;
+        }
+        ScenePipelineJob job;
+        job.key = k;
+        job.vs = vs;
+        job.ps = ps;
+        job.pass = pass;
+        scene_jobs_.push_back(job);
+    }
+    RecordPipeline(k, vs, ps);
+    scene_cv_.notify_one();
+    StartSceneWarm();
+    return true;
+}
+
+void VulkanBackend::StartSceneWarm() {
+    if (scene_started_.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(scene_mutex_);
+    if (scene_threads_.empty() && !scene_stop_) {
+        const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+        const uint32_t threads = cores >= 8 ? 2 : 1;  // two shader compiles in parallel on a desktop
+        for (uint32_t i = 0; i < threads; i++) scene_threads_.emplace_back([this] { SceneWarmWorker(); });
+        LOGR("vulkan: shader/pipeline build worker started on %u threads", threads);
+    }
+    scene_started_.store(true, std::memory_order_release);
+}
+
+void VulkanBackend::StopSceneWarm() {
+    {
+        std::lock_guard lock(scene_mutex_);
+        scene_stop_ = true;
+        scene_jobs_.clear();
+        scene_shader_jobs_.clear();
+        scene_pending_.clear();
+        scene_shader_pending_.clear();
+    }
+    scene_cv_.notify_all();
+    for (auto& t : scene_threads_)
+        if (t.joinable()) t.join();
+    scene_threads_.clear();
+}
+
+// Workers, below normal priority: the render thread's own work always wins. Shader jobs run first:
+// they unblock draws, and a pipeline job is only queued once both of its modules exist.
+// CreatePipelines takes the pipeline cache's shared lock, so the cache save cannot read it mid-change.
+void VulkanBackend::SceneWarmWorker() {
+    t_warm_thread = true;
+    LowerThreadPriority();
+    for (;;) {
+        SceneShaderJob shader;
+        ScenePipelineJob pipeline;
+        bool has_shader = false, has_pipeline = false;
+        {
+            std::unique_lock lock(scene_mutex_);
+            scene_cv_.wait(lock, [this] {
+                return scene_stop_ || !scene_shader_jobs_.empty() || !scene_jobs_.empty();
+            });
+            if (!scene_shader_jobs_.empty()) {
+                shader = std::move(scene_shader_jobs_.front());
+                scene_shader_jobs_.pop_front();
+                has_shader = true;
+            } else if (!scene_jobs_.empty()) {
+                pipeline = scene_jobs_.front();
+                scene_jobs_.pop_front();
+                has_pipeline = true;
+            } else {
+                if (scene_stop_) return;
+                continue;
+            }
+        }
+        if (has_shader) {
+            const VkShaderModule module = AcquireSpvModule(shader.source, shader.spv_key, shader.kind);
+            std::lock_guard lock(scene_mutex_);
+            scene_shader_pending_.erase(shader.spv_key);
+            if (module == VK_NULL_HANDLE) scene_shader_failed_.insert(shader.spv_key);
+            continue;
+        }
+        if (!has_pipeline) continue;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        const bool ok = CreatePipeline(pipeline.key, pipeline.vs, pipeline.ps, pipe, pipeline.pass);
+        if (ok) {
+            std::lock_guard lock(warm_mutex_);
+            if (!warm_pipelines_.emplace(pipeline.key, pipe).second) vkDestroyPipeline(device_, pipe, nullptr);
+        } else {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                LOGE("vulkan: async pipeline build failed for state %016llX; that draw builds it in place",
+                     static_cast<unsigned long long>(Hash(&pipeline.key, sizeof(pipeline.key))));
+        }
+        std::lock_guard lock(scene_mutex_);
+        scene_pending_.erase(pipeline.key);
+        if (!ok) scene_failed_.insert(pipeline.key);
+    }
+}
+
 // A compiled module the warm threads decoded from the SPIR-V cache, handed to CompileShader so
 // the render thread does not open the file and create the module again.
 VkShaderModule VulkanBackend::TakeWarmModule(uint64_t key) {
@@ -2461,6 +2685,8 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     aniso_setting_ = app::Snapshot().aniso;
     aspect_ = app::AspectRatio();
     perf_ = std::getenv("TCNYC_PERF") != nullptr;
+    if (const char* view = std::getenv("TCNYC_AO_VIEW"); view && *view && std::atoi(view) != 0)
+        g_ao_debug_view = true;
     // testing only: no occlusion set can be bound, to exercise the non-AO receiver fallback
     ao_fail_test_ = DevEnv("TCNYC_AO_FAIL_TEST") != nullptr;
     trace_ = std::getenv("TCNYC_TRACE") != nullptr;
@@ -2701,7 +2927,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     VkPipelineLayoutCreateInfo apl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     apl.setLayoutCount = 1;
     apl.pSetLayouts = &ao_set_layout_;
-    VkPushConstantRange aoPush{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};  // src + ao/planes
+    VkPushConstantRange aoPush{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48};  // src + ao/planes + up
     apl.pushConstantRangeCount = 1;
     apl.pPushConstantRanges = &aoPush;
     if (vkCreatePipelineLayout(device_, &apl, nullptr, &ao_pipeline_layout_) != VK_SUCCESS) return false;
@@ -2728,15 +2954,21 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     if (!CreatePresent()) return false;
     if (ao_mode_) {
         LOGR("vulkan: preparing ambient occlusion shaders");
-        const bool ready = EnsureAoPipelines(PickSampleCount(msaa_, ao_color_samples_) > 1);
+        const bool ready = EnsureAoPipelines(PickAoSampleCount(msaa_, ao_color_samples_) > 1);
         LOGR("vulkan: ambient occlusion shader preparation %s", ready ? "complete" : "incomplete");
     }
+    if (const char* e = std::getenv("TCNYC_PIPELINE_ASYNC"); e && std::strcmp(e, "0") == 0) scene_async_ = false;
     StartPipelineWarm();  // needs the pipeline layout and the depth format
+    // Build every saved pipeline before the game can draw with a state that is not ready yet. With
+    // a valid pipeline cache this is a few hundred milliseconds; after a driver update it is the
+    // one-time cost of compiling the whole saved set, instead of a hitch when each state appears.
+    WaitPipelineWarm();
     // the game ends through kernel::Shutdown, which skips Shutdown() here: save the caches there
     g_exit_backend = this;
     kernel::SetExitSave([] {
         if (VulkanBackend* b = g_exit_backend.load()) {
             b->StopAoWarm();       // no worker may build a pipeline while the caches are serialized
+            b->StopSceneWarm();
             b->StopPipelineWarm();  // and the pipeline cache must not be read while it is changed
             b->SavePipelineCache(true);
             b->SaveSavedPipelines(true);
@@ -4109,6 +4341,7 @@ float4 psmain(O i) : SV_Target {
 void VulkanBackend::Shutdown() {
     g_exit_backend = nullptr;
     StopAoWarm();
+    StopSceneWarm();
     StopPipelineWarm();
     FlushSpvCacheWrites();
     // modules the warm threads left for the render thread were never taken: safe to destroy now,
@@ -5206,7 +5439,7 @@ bool VulkanBackend::EnsureAoHalf(uint32_t w, uint32_t h) {
         ao_half_fb_ = VK_NULL_HANDLE;
         DestroyAoImage(ao_half_);
     }
-    if (!CreateAoImage(ao_half_, aw, ah, VK_FORMAT_R8_UNORM, 1,
+    if (!CreateAoImage(ao_half_, aw, ah, VK_FORMAT_R16_UNORM, 1,
                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
         return false;
@@ -5222,7 +5455,7 @@ bool VulkanBackend::EnsureAoOcc(uint32_t w, uint32_t h) {
         ao_occ_fb_ = VK_NULL_HANDLE;
         DestroyAoImage(ao_occ_);
     }
-    if (!CreateAoImage(ao_occ_, w, h, VK_FORMAT_R8_UNORM, 1,
+    if (!CreateAoImage(ao_occ_, w, h, VK_FORMAT_R16_UNORM, 1,
                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
         return false;
@@ -5236,7 +5469,7 @@ bool VulkanBackend::EnsureAoZero(uint32_t w, uint32_t h) {
         EndRecord(true);
         DestroyAoImage(ao_zero_);
     }
-    if (!CreateAoImage(ao_zero_, w, h, VK_FORMAT_R8_UNORM, 1,
+    if (!CreateAoImage(ao_zero_, w, h, VK_FORMAT_R16_UNORM, 1,
                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return false;
     // A receiver recorded with ao = 1 must still have a real, full-size t4. A 1x1 image would
@@ -5309,7 +5542,7 @@ VkRenderPass VulkanBackend::AoPrepassPass(uint32_t samples) {
 VkRenderPass VulkanBackend::AoColorPass() {
     if (ao_color_pass_) return ao_color_pass_;
     VkAttachmentDescription att{};
-    att.format = VK_FORMAT_R8_UNORM;
+    att.format = VK_FORMAT_R16_UNORM;
     att.samples = VK_SAMPLE_COUNT_1_BIT;
     att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -5499,7 +5732,8 @@ void VulkanBackend::DumpAoProbe(AoImage& image) {
         ao_dist_probed_ = true;
     else
         ao_probed_ = true;
-    const uint64_t bytes = uint64_t(image.w) * image.h * (dist ? 4 : 1);
+    const bool ao16 = !dist && image.format == VK_FORMAT_R16_UNORM;
+    const uint64_t bytes = uint64_t(image.w) * image.h * (dist ? 4 : ao16 ? 2 : 1);
     EndRecord(true);
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -5528,6 +5762,12 @@ void VulkanBackend::DumpAoProbe(AoImage& image) {
                 // Near geometry white, the 1e30 clear black; enough to see the prepass coverage.
                 px[i] = uint8_t(std::clamp(1.0f - src[i] / 50.0f, 0.0f, 1.0f) * 255.0f);
             }
+            std::fwrite(px.data(), 1, px.size(), f);
+        } else if (ao16) {
+            const uint16_t* src = static_cast<const uint16_t*>(map);
+            const size_t n = size_t(image.w) * image.h;
+            std::vector<uint8_t> px(n);
+            for (size_t i = 0; i < n; i++) px[i] = uint8_t(src[i] >> 8);
             std::fwrite(px.data(), 1, px.size(), f);
         } else {
             std::fwrite(map, 1, size_t(image.w) * image.h, f);
@@ -5713,7 +5953,7 @@ void VulkanBackend::FlushDeferredScene(std::source_location where) {
         receiver_draws = receiver_draws || d.receiver;
     }
     if (ao_mode_ != 0 && rt && ds && receivers) {
-        const uint32_t ao_samples = PickSampleCount(rt->samples, ao_color_samples_);
+        const uint32_t ao_samples = PickAoSampleCount(rt->samples, ao_color_samples_);
         const bool depth_ms = ao_samples > 1;
         const bool zero_ok = EnsureAoZero(rt->w, rt->h);
         const bool ready = zero_ok && EnsureAoDepth(rt->w, rt->h, ao_samples) && EnsureAoHalf(rt->w, rt->h) &&
@@ -5807,9 +6047,17 @@ void VulkanBackend::FlushDeferredScene(std::source_location where) {
                     const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
                     if (fov > 1.0f && fov < 179.0f && aspect > 0.1f)
                         tan_half_fov = std::tan(fov * 3.14159265f / 360.0f) / aspect;
-                    const float push[8] = {1.0f / float(std::max(1u, ao_dist_.w)),
-                                           1.0f / float(std::max(1u, ao_dist_.h)), 0.0f, kAoDistClear,
-                                           kAoStrength, kAoRadius, tan_half_fov, aspect};
+                    // the world's up axis in view space, for the flat-wall test; view Y until a camera is seen
+                    float up[3] = {0, 1, 0};
+                    const int up_axis_before = ao_up_axis_;
+                    ViewUpInView(CameraOf(frames_ + 8 - 1), ao_up_axis_, up);
+                    if (up_axis_before < 0 && ao_up_axis_ >= 0)
+                        LOGR("vulkan: AO flat-wall up is world axis %d, view (%.3f %.3f %.3f)", ao_up_axis_,
+                             up[0], up[1], up[2]);
+                    const float push[12] = {1.0f / float(std::max(1u, ao_dist_.w)),
+                                            1.0f / float(std::max(1u, ao_dist_.h)), 0.0f, kAoDistClear,
+                                            kAoStrength, kAoRadius, tan_half_fov, aspect,
+                                            up[0], up[1], up[2], 1.0f - AoWallKeep()};
                     vkCmdPushConstants(cmd_, ao_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
                     VkViewport vp{0, 0, float(ao_half_.w), float(ao_half_.h), 0, 1};
                     VkRect2D sc{{0, 0}, {ao_half_.w, ao_half_.h}};
@@ -6144,7 +6392,7 @@ void VulkanBackend::ScheduleAoVariants(const PixelKey& base, const PsoKey& k, Vk
     if (k.topo == 0 || k.topo == 1) return;  // points and lines add the geometry shader path
     const uint64_t base_hash = Hash(&base, sizeof(base));
     AoWarmJob job;
-    const uint32_t ao_samples = PickSampleCount(k.samples, ao_color_samples_);
+    const uint32_t ao_samples = PickAoSampleCount(k.samples, ao_color_samples_);
     if (color) job.color_id = AoVariantId(k, base_hash);
     if (depth) {
         PixelKey depth_pixel = base;
@@ -6243,11 +6491,12 @@ void VulkanBackend::StopAoWarm() {
     ao_threads_.clear();
 }
 
-// Worker-side module fetch for a scheduled AO variant: the shared warm cache, the disk cache, or
-// a compile with this thread's own shaderc state. The source and cache key were made on the
-// render thread, so this cannot derive a different variant than the draw path will ask for. The
-// module is published for the render thread's CompileShader (which otherwise re-reads the .spv).
-VkShaderModule VulkanBackend::AcquireSpvModule(const std::string& source, uint64_t spv_key) {
+// Worker-side module fetch: the shared warm cache, the disk cache, or a compile with this thread's
+// own shaderc state. The source and cache key were made on the render thread, so this cannot
+// derive a different variant than the draw path will ask for. The module is published for the
+// render thread's CompileShader (which otherwise re-reads the .spv).
+VkShaderModule VulkanBackend::AcquireSpvModule(const std::string& source, uint64_t spv_key,
+                                               shaderc_shader_kind kind) {
     if (VkShaderModule module = PeekWarmModule(spv_key)) return module;
     const std::filesystem::path cache_path = SpvCachePath(spv_key);
     if (VkShaderModule module = LoadSpirv(device_, cache_path))
@@ -6255,20 +6504,23 @@ VkShaderModule VulkanBackend::AcquireSpvModule(const std::string& source, uint64
     auto& compiler = ThreadShaderCompiler();
     if (!compiler.compiler || !compiler.options) return VK_NULL_HANDLE;
     const auto started = std::chrono::steady_clock::now();
-    shaderc_compilation_result_t result = shaderc_compile_into_spv(
-        compiler.compiler, source.data(), source.size(), shaderc_fragment_shader, "tcnyc", "main", compiler.options);
+    shaderc_compilation_result_t result =
+        shaderc_compile_into_spv(compiler.compiler, source.data(), source.size(), kind, "tcnyc", "main",
+                                 compiler.options);
     if (!result) return VK_NULL_HANDLE;
     const double compile_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     if (shaderc_result_get_compilation_status(result) != shaderc_compilation_status_success) {
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
-            LOGE("vulkan: AO pixel variant failed: %s", shaderc_result_get_error_message(result));
+            LOGE("vulkan: async shader failed: %s", shaderc_result_get_error_message(result));
         shaderc_result_release(result);
         return VK_NULL_HANDLE;
     }
     if (compile_ms >= 50.0)
-        LOGR("vulkan: AO pixel variant compiled in %.1f ms (%zu bytes)", compile_ms, source.size());
+        LOGR("vulkan: %s main compiled in %.1f ms (%zu bytes, async)",
+             kind == shaderc_vertex_shader ? "vertex" : kind == shaderc_geometry_shader ? "geometry" : "pixel",
+             compile_ms, source.size());
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     info.codeSize = shaderc_result_get_length(result);
     info.pCode = reinterpret_cast<const uint32_t*>(shaderc_result_get_bytes(result));
@@ -6282,7 +6534,7 @@ VkShaderModule VulkanBackend::AcquireSpvModule(const std::string& source, uint64
     }
     shaderc_result_release(result);
     if (r != VK_SUCCESS) {
-        LOGE("vulkan: AO shader module creation failed: %s", VkError(r));
+        LOGE("vulkan: async shader module creation failed: %s", VkError(r));
         return VK_NULL_HANDLE;
     }
     return PublishWarmModule(spv_key, module);
@@ -6389,7 +6641,7 @@ void main(point VOut v[1], inout TriangleStream<VOut> strip) {
 }
 
 VkShaderModule VulkanBackend::VertexShaderFor(const State& s, const Assembled& a, bool prog, bool sprite,
-                                              uint64_t& key, bool prev) {
+                                              uint64_t& key, bool prev, bool async) {
     prev = prev && prog;
     // key by what the source is built from, not by the source text: generating and hashing the HLSL for every draw
     // is far too slow with ~1500 draws a frame. The string is only built on a cache miss.
@@ -6426,6 +6678,8 @@ VkShaderModule VulkanBackend::VertexShaderFor(const State& s, const Assembled& a
         const size_t at = src.find(tail);
         if (at != std::string::npos) src.insert(at + std::strlen(tail), kDepthScale);
     }
+    uint64_t spv_key = 0;
+    if (async && CompileSceneShaderAsync(src, shaderc_vertex_shader, "main", spv_key)) return VK_NULL_HANDLE;
     VkShaderModule module = CompileShader(src, shaderc_vertex_shader, "main");
     if (module) {
         vs_cache_[key] = module;
@@ -6433,10 +6687,19 @@ VkShaderModule VulkanBackend::VertexShaderFor(const State& s, const Assembled& a
     return module;
 }
 
-VkShaderModule VulkanBackend::PixelShaderFor(const PixelKey& pk, uint64_t& key) {
+VkShaderModule VulkanBackend::PixelShaderFor(const PixelKey& pk, uint64_t& key, bool async) {
     key = Hash(&pk, sizeof(pk));
-    if (auto it = ps_cache_.find(key); it != ps_cache_.end()) return it->second;
+    if (auto it = ps_cache_.find(key); it != ps_cache_.end()) {
+        pending_scene_ps_.erase(key);
+        return it->second;
+    }
     const std::string src = PixelHlsl(pk);
+    uint64_t spv_key = 0;
+    if (async && CompileSceneShaderAsync(src, shaderc_fragment_shader, "main", spv_key)) {
+        pending_scene_ps_.insert(key);
+        return VK_NULL_HANDLE;
+    }
+    pending_scene_ps_.erase(key);
     VkShaderModule module = CompileShader(src, shaderc_fragment_shader, "main");
     if (module) {
         ps_cache_[key] = module;
@@ -8556,7 +8819,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     const bool sprite = a.topology == Topology::Points && prog && s.rs[kRsPointSpriteEnable];
     const bool fixed_transform = !prog && !a.pretransformed;
     uint64_t vkey = 0;
-    VkShaderModule vs = VertexShaderFor(s, a, prog, sprite, vkey);
+    VkShaderModule vs = VertexShaderFor(s, a, prog, sprite, vkey, false, !a.pretransformed);
     if (!vs) return;
     splits.At("vertex shader lookup");
 
@@ -8625,8 +8888,10 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             if ((info[size_t(i)].flags & kTexTarget) && !info[size_t(i)].shadow) return true;
         return false;
     };
+    // a.topology is the mapped enum; the guest prim code (2 for a line list) is not it
+    const bool thin_prim = a.topology == Topology::Points || a.topology == Topology::Lines;
     const uint8_t ao_roles = ao_mode_ != 0 && scene_sized && !a.pretransformed && scene_view
-                                 ? AoRoles(s, samples_colour_rt())
+                                 ? AoRoles(s, samples_colour_rt(), thin_prim)
                                  : 0;
     // Other draws into the open scene list's own targets (screen-space and small-viewport effects
     // between world draws) join the list in order, without an AO role. Drawing them immediately
@@ -8699,7 +8964,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             }
             if (prev_consts) {
                 uint64_t mkey = 0;
-                VkShaderModule mvs = VertexShaderFor(s, a, prog, sprite, mkey, true);
+                VkShaderModule mvs = VertexShaderFor(s, a, prog, sprite, mkey, true, !a.pretransformed);
                 if (mvs) {
                     vs = mvs;
                     vkey = mkey;
@@ -8715,7 +8980,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     splits.At("pixel key");
     pk.quad = count <= 4 && !s.rs[kRsZEnable] && a.topology != Topology::Points;
     pk.motion = prev_consts ? 1 : 0;
-    if (!pk.motion && (fsr_on_ || dlss_on_) && pass_motion_ && SimpleState(s, kMBlendEnable) &&
+    // HUD marking applies to plain TAA too (taa_on_ covers TAA, FSR and DLSS): unmarked, HUD and
+    // menu boxes took the camera's motion and warped as it moved. The reactive mask stays FSR-only.
+    if (!pk.motion && taa_on_ && pass_motion_ && SimpleState(s, kMBlendEnable) &&
         SimpleState(s, kMSrcBlend) == 0x302 && !SimpleState(s, kMZWriteEnable) &&
         BlendOp(SimpleState(s, kMBlendOp)) == VK_BLEND_OP_ADD && (SimpleState(s, kMColorWriteEnable) & 0x010101)) {
         const uint32_t dst = SimpleState(s, kMDestBlend);
@@ -8798,14 +9065,15 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (ao_roles & kAoDepth) {
             PixelKey depth_pixel = pk_base;
             depth_pixel.motion = 0;
-            const uint32_t ao_samples = PickSampleCount(k.samples, ao_color_samples_);
+            const uint32_t ao_samples = PickAoSampleCount(k.samples, ao_color_samples_);
             const uint64_t id = AoVariantId(AoDepthPsoKey(k, 0, ao_samples), Hash(&depth_pixel, sizeof(depth_pixel)));
             ao_depth_pending = !AoDepthReady(id);
         }
     }
     pk.ao = ao_receiver ? 1 : 0;
     uint64_t pkey = 0;
-    VkShaderModule ps = PixelShaderFor(pk, pkey);
+    VkShaderModule ps = PixelShaderFor(pk, pkey, !a.pretransformed);
+    if (!ps && ScenePixelPending(pkey)) return;  // the worker is compiling it
     if (!ps && pk.motion) {
         LOG_FIRST(4, "vulkan: TAA motion pixel shader failed, drawing without motion");
         pk.motion = 0;
@@ -8815,13 +9083,15 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             ao_color_pending = true;
         }
         prev_consts = nullptr;
-        ps = PixelShaderFor(pk, pkey);
+        ps = PixelShaderFor(pk, pkey, !a.pretransformed);
+        if (!ps && ScenePixelPending(pkey)) return;
     }
     if (!ps && pk.ao) {
         // The AO variant failed to compile: draw the game's original shader.
         LOG_FIRST(4, "vulkan: AO pixel shader variant failed, drawing without AO");
         pk.ao = 0;
-        ps = PixelShaderFor(pk, pkey);
+        ps = PixelShaderFor(pk, pkey, !a.pretransformed);
+        if (!ps && ScenePixelPending(pkey)) return;
     }
     if (!ps) return;
     splits.At("pixel shader lookup");
@@ -8915,6 +9185,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             std::lock_guard lock(warm_mutex_);
             warm_skip_.insert(k);
         }
+        // A state first seen during play: build it on the async worker and skip this draw until
+        // the next frame. A failure or a full queue falls through to the synchronous build.
+        if (!a.pretransformed && !ScenePipelineFailed(k) && ScheduleScenePipeline(k, vs, ps)) return;
         if (!CreatePipeline(k, vs, ps, pipe)) return;
         pipelines_[k] = pipe;
         RecordPipeline(k, vs, ps);
@@ -8929,9 +9202,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         dpk.ao = 3;
         dpk.motion = 0;  // the prepass writes only the view distance
         uint64_t dkey = 0;
-        VkShaderModule dps = PixelShaderFor(dpk, dkey);
+        VkShaderModule dps = PixelShaderFor(dpk, dkey, !a.pretransformed);
         if (dps) {
-            const uint32_t ao_samples = PickSampleCount(rt->samples, ao_color_samples_);
+            const uint32_t ao_samples = PickAoSampleCount(rt->samples, ao_color_samples_);
             const PsoKey dk = AoDepthPsoKey(k, dkey, ao_samples);
             if (auto it = pipelines_.find(dk); it != pipelines_.end()) {
                 depth_pipe = it->second;

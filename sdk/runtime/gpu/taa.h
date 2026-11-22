@@ -144,6 +144,9 @@ float4 taa(O i) : SV_Target {
     // this frame shifted by its jitter: read it back where the pixel centre landed, so the blend does not wobble
     float3 c = cur.SampleLevel(ls, i.uv + px.xy, 0).rgb;
     if (z.w > 0) return float4(c, 1);
+    // A HUD pixel (marked by its draw) is kept exactly as drawn: the HUD is not jittered, so read it
+    // unshifted rather than through the jitter offset, which made it wobble by a fraction of a pixel.
+    if (flags.y < 0.5 && motionMetadata.Load(int3(ip, 0)).y == -2) return float4(cur.Load(int3(ip, 0)).rgb, 1);
     // the neighbourhood's mean and spread in YCoCg, and the nearest depth around (edges move with the nearer surface)
     float3 sum1 = 0, sum2 = 0;
     float near_depth = -1;

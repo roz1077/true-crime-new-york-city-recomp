@@ -303,10 +303,12 @@ constexpr uint32_t kFallbackSamplers = kSamplerCount - 4;
 constexpr uint32_t kRtvCount = 1024;
 constexpr uint32_t kDsvCount = 256;
 constexpr uint32_t kSmaaRtvs = 3;  // after the back buffers' views: SMAA edges, weights, output
-constexpr uint32_t kAoRtvs = 3;    // after SMAA: raw AO, full-size occlusion, prepass view distance
+constexpr uint32_t kAoRtvs = 6;    // raw AO, occlusion, distance, two AO+distance history pairs, AO motion
 constexpr uint32_t kAoRtv = kRtvCount + kFrames + kSmaaRtvs;
 constexpr uint32_t kAoOccRtv = kAoRtv + 1;
 constexpr uint32_t kAoDistRtv = kAoRtv + 2;
+constexpr uint32_t kAoHistRtv = kAoRtv + 3;  // + history index (0/1), RG16F: AO + view distance
+constexpr uint32_t kAoMotionRtv = kAoRtv + 5;  // temporal AO's own motion target, separate from TAA's
 // after AO: the bloom chain's four down levels (half to 1/16 size), then its three up levels (half to 1/8)
 constexpr uint32_t kBloomRtvs = 2 * kBloomLevels - 1;
 constexpr uint32_t kBloomRtv = kAoRtv + kAoRtvs;
@@ -337,7 +339,11 @@ constexpr DXGI_FORMAT kFsr3OutputFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 // hyperbolic depth back into distance with a guessed near/far: most draws are vertex programs
 // whose projection the port cannot see, and a wrong guess bent flat surfaces into stripes.
 constexpr DXGI_FORMAT kAoDistFormat = DXGI_FORMAT_R32_FLOAT;
-constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R8_UNORM;
+// R16, not R8: the AO factor is a smooth gradient over large surfaces, and 8-bit steps read as
+// banding once the scene is darkened by it (most visible at Half resolution).
+constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R16_UNORM;
+constexpr DXGI_FORMAT kAoHistFormat = DXGI_FORMAT_R16G16_FLOAT;  // temporal AO + view distance
+constexpr DXGI_FORMAT kAoMotionFormat = DXGI_FORMAT_R16G16_FLOAT;  // AO prepass motion vectors
 constexpr DXGI_FORMAT kBgra = DXGI_FORMAT_B8G8R8A8_UNORM;
 constexpr DXGI_FORMAT kSceneFp16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr uint32_t kQueries = 8192;  // occlusion queries in flight, several frames of counted draws
@@ -386,6 +392,7 @@ struct Perf {
     uint64_t texup_bytes = 0;
     uint64_t newtex = 0;
     uint64_t targets = 0;
+    uint64_t target_reuses = 0;  // EnsureTarget took a parked target instead of creating one
     uint64_t rtups = 0;
     uint64_t shrinks = 0;
     uint64_t syncs = 0;
@@ -1100,9 +1107,16 @@ private:
         ID3D12Resource* depth_write = nullptr;
         bool drew = false;
         bool opaque = false;  // an AO receiver: also recorded depth-only into the AO depth prepass
-        ComPtr<ID3D12GraphicsCommandList> depth_list;  // that prepass bundle, null when none
+        bool world = false;   // world geometry (AO receiver or depth writer), not an effect or HUD
+        // The AO depth prepass copies of this bundle's receivers, in draw order. A run's draws all
+        // write the same targets: distance only, or distance plus motion (temporal AO).
+        struct DepthRun {
+            ComPtr<ID3D12GraphicsCommandList> list;
+            bool motion = false;
+        };
+        std::vector<DepthRun> depth_runs;
     };
-    // What a deferred AO receiver bound, so EndDeferredBundle can record its depth-only copy
+    // What a deferred AO receiver bound, so CloseDeferredBatch can record its depth-only copy
     // once the main bundle is closed (bundles share one allocator, one open list at a time).
     struct DepthReplay {
         ID3D12PipelineState* pso = nullptr;
@@ -1117,6 +1131,7 @@ private:
         uint32_t index_count = 0, draw_count = 0;
         int32_t base_vertex = 0;
         bool drew = false;
+        bool motion = false;  // the prepass pixel shader writes distance + motion
     };
     struct Frame {
         ComPtr<ID3D12CommandAllocator> alloc;
@@ -1230,14 +1245,19 @@ private:
     void LatchPackImage(Tex& tx);
     void CreatePackTexture(Tex& r, const texturedumper::Image& img);
     void ReleasePackTextures();
-    void EnsurePixelShader(const PixelKey& pk, DrawShaders& sh);
+    void EnsurePixelShader(const PixelKey& pk, DrawShaders& sh, bool async = true);
     void BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k);
     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
-    ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
+    // async: a new state may be built on the worker and this draw skipped. Screen-space (2D) draws
+    // pass false, so a HUD or menu element never blinks for a frame.
+    ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, bool async = true);
     HRESULT CreatePipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ComPtr<ID3D12PipelineState>& pso);
     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
-    void ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool sprite);
-    void ExpandLines(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d);
+    // The point/line geometry shaders are static, so they are compiled once on the render thread and
+    // then attached on the warm threads too. That is what lets the startup warm build point and line
+    // pipelines instead of leaving them to compile in a draw.
+    void PrepareGeometryShaders();
+    void ApplyGeometryShader(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const PsoKey& k) const;
     float TargetScale() const;   // host pixels per console pixel of the bound target, along x
     float TargetScaleY() const;  // and along y: less than TargetScale on a frame wider than the console's
     float UiSqueeze(const State& s, const Assembled& a, const DrawTextures& stages) const;
@@ -1264,21 +1284,27 @@ private:
     void DrawGeometry(const Assembled& a);
     // deferred scene display list, active only with TCNYC_DEFER_SCENE=1
     ID3D12GraphicsCommandList* Cmd() const { return bundle_ ? bundle_ : cl_; }
-    bool DeferredPending() { return !CurrentFrame().bundles.empty(); }
+    // pending: recorded bundles, or a batch that is open between draws
+    bool DeferredPending() { return batch_ || !CurrentFrame().bundles.empty(); }
     bool DeferredPendingResource(ID3D12Resource* r) const {
         return r && (defer_reads_.count(r) || defer_writes_.count(r));
     }
-    bool BeginDeferredBundle(const DrawTextures& stages, bool opaque);
-    void EndDeferredBundle();
+    bool BeginDeferredBundle(const DrawTextures& stages, bool opaque, bool world, const D3D12_VIEWPORT& vp,
+                             const D3D12_RECT& rect);
+    void SuspendDeferredBundle();
+    void CloseDeferredBatch();
+    void ViewportScissorFor(const State& s, uint32_t gw, uint32_t gh, float squeeze, D3D12_VIEWPORT& vp,
+                            D3D12_RECT& rect) const;
     void FlushDeferredScene();
     bool DeferredBarrier(const char* why);
     void DeferredFallback(const char* why);
     void ReportDeferred();
-    // ends the bundle on every return from Draw once one was started
+    // suspends the bundle on every return from Draw once one was started; the next compatible
+    // deferred draw resumes it
     struct DeferredScope {
         D3D12Backend* backend;
         ~DeferredScope() {
-            if (backend->bundle_) backend->EndDeferredBundle();
+            if (backend->bundle_) backend->SuspendDeferredBundle();
         }
     };
     bool UploadGeometry(const Assembled& a, D3D12_VERTEX_BUFFER_VIEW* vbv,
@@ -1326,7 +1352,15 @@ private:
     ID3D12GraphicsCommandList* AcquireBundleList();
     bool EnsureAoDepth(const Target& like);
     bool EnsureAoOcclusion(uint32_t w, uint32_t h);
+    bool EnsureAoTemporal(uint32_t w, uint32_t h);
+    bool RenderAoTemporal();
     bool RenderAoOcclusion(Target& rt, float near_z, float far_z);
+    // Fused AO (TCNYC_AO_FUSED=1): the world is drawn once into the scene, its depth is linearised into
+    // the AO distance target, and the result is multiplied over the world colour before the effects.
+    struct SceneDepth;
+    bool LinearizeAoDepth(Target& ds, const SceneDepth& sd);
+    bool PostAoMultiply(Target& rt);
+    bool CopyAoDepth(Target& src);
     void BindAoView(bool occlusion);
     void RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE target);
     bool EnsureHdrUiTarget();
@@ -1381,7 +1415,19 @@ private:
     }
     uint64_t SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const;
     bool TargetStale(uint32_t data) const;
-    void ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it);
+    void ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it, bool park = false);
+    // A guest address the title draws at two sizes in turn (895F4000: 128x32, then 256x256, every
+    // frame) used to destroy one GPU texture and create the other on each switch. The replaced
+    // target is parked here instead and taken back when the same address and size return.
+    struct SpareTarget {
+        Target t;
+        uint64_t frame = 0;  // when it was parked
+    };
+    static constexpr size_t kMaxSpareTargets = 8;
+    static constexpr uint64_t kSpareFrames = 120;  // released after this many frames unused
+    std::vector<SpareTarget> spare_targets_;
+    void DropSpareTargets(bool all);
+    bool TakeSpareTarget(Target& t, uint32_t data, bool depth, uint32_t gw, uint32_t gh);
     void SweepTargets();
     bool CreateTargetResource(Target& t, const Surface& s);
     bool CreateTargetView(Target& t);
@@ -1475,6 +1521,7 @@ private:
     ComPtr<ID3D12RootSignature> root_;
     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> blobs_;
     std::unordered_map<uint64_t, uint64_t> shader_src_;  // vertex and pixel program keys to source hash
+    ComPtr<ID3DBlob> point_gs_, sprite_gs_, line_gs_;    // see PrepareGeometryShaders
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
     // Pipelines kept on disk between runs (shader-cache/.../pipelines.bin): the driver's compiled
     // pipelines, so a pipeline the game needed before does not stall a frame the first time again.
@@ -1518,9 +1565,48 @@ private:
     void RecordPipelineKey(const PsoKey& k, uint64_t h);
     void StartPipelineWarm();
     void StopPipelineWarm();
+    void WaitPipelineWarm();
     void WarmPipelines();
     ComPtr<ID3D12PipelineState> TakeWarmPipeline(uint64_t h);
     ComPtr<ID3DBlob> TakeWarmBlob(uint64_t h);
+    // A draw state first seen during play. Building its pipeline on the render thread is the hitch
+    // this queue exists to avoid: a worker builds it from the already compiled shaders and the draw
+    // that needs it is skipped until the next frame, when TakeWarmPipeline returns it.
+    // TCNYC_PIPELINE_ASYNC=0 compiles such states in the draw, the old behaviour.
+    struct ScenePipelineJob {
+        PsoKey key;
+        ComPtr<ID3DBlob> vs, ps;
+    };
+    struct SceneShaderJob {
+        std::string source;
+        uint64_t hash = 0;
+        const char* entry = nullptr;    // literals from the call site
+        const char* profile = nullptr;
+    };
+    std::deque<ScenePipelineJob> scene_jobs_;        // guarded by scene_mutex_
+    std::deque<SceneShaderJob> scene_shader_jobs_;   // guarded by scene_mutex_
+    std::mutex scene_mutex_;
+    std::condition_variable scene_cv_;
+    std::vector<std::thread> scene_threads_;
+    std::unordered_set<uint64_t> scene_pending_;
+    std::unordered_set<uint64_t> scene_failed_;
+    std::unordered_set<uint64_t> scene_shader_pending_;
+    std::unordered_set<uint64_t> scene_shader_failed_;
+    bool scene_stop_ = false;  // guarded by scene_mutex_
+    bool scene_async_ = true;
+    std::atomic<bool> scene_started_{false};
+    bool ScheduleScenePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
+    // The scene path's shaders: a first-seen source is compiled on the worker, and the draw that
+    // needs it waits a frame. false means the caller should call Compile on the render thread
+    // (async off, a cache hit is waiting, or the compile already failed).
+    bool CompileSceneShaderAsync(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
+    bool SceneShaderPending(uint64_t h);
+    ComPtr<ID3DBlob> LoadShaderSource(const std::string& source, uint64_t hash, const char* entry,
+                                      const char* profile);
+    void StartSceneWarm();
+    void StopSceneWarm();
+    void SceneWarmWorker();
+    bool ScenePipelineFailed(uint64_t h);
     // Progressive AO. The receiver (t4) and depth-prepass variants of world draws are compiled and
     // their pipelines built on worker threads. A draw applies AO only once its variant is ready;
     // until then it uses the game's shader and is scheduled here. Switching AO on therefore costs
@@ -1557,6 +1643,7 @@ private:
     ComPtr<ID3DBlob> AoLoadPixelShader(const std::string& source, uint64_t hash);
     bool BuildWarmPipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, ComPtr<ID3D12PipelineState>& out);
     PsoKey AoDepthPsoKey(const PsoKey& k, uint64_t ps);
+    PsoKey AoDepthMotionPsoKey(const PsoKey& k, uint64_t ps);
     // sampler descriptors are rewritten per frame like the SRV ring; a descriptor set from an
     // earlier frame may still be referenced by in-flight GPU work until its fence completes.
     static constexpr uint32_t kSamplersPerFrame = (kSamplerCount / kFrames) & ~3u;
@@ -1594,6 +1681,19 @@ private:
     Target* defer_rt_ = nullptr;     // this frame's full-size scene colour target
     ID3D12GraphicsCommandList* bundle_ = nullptr;  // the bundle being recorded, if any
     BundleDesc bundle_desc_;         // its direct-list state
+    // Batching: consecutive deferred draws with the same targets, viewport/scissor and AO role
+    // share one bundle. Recording one bundle per draw (reset, close, every binding again, a second
+    // bundle for the AO depth copy) cost about 2.5 us of CPU a draw with AO on. Between draws the
+    // open bundle is parked in batch_ so other commands go to the direct list; bundle_desc_ keeps
+    // describing it.
+    static constexpr uint32_t kMaxBatchDraws = 256;
+    ID3D12GraphicsCommandList* batch_ = nullptr;  // the open batch, between draws
+    DrawBinds batch_binds_;          // what the open batch has bound (bundles inherit nothing)
+    std::vector<DepthReplay> batch_depth_;  // its receivers' AO depth copies, recorded at close
+    uint32_t batch_draws_ = 0;
+    D3D12_VIEWPORT batch_vp_{};
+    D3D12_RECT batch_rect_{};
+    bool defer_draw_drew_ = false;   // the draw being recorded reached its draw call
     std::unordered_set<ID3D12Resource*> defer_reads_;   // resources pending bundles read
     std::unordered_set<ID3D12Resource*> defer_writes_;  // resources pending bundles write
     uint32_t defer_bundles_this_frame_ = 0;
@@ -1605,6 +1705,7 @@ private:
     Extension* ext_ = nullptr;
     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
     FILE* cap_ = nullptr;
+    uint32_t cap_ao_ = 0;  // AO roles/receiver decision for the draw being captured
     uint32_t cap_reports_left_ = 0;  // visibility results logged after a capture
     std::filesystem::path cap_dir_;
     uint32_t cap_i_ = 0;
@@ -1732,6 +1833,30 @@ private:
     std::array<uint32_t, 5> fsr_profile_mode_{};
     unsigned fsr_profile_warmup_ = 0, fsr_profile_count_ = 0;
     double fsr_profile_frame_ms_ = 0, fsr_profile_pass_ms_ = 0;
+    // TCNYC_PROFILE_AO=1: GPU timestamps around each AO pass (prepass, horizon, temporal, resolve)
+    // plus the frame's GPU span and the CPU time of the AO flush path, averaged and logged every
+    // 120 frames that ran AO.
+    void InitAoProfile();
+    void CollectAoProfile();
+    void AoProfileFrameBegin();
+    void AoProfileFrameEnd();
+    uint32_t AoProfileBegin(uint32_t kind);
+    void AoProfileEnd(uint32_t pair);
+    static constexpr uint32_t kAoProfilePairs = 32;
+    static constexpr uint32_t kAoProfileQueries = 2 + 2 * kAoProfilePairs;  // frame begin/end + pairs
+    static constexpr uint32_t kAoProfileKinds = 4;  // prepass, horizon, temporal, resolve
+    ComPtr<ID3D12QueryHeap> ao_profile_queries_;
+    ComPtr<ID3D12Resource> ao_profile_readback_;
+    uint64_t ao_profile_frequency_ = 0;
+    uint8_t ao_profile_kind_[kFrames][kAoProfilePairs] = {};
+    uint32_t ao_profile_pairs_[kFrames] = {};
+    bool ao_profile_began_[kFrames] = {};
+    bool ao_profile_resolved_[kFrames] = {};
+    double ao_profile_cpu_[kFrames] = {};  // CPU ms in the AO flush path, per frame slot
+    uint32_t ao_profile_mode_ = ~0u;
+    unsigned ao_profile_warmup_ = 0, ao_profile_count_ = 0, ao_profile_frames_ = 0, ao_profile_flushes_ = 0;
+    double ao_profile_gpu_ms_ = 0, ao_profile_pass_ms_[kAoProfileKinds] = {}, ao_profile_cpu_ms_ = 0;
+    std::chrono::steady_clock::time_point ao_profile_wall_{};
     ID3D12Resource* DispatchFsr3(ID3D12Resource* color, D3D12_RESOURCE_STATES& color_state,
                                 const CameraFrame& camera, bool reset, const float* constants, bool motion);
     // TAA object motion: a motion target beside the frame's scene target, written by program draws matched to the
@@ -1837,6 +1962,28 @@ private:
     uint32_t ao_occ_w_ = 0, ao_occ_h_ = 0;
     uint32_t ao_pick_requested_ = 0;  // PickAoSamples cache: the scene count asked for...
     uint32_t ao_pick_samples_ = 1;    // ...and the count both AO targets accept
+    bool ao_pick_cached_ = false;     // the two above hold a result
+    int ao_up_axis_ = -1;             // the world's up axis, latched for the flat-wall test
+    bool ao_fused_ = false;           // TCNYC_AO_FUSED=1: draw the world once and post-multiply AO
+    int ao_scene_mode_ = 0;           // 0 new view, 1 fused world pass done, 2 receiver AO for the rest
+    bool ao_temporal_ = false;        // TCNYC_AO_TEMPORAL=1: accumulate AO across frames
+    ComPtr<ID3D12Resource> ao_hist_[2];  // RG16F: AO factor + view distance
+    D3D12_RESOURCE_STATES ao_hist_state_[2] = {D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                               D3D12_RESOURCE_STATE_RENDER_TARGET};
+    ComPtr<ID3D12Resource> ao_motion_;   // RG16F: the AO prepass's own motion, not TAA's
+    D3D12_RESOURCE_STATES ao_motion_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    uint64_t ao_motion_frame_ = ~0ull;   // guest frame the AO motion was last cleared for
+    uint32_t ao_hist_w_ = 0, ao_hist_h_ = 0;
+    uint32_t ao_motion_bundles_ = 0, ao_plain_bundles_ = 0;  // last temporal prepass
+    uint32_t ao_hist_write_ = 0;      // history index written this frame (the other one is read)
+    uint32_t ao_temporal_source_ = 0; // history index the resolve reads after the temporal pass
+    bool ao_hist_valid_ = false;      // the read history holds a usable frame
+    CameraFrame ao_hist_cam_;         // the camera the read history was made with
+    uint64_t ao_hist_frame_ = ~0ull;  // present the read history was made in
+    uint64_t ao_temporal_frame_ = ~0ull;  // present of the last temporal update
+    bool ao_frame_wrote_ = false;     // this frame's update wrote ao_hist_[ao_hist_write_]
+    CameraFrame ao_frame_cam_;        // the camera this frame's update used
+    bool ao_temporal_depth_ = false;  // ao_depth_ holds the prepass the current AO was made from
     // A copy of the AO ready sets taken once a frame: a draw tests it without touching ao_mutex_, which
     // the variant workers hold job by job. A variant that becomes ready applies from the next frame.
     std::unordered_set<uint64_t> ao_color_ready_view_, ao_depth_ready_view_;
@@ -1919,6 +2066,14 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     render_ = app::Snapshot();
     LoadFsr3();
     g_reversed_depth = true;
+    if (const char* view = std::getenv("TCNYC_AO_VIEW"); view && *view && std::atoi(view) != 0)
+        g_ao_debug_view = true;
+    if (const char* fused = std::getenv("TCNYC_AO_FUSED"); fused && *fused && std::atoi(fused) != 0) {
+        ao_fused_ = true;
+        LOGR("d3d12: experimental fused AO on (TCNYC_AO_FUSED=1)");
+    }
+    ao_temporal_ = AoTemporal();
+    if (ao_temporal_) LOGR("d3d12: experimental temporal AO on (TCNYC_AO_TEMPORAL=1)");
     guest_w_ = width;
     guest_h_ = height;
     if (const char* e = std::getenv("TCNYC_DEFER_SCENE")) defer_forced_ = *e && std::atoi(e) != 0;
@@ -1947,6 +2102,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     kernel::SetExitSave([] {
         if (D3D12Backend* b = g_exit_backend.load()) {
             b->StopAoWarm();  // no worker may build a pipeline while the library is serialized
+            b->StopSceneWarm();
             b->StopPipelineWarm();
             b->SavePipelineLibrary(true);
             b->SavePipelineKeys(true);
@@ -1954,6 +2110,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
         FlushShaderCacheWrites();  // the last shaders compiled this run are still queued
     });
     if (!CreateFrames()) return false;
+    if (const char* e = std::getenv("TCNYC_PIPELINE_ASYNC"); e && std::strcmp(e, "0") == 0) scene_async_ = false;
     CreateGammaLut();
     ImGui_ImplDX12_InitInfo ui_init{};
     ui_init.Device = dev_.Get();
@@ -1969,7 +2126,12 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     PrepareAoPipelines();
     EnsureBlitPipeline(kBgra, false, 1);
     EnsureBlitPipeline(kBgra, false, 1, true);
+    PrepareGeometryShaders();
     StartPipelineWarm();
+    // Build every saved pipeline before the game can draw with a state that is not ready yet. With
+    // a valid pipeline library this is a few hundred milliseconds; after a driver update it is the
+    // one-time cost of compiling the whole saved set, instead of a hitch when each state appears.
+    WaitPipelineWarm();
 #if !defined(TCNYC_HAVE_DLSS)
     g_dlss_state.store(DlssState::NotBuilt, std::memory_order_relaxed);
 #endif
@@ -1977,6 +2139,8 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     Begin();
     InitFsr3Profile();
     if (fsr_profile_queries_) cl_->EndQuery(fsr_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    InitAoProfile();
+    AoProfileFrameBegin();
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
 }
@@ -2323,6 +2487,52 @@ void D3D12Backend::LoadSettings() {
     }
 }
 
+// Fused AO: turn the scene depth (already drawn, world geometry only) into the view-distance target
+// the GTAO kernel reads. Host depth is reversed (0 far, 1 near); the scene's own near/far and the
+// w-scale that normalises far planes come from the deferred display list's SceneDepth entry.
+static const char kAoLinearizeHlsl[] = R"(
+Texture2D<float> depthTex : register(t0);
+cbuffer B : register(b1) { float4 src; float4 planes; };
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float4 psmain(O i) : SV_Target {
+    uint w, h;
+    depthTex.GetDimensions(w, h);
+    uint2 p = min(uint2(i.uv * float2(w, h)), uint2(max(w, 1) - 1, max(h, 1) - 1));
+    const float depth = depthTex.Load(int3(p, 0));
+    if (depth <= 0.0) return float4(1e30, 0, 0, 1);  // the far clear: sky, the AO kernel's empty marker
+    const float raw = 1.0 - depth;
+    const float z = src.z * src.w / max(src.w - raw * (src.w - src.z), 1e-4) * planes.x;
+    return float4(min(z, 1e29), 0, 0, 1);
+}
+)";
+
+// The world's finished colour scaled by the AO factor, before the effects are drawn over it.
+static const char kAoPostHlsl[] = R"(
+Texture2D<float4> sceneTex : register(t0);
+Texture2D<float> aoTex : register(t1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float4 psmain(O i) : SV_Target {
+    const int2 p = int2(i.p.xy);
+    float4 c = sceneTex.Load(int3(p, 0));
+    c.rgb *= saturate(1.0 - aoTex.Load(int3(p, 0)));
+    return c;
+}
+)";
+
 void D3D12Backend::PrepareAoPipelines() {
     if (render_.ao == 0) return;
     LOGR("d3d12: preparing ambient occlusion shaders");
@@ -2335,11 +2545,25 @@ void D3D12Backend::PrepareAoPipelines() {
                                                    "AO occlusion resolve");
         ready = ready && occlusion;
         for (uint32_t mode : {1u, 2u}) {
-            const auto horizon = AoHorizonSource(mode, depth_ms, render_.ao_method == 1);
+            const auto horizon = AoHorizonSource(mode, depth_ms, render_.ao_method == 1, ao_temporal_);
             const auto* gtao = EnsurePassPipeline(horizon.c_str(), "psmain", kAoFormat, -1, DXGI_FORMAT_UNKNOWN,
                                                   "GTAO horizon search");
             ready = ready && gtao;
         }
+    }
+    if (ao_temporal_) {
+        const auto* temporal = EnsurePassPipeline(kAoTemporalHlsl, "psmain", kAoHistFormat, -1,
+                                                  DXGI_FORMAT_UNKNOWN, "AO temporal resolve");
+        ready = ready && temporal;
+    }
+    if (ao_fused_) {
+        const auto* lin = EnsurePassPipeline(kAoLinearizeHlsl, "psmain", kAoDistFormat, -1, DXGI_FORMAT_UNKNOWN,
+                                             "AO depth linearise");
+        const auto* post_fp16 = EnsurePassPipeline(kAoPostHlsl, "psmain", kSceneFp16, -1, DXGI_FORMAT_UNKNOWN,
+                                                   "AO post multiply");
+        const auto* post_bgra = EnsurePassPipeline(kAoPostHlsl, "psmain", kBgra, -1, DXGI_FORMAT_UNKNOWN,
+                                                   "AO post multiply");
+        ready = ready && lin && post_fp16 && post_bgra && EnsureDepthCopyPipeline(1);
     }
     LOGR("d3d12: ambient occlusion shader preparation %s", ready ? "complete" : "incomplete");
 }
@@ -2517,7 +2741,7 @@ uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
 
 void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D12_RESOURCE_STATES want) {
     if (cur == want) return;
-    if (defer_scene_ && r && !CurrentFrame().bundles.empty()) {
+    if (defer_scene_ && r && DeferredPending()) {
         // A pending bundle must see the resource in the state it was recorded against. A
         // barrier to another state would change what the later bundle executes with.
         const bool pending_read = defer_reads_.count(r) != 0;
@@ -2549,7 +2773,7 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
 }
 
 // a resized target gives back its view and its resources
-void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
+void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it, bool park) {
     if (DeferredPendingResource(it->second.res.Get()) ||
         (it->second.resolved && DeferredPendingResource(it->second.resolved.Get()))) {
         DeferredBarrier("target released while deferred");
@@ -2563,6 +2787,22 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator 
     if (motion_rt_ == &it->second) motion_rt_ = nullptr;
     last_scene_rt_ = nullptr;  // the one-entry scene_depth_ cache may name it
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) bound_rt_ = bound_ds_ = nullptr;
+    if (park && !ext_) {
+        // keeps its resource and view: still valid for commands already recorded against it
+        if (spare_targets_.size() >= kMaxSpareTargets) DropSpareTargets(false);
+        if (spare_targets_.size() >= kMaxSpareTargets) {  // all recent: release the oldest
+            Target& old = spare_targets_.front().t;
+            (old.depth ? CurrentFrame().dsv_garbage : CurrentFrame().rtv_garbage).push_back(old.view);
+            CurrentFrame().garbage.push_back(old.res);
+            if (old.resolved) CurrentFrame().garbage.push_back(old.resolved);
+            if (old.fb) CurrentFrame().garbage.push_back(old.fb);
+            spare_targets_.erase(spare_targets_.begin());
+        }
+        spare_targets_.push_back({std::move(it->second), frame_});
+        targets_.erase(it);
+        ++targets_epoch_;
+        return;
+    }
     // The command list still references this view index: return it only after the frame's fence.
     (it->second.depth ? CurrentFrame().dsv_garbage : CurrentFrame().rtv_garbage).push_back(it->second.view);
     CurrentFrame().garbage.push_back(it->second.res);
@@ -2570,6 +2810,44 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator 
     if (it->second.fb) CurrentFrame().garbage.push_back(it->second.fb);
     targets_.erase(it);
     ++targets_epoch_;  // any memoised Target* is stale from here
+}
+
+// Release parked targets: all of them, or those parked more than kSpareFrames ago.
+void D3D12Backend::DropSpareTargets(bool all) {
+    std::erase_if(spare_targets_, [&](SpareTarget& sp) {
+        if (!all && frame_ - sp.frame <= kSpareFrames) return false;
+        (sp.t.depth ? CurrentFrame().dsv_garbage : CurrentFrame().rtv_garbage).push_back(sp.t.view);
+        CurrentFrame().garbage.push_back(sp.t.res);
+        if (sp.t.resolved) CurrentFrame().garbage.push_back(sp.t.resolved);
+        if (sp.t.fb) CurrentFrame().garbage.push_back(sp.t.fb);
+        return true;
+    });
+}
+
+// A parked target for this address and size, made with the current MSAA, scale and stretch: moved
+// into t with its per-use state reset as a new target's would be. False when there is none.
+bool D3D12Backend::TakeSpareTarget(Target& t, uint32_t data, bool depth, uint32_t gw, uint32_t gh) {
+    if (ext_) return false;
+    for (auto it = spare_targets_.begin(); it != spare_targets_.end(); ++it) {
+        const Target& sp = it->t;
+        if (sp.data != data || sp.depth != depth || sp.gw != gw || sp.gh != gh || sp.want_samples != msaa_ ||
+            sp.want_scale != WantScale(data, depth) || sp.want_stretch != stretch_)
+            continue;
+        t = std::move(it->t);
+        spare_targets_.erase(it);
+        t.drawn = false;
+        t.cpu = false;
+        t.scene_frame = ~0ull;
+        t.picture = false;
+        t.picture_kind = Picture::Unknown;
+        t.read.clear();
+        t.depth_resolved = false;
+        t.range = 1;
+        t.epoch_gen = 0;
+        t.depth_clear = 0.0f;
+        return true;
+    }
+    return false;
 }
 
 // the host texture of a new target, at render scale or the extension's
@@ -2743,24 +3021,28 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
         ReleaseTarget(slot.it);
         memo.valid = false;
     } else if (slot.it != targets_.end()) {
-        ReleaseTarget(slot.it);
+        ReleaseTarget(slot.it, true);  // the same address at another size: park it for when that size returns
         memo.valid = false;
     }
     Target t;
-    t.depth = depth;
-    t.gw = slot.gw;
-    t.gh = slot.gh;
-    t.data = slot.data;  // CreateTargetResource picks a shadow map's scale by it
-    if (diag::Perf())
-        LOG_FIRST(400, "d3d12: target created %08X %ux%u depth %d sized %d", slot.data, slot.gw, slot.gh, depth ? 1 : 0,
-                  slot.sized ? 1 : 0);
-    {
-        PerfScope perf_targetcreate{g_perf.targetcreate};
-        g_perf.targets++;
-        if (!CreateTargetResource(t, s)) return nullptr;
+    if (alt == 0 && TakeSpareTarget(t, slot.data, depth, slot.gw, slot.gh)) {
+        ++g_perf.target_reuses;
+    } else {
+        t.depth = depth;
+        t.gw = slot.gw;
+        t.gh = slot.gh;
+        t.data = slot.data;  // CreateTargetResource picks a shadow map's scale by it
+        if (diag::Perf())
+            LOG_FIRST(400, "d3d12: target created %08X %ux%u depth %d sized %d", slot.data, slot.gw, slot.gh,
+                      depth ? 1 : 0, slot.sized ? 1 : 0);
+        {
+            PerfScope perf_targetcreate{g_perf.targetcreate};
+            g_perf.targets++;
+            if (!CreateTargetResource(t, s)) return nullptr;
+        }
+        // an empty pool drops the new resource with t
+        if (!CreateTargetView(t)) return nullptr;
     }
-    // an empty pool drops the new resource with t
-    if (!CreateTargetView(t)) return nullptr;
     t.data = slot.data;
     t.guest_format = s.format;
     t.bytes = GuestPitch(slot.gw) * slot.gh;
@@ -3572,25 +3854,27 @@ void main(point VOut v[1], inout TriangleStream<VOut> strip) {
 )";
 }
 
-// a point is drawn as its whole console pixel, or a sprite as its square, by a geometry shader, solid, front facing
-// and never culled
-void D3D12Backend::ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool sprite) {
+// The point/line geometry shaders depend on nothing in a draw, so compile them once. The warm
+// threads then attach the same blobs as the render thread; calling Compile there would touch the
+// render thread's shader maps and the extension hooks.
+void D3D12Backend::PrepareGeometryShaders() {
     uint64_t hash;
-    ID3DBlob* gs = Compile(sprite ? SpriteHlsl() : PointHlsl(), "main", "gs_5_0", hash);
-    if (!gs) return;
-    d.GS = {gs->GetBufferPointer(), gs->GetBufferSize()};
-    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    d.RasterizerState.FrontCounterClockwise = FALSE;
+    if (!point_gs_) point_gs_ = Compile(PointHlsl(), "main", "gs_5_0", hash, "point geometry");
+    if (!sprite_gs_) sprite_gs_ = Compile(SpriteHlsl(), "main", "gs_5_0", hash, "point sprite geometry");
+    if (!line_gs_) line_gs_ = Compile(LineHlsl(), "main", "gs_5_0", hash, "line geometry");
 }
 
-void D3D12Backend::ExpandLines(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) {
-    uint64_t hash;
-    ID3DBlob* gs = Compile(LineHlsl(), "main", "gs_5_0", hash);
+// a point is drawn as its whole console pixel, or a sprite as its square, by a geometry shader, solid, front facing
+// and never culled; a line is widened the same way
+void D3D12Backend::ApplyGeometryShader(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const PsoKey& k) const {
+    ID3DBlob* gs = nullptr;
+    if (k.topo == uint32_t(Topology::Points)) gs = k.sprite ? sprite_gs_.Get() : point_gs_.Get();
+    else if (k.topo == uint32_t(Topology::Lines)) gs = line_gs_.Get();
     if (!gs) return;
     d.GS = {gs->GetBufferPointer(), gs->GetBufferSize()};
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    if (k.topo == uint32_t(Topology::Points)) d.RasterizerState.FrontCounterClockwise = FALSE;
 }
 
 float D3D12Backend::TargetScale() const {
@@ -3835,7 +4119,7 @@ void D3D12Backend::SavePipelineLibrary(bool force) {
     else pso_lib_write_ = std::async(std::launch::async, std::move(write));
 }
 
-ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps) {
+ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, bool async) {
     uint64_t h = Hash(&k, sizeof(k));
     auto it = psos_.find(h);
     if (it != psos_.end()) return it->second.Get();
@@ -3850,13 +4134,16 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
         std::lock_guard lock(warm_mutex_);
         warm_skip_.insert(h);
     }
+    // A state first seen during play: build it on the async worker and skip this draw until the
+    // next frame. A failure or a full queue falls through to the old synchronous build.
+    if (async && scene_async_ && vs && ps && !ScenePipelineFailed(h) && ScheduleScenePipeline(k, vs, ps))
+        return nullptr;
     D3D12_INPUT_ELEMENT_DESC el[16];
     uint32_t n = FillInputLayout(k, el);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
     d.InputLayout = {el, n};
     FillPipelineDesc(k, vs, ps, d);
-    if (k.topo == uint32_t(Topology::Points)) ExpandPoints(d, k.sprite);
-    else if (k.topo == uint32_t(Topology::Lines)) ExpandLines(d);
+    ApplyGeometryShader(d, k);
     ComPtr<ID3D12PipelineState> pso;
     const HRESULT hr = CreatePipeline(d, pso);
     if (FAILED(hr)) {
@@ -3891,7 +4178,10 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
 namespace {
 constexpr uint64_t kPipelineKeysMagic = 0x315359454B4F5350ull;  // "PSOKEYS1"
 constexpr size_t kMaxPipelineKeys = 8192;  // kept on disk
-constexpr size_t kMaxWarmPipelines = 4096;  // built at start, the oldest first
+// Build every key the manifest can hold at start. The old 4096 cap left the newest states out, so
+// exactly the effects and late areas a player reaches after the cap were compiled in a draw on
+// every launch. Memory is bounded by the manifest size and the warm PSOs are claimed as used.
+constexpr size_t kMaxWarmPipelines = kMaxPipelineKeys;
 constexpr size_t kMaxWarmBlobs = 4096;      // decoded shaders shared with the render thread (both stages)
 std::filesystem::path PipelineKeysFile() { return ShaderCacheDirectory() / "pipelines.keys"; }
 std::filesystem::path DxbcFile(uint64_t hash) {
@@ -3973,9 +4263,11 @@ void D3D12Backend::SavePipelineKeys(bool force) {
 void D3D12Backend::StartPipelineWarm() {
     LoadPipelineKeys();
     if (const char* e = std::getenv("TCNYC_PIPELINE_WARM"); e && std::strcmp(e, "0") == 0) return;
+    PrepareGeometryShaders();  // point/line keys now build through the warm threads too
     for (const PsoKey& k : pso_keys_) {
-        // points and lines add a geometry shader through Compile, which is the render thread's alone
-        if (k.topo == uint32_t(Topology::Points) || k.topo == uint32_t(Topology::Lines)) continue;
+        // points and lines carry a geometry shader prepared on the render thread before the warm
+        if (k.topo == uint32_t(Topology::Points) && !(k.sprite ? sprite_gs_ : point_gs_)) continue;
+        if (k.topo == uint32_t(Topology::Lines) && !line_gs_) continue;
         if (k.samples > 1) {  // the MSAA setting may have changed since the key was kept
             D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{DXGI_FORMAT(k.rtfmt), k.samples};
             if (k.has_rt && (FAILED(dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q,
@@ -3992,11 +4284,17 @@ void D3D12Backend::StartPipelineWarm() {
     for (uint32_t i = 0; i < threads; i++) warm_threads_.emplace_back([this] { WarmPipelines(); });
 }
 
-void D3D12Backend::StopPipelineWarm() {
-    warm_stop_ = true;
+// Join the warm threads without asking them to stop: startup uses this to finish the saved set
+// before the game runs. StopPipelineWarm sets the stop flag first, for exit.
+void D3D12Backend::WaitPipelineWarm() {
     for (auto& t : warm_threads_)
         if (t.joinable()) t.join();
     warm_threads_.clear();
+}
+
+void D3D12Backend::StopPipelineWarm() {
+    warm_stop_ = true;
+    WaitPipelineWarm();
 }
 
 // Build a pipeline from saved or freshly compiled shaders, through the kept library when it has
@@ -4009,6 +4307,7 @@ bool D3D12Backend::BuildWarmPipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
     d.InputLayout = {el, n};
     FillPipelineDesc(k, vs, ps, d);
+    ApplyGeometryShader(d, k);
     if (pso_lib_) {
         const std::wstring name = PipelineName(d);
         bool loaded;
@@ -4105,6 +4404,157 @@ ComPtr<ID3DBlob> D3D12Backend::TakeWarmBlob(uint64_t h) {
     return blob;
 }
 
+// A draw state first seen during play is built here, on a worker, instead of in the draw. The
+// render thread records the key immediately so the next start warms it even if this run ends (or
+// the build fails) before the pipeline is published.
+bool D3D12Backend::ScenePipelineFailed(uint64_t h) {
+    std::lock_guard lock(scene_mutex_);
+    return scene_failed_.count(h) != 0;
+}
+
+bool D3D12Backend::SceneShaderPending(uint64_t h) {
+    std::lock_guard lock(scene_mutex_);
+    return scene_shader_pending_.count(h) != 0;
+}
+
+// A shader source first seen during play is compiled here, on the worker. The caller keeps the
+// hash in shader_src_ and leaves the code null, so its draw is skipped until the worker publishes
+// the blob to warm_blobs_; Compile takes it on the next frame. false means compile synchronously.
+bool D3D12Backend::CompileSceneShaderAsync(const std::string& src, const char* entry, const char* profile,
+                                           uint64_t& hash) {
+    if (!scene_async_) return false;
+    std::string source = ShaderCacheSource(src);
+    hash = ShaderCacheHash(source, entry, profile);
+    if (blobs_.find(hash) != blobs_.end()) return false;
+    {
+        std::lock_guard lock(warm_mutex_);
+        if (warm_blobs_.count(hash)) return false;  // ready; Compile takes it
+    }
+    {
+        std::lock_guard lock(scene_mutex_);
+        if (scene_stop_ || scene_shader_failed_.count(hash)) return false;
+        if (!scene_shader_pending_.insert(hash).second) return true;  // already queued, or being built
+        if (scene_shader_jobs_.size() + scene_jobs_.size() >= 256) {
+            scene_shader_pending_.erase(hash);
+            return false;
+        }
+        SceneShaderJob job;
+        job.source = std::move(source);
+        job.hash = hash;
+        job.entry = entry;
+        job.profile = profile;
+        scene_shader_jobs_.push_back(std::move(job));
+    }
+    scene_cv_.notify_one();
+    StartSceneWarm();
+    return true;
+}
+
+bool D3D12Backend::ScheduleScenePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps) {
+    // A worker must not call Compile: the geometry shader for points and lines has to be ready.
+    if (k.topo == uint32_t(Topology::Points) && !(k.sprite ? sprite_gs_ : point_gs_)) return false;
+    if (k.topo == uint32_t(Topology::Lines) && !line_gs_) return false;
+    const uint64_t h = Hash(&k, sizeof(k));
+    {
+        std::lock_guard lock(scene_mutex_);
+        if (scene_stop_ || scene_failed_.count(h)) return false;
+        if (!scene_pending_.insert(h).second) return true;  // already queued, or being built
+        if (scene_jobs_.size() >= 256) {  // do not let a state storm skip the whole world
+            scene_pending_.erase(h);
+            return false;
+        }
+        ScenePipelineJob job;
+        job.key = k;
+        job.vs = vs;
+        job.ps = ps;
+        scene_jobs_.push_back(std::move(job));
+    }
+    RecordPipelineKey(k, h);
+    scene_cv_.notify_one();
+    StartSceneWarm();
+    return true;
+}
+
+void D3D12Backend::StartSceneWarm() {
+    if (scene_started_.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(scene_mutex_);
+    if (scene_threads_.empty() && !scene_stop_) {
+        const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+        const uint32_t threads = cores >= 8 ? 2 : 1;  // two shader compiles in parallel on a desktop
+        for (uint32_t i = 0; i < threads; i++) scene_threads_.emplace_back([this] { SceneWarmWorker(); });
+        LOGR("d3d12: shader/pipeline build worker started on %u threads", threads);
+    }
+    scene_started_.store(true, std::memory_order_release);
+}
+
+void D3D12Backend::StopSceneWarm() {
+    {
+        std::lock_guard lock(scene_mutex_);
+        scene_stop_ = true;
+        scene_jobs_.clear();
+        scene_shader_jobs_.clear();
+        scene_pending_.clear();
+        scene_shader_pending_.clear();
+    }
+    scene_cv_.notify_all();
+    for (auto& t : scene_threads_)
+        if (t.joinable()) t.join();
+    scene_threads_.clear();
+}
+
+// One worker, below normal priority: the render thread's own work always wins. Shader jobs run
+// first: they unblock draws, and a pipeline job is only queued once both of its shaders exist.
+void D3D12Backend::SceneWarmWorker() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        SceneShaderJob shader;
+        ScenePipelineJob pipeline;
+        bool has_shader = false, has_pipeline = false;
+        {
+            std::unique_lock lock(scene_mutex_);
+            scene_cv_.wait(lock, [this] {
+                return scene_stop_ || !scene_shader_jobs_.empty() || !scene_jobs_.empty();
+            });
+            if (!scene_shader_jobs_.empty()) {
+                shader = std::move(scene_shader_jobs_.front());
+                scene_shader_jobs_.pop_front();
+                has_shader = true;
+            } else if (!scene_jobs_.empty()) {
+                pipeline = std::move(scene_jobs_.front());
+                scene_jobs_.pop_front();
+                has_pipeline = true;
+            } else {
+                if (scene_stop_) return;
+                continue;
+            }
+        }
+        if (has_shader) {
+            ComPtr<ID3DBlob> code =
+                LoadShaderSource(shader.source, shader.hash, shader.entry, shader.profile);
+            std::lock_guard lock(scene_mutex_);
+            scene_shader_pending_.erase(shader.hash);
+            if (!code) scene_shader_failed_.insert(shader.hash);
+            continue;
+        }
+        if (!has_pipeline) continue;
+        const uint64_t h = Hash(&pipeline.key, sizeof(pipeline.key));
+        ComPtr<ID3D12PipelineState> pso;
+        const bool ok = BuildWarmPipeline(pipeline.key, pipeline.vs.Get(), pipeline.ps.Get(), pso);
+        if (ok) {
+            std::lock_guard lock(warm_mutex_);
+            warm_psos_.emplace(h, std::move(pso));
+        } else {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                LOGE("d3d12: async pipeline build failed for state %016llX; that draw compiles it in place",
+                     static_cast<unsigned long long>(h));
+        }
+        std::lock_guard lock(scene_mutex_);
+        scene_pending_.erase(h);
+        if (!ok) scene_failed_.insert(h);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Progressive ambient occlusion variants
 
@@ -4125,10 +4575,19 @@ PsoKey D3D12Backend::AoDepthPsoKey(const PsoKey& k, uint64_t ps) {
     return dk;
 }
 
-// Worker-side shader fetch for a scheduled AO variant: the shared warm cache, then the disk cache,
-// then the compiler. The source and hash were generated on the render thread, so this cannot
-// derive a different variant than the draw path will later ask for.
-ComPtr<ID3DBlob> D3D12Backend::AoLoadPixelShader(const std::string& source, uint64_t hash) {
+// The same prepass but with the scene motion target beside the distance target, so temporal AO
+// can reproject with the draw's own (object and camera) motion instead of reconstructing it.
+PsoKey D3D12Backend::AoDepthMotionPsoKey(const PsoKey& k, uint64_t ps) {
+    PsoKey dk = AoDepthPsoKey(k, ps);
+    dk.motion = kMotionWrite;  // RG16F AO motion target, not the scene's reactive TAA target
+    return dk;
+}
+
+// Worker-side shader fetch: the shared warm cache, then the disk cache, then the compiler. The
+// source and hash were generated on the render thread, so this cannot derive a different variant
+// than the draw path will later ask for. AO variants and the scene's first-seen shaders both use it.
+ComPtr<ID3DBlob> D3D12Backend::LoadShaderSource(const std::string& source, uint64_t hash, const char* entry,
+                                                const char* profile) {
     {
         std::lock_guard lock(warm_mutex_);
         auto it = warm_blobs_.find(hash);
@@ -4151,13 +4610,17 @@ ComPtr<ID3DBlob> D3D12Backend::AoLoadPixelShader(const std::string& source, uint
     }
     ComPtr<ID3DBlob> code;
     ComPtr<ID3DBlob> err;
-    HRESULT hr = D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr, "main", "ps_5_0",
+    const auto started = std::chrono::steady_clock::now();
+    HRESULT hr = D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr, entry, profile,
                             kShaderCompileFlags, 0, &code, &err);
     if (FAILED(hr)) {
-        LOGE("d3d12: AO pixel variant compile failed: %s",
+        LOGE("d3d12: %s %s compile failed: %s", profile, entry,
              err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
         return {};
     }
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (ms >= 50.0) LOGR("d3d12: %s %s compiled in %.1f ms (%zu bytes, async)", profile, entry, ms, source.size());
     if (!cache.empty())
         ShaderCacheWriter::Get().Enqueue(cache, hash, code->GetBufferPointer(), code->GetBufferSize());
     {
@@ -4165,6 +4628,10 @@ ComPtr<ID3DBlob> D3D12Backend::AoLoadPixelShader(const std::string& source, uint
         if (warm_blobs_.size() < kMaxWarmBlobs) warm_blobs_.emplace(hash, code);
     }
     return code;
+}
+
+ComPtr<ID3DBlob> D3D12Backend::AoLoadPixelShader(const std::string& source, uint64_t hash) {
+    return LoadShaderSource(source, hash, "main", "ps_5_0");
 }
 
 // The pixel program and the remaining pipeline state jointly identify a warm variant.
@@ -4893,10 +5360,20 @@ void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawSh
             sh.vh = vit->second;
             return;
         }
+        if (SceneShaderPending(vit->second)) {  // the worker is still compiling it
+            sh.vh = vit->second;
+            return;
+        }
         shader_src_.erase(vit);  // the blob cache was cleared; compile the program again
     }
     std::string src = ReversedDepthHlsl(VertexHlsl(s, a, sh));
-    sh.vs_code = Compile(sh.quad ? QuadHlsl(std::move(src)) : src, "main", "vs_5_0", sh.vh);
+    if (sh.quad) src = QuadHlsl(std::move(src));
+    // A screen-space draw keeps the old synchronous build so a HUD or menu piece never blinks.
+    if (!a.pretransformed && CompileSceneShaderAsync(src, "main", "vs_5_0", sh.vh)) {
+        shader_src_[sh.vkey] = sh.vh;
+        return;
+    }
+    sh.vs_code = Compile(src, "main", "vs_5_0", sh.vh);
     shader_src_[sh.vkey] = sh.vh;
 }
 
@@ -4917,7 +5394,7 @@ bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& sta
 constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
 
 // sets sh.ph and sh.ps_code, compiling the shader on a cache miss
-void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
+void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh, bool async) {
     // pixel shaders share the map with vertex shaders, the salt keeps their keys apart
     auto pit = shader_src_.find(sh.pkey ^ kPixelKeySalt);
     if (pit != shader_src_.end()) {
@@ -4927,9 +5404,18 @@ void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
             sh.ph = pit->second;
             return;
         }
+        if (SceneShaderPending(pit->second)) {  // the worker is still compiling it
+            sh.ph = pit->second;
+            return;
+        }
         shader_src_.erase(pit);  // the blob cache was cleared; compile the shader again
     }
-    sh.ps_code = Compile(PixelHlsl(pk), "main", "ps_5_0", sh.ph);
+    const std::string src = PixelHlsl(pk);
+    if (async && CompileSceneShaderAsync(src, "main", "ps_5_0", sh.ph)) {
+        shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
+        return;
+    }
+    sh.ps_code = Compile(src, "main", "ps_5_0", sh.ph);
     shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
 }
 
@@ -5604,10 +6090,11 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
 // SetScissors(0) clips to the guest viewport. An explicit inclusive scissor replaces
 // that clip, rather than intersecting it (XDK 5849 SetScissors, 0x2B8F0F..0x2B9059).
 // The locker preview deliberately draws above its viewport through a larger scissor.
-void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw, uint32_t gh, float squeeze) {
+void D3D12Backend::ViewportScissorFor(const State& s, uint32_t gw, uint32_t gh, float squeeze, D3D12_VIEWPORT& vp,
+                                      D3D12_RECT& rect) const {
     float W = float(bound_rt_ ? bound_rt_->w : bound_ds_->w);
     float H = float(bound_rt_ ? bound_rt_->h : bound_ds_->h);
-    D3D12_VIEWPORT vp{0, 0, W, H, 0, 1};
+    vp = D3D12_VIEWPORT{0, 0, W, H, 0, 1};
     float sx = W / gw, sy = H / gh;
     LONG x0 = LONG(s.viewport.x * sx);
     LONG y0 = LONG(s.viewport.y * sy);
@@ -5625,13 +6112,22 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw, uint32_t gh, 
         x0 = LONG(std::ceil(inset + std::clamp(x0, 0L, LONG(W)) * squeeze));
         x1 = LONG(std::ceil(inset + std::clamp(x1, 0L, LONG(W)) * squeeze));
     }
-    D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
-                    std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
+    rect = D3D12_RECT{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
+                      std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
+}
+
+void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw, uint32_t gh, float squeeze) {
+    D3D12_VIEWPORT vp;
+    D3D12_RECT rect;
+    ViewportScissorFor(s, gw, gh, squeeze, vp, rect);
     bool same = binds_.rasterizer && !std::memcmp(&vp, &binds_.viewport, sizeof(vp)) &&
                 !std::memcmp(&rect, &binds_.scissor, sizeof(rect));
     if (same) return;
     if (bundle_) {
-        // Bundles cannot set viewports or scissors: keep them for the direct list at replay.
+        // Bundles cannot set viewports or scissors: keep them for the direct list at replay. A
+        // batch only takes draws with its own viewport and scissor (BeginDeferredBundle).
+        if (batch_draws_ && (std::memcmp(&vp, &batch_vp_, sizeof(vp)) || std::memcmp(&rect, &batch_rect_, sizeof(rect))))
+            LOG_FIRST(4, "d3d12: deferred batch viewport changed inside a batch");
         bundle_desc_.viewport = vp;
         bundle_desc_.scissor = rect;
         bundle_desc_.has_viewport = true;
@@ -5894,7 +6390,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             DeferredBarrier("counted scene draw");
     }
     // A scene draw that cannot be recorded must run after the pending bundles it overlaps.
-    if (!defer_possible && defer_scene_ && !CurrentFrame().bundles.empty() &&
+    if (!defer_possible && defer_scene_ && DeferredPending() &&
         FindTarget(s.rt, false) == defer_rt_) {
         if (DeferredBarrier("main scene draw could not be deferred")) {
             if (!BindTargets(s)) return;
@@ -5924,6 +6420,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (sh.prog) EnsureProgramHash(s);
     sh.vkey = VertexKey(s, a, sh);
     EnsureVertexShader(s, a, sh);
+    if (!sh.vs_code && SceneShaderPending(sh.vh)) return;  // the worker is compiling it
 
     // stage textures, then the pixel shader made for them
     DrawTextures stages;
@@ -5960,12 +6457,23 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             if (stages.rt[i] && !stages.info[i].shadow) return true;
         return false;
     };
+    // a.topology is the mapped enum; the guest prim code (2 for a line list) is not it
+    const bool thin_prim = a.topology == Topology::Points || a.topology == Topology::Lines;
     uint8_t ao_roles = render_.ao != 0 && bound_rt_ && bound_ds_ && bound_ds_->res && !a.pretransformed &&
                                      scene_view && bound_ds_->w == bound_rt_->w && bound_ds_->h == bound_rt_->h
-                                 ? AoRoles(s, samples_colour_rt())
+                                 ? AoRoles(s, samples_colour_rt(), thin_prim)
                                  : 0;
     const bool opaque = (ao_roles & kAoDepth) != 0;  // recorded into the AO depth prepass
-    if (defer_now && !BeginDeferredBundle(stages, opaque)) {
+    const bool world = (ao_roles & (kAoDepth | kAoColour)) != 0;  // not an effect or the HUD
+    D3D12_VIEWPORT defer_vp{};
+    D3D12_RECT defer_rect{};
+    if (defer_now) {
+        // the viewport and scissor SetViewportScissor will compute: a batch shares them
+        GuestExtent vsize;
+        SurfaceSize(bound_rt_ ? s.rt : s.zs, vsize.w, vsize.h);
+        ViewportScissorFor(s, vsize.w, vsize.h, UiSqueeze(s, a, stages), defer_vp, defer_rect);
+    }
+    if (defer_now && !BeginDeferredBundle(stages, opaque, world, defer_vp, defer_rect)) {
         defer_now = false;
         DeferredFallback("bundle allocation failed");
     }
@@ -6028,11 +6536,14 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             sh.motion = true;
             sh.vkey = VertexKey(s, a, sh);
             EnsureVertexShader(s, a, sh);
-            if (!sh.vs_code) {  // the variant failed: the draw keeps its plain program
+            if (!sh.vs_code) {
+                if (SceneShaderPending(sh.vh)) return;  // the worker is compiling it
+                // the variant failed: the draw keeps its plain program
                 LOG_FIRST(4, "d3d12: TAA motion vertex shader failed, drawing without motion");
                 sh.motion = false;
                 sh.vkey = VertexKey(s, a, sh);
                 EnsureVertexShader(s, a, sh);
+                if (!sh.vs_code && SceneShaderPending(sh.vh)) return;
                 prev_consts = nullptr;
                 if (trace_scene_draw) motion_reason = "motion shader failed";
             }
@@ -6045,12 +6556,13 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
     pk.quad = sh.quad;
     // The guest HUD is composited into the scene before Present. Mark its alpha-blended
-    // screen-space draws so Native AA can preserve those pixels from the current frame.
+    // screen-space draws so TAA, FSR and DLSS keep those pixels from the current frame. Plain TAA
+    // needs it too: unmarked, HUD and menu boxes took the camera's motion and warped as it moved.
     const auto& hud_texture = stages.desc[0];
     const bool hud_source = !stages.rt[0] || (hud_texture &&
         uint64_t(hud_texture->width) * hud_texture->height <= kSmallTargetPixels);
     const bool temporal_upscaler = FsrEnabled() || DlssEnabled();
-    const bool fsr_hud = temporal_upscaler && bound_motion_ && a.pretransformed && hud_source &&
+    const bool fsr_hud = TemporalEnabled() && bound_motion_ && a.pretransformed && hud_source &&
                          blend_on && bsrc == 0x302 && bdst == 0x303 && !SimpleState(s, kMZWriteEnable) &&
                          BlendOp(SimpleState(s, kMBlendOp)) == D3D12_BLEND_OP_ADD &&
                          (SimpleState(s, kMColorWriteEnable) & 0x010101);
@@ -6093,14 +6605,18 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
     pk.ao = ao_receiver ? 1 : 0;
     sh.pkey = Hash(&pk, sizeof(pk));
-    EnsurePixelShader(pk, sh);
-    if (ao_receiver && !sh.ps_code) {
-        // the AO variant failed to compile: draw it as the game made it, without AO
-        LOG_FIRST(4, "d3d12: AO pixel shader variant failed, drawing without AO");
-        ao_receiver = false;
-        pk.ao = 0;
-        sh.pkey = Hash(&pk, sizeof(pk));
-        EnsurePixelShader(pk, sh);
+    EnsurePixelShader(pk, sh, !a.pretransformed);
+    if (!sh.ps_code) {
+        if (SceneShaderPending(sh.ph)) return;  // the worker is compiling it
+        if (ao_receiver) {
+            // the AO variant failed to compile: draw it as the game made it, without AO
+            LOG_FIRST(4, "d3d12: AO pixel shader variant failed, drawing without AO");
+            ao_receiver = false;
+            pk.ao = 0;
+            sh.pkey = Hash(&pk, sizeof(pk));
+            EnsurePixelShader(pk, sh, !a.pretransformed);
+            if (!sh.ps_code && SceneShaderPending(sh.ph)) return;
+        }
     }
     if (pk.motion && !sh.ps_code) {  // the motion variant failed to compile: draw it without motion
         LOG_FIRST(4, "d3d12: TAA motion pixel shader failed, drawing without motion");
@@ -6112,10 +6628,12 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             ao_depth_pending = opaque;
         }
         sh.pkey = Hash(&pk, sizeof(pk));
-        EnsurePixelShader(pk, sh);
+        EnsurePixelShader(pk, sh, !a.pretransformed);
+        if (!sh.ps_code && SceneShaderPending(sh.ph)) return;
         sh.motion = false;
         sh.vkey = VertexKey(s, a, sh);
         EnsureVertexShader(s, a, sh);
+        if (!sh.vs_code && SceneShaderPending(sh.vh)) return;
         prev_consts = nullptr;
     }
     if (!sh.vs_code || !sh.ps_code) return;
@@ -6132,7 +6650,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     ID3D12PipelineState* pso;
     {
         PerfScope perf_key{g_perf.key};
-        pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
+        pso = EnsurePipeline(k, sh.vs_code, sh.ps_code, !a.pretransformed);
     }
     if (!pso) return;
     depth_replay_ = {};
@@ -6141,15 +6659,29 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         // R32F distance target, through the pixel shader's distance variant so alpha tests and
         // discards still apply. No stencil: the AO depth's stencil is always 0, so the game's
         // stencil test would reject the writes.
-        DrawShaders dsh = sh;
-        PixelKey dpk = pk;
-        dpk.ao = 3;
-        dpk.motion = 0;
-        dsh.pkey = Hash(&dpk, sizeof(dpk));
-        EnsurePixelShader(dpk, dsh);
-        if (dsh.ps_code) {
-            const PsoKey dk = AoDepthPsoKey(k, dsh.ph);
-            depth_replay_.pso = EnsurePipeline(dk, dsh.vs_code, dsh.ps_code);
+        auto build_depth = [&](bool motion) {
+            DrawShaders dsh = sh;
+            PixelKey dpk = pk;
+            dpk.ao = motion ? 4 : 3;
+            dpk.motion = motion ? 1 : 0;
+            dsh.pkey = Hash(&dpk, sizeof(dpk));
+            EnsurePixelShader(dpk, dsh, !a.pretransformed);
+            if (!dsh.ps_code) return false;
+            const PsoKey dk = motion ? AoDepthMotionPsoKey(k, dsh.ph) : AoDepthPsoKey(k, dsh.ph);
+            ID3D12PipelineState* dpso = EnsurePipeline(dk, dsh.vs_code, dsh.ps_code, !a.pretransformed);
+            if (!dpso) return false;
+            depth_replay_.pso = dpso;
+            depth_replay_.motion = motion;
+            return true;
+        };
+        // Temporal AO: when this draw has a matched previous position, the prepass also writes
+        // the scene motion target, so reprojection uses the draw's own motion. If the new variant
+        // is still compiling, keep the plain distance prepass for this draw; AO never goes missing
+        // while the motion variant warms up.
+        const bool want_motion = ao_temporal_ && pk.motion == 1;
+        if (!build_depth(want_motion) && want_motion) {
+            depth_replay_ = {};
+            build_depth(false);
         }
     }
     if (ext_) binds_ = {};  // the extension may set anything
@@ -6215,7 +6747,9 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (ext_) binds_ = {};
 
     if (cap_) {
+        cap_ao_ = uint32_t(ao_roles) | (ao_receiver ? 0x100u : 0u);
         CaptureDraw(s, prim, count, k, c, stages, sh.vkey);
+        fprintf(cap_, " ao %X", cap_ao_);
         if (motion_reason) {
             fprintf(cap_, " | motion %s start %u index %08X base %08X program %016llX", motion_reason, start,
                     s.index_data, s.base_vertex, static_cast<unsigned long long>(sh.prog ? s.vs->hash : 0));
@@ -6250,7 +6784,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         Cmd()->SetGraphicsRootConstantBufferView(5, vcp);
     }
     uint32_t query = BeginCountedDraw(s);
-    if (defer_now) bundle_desc_.drew = true;
+    if (defer_now) {
+        bundle_desc_.drew = true;
+        defer_draw_drew_ = true;
+    }
     {
         PerfScope perf_geometry{g_perf.geometry};
         DrawGeometry(a);
@@ -6314,7 +6851,30 @@ ID3D12GraphicsCommandList* D3D12Backend::AcquireBundleList() {
     return list;
 }
 
-bool D3D12Backend::BeginDeferredBundle(const DrawTextures& stages, bool opaque) {
+bool D3D12Backend::BeginDeferredBundle(const DrawTextures& stages, bool opaque, bool world, const D3D12_VIEWPORT& vp,
+                                       const D3D12_RECT& rect) {
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = bound_rt_ ? Cpu(rtv_heap_.Get(), bound_rt_->view, rtv_inc_)
+                                                      : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = bound_ds_ ? Cpu(dsv_heap_.Get(), bound_ds_->view, dsv_inc_)
+                                                      : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    if (batch_) {
+        // Resume the open batch when this draw replays with exactly its direct-list state.
+        const BundleDesc& d = bundle_desc_;
+        const bool same = d.has_rt == (bound_rt_ != nullptr) && d.has_ds == (bound_ds_ != nullptr) &&
+                          d.rtv.ptr == rtv.ptr && d.dsv.ptr == dsv.ptr &&
+                          d.write == (bound_rt_ ? bound_rt_->res.Get() : nullptr) &&
+                          d.depth_write == (bound_ds_ ? bound_ds_->res.Get() : nullptr) && d.opaque == opaque &&
+                          d.world == world && !std::memcmp(&vp, &batch_vp_, sizeof(vp)) &&
+                          !std::memcmp(&rect, &batch_rect_, sizeof(rect));
+        if (same) {
+            bundle_ = std::exchange(batch_, nullptr);
+            binds_ = batch_binds_;  // the bundle's own bindings, not the direct list's
+            for (int i = 0; i < 4; i++) bundle_desc_.reads[i] = stages.res[i];
+            defer_draw_drew_ = false;
+            return true;
+        }
+        CloseDeferredBatch();
+    }
     Frame& f = CurrentFrame();
     ID3D12GraphicsCommandList* list = AcquireBundleList();
     if (!list) return false;
@@ -6322,36 +6882,72 @@ bool D3D12Backend::BeginDeferredBundle(const DrawTextures& stages, bool opaque) 
     bundle_desc_.list = f.bundle_pool[f.bundle_next - 1];
     bundle_desc_.has_rt = bound_rt_ != nullptr;
     bundle_desc_.has_ds = bound_ds_ != nullptr;
-    if (bound_rt_) bundle_desc_.rtv = Cpu(rtv_heap_.Get(), bound_rt_->view, rtv_inc_);
-    if (bound_ds_) bundle_desc_.dsv = Cpu(dsv_heap_.Get(), bound_ds_->view, dsv_inc_);
+    bundle_desc_.rtv = rtv;
+    bundle_desc_.dsv = dsv;
     bundle_desc_.write = bound_rt_ ? bound_rt_->res.Get() : nullptr;
     bundle_desc_.depth_write = bound_ds_ ? bound_ds_->res.Get() : nullptr;
     bundle_desc_.opaque = opaque;
+    bundle_desc_.world = world;
     if (!defer_rt_) defer_rt_ = bound_rt_;
     if (!defer_ds_) defer_ds_ = bound_ds_;
     for (int i = 0; i < 4; i++) bundle_desc_.reads[i] = stages.res[i];
     bundle_ = list;
+    batch_vp_ = vp;
+    batch_rect_ = rect;
+    batch_draws_ = 0;
+    batch_depth_.clear();
+    defer_draw_drew_ = false;
     // The bundle inherits PSO and topology from nowhere: force this draw to set everything.
     binds_ = {};
     return true;
 }
 
-void D3D12Backend::EndDeferredBundle() {
+// End of a deferred draw: its reads and writes become pending (so a later immediate command that
+// conflicts flushes first), its AO depth copy joins the batch, and the bundle is parked for the
+// next compatible draw.
+void D3D12Backend::SuspendDeferredBundle() {
     if (!bundle_) return;
-    ID3D12GraphicsCommandList* list = bundle_;
-    bundle_ = nullptr;
+    if (defer_draw_drew_) {
+        const DepthReplay& d = depth_replay_;
+        if (bundle_desc_.opaque && d.pso && d.drew) batch_depth_.push_back(d);
+        for (ID3D12Resource* r : bundle_desc_.reads) {
+            if (r) defer_reads_.insert(r);
+        }
+        if (bundle_desc_.write) defer_writes_.insert(bundle_desc_.write);
+        if (bundle_desc_.depth_write) defer_writes_.insert(bundle_desc_.depth_write);
+    }
+    depth_replay_ = {};
+    defer_draw_drew_ = false;
+    batch_ = std::exchange(bundle_, nullptr);
+    batch_binds_ = binds_;
+    binds_ = {};  // the direct list's bindings are unknown after recording into the bundle
+    if (++batch_draws_ >= kMaxBatchDraws) CloseDeferredBatch();
+}
+
+// Close the open batch and queue it, with its receivers' AO depth copies recorded into one
+// bundle per run of the same prepass target layout (bundles share one allocator, so this runs
+// after the main bundle is closed).
+void D3D12Backend::CloseDeferredBatch() {
+    if (!batch_) return;
+    ID3D12GraphicsCommandList* list = std::exchange(batch_, nullptr);
+    batch_binds_ = {};
+    batch_draws_ = 0;
     const HRESULT hr = list->Close();
     if (FAILED(hr)) {
         bundle_desc_ = {};
+        batch_depth_.clear();
         DeviceFailure(hr, "bundle close");
         return;
     }
-    // An AO receiver's depth-only copy, recorded from the bindings the main bundle used. It
-    // writes only the AO depth target, which no guest draw touches.
-    const DepthReplay& d = depth_replay_;
-    if (bundle_desc_.drew && bundle_desc_.opaque && d.pso && d.drew) {
-        if (ID3D12GraphicsCommandList* dl = AcquireBundleList()) {
-            dl->SetPipelineState(d.pso);
+    for (size_t i = 0; i < batch_depth_.size();) {
+        const bool motion = batch_depth_[i].motion;
+        ID3D12GraphicsCommandList* dl = AcquireBundleList();
+        if (!dl) break;
+        ID3D12PipelineState* pso = nullptr;
+        size_t j = i;
+        for (; j < batch_depth_.size() && batch_depth_[j].motion == motion; j++) {
+            const DepthReplay& d = batch_depth_[j];
+            if (d.pso != pso) dl->SetPipelineState(pso = d.pso);
             dl->SetGraphicsRootConstantBufferView(0, d.vsc);
             dl->SetGraphicsRootConstantBufferView(1, d.dc);
             dl->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), d.views, srv_inc_));
@@ -6369,26 +6965,21 @@ void D3D12Backend::EndDeferredBundle() {
             } else {
                 dl->DrawInstanced(d.draw_count, 1, 0, 0);
             }
-            if (SUCCEEDED(dl->Close())) bundle_desc_.depth_list = CurrentFrame().bundle_pool[CurrentFrame().bundle_next - 1];
         }
+        if (SUCCEEDED(dl->Close()))
+            bundle_desc_.depth_runs.push_back({CurrentFrame().bundle_pool[CurrentFrame().bundle_next - 1], motion});
+        i = j;
     }
-    depth_replay_ = {};
-    if (bundle_desc_.drew) {
-        for (ID3D12Resource* r : bundle_desc_.reads) {
-            if (r) defer_reads_.insert(r);
-        }
-        if (bundle_desc_.write) defer_writes_.insert(bundle_desc_.write);
-        if (bundle_desc_.depth_write) defer_writes_.insert(bundle_desc_.depth_write);
-    }
+    batch_depth_.clear();
     CurrentFrame().bundles.push_back(std::move(bundle_desc_));
     bundle_desc_ = {};
-    binds_ = {};
 }
 
 // Execute the frame's pending bundles in their original order. Called at present, and before
 // any command that would touch a resource a pending bundle still has to write.
 void D3D12Backend::FlushDeferredScene() {
     if (bundle_) return;  // bundles are never flushed from inside a recorded draw
+    CloseDeferredBatch();
     Frame& f = CurrentFrame();
     if (f.bundles.empty()) {
         defer_reads_.clear();
@@ -6441,7 +7032,7 @@ void D3D12Backend::FlushDeferredScene() {
     //    1 - occlusion; effects draw over the darkened scene exactly as the game ordered them.
     uint32_t receivers = 0;
     for (const BundleDesc& b : bundles)
-        if (b.depth_list) receivers++;
+        if (!b.depth_runs.empty()) receivers++;
     // The AO passes need a handful of SRV slots (null view, two 4-slot tables, occlusion view).
     // Only run them when the frame's ring has that room: otherwise the flush would exhaust the
     // ring, submit mid-flush, reset the command list and overwrite descriptors the pending
@@ -6451,43 +7042,185 @@ void D3D12Backend::FlushDeferredScene() {
     const bool ao_room = CurrentFrame().srv + kAoFlushSrvHeadroom <= kSrvPerFrame;
     if (ao_wanted && !ao_room) LOG_FIRST(4, "d3d12: AO skipped this flush: descriptor ring near full");
     bool ao_bound = false;
+    bool fused_done = false;
+    bool use_receiver = false;
+    size_t split = 0;
     if (ao_wanted && ao_room) {
+        if (ao_depth_clear_) ao_scene_mode_ = 0;  // a new view: either path may start it
         const auto depth = scene_depth_.find(defer_rt_);
         if (depth != scene_depth_.end() && depth->second.target == defer_ds_ && EnsureAoDepth(*defer_ds_)) {
-            const D3D12_CPU_DESCRIPTOR_HANDLE dh = Cpu(dsv_heap_.Get(), ao_depth_view_, dsv_inc_);
-            const D3D12_CPU_DESCRIPTOR_HANDLE distv = Cpu(rtv_heap_.Get(), kAoDistRtv, rtv_inc_);
-            Transition(ao_depth_.Get(), ao_depth_state_, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-            Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            // the prepass accumulates across a view's flushes; a scene clear starts it again
-            if (std::exchange(ao_depth_clear_, false)) {
-                // Replay uses the scene's depth tests, so start from the same reversed clear value.
-                cl_->ClearDepthStencilView(dh, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-                                           defer_ds_->depth_clear, 0, 0, nullptr);
+            // The receiver path over a range of bundles, used both on its own and for the suffix
+            // after a fused prefix. It accumulates into ao_depth_/ao_dist_ unless clear is set.
+            auto receiver_ao = [&](size_t begin, bool clear) -> bool {
+                const auto cpu_start = ao_profile_queries_ ? std::chrono::steady_clock::now()
+                                                           : std::chrono::steady_clock::time_point{};
+                const uint32_t prepass_timer = AoProfileBegin(0);
+                const D3D12_CPU_DESCRIPTOR_HANDLE dh = Cpu(dsv_heap_.Get(), ao_depth_view_, dsv_inc_);
+                const D3D12_CPU_DESCRIPTOR_HANDLE distv = Cpu(rtv_heap_.Get(), kAoDistRtv, rtv_inc_);
+                Transition(ao_depth_.Get(), ao_depth_state_, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                if (clear) {
+                    // Every frame starts a new view here, so this must not drop the temporal history
+                    // (it did, and the history was never used). A changed view is rejected per pixel
+                    // by the reprojected depth, and a cut by the camera test in RenderAoTemporal.
+                    // Replay uses the scene's depth tests, so start from the same reversed clear value.
+                    cl_->ClearDepthStencilView(dh, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                                               defer_ds_->depth_clear, 0, 0, nullptr);
+                    const float far_dist[4] = {kAoDistClear, 0, 0, 0};
+                    cl_->ClearRenderTargetView(distv, far_dist, 0, nullptr);
+                }
+                BindAoView(false);  // the receivers' shaders declare it; the prepass does not read it
+                const D3D12_CPU_DESCRIPTOR_HANDLE motion_rtv = Cpu(rtv_heap_.Get(), kAoMotionRtv, rtv_inc_);
+                const bool can_motion = ao_motion_ && ao_motion_->GetDesc().SampleDesc.Count == 1;
+                if (can_motion && std::exchange(ao_motion_frame_, frame_) != frame_) {
+                    Transition(ao_motion_.Get(), ao_motion_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    const float none[4] = {60000.0f, 60000.0f, 0, 1};
+                    cl_->ClearRenderTargetView(motion_rtv, none, 0, nullptr);
+                }
+                ao_motion_bundles_ = ao_plain_bundles_ = 0;
+                bool rt_bound = false, rt_motion = false;
+                for (size_t i = begin; i < bundles.size(); i++) {
+                  const BundleDesc& b = bundles[i];
+                  for (const BundleDesc::DepthRun& run : b.depth_runs) {
+                    if (run.motion) ++ao_motion_bundles_;
+                    else ++ao_plain_bundles_;
+                    const bool motion = run.motion && can_motion;
+                    if (run.motion && !can_motion) continue;  // the motion RTV pair is unavailable
+                    if (!rt_bound || motion != rt_motion) {
+                        if (motion) {
+                            const D3D12_CPU_DESCRIPTOR_HANDLE rh[2] = {distv, motion_rtv};
+                            cl_->OMSetRenderTargets(2, rh, FALSE, &dh);
+                        } else {
+                            cl_->OMSetRenderTargets(1, &distv, FALSE, &dh);
+                        }
+                        rt_bound = true;
+                        rt_motion = motion;
+                    }
+                    if (b.has_viewport) cl_->RSSetViewports(1, &b.viewport);
+                    if (b.has_scissor) cl_->RSSetScissorRects(1, &b.scissor);
+                    cl_->ExecuteBundle(run.list.Get());
+                  }
+                }
+                Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                AoProfileEnd(prepass_timer);
+                ao_temporal_depth_ = true;  // ao_depth_ holds this view's prepass: temporal may reproject
+                const bool bound = RenderAoOcclusion(*defer_rt_, 0.0f, kAoDistClear);  // far: the clear
+                ao_temporal_depth_ = false;
+                if (ao_profile_queries_)
+                    ao_profile_cpu_[frame_ % kFrames] += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - cpu_start).count();
+                cl_->SetGraphicsRootSignature(root_.Get());
+                rtv = dsv = ~SIZE_T(0);
+                binds_ = {};
+                if (!bound) LOG_FIRST(4, "d3d12: deferred AO pass failed");
+                return bound;
+            };
+            // Fused experiment: draw a prefix of leading background draws and world draws once
+            // into the scene, linearise that depth, and multiply AO over the world colour. The
+            // rest of the flush (from the first non-world after the world) replays in its original
+            // order with the receiver path, so effects keep their place. The prefix needs a
+            // single-sample scene colour target (the post-multiply pipeline is single-sample).
+            bool fused = ao_fused_ && ao_scene_mode_ == 0 &&
+                         defer_rt_->res->GetDesc().SampleDesc.Count == 1;
+            size_t first_world = bundles.size(), bad_bundle = size_t(-1);
+            if (fused) {
+                bool seen_world = false;
+                split = bundles.size();
+                for (size_t i = 0; i < bundles.size(); i++) {
+                    if (bundles[i].world) {
+                        if (!seen_world) {
+                            seen_world = true;
+                            first_world = i;
+                        }
+                    } else if (seen_world) {
+                        split = i;
+                        break;
+                    }
+                }
+                fused = first_world != bundles.size();
+                // Every world draw in the prefix must share the scene colour/depth targets. Leading
+                // background draws are allowed; one that writes depth joins the AO input (sky or
+                // backdrop depth is far, so it does not occlude the world).
+                for (size_t i = first_world; fused && i < split; i++) {
+                    const BundleDesc& b = bundles[i];
+                    if (b.world && (!b.has_ds || b.depth_write != defer_ds_->res.Get() ||
+                                    b.write != defer_rt_->res.Get())) {
+                        bad_bundle = i;
+                        fused = false;
+                    }
+                }
+                for (size_t i = 0; fused && i < first_world; i++)
+                    if (bundles[i].has_ds && bundles[i].depth_write)
+                        LOG_FIRST(4, "d3d12: fused AO: a leading background bundle writes depth");
+            }
+            if (ao_fused_ && !fused)
+                LOG_FIRST(4, "d3d12: fused AO not taken: mode %d samples %u first %zu split %zu/%zu bad %zu",
+                          ao_scene_mode_, defer_rt_->res->GetDesc().SampleDesc.Count, first_world, split,
+                          bundles.size(), bad_bundle);
+            if (fused) {
+                // Compile/bind everything before any world draw: a failure here falls back cleanly.
+                const bool half = EnsureAoHalf(defer_rt_->w, defer_rt_->h);
+                const bool occ = half && EnsureAoOcclusion(defer_rt_->w, defer_rt_->h);
+                const bool lin = occ && EnsurePassPipeline(kAoLinearizeHlsl, "psmain", kAoDistFormat, -1,
+                                                           DXGI_FORMAT_UNKNOWN, "AO depth linearise");
+                const bool post = lin && EnsurePassPipeline(kAoPostHlsl, "psmain", defer_rt_->fmt, -1,
+                                                            DXGI_FORMAT_UNKNOWN, "AO post multiply");
+                const bool dcp = post && EnsureDepthCopyPipeline(1);
+                if (!dcp)
+                    LOG_FIRST(4, "d3d12: fused AO preflight failed: half %d occ %d lin %d post %d dcp %d",
+                              half, occ, lin, post, dcp);
+                fused = dcp;
+            }
+            if (fused) {
+                std::exchange(ao_depth_clear_, false);
+                const D3D12_CPU_DESCRIPTOR_HANDLE distv = Cpu(rtv_heap_.Get(), kAoDistRtv, rtv_inc_);
+                Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 const float far_dist[4] = {kAoDistClear, 0, 0, 0};
                 cl_->ClearRenderTargetView(distv, far_dist, 0, nullptr);
+                Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                BindAoView(false);  // the world is drawn once, un-darkened; AO is multiplied below
+                for (size_t i = 0; i < split; i++) execute(bundles[i]);
+                rtv = dsv = ~SIZE_T(0);
+                binds_ = {};
+                const bool occ = LinearizeAoDepth(*defer_ds_, depth->second) &&
+                                 RenderAoOcclusion(*defer_rt_, 0.0f, kAoDistClear) && PostAoMultiply(*defer_rt_);
+                ao_bound = occ;
+                cl_->SetGraphicsRootSignature(root_.Get());
+                rtv = dsv = ~SIZE_T(0);
+                binds_ = {};
+                // Later flushes of this view still need a clean world depth for the receiver path.
+                if (!CopyAoDepth(*defer_ds_)) ao_depth_clear_ = true;
+                ao_scene_mode_ = 2;
+                if (split < bundles.size()) {
+                    // Effects and later world draws replay in their original order; the receiver
+                    // path adds AO to the world draws among them. The prefix already has its AO.
+                    use_receiver = receiver_ao(split, std::exchange(ao_depth_clear_, false));
+                    ao_bound = ao_bound || use_receiver;
+                } else {
+                    use_receiver = ao_bound;
+                }
+                static std::atomic<bool> fused_announced{false};
+                if (!fused_announced.exchange(true))
+                    LOGR("d3d12: fused AO %s: %zu prefix bundle(s) drawn once, %zu replayed", 
+                         ao_bound ? "active" : "failed", split, bundles.size() - split);
+                fused_done = true;
             }
-            BindAoView(false);  // the receivers' shaders declare it; the prepass does not read it
-            cl_->OMSetRenderTargets(1, &distv, FALSE, &dh);
-            for (const BundleDesc& b : bundles) {
-                if (!b.depth_list) continue;
-                if (b.has_viewport) cl_->RSSetViewports(1, &b.viewport);
-                if (b.has_scissor) cl_->RSSetScissorRects(1, &b.scissor);
-                cl_->ExecuteBundle(b.depth_list.Get());
+            if (!fused_done) {
+                ao_scene_mode_ = 2;
+                use_receiver = receiver_ao(0, std::exchange(ao_depth_clear_, false));
+                ao_bound = use_receiver;
             }
-            Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            ao_bound = RenderAoOcclusion(*defer_rt_, 0.0f, kAoDistClear);  // far: the distance clear
-            cl_->SetGraphicsRootSignature(root_.Get());
-            if (ao_bound) BindAoView(true);
-            rtv = dsv = ~SIZE_T(0);
-            binds_ = {};
-            if (!ao_bound) LOG_FIRST(4, "d3d12: deferred AO pass failed");
         } else {
             LOG_FIRST(4, "d3d12: deferred AO skipped on frame %llu, no scene depth for the display list target",
                       static_cast<unsigned long long>(frame_));
         }
     }
-    if (!ao_bound) BindAoView(false);  // receivers draw unchanged
-    for (BundleDesc& b : bundles) execute(b);
+    BindAoView(use_receiver);  // the suffix's receivers read the AO view; effects ignore it
+    if (fused_done) {
+        for (size_t i = split; i < bundles.size(); i++) execute(bundles[i]);
+    } else {
+        for (BundleDesc& b : bundles) execute(b);
+    }
     if (ao_bound) {
         static std::atomic<bool> announced{false};
         if (!announced.exchange(true))
@@ -6520,7 +7253,7 @@ void D3D12Backend::BindAoView(bool occlusion) {
 bool D3D12Backend::EnsureAoDepth(const Target& like) {
     const D3D12_RESOURCE_DESC want = like.res->GetDesc();
     const uint32_t samples = PickAoSamples(want.SampleDesc.Count);
-    if (ao_depth_ && ao_dist_) {
+    if (ao_depth_ && ao_dist_ && (!ao_temporal_ || ao_motion_)) {
         const D3D12_RESOURCE_DESC have = ao_depth_->GetDesc();
         if (have.Width == want.Width && have.Height == want.Height &&
             have.SampleDesc.Count == samples)
@@ -6531,6 +7264,8 @@ bool D3D12Backend::EnsureAoDepth(const Target& like) {
         CurrentFrame().garbage.push_back(ao_dist_);
         ao_depth_.Reset();
         ao_dist_.Reset();
+        if (ao_motion_) CurrentFrame().garbage.push_back(ao_motion_);
+        ao_motion_.Reset();
     }
     if (ao_depth_view_ == UINT32_MAX) {
         if (free_dsv_.empty()) return false;
@@ -6569,9 +7304,142 @@ bool D3D12Backend::EnsureAoDepth(const Target& like) {
         return false;
     }
     dev_->CreateRenderTargetView(ao_dist_.Get(), nullptr, Cpu(rtv_heap_.Get(), kAoDistRtv, rtv_inc_));
+    if (ao_temporal_) {
+        D3D12_RESOURCE_DESC md = Texture2DDesc(kAoMotionFormat, uint32_t(want.Width), want.Height);
+        md.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        md.SampleDesc.Count = samples;
+        D3D12_CLEAR_VALUE mcv{};
+        mcv.Format = kAoMotionFormat;
+        mcv.Color[0] = 60000.0f;
+        mcv.Color[1] = 60000.0f;
+        ao_motion_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &md, ao_motion_state_, &mcv,
+                                                 IID_PPV_ARGS(&ao_motion_)))) {
+            LOGE("d3d12: AO motion target could not be created");
+            ao_depth_.Reset();
+            ao_dist_.Reset();
+            return false;
+        }
+        dev_->CreateRenderTargetView(ao_motion_.Get(), nullptr, Cpu(rtv_heap_.Get(), kAoMotionRtv, rtv_inc_));
+        ao_motion_frame_ = ~0ull;
+    }
     ao_depth_clear_ = true;
     LOGR("d3d12: AO depth prepass target %llux%u, %u sample(s)", static_cast<unsigned long long>(want.Width),
          want.Height, td.SampleDesc.Count);
+    return true;
+}
+
+bool Invert4(const float* m, float* out);  // defined below, for temporal AO's reprojection
+
+// Two ping-pong RG16F histories at the AO resolution: the AO factor and the view distance that
+// produced it. They live outside the Target pool: only the AO passes touch them, and the resolve
+// reads the AO channel of the one written this frame.
+bool D3D12Backend::EnsureAoTemporal(uint32_t w, uint32_t h) {
+    if (ao_hist_[0] && ao_hist_[1] && ao_hist_w_ == w && ao_hist_h_ == h) return true;
+    for (int i = 0; i < 2; i++) {
+        if (ao_hist_[i]) CurrentFrame().garbage.push_back(ao_hist_[i]);
+        ao_hist_[i].Reset();
+        ao_hist_state_[i] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    for (int i = 0; i < 2; i++) {
+        D3D12_RESOURCE_DESC td = Texture2DDesc(kAoHistFormat, w, h);
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, ao_hist_state_[i], nullptr,
+                                                 IID_PPV_ARGS(&ao_hist_[i]))))
+            return false;
+        dev_->CreateRenderTargetView(ao_hist_[i].Get(), nullptr, Cpu(rtv_heap_.Get(), kAoHistRtv + i, rtv_inc_));
+    }
+    ao_hist_w_ = w;
+    ao_hist_h_ = h;
+    ao_hist_write_ = 0;
+    ao_hist_valid_ = false;
+    ao_frame_wrote_ = false;
+    LOGR("d3d12: temporal AO history %ux%u", w, h);
+    return true;
+}
+
+// Reproject the previous frame's AO (object motion where the prepass wrote it, otherwise the camera
+// from the prepass depth), reject it where the surface does not match, clip it to the current
+// neighbourhood and blend. Writes this frame's history: AO and linear view depth. Every AO flush of
+// a frame reruns it from the same previous history, so a later flush's fuller prepass replaces the
+// earlier result instead of being left with the raw factor; the last write becomes next frame's history.
+bool D3D12Backend::RenderAoTemporal() {
+    if (!ao_temporal_ || !ao_half_ || !ao_dist_ || !ao_depth_ || !ao_hist_[0] || !ao_hist_[1]) return false;
+    // The reprojection reads the prepass depth and motion as single-sample textures.
+    if (!ao_temporal_depth_ || ao_depth_->GetDesc().SampleDesc.Count != 1) return false;
+    if (ao_temporal_frame_ != presents_) {
+        // A new frame: the previous frame's last write becomes the history.
+        if (ao_frame_wrote_) {
+            ao_hist_write_ ^= 1;
+            ao_hist_cam_ = ao_frame_cam_;
+            ao_hist_valid_ = true;
+            ao_hist_frame_ = ao_temporal_frame_;
+        }
+        ao_frame_wrote_ = false;
+        ao_temporal_frame_ = presents_;
+    }
+    // The snapshot one present back, as TAA uses: the scene hook records the next frame's camera.
+    const CameraFrame cam = CameraOf(presents_ + 8 - 1);
+    float inv[16], m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    const bool cam_ok = cam.serial && cam.xs > 0 && cam.ys > 0 && cam.near_z > 0 && Invert4(cam.view, inv);
+    const bool stale = ao_hist_frame_ == ~0ull || presents_ - ao_hist_frame_ > 2;
+    // A cut or a menu camera turns the view by a large angle in one frame. Only the rotation is
+    // tested: the translation is in world units (a fast car moves far each frame), and a surface
+    // that is no longer there is rejected per pixel by its reprojected depth.
+    float turn = 0;
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) turn = std::max(turn, std::abs(cam.view[r * 4 + c] - ao_hist_cam_.view[r * 4 + c]));
+    const bool reset = stale || !ao_hist_valid_ || !cam_ok || turn > 0.35f ||
+                       cam.world_generation != ao_hist_cam_.world_generation || ao_hist_cam_.xs <= 0;
+    if (!reset) {
+        // row vectors: previous view = current view * inverse(current V) * previous V
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) {
+                float sum = 0;
+                for (int k = 0; k < 4; k++) sum += inv[r * 4 + k] * ao_hist_cam_.view[k * 4 + c];
+                m[r * 4 + c] = sum;
+            }
+    }
+    const uint32_t wr = ao_hist_write_ & 1, rd = wr ^ 1;
+    // The AO prepass's own motion target: separate from TAA's, so this pass never changes the
+    // scene motion target's state or competes with the main draw's writes.
+    const bool motion = ao_motion_ && ao_motion_->GetDesc().SampleDesc.Count == 1 && ao_motion_frame_ == frame_;
+    static std::atomic<bool> motion_logged{false};
+    if (!motion_logged.exchange(true))
+        LOGR("d3d12: temporal AO motion target %s (%ux%u); prepass %u motion, %u plain",
+             motion ? "used" : "missing", ao_hist_w_, ao_hist_h_, ao_motion_bundles_, ao_plain_bundles_);
+    static std::atomic<bool> motion_seen{false};
+    if (ao_motion_bundles_ && !motion_seen.exchange(true))
+        LOGR("d3d12: temporal AO motion prepass active (%u motion, %u plain)", ao_motion_bundles_,
+             ao_plain_bundles_);
+    Transition(ao_hist_[rd].Get(), ao_hist_state_[rd], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(ao_hist_[wr].Get(), ao_hist_state_[wr], D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Transition(ao_depth_.Get(), ao_depth_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (motion) Transition(ao_motion_.Get(), ao_motion_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    const D3D12_RESOURCE_DESC dd = ao_depth_->GetDesc();
+    const bool jittered = TemporalEnabled();
+    const float p[32] = {m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                         m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15],
+                         cam.xs, cam.ys, ao_hist_cam_.xs, ao_hist_cam_.ys,
+                         cam.near_z, cam.far_z > 0 ? cam.far_z : 1e7f, 0, 0,
+                         jittered ? taa_jitter_[0] / float(std::max<uint64_t>(dd.Width, 1)) : 0.0f,
+                         jittered ? taa_jitter_[1] / float(std::max<uint32_t>(dd.Height, 1)) : 0.0f, 0, 0,
+                         reset ? 0.0f : 1.0f, AoTemporalBlend(), motion ? 1.0f : 0.0f, 0};
+    ID3D12Resource* src[3] = {ao_half_.Get(), ao_depth_.Get(), ao_hist_[rd].Get()};
+    DXGI_FORMAT fmt[3] = {kAoFormat, kDepthRead, kAoHistFormat};
+    const bool drew = PassN(kAoTemporalHlsl, "psmain", kAoHistFormat,
+                            Cpu(rtv_heap_.Get(), kAoHistRtv + wr, rtv_inc_), ao_half_w_, ao_half_h_, src, fmt, p,
+                            32, -1, motion ? ao_motion_.Get() : nullptr, kAoMotionFormat);
+    Transition(ao_hist_[wr].Get(), ao_hist_state_[wr], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(ao_depth_.Get(), ao_depth_state_, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    if (motion) Transition(ao_motion_.Get(), ao_motion_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (!drew) return false;
+    ao_temporal_source_ = wr;
+    ao_frame_wrote_ = cam_ok;  // without a camera the next frame cannot reproject it
+    ao_frame_cam_ = cam;
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true)) LOGR("d3d12: temporal AO resolve active (camera + object reprojection)");
     return true;
 }
 
@@ -6602,15 +7470,107 @@ bool D3D12Backend::EnsureAoOcclusion(uint32_t w, uint32_t h) {
     return true;
 }
 
+// Fused AO step 1: the scene depth the world pass just wrote, linearised into ao_dist_ for the
+// GTAO kernel. This replaces the geometry prepass; the distance target then matches what the
+// prepass wrote (clip w in the same units).
+bool D3D12Backend::LinearizeAoDepth(Target& ds, const SceneDepth& sd) {
+    if (!ao_dist_ || !ds.res) return false;
+    const bool ms = ds.res->GetDesc().SampleDesc.Count > 1;
+    ID3D12Resource* depth = ds.res.Get();
+    DXGI_FORMAT depth_fmt = kDepthRead;
+    if (ms) {
+        depth = ResolveDepth(ds);
+        if (!depth) return false;
+        depth_fmt = DXGI_FORMAT_R32_FLOAT;
+        Transition(depth, ds.resolved_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    } else {
+        Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const float p[8] = {1.0f / float(std::max(ds.w, 1u)), 1.0f / float(std::max(ds.h, 1u)),
+                        sd.near_z, sd.far_z, sd.w_scale, 0, 0, 0};
+    ID3D12Resource* src[3] = {depth, nullptr, nullptr};
+    DXGI_FORMAT fmt[3] = {depth_fmt, kBgra, kBgra};
+    const bool drew = PassN(kAoLinearizeHlsl, "psmain", kAoDistFormat,
+                            Cpu(rtv_heap_.Get(), kAoDistRtv, rtv_inc_), ds.w, ds.h, src, fmt, p, 8, -1);
+    // the effects that follow test against the same depth, so put it back
+    if (ms) Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    else Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return drew;
+}
+
+// Fused AO step 3: scale the world colour by the finished AO factor. The copy is Feedback's
+// readable copy of the scene target; effects draw over the result afterwards, unaffected.
+bool D3D12Backend::PostAoMultiply(Target& rt) {
+    if (!rt.res || !ao_occ_) return false;
+    ID3D12Resource* copy = Feedback(rt);
+    if (!copy) return false;
+    Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12Resource* src[3] = {copy, ao_occ_.Get(), nullptr};
+    DXGI_FORMAT fmt[3] = {rt.fmt, kAoFormat, kBgra};
+    const float p[8] = {};
+    return PassN(kAoPostHlsl, "psmain", rt.fmt, Cpu(rtv_heap_.Get(), rt.view, rtv_inc_), rt.w, rt.h, src, fmt, p, 8,
+                 -1);
+}
+
+// Fused AO step 4: remember the world depth so a later flush of the same view can still use the
+// receiver prepass. ao_depth_ has no Target wrapper, so this mirrors DrawDepthCopy on its DSV.
+bool D3D12Backend::CopyAoDepth(Target& src) {
+    if (!ao_depth_ || !src.res) return false;
+    const bool ms = src.res->GetDesc().SampleDesc.Count > 1;
+    ID3D12Resource* depth = src.res.Get();
+    DXGI_FORMAT depth_fmt = kDepthRead;
+    if (ms) {
+        depth = ResolveDepth(src);
+        if (!depth) return false;
+        depth_fmt = DXGI_FORMAT_R32_FLOAT;
+        Transition(depth, src.resolved_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    } else {
+        Transition(src.res.Get(), src.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    ID3D12PipelineState* pso = EnsureDepthCopyPipeline(1);
+    if (!pso) {
+        Transition(src.res.Get(), src.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        return false;
+    }
+    Transition(ao_depth_.Get(), ao_depth_state_, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    const auto dh = Cpu(dsv_heap_.Get(), ao_depth_view_, dsv_inc_);
+    cl_->OMSetRenderTargets(0, nullptr, FALSE, &dh);
+    SetFullViewport(src.w, src.h);
+    const uint32_t slot = AllocSrvSlots(1);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = depth_fmt;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    dev_->CreateShaderResourceView(depth, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+    Alloc cb = Upload(256, 256);
+    if (cb.res) DrawFullScreen(pso, cb.gpu, slot);
+    Transition(src.res.Get(), src.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    bound_rt_ = bound_ds_ = nullptr;
+    return cb.res != nullptr;
+}
+
 // AO from the prepass depth (already readable), then the depth-aware blur and upsample into
 // the full-size occlusion target, left readable for the receivers' pixel shaders.
 bool D3D12Backend::RenderAoOcclusion(Target& rt, float near_z, float far_z) {
     dof_depth_ = ao_dist_.Get();
     dof_near_ = near_z;
     dof_far_ = far_z;
+    const uint32_t horizon_timer = AoProfileBegin(1);
     RenderHalfAo(rt);
+    AoProfileEnd(horizon_timer);
     dof_depth_ = nullptr;
     if (!ao_half_ready_ || !EnsureAoOcclusion(rt.w, rt.h)) return false;
+    // Every flush updates the temporal AO from the previous frame's history (RenderAoTemporal).
+    bool temporal_ok = false;
+    if (ao_temporal_ && EnsureAoTemporal(ao_half_w_, ao_half_h_)) {
+        const uint32_t temporal_timer = AoProfileBegin(2);
+        temporal_ok = RenderAoTemporal();
+        AoProfileEnd(temporal_timer);
+    }
+    ID3D12Resource* ao_source = temporal_ok ? ao_hist_[ao_temporal_source_].Get() : ao_half_.Get();
     const bool depth_ms = ao_dist_->GetDesc().SampleDesc.Count > 1;
     // built once per variant, not on every AO run
     static const std::string kShaders[2] = {AoResolveSource(false), AoResolveSource(true)};
@@ -6618,16 +7578,18 @@ bool D3D12Backend::RenderAoOcclusion(Target& rt, float near_z, float far_z) {
     if (!EnsurePassPipeline(shader.c_str(), "psmain", kAoFormat, -1, DXGI_FORMAT_UNKNOWN, "AO occlusion resolve"))
         return false;
     Transition(ao_occ_.Get(), ao_occ_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    ID3D12Resource* src[3] = {ao_half_.Get(), ao_dist_.Get(), nullptr};
-    DXGI_FORMAT fmt[3] = {kAoFormat, kAoDistFormat, kBgra};
+    ID3D12Resource* src[3] = {ao_source, ao_dist_.Get(), nullptr};
+    DXGI_FORMAT fmt[3] = {temporal_ok ? kAoHistFormat : kAoFormat, kAoDistFormat, kBgra};
     // cbuffer { float4 src; float4 planes; }: texel size in src.xy, near/far in planes.xy
     const float p[8] = {1.0f / float(std::max(ao_half_w_, 1u)), 1.0f / float(std::max(ao_half_h_, 1u)), 0, 0,
                         near_z, far_z, 0, 0};
     // The pipeline may have failed or the constants upload may be unavailable: only claim AO ran
     // when the occlusion pass actually recorded, so the receivers bind the null view instead of
     // sampling the cleared (or an unwritten) target.
+    const uint32_t resolve_timer = AoProfileBegin(3);
     const bool drew = PassN(shader.c_str(), "psmain", kAoFormat, Cpu(rtv_heap_.Get(), kAoOccRtv, rtv_inc_),
                             ao_occ_w_, ao_occ_h_, src, fmt, p, 8, -1);
+    AoProfileEnd(resolve_timer);
     Transition(ao_occ_.Get(), ao_occ_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     return drew;
 }
@@ -6636,7 +7598,7 @@ bool D3D12Backend::RenderAoOcclusion(Target& rt, float near_z, float far_z) {
 // targets. This is the normal materialisation path, not a failure: the frame keeps deferring
 // after the command. Only a conflict while a bundle is open forces the old immediate fallback.
 bool D3D12Backend::DeferredBarrier(const char* why) {
-    if (!defer_scene_ || CurrentFrame().bundles.empty()) return false;
+    if (!defer_scene_ || !DeferredPending()) return false;
     if (bundle_) {
         DeferredFallback(why);
         return false;
@@ -7764,6 +8726,7 @@ bool Invert4(const float* m, float* out) {
 D3D12Backend::~D3D12Backend() {
     g_exit_backend = nullptr;
     StopAoWarm();
+    StopSceneWarm();
     StopPipelineWarm();
     SavePipelineLibrary(true);
     SavePipelineKeys(true);
@@ -8595,7 +9558,8 @@ void D3D12Backend::RenderHalfAo(Target& t) {
     const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
     if (fov > 1.0f && fov < 179.0f && aspect > 0.1f)
         tan_half_fov = std::tan(fov * 3.14159265f / 360.0f) / aspect;
-    const std::string shader = AoHorizonSource(render_.ao, depth_desc.SampleDesc.Count > 1, render_.ao_method == 1);
+    const std::string shader =
+        AoHorizonSource(render_.ao, depth_desc.SampleDesc.Count > 1, render_.ao_method == 1, ao_temporal_);
     if (!EnsurePassPipeline(shader.c_str(), "psmain", kAoFormat, -1, DXGI_FORMAT_UNKNOWN, "GTAO horizon search")) {
         static std::atomic<int> logged_pipe{0};
         if (logged_pipe.fetch_add(1, std::memory_order_relaxed) < 4)
@@ -8604,9 +9568,22 @@ void D3D12Backend::RenderHalfAo(Target& t) {
     }
     ID3D12Resource* depth_src[3] = {dof_depth_, nullptr, nullptr};
     DXGI_FORMAT depth_fmt[3] = {kAoDistFormat, kBgra, kBgra};  // the prepass view distance
-    const float p[8] = {src[0], src[1], src[2], src[3], kAoStrength, kAoRadius, tan_half_fov, aspect};
+    // the world's up axis in view space, for the flat-wall test; view Y until a camera is seen
+    float up[3] = {0, 1, 0};
+    const int up_axis_before = ao_up_axis_;
+    ViewUpInView(CameraOf(presents_ + 8 - 1), ao_up_axis_, up);
+    if (up_axis_before < 0 && ao_up_axis_ >= 0)
+        LOGR("d3d12: AO flat-wall up is world axis %d, view (%.3f %.3f %.3f)", ao_up_axis_, up[0], up[1], up[2]);
+    // ao_up.w: how much of a vertical surface's AO to hide (0 keeps all, 1 hides it)
+    // ao_t (temporal only): this frame's kernel rotation and step offsets, an R2 low-discrepancy
+    // sequence, so the history averages many rotations rather than one screen-locked pattern
+    const double n = double(presents_ % 4096);
+    const float p[16] = {src[0], src[1], src[2], src[3], kAoStrength, kAoRadius, tan_half_fov, aspect,
+                         up[0], up[1], up[2], 1.0f - AoWallKeep(),
+                         ao_temporal_ ? float(std::fmod(n * 0.7548776662, 1.0)) : 0.0f,
+                         ao_temporal_ ? float(std::fmod(n * 0.5698402910, 1.0)) : 0.0f, 0, 0};
     const bool drew = PassN(shader.c_str(), "psmain", kAoFormat, Cpu(rtv_heap_.Get(), kAoRtv, rtv_inc_),
-                            ao_half_w_, ao_half_h_, depth_src, depth_fmt, p, 8, -1);
+                            ao_half_w_, ao_half_h_, depth_src, depth_fmt, p, 16, -1);
     Transition(ao_half_.Get(), ao_half_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ao_half_ready_ = drew;
 }
@@ -8689,6 +9666,120 @@ void D3D12Backend::CollectFsr3Profile(Frame& frame) {
     }
 }
 
+void D3D12Backend::InitAoProfile() {
+    if (!DevEnv("TCNYC_PROFILE_AO")) return;
+    const D3D12_QUERY_HEAP_DESC queries{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kFrames * kAoProfileQueries, 0};
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+    const auto buffer = BufferDesc(uint64_t(queries.Count) * sizeof(uint64_t));
+    if (FAILED(queue_->GetTimestampFrequency(&ao_profile_frequency_)) || !ao_profile_frequency_ ||
+        FAILED(dev_->CreateQueryHeap(&queries, IID_PPV_ARGS(&ao_profile_queries_))) ||
+        FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                                             nullptr, IID_PPV_ARGS(&ao_profile_readback_)))) {
+        ao_profile_queries_.Reset();
+        LOGR("d3d12: AO GPU timestamp profiling unavailable");
+        return;
+    }
+    ao_profile_wall_ = std::chrono::steady_clock::now();
+    LOGR("d3d12: AO GPU profiling on (TCNYC_PROFILE_AO=1), logged every 120 frames with AO");
+}
+
+void D3D12Backend::AoProfileFrameBegin() {
+    if (!ao_profile_queries_) return;
+    const uint32_t f = uint32_t(frame_ % kFrames);
+    ao_profile_pairs_[f] = 0;
+    ao_profile_cpu_[f] = 0;
+    ao_profile_resolved_[f] = false;
+    ao_profile_began_[f] = true;
+    cl_->EndQuery(ao_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, f * kAoProfileQueries);
+}
+
+void D3D12Backend::AoProfileFrameEnd() {
+    if (!ao_profile_queries_) return;
+    const uint32_t f = uint32_t(frame_ % kFrames);
+    if (!ao_profile_began_[f]) return;
+    const uint32_t base = f * kAoProfileQueries;
+    cl_->EndQuery(ao_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 1);
+    cl_->ResolveQueryData(ao_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base,
+                          2 + 2 * ao_profile_pairs_[f], ao_profile_readback_.Get(), uint64_t(base) * sizeof(uint64_t));
+    ao_profile_resolved_[f] = true;
+}
+
+uint32_t D3D12Backend::AoProfileBegin(uint32_t kind) {
+    if (!ao_profile_queries_) return UINT32_MAX;
+    const uint32_t f = uint32_t(frame_ % kFrames);
+    if (!ao_profile_began_[f] || ao_profile_pairs_[f] >= kAoProfilePairs) return UINT32_MAX;
+    const uint32_t pair = ao_profile_pairs_[f]++;
+    ao_profile_kind_[f][pair] = uint8_t(kind);
+    cl_->EndQuery(ao_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, f * kAoProfileQueries + 2 + pair * 2);
+    return pair;
+}
+
+void D3D12Backend::AoProfileEnd(uint32_t pair) {
+    if (pair == UINT32_MAX || !ao_profile_queries_) return;
+    const uint32_t f = uint32_t(frame_ % kFrames);
+    cl_->EndQuery(ao_profile_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, f * kAoProfileQueries + 3 + pair * 2);
+}
+
+// Called once the frame slot's fence has completed: its timestamps are in the readback buffer.
+void D3D12Backend::CollectAoProfile() {
+    const uint32_t f = uint32_t(frame_ % kFrames);
+    if (!ao_profile_resolved_[f]) return;
+    ao_profile_resolved_[f] = false;
+    const uint32_t pairs = ao_profile_pairs_[f];
+    const double cpu = ao_profile_cpu_[f];
+    if (!pairs) return;  // a frame without AO (menus, movies)
+    const uint32_t mode = render_.ao | (render_.ao_method << 4) | (ao_temporal_ ? 0x100u : 0u);
+    if (mode != ao_profile_mode_) {
+        ao_profile_mode_ = mode;
+        ao_profile_warmup_ = 30;
+        ao_profile_count_ = ao_profile_frames_ = ao_profile_flushes_ = 0;
+        ao_profile_gpu_ms_ = ao_profile_cpu_ms_ = 0;
+        for (double& v : ao_profile_pass_ms_) v = 0;
+        ao_profile_wall_ = std::chrono::steady_clock::now();
+    }
+    if (ao_profile_warmup_) {
+        if (--ao_profile_warmup_ == 0) ao_profile_wall_ = std::chrono::steady_clock::now();
+        return;
+    }
+    const size_t offset = size_t(f) * kAoProfileQueries * sizeof(uint64_t);
+    const size_t bytes = size_t(2 + 2 * pairs) * sizeof(uint64_t);
+    const D3D12_RANGE range{offset, offset + bytes};
+    void* mapped = nullptr;
+    if (FAILED(ao_profile_readback_->Map(0, &range, &mapped))) return;
+    uint64_t ticks[kAoProfileQueries];
+    std::memcpy(ticks, static_cast<const uint8_t*>(mapped) + offset, bytes);
+    const D3D12_RANGE written{0, 0};
+    ao_profile_readback_->Unmap(0, &written);
+    if (ticks[1] <= ticks[0]) return;
+    const double ms_per_tick = 1000.0 / double(ao_profile_frequency_);
+    ao_profile_gpu_ms_ += double(ticks[1] - ticks[0]) * ms_per_tick;
+    for (uint32_t i = 0; i < pairs; i++) {
+        const uint64_t a = ticks[2 + i * 2], b = ticks[3 + i * 2];
+        if (b >= a && ao_profile_kind_[f][i] < kAoProfileKinds)
+            ao_profile_pass_ms_[ao_profile_kind_[f][i]] += double(b - a) * ms_per_tick;
+        if (ao_profile_kind_[f][i] == 0) ++ao_profile_flushes_;
+    }
+    ao_profile_cpu_ms_ += cpu;
+    ++ao_profile_frames_;
+    if (++ao_profile_count_ == 120) {
+        const auto now = std::chrono::steady_clock::now();
+        const double wall = std::chrono::duration<double, std::milli>(now - ao_profile_wall_).count();
+        const double n = double(ao_profile_frames_);
+        const double* ms = ao_profile_pass_ms_;
+        const double ao_total = ms[0] + ms[1] + ms[2] + ms[3];
+        LOGR("AO GPU profile: %s %s%s %ux%u | 120 frames | frame %.2f ms wall, GPU span %.2f ms | AO GPU %.2f ms: "
+             "prepass %.2f, horizon %.2f, temporal %.2f, resolve %.2f | %.2f flushes/frame | AO flush CPU %.2f ms",
+             render_.ao_method == 1 ? "SSAO" : "GTAO", render_.ao == 1 ? "Half" : "Full",
+             ao_temporal_ ? " temporal" : "", ao_half_w_, ao_half_h_, wall / n, ao_profile_gpu_ms_ / n,
+             ao_total / n, ms[0] / n, ms[1] / n, ms[2] / n, ms[3] / n, double(ao_profile_flushes_) / n,
+             ao_profile_cpu_ms_ / n);
+        ao_profile_count_ = ao_profile_frames_ = ao_profile_flushes_ = 0;
+        ao_profile_gpu_ms_ = ao_profile_cpu_ms_ = 0;
+        for (double& v : ao_profile_pass_ms_) v = 0;
+        ao_profile_wall_ = now;
+    }
+}
+
 void D3D12Backend::ResetFrame() {
     Frame& f = CurrentFrame();
     const uint64_t completed = fence_->GetCompletedValue();
@@ -8702,6 +9793,7 @@ void D3D12Backend::ResetFrame() {
         }
     }
     if (fsr_profile_queries_) CollectFsr3Profile(f);
+    if (ao_profile_queries_) CollectAoProfile();
     RefreshAoReadyView();  // the AO workers' progress, for this frame's draws to read without locking
     HRESULT hr = f.alloc->Reset();
     if (FAILED(hr)) DeviceFailure(hr, "frame command allocator reset");
@@ -8712,6 +9804,14 @@ void D3D12Backend::ResetFrame() {
     f.smp = uint32_t(frame_ % kFrames) * kSamplersPerFrame;
     samplers_[frame_ % kFrames].clear();
     last_sampler_slot_ = UINT32_MAX;  // the slot belongs to the frame region that was just recycled
+    if (batch_) {  // never left open past present; close it before its allocator is reset
+        LOG_FIRST(4, "d3d12: deferred batch still open at frame reset");
+        batch_->Close();
+        batch_ = nullptr;
+    }
+    batch_binds_ = {};
+    batch_depth_.clear();
+    batch_draws_ = 0;
     if (f.bundle_alloc) {
         hr = f.bundle_alloc->Reset();
         if (FAILED(hr)) DeviceFailure(hr, "frame bundle allocator reset");
@@ -8738,6 +9838,7 @@ void D3D12Backend::ResetFrame() {
     hr = cl_->Reset(f.alloc.Get(), nullptr);
     if (FAILED(hr)) DeviceFailure(hr, "frame command list reset");
     Begin();
+    AoProfileFrameBegin();
 }
 
 void D3D12Backend::CountFps() {
@@ -8775,11 +9876,11 @@ void LogPerf() {
              g_perf_wait_kind_ns[5].exchange(0) / n / 1e6, g_perf_sync_block.exchange(0) / n,
              g_perf_sync_late.exchange(0) / n);
         LOGI("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB "
-             "hashed | %.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f shrinks, "
+             "hashed | %.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets (%.1f reused), %.1f target uploads, %.1f shrinks, "
              "%.1f read-backs %.1f late | %llu shaders %llu psos %llu shader cache hits this second",
              p.draws / n, p.raw / n, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n, p.sigs / n,
              p.sig_bytes / n / 1048576.0, p.texups / n, p.texup_bytes / n / 1048576.0, p.newtex / n,
-             p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
+             p.targets / n, p.target_reuses / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
              (unsigned long long)p.shaders, (unsigned long long)p.psos, (unsigned long long)p.shader_hits);
         LOGI("perf: pipeline creation %.3f ms/frame, %llu built, %llu from the saved library (%llu not in it), "
              "%llu pre-built at start",
@@ -8898,6 +9999,7 @@ void D3D12Backend::Present(const Surface& front) {
     scene_depth_.clear();
     last_scene_rt_ = nullptr;
     dof_depth_ = nullptr;
+    AoProfileFrameEnd();
     Submit(false);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     DeliverReports();
@@ -9005,24 +10107,40 @@ uint32_t D3D12Backend::SupportedMsaa(uint32_t samples) {
 // and the depth format all accept (the Vulkan backend does the same). The prepass pipelines key
 // on the result, so the AO targets and their pipelines never disagree on samples.
 uint32_t D3D12Backend::PickAoSamples(uint32_t requested) {
-    if (requested == ao_pick_requested_) return ao_pick_samples_;
+    // The GTAO horizon reads one depth sample. A multisampled prepass can put a different
+    // triangle's sample-0 depth on either side of a coplanar triangle seam, leaving a dark AO
+    // line on a flat wall (worst with MSAA). AO is low frequency: one sample is enough.
+    // TCNYC_AO_SAMPLES=N restores a multisampled prepass for comparison.
+    // Called for every AO receiver's prepass key: read the environment and the device's support
+    // once. A getenv per draw was over a quarter of the render thread's CPU in a dev build.
+    static const uint32_t forced = [] {
+        const char* e = DevEnv("TCNYC_AO_SAMPLES");
+        return e && *e ? std::max(1u, uint32_t(std::strtoul(e, nullptr, 10))) : 1u;
+    }();
+    if (ao_pick_cached_ && requested == ao_pick_requested_) return ao_pick_samples_;
     uint32_t picked = 1;
-    for (uint32_t samples : {8u, 4u, 2u}) {
-        if (requested < samples) continue;
-        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS color{kAoDistFormat, samples};
-        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS depth{kDepthFormat, samples};
-        if (SUCCEEDED(dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &color, sizeof(color))) &&
-            color.NumQualityLevels &&
-            SUCCEEDED(dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &depth, sizeof(depth))) &&
-            depth.NumQualityLevels) {
-            picked = samples;
-            break;
+    if (forced > 1) {
+        for (uint32_t samples : {8u, 4u, 2u}) {
+            if (forced < samples) continue;
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS color{kAoDistFormat, samples};
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS depth{kDepthFormat, samples};
+            if (SUCCEEDED(dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &color, sizeof(color))) &&
+                color.NumQualityLevels &&
+                SUCCEEDED(dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &depth, sizeof(depth))) &&
+                depth.NumQualityLevels) {
+                picked = samples;
+                break;
+            }
         }
+        if (picked < forced) LOGR("d3d12: AO prepass capped to %ux MSAA (asked %ux)", picked, forced);
     }
-    if (requested > 1 && picked < requested)
-        LOGR("d3d12: AO prepass capped to %ux MSAA (scene %ux)", picked, requested);
-    ao_pick_requested_ = requested;
-    ao_pick_samples_ = picked;
+    if (!ao_pick_cached_ || requested != ao_pick_requested_ || picked != ao_pick_samples_) {
+        ao_pick_cached_ = true;
+        ao_pick_requested_ = requested;
+        ao_pick_samples_ = picked;
+        if (requested > 1 && picked < requested)
+            LOGR("d3d12: AO prepass uses %ux (scene %ux)", picked, requested);
+    }
     return picked;
 }
 
@@ -9088,6 +10206,7 @@ void D3D12Backend::ApplySettings() {
         ++targets_epoch_;
         target_memo_[0].valid = target_memo_[1].valid = false;
         Flush();
+        DropSpareTargets(true);  // made for the old scale or sample count
         scene_depth_.clear();
         last_scene_rt_ = nullptr;
         if (remake) {
@@ -9195,6 +10314,7 @@ bool D3D12Backend::TargetStale(uint32_t data) const {
 
 // long sessions create render targets at new guest addresses; keep only the live set
 void D3D12Backend::SweepTargets() {
+    DropSpareTargets(false);
     for (auto it = targets_.begin(); it != targets_.end();) {
         const Target& t = it->second;
         auto used_it = target_used_.find(t.data);

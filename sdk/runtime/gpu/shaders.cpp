@@ -970,7 +970,11 @@ std::string PixelHlsl(const PixelKey& k) {
     // occlusion, not brightness: an unset (null) view reads 0 and leaves the colour alone
     // t4: past the stages' t0-t3 (ps_5_0 has no register spaces)
     if (k.ao == 1) s += "Texture2D<float> aoOcc : register(t4);\n";
-    if (k.motion)
+    if (k.ao == 4)
+        // AO depth prepass with the scene motion target beside the distance target.
+        s += "struct PsDepthMotion { float4 d : SV_Target0; float4 m : SV_Target1; };\n"
+             "PsDepthMotion main(VOut i, bool front : SV_IsFrontFace) {\n";
+    else if (k.motion)
         s += "struct PsMotion { float4 c : SV_Target0; float4 m : SV_Target1; };\n"
              "PsMotion main(VOut i, bool front : SV_IsFrontFace) {\n";
     else
@@ -1053,7 +1057,22 @@ std::string PixelHlsl(const PixelKey& k) {
     if (k.alphatest) body += "alphatest(outc.a);\n";
     // AO depth prepass: the view distance (clip w, which SV_Position.w carries into the pixel
     // shader) after the draw's own alpha test and discards
-    if (k.ao == 3)
+    if (k.ao == 4) {
+        // The AO prepass with the scene motion target: distance plus the uv this pixel had in the
+        // previous frame minus its uv now. 60000 means "no previous position".
+        body += "#if TCNYC_VULKAN\n"
+                "float pd = 1.0 / i.pos.w;\n"
+                "#else\n"
+                "float pd = i.pos.w;\n"
+                "#endif\n"
+                "PsDepthMotion r; r.d = float4(pd, 0, 0, 1);\n"
+                "if (i.mp.w > 0) {\n"
+                "    float2 now = i.mc.xy / i.mc.w, was = i.mp.xy / i.mp.w;\n"
+                "    r.m = float4((was - now) * float2(0.5, -0.5), 0, 1);\n"
+                "} else {\n"
+                "    r.m = float4(60000, 60000, 0, 1);\n"
+                "}\nreturn r;\n}\n";
+    } else if (k.ao == 3)
         body += "#if TCNYC_VULKAN\n"
                 "return float4(1.0 / i.pos.w, 0, 0, 1);\n"
                 "#else\n"
@@ -1062,8 +1081,18 @@ std::string PixelHlsl(const PixelKey& k) {
     // AO darkens the surface colour before fog, not the fogged result: the colour is already
     // lerp(fog, surface, f), so scaling it by ao and adding back the fog share it took gives
     // lerp(fog, surface * ao, f). Without fog (f = 1) this is a plain multiply.
-    else if (k.ao) body += "{ float ao = 1.0 - aoOcc.Load(int3(i.pos.xy, 0));\n"
-                           "  outc.rgb = outc.rgb * ao + (1.0 - fogin.a) * fogin.rgb * (1.0 - ao); }\n";
+    else if (k.ao) {
+        body += "{ float ao = 1.0 - aoOcc.Load(int3(i.pos.xy, 0));\n";
+        if (g_ao_debug_view)
+            body += "  outc.rgb = ao.xxx; outc.a = 1;\n";
+        else
+            body += "  outc.rgb = outc.rgb * ao + (1.0 - fogin.a) * fogin.rgb * (1.0 - ao);\n";
+        body += "}\n";
+    }
+    if (k.ao == 4) {  // the depth+motion variant returned above
+        s += body;
+        return k.quad ? QuadHlsl(std::move(s)) : s;
+    }
     body += Hooks().Output();
     if (k.motion == 2)
         body += "if (outc.a <= 0) discard;\n"

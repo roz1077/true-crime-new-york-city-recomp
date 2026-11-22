@@ -21,6 +21,14 @@
   ultrawide HUD centred instead of stretched. A clear with no rectangles also clears only the current viewport.
 - Windows Vulkan DLSS can be built with `TCNYC_DLSS_VK_SDK` pointed at NVIDIA's NGX SDK (Vulkan headers and
   `nvsdk_ngx.lib`); it is optional exactly like the Direct3D 12 DLSS build.
+- **Ambient occlusion remains experimental and off by default.** A captured frame showed the game's own render
+  target is clean, so the hard dark line where a contact band crossed a flat wall, sign or billboard came from the
+  host AO pass, not game geometry or a shadow. Blur width/depth, radius, strength, MSAA, normal reconstruction and
+  R16 precision did not remove it. GTAO and SSAO now keep only half the AO on vertical surfaces (walls, signs and
+  billboards), where a band edge has no shape under it and reads as a moving line, so its contrast is halved
+  without losing the shading; floors, roads, props and characters keep their full contact shadows.
+  `TCNYC_AO_WALL` sets the fraction kept (0 hides walls entirely, 1 is the old behaviour), and
+  `TCNYC_AO_FLATS=0` turns the whole test off.
 
 - New **Gamma**, **Brightness**, **Contrast** and **Saturation** display adjustments in the launcher,
   the F10 Graphics menu and Options > Display. All four default to 100%, which leaves the picture
@@ -238,6 +246,11 @@
   and the next start builds them on background threads before the game needs them. The list
   survives a driver update that empties the driver's own cache, and both are now saved when the
   game exits. `TCNYC_PIPELINE_WARM=0` turns the pre-build off. Linux and Windows.
+- The startup build now covers the whole saved list, including points and lines, and finishes
+  before the game runs, so a state seen in an earlier run cannot compile in a draw. A shader or
+  pipeline state first seen during play is compiled/built on a worker instead; that one draw waits
+  a frame instead of hitching. `TCNYC_PIPELINE_ASYNC=0` restores the old in-draw build. Linux and
+  Windows.
 
 ### Menus
 - A native Exit Game row in the main menu and the pause menu, with a confirmation step. It

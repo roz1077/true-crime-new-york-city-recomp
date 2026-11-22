@@ -85,6 +85,7 @@ struct ShaderHooks {
 };
 inline const ShaderHooks* g_shader_hooks = nullptr;
 inline bool g_reversed_depth = false;  // the renderer stores depth reversed: shadow compares turn r with it
+inline bool g_ao_debug_view = false;   // TCNYC_AO_VIEW=1: AO receivers output 1 - occlusion as grey
 
 // the Shadow softness setting (0 off, 1 soft, 2 softer) as DrawConstants::tscale[3]
 inline float ShadowSpacing(uint32_t softness) { return softness == 1 ? 1.0f : softness >= 2 ? 1.75f : 0.0f; }

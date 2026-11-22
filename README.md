@@ -50,7 +50,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 - **Modern graphics** — render scale, aspect ratio, field of view, object detail, MSAA, SMAA, bloom, depth of field and GTAO ambient occlusion on both platforms, plus sharper and softer shadows.
 - **TAA and upscaling** - temporal anti-aliasing with per-object motion, AMD FSR 1 and FSR 3.1 on both platforms, FSR 4.1 on Windows (Direct3D 12 and Vulkan) with a supported AMD GPU, and RCAS sharpening.
 - **Steam Deck and handhelds** — a native SteamOS build with Deck button prompts, tested on a Radeon 890M handheld. See the [Linux / SteamOS guide](README-LINUX.md) for setup on SteamOS.
-- **Fewer stutters** — compiled pipelines are kept between runs and pre-built in the background at start, so effects the game has used before do not hitch the first time they appear.
+- **Fewer stutters** - compiled pipelines are kept between runs and built at start before the first frame, so effects the game has used before do not hitch the first time they appear. A shader or state seen for the first time is compiled on a worker instead of in a draw.
 - **HDR output** — optional HDR on Windows (scRGB or HDR10) and Linux (HDR10 or extended sRGB), with paper white, peak brightness and highlight strength settings.
 - **Widescreen** — up to 32:9 for the 3D view, with the HUD and menus kept in the middle and the intro movies stretched to fill the screen.
 - **Controller and mouse** — Xbox, PlayStation and Switch controllers with hot-plug, rumble and matching button prompts, including Steam Deck glyphs and Xbox prompts for the ROG Ally and Legion Go under Steam Input. Raw mouse aim works in precision aim and snaps onto a lock-on target; keyboard prompts switch to the pedal keys in a car.
@@ -109,7 +109,7 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Shadow quality | Original (follows render scale), High (1024x1024) or Ultra (2048x2048) shadow image. Original by default. |
 | Shadow softness | Off, Soft or Softer shadow edges. Off by default. |
 | Depth of field | Distance blur for 3D scenes. On by default. |
-| Ambient occlusion | GTAO contact shadows in corners and under objects, applied to world geometry only so lights, fog and effects keep their brightness. Off, Half or Full resolution. Off by default. Windows (D3D12) and Linux (Vulkan). |
+| Ambient occlusion | **Experimental.** GTAO contact shadows in corners and under objects, applied to world geometry only so lights, fog and effects keep their brightness. Off, Half or Full resolution. Off by default. Vertical surfaces (walls, signs and billboards) keep half their AO, which softens the moving band edge there; floors, roads, props and characters keep all of theirs. Windows (D3D12) and Linux (Vulkan). |
 | Building seam fix | Experimental: gives detailed buildings priority over simplified city meshes. On by default. |
 | PC contrast | Softer shadow roll-off inspired by the PC version. On by default. |
 | Gamma | 50% to 250%: display gamma for dark scenes. 100% is unchanged and leaves the picture identical. |

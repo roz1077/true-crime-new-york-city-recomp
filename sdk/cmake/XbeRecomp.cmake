@@ -263,8 +263,10 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_include_directories(${target}_code PRIVATE ${XBE_SDK_DIR}/runtime ${GEN})
     target_include_directories(${target}_code SYSTEM PRIVATE ${XBE_SDK_DIR}/runtime/cpu/freestanding)
     target_compile_definitions(${target}_code PRIVATE X86_GAME_CODE)
-    target_compile_options(${target}_code PRIVATE -fms-extensions -fms-compatibility-version=19.40 -O2 -fno-strict-aliasing -nostdinc
-        -nostdinc++ -w)
+    # -march must match the host executable's baseline: without SSE4.1 the freestanding <cmath> hands
+    # trunc/nearbyint/floor/ceil to the C runtime, which this DLL does not link (/nodefaultlib).
+    target_compile_options(${target}_code PRIVATE -march=x86-64-v2 -fms-extensions -fms-compatibility-version=19.40 -O2
+        -fno-strict-aliasing -nostdinc -nostdinc++ -w)
     target_link_libraries(${target}_code PRIVATE ${target})
     target_link_options(${target}_code PRIVATE -fuse-ld=lld -Wl,/noentry,/nodefaultlib,/opt:noicf)
     # The MinGW lld driver reads /def: as a file name; it takes the .def file as an input instead.
