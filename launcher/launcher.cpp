@@ -1284,6 +1284,9 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
             error = true;
         }
 
+        // TCNYC_LAUNCHER_TIMING (developer builds): the CPU time of each redraw, averaged into launcher.log
+        static const bool timing = DevEnv("TCNYC_LAUNCHER_TIMING") != nullptr;
+        const uint64_t draw_start = timing ? SDL_GetPerformanceCounter() : 0;
         ImGui::Render();
         // The SDL_Renderer backend leaves vertex positions in window units and expects the renderer scaled
         // to the backbuffer. With desktop scaling (KDE at 150%: a 760x620 window has a 1140x930 backbuffer)
@@ -1295,6 +1298,22 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
         SaveLauncherShot(renderer);
         SDL_RenderPresent(renderer);
+        if (timing) {
+            static double total_ms = 0, max_ms = 0;
+            static int frames = 0;
+            const double ms = double(SDL_GetPerformanceCounter() - draw_start) * 1000.0 /
+                              double(SDL_GetPerformanceFrequency());
+            total_ms += ms;
+            max_ms = std::max(max_ms, ms);
+            if (++frames == 50) {
+                int w = 0, h = 0;
+                SDL_GetCurrentRenderOutputSize(renderer, &w, &h);
+                LogLine("launcher: %s %dx%d, 50 redraws: %.2f ms average, %.2f ms max", SDL_GetRendererName(renderer),
+                        w, h, total_ms / frames, max_ms);
+                total_ms = max_ms = 0;
+                frames = 0;
+            }
+        }
         const bool busy = updating || updater.state() == Updater::State::Checking || picking || controls.Capturing();
         if (!play && !busy && SDL_GetTicks() - last_activity >= 250)
             waited_event = SDL_WaitEventTimeout(&event, 100);
@@ -1307,6 +1326,22 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
 
 } // namespace
 
+// The launcher's renderer: SDL's default (Direct3D 11 on Windows). TCNYC_LAUNCHER_RENDERER (developer builds)
+// picks another SDL renderer for comparison, with TCNYC_LAUNCHER_TIMING to time the redraws.
+//
+// RivaTuner Statistics Server (MSI Afterburner) hooks every Direct3D device a process creates. In Beta 4.x the
+// game ran on in the launcher's process after that device was gone, and with RTSS's default hooking the game
+// never started (issues #17 and #22); the game now runs in its own process (LaunchGame). SDL's "software"
+// renderer would give RTSS nothing to hook at all, but it measured 23.7 ms a redraw against 0.24 ms for
+// Direct3D 11 at 760x620, and the animated background redraws continuously, so it is not the default.
+SDL_Renderer *CreateLauncherRenderer(SDL_Window *window) {
+    if (const char *forced = DevEnv("TCNYC_LAUNCHER_RENDERER")) {
+        if (SDL_Renderer *renderer = SDL_CreateRenderer(window, forced)) return renderer;
+        LogLine("launcher: the %s renderer failed (%s), using SDL's default", forced, SDL_GetError());
+    }
+    return SDL_CreateRenderer(window, nullptr);
+}
+
 bool Run(app::GameSource& source) {
     input::SetHints();
     constexpr auto subsystems = SDL_INIT_VIDEO | SDL_INIT_GAMEPAD;
@@ -1315,9 +1350,10 @@ bool Run(app::GameSource& source) {
         return false;
     }
     SDL_Window *window = SDL_CreateWindow(kTitle, 760, 620, SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE);
-    SDL_Renderer *renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
+    SDL_Renderer *renderer = window ? CreateLauncherRenderer(window) : nullptr;
     bool play = false;
     if (renderer) {
+        LogLine("launcher: renderer %s", SDL_GetRendererName(renderer));
         const float pixel_density = std::max(1.0f, SDL_GetWindowPixelDensity(window));
         const float scale = std::max(1.0f, SDL_GetWindowDisplayScale(window) / pixel_density);
         if (scale > 1.0f) SDL_SetWindowSize(window, int(760 * scale), int(620 * scale));
