@@ -714,21 +714,25 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]) {
         // copy can look like holes in the panels. Keep the paint term at full weight.
         // Match the combiner definition and target use so glass and other materials retain
         // their reflection and alpha. These shader definitions are shared by USA and PAL.
+        // Stage 0 is v0 * t0 for textured paint and v0 * (1 - 0) for untextured paint (d[54]
+        // 0x20, no stage 0 texture). Both must be matched: a car whose body is untextured paint
+        // with a few textured panels (boot lid, trim) otherwise shows those panels without the
+        // reflection tint and they read as differently coloured squares.
         constexpr uint32_t kLerpReflection = 0x11CDCC31;
-        const bool car_paint = d[53] == 0x11105 && d[54] == 0x21 && d[34] == 0xC4C80000 &&
+        const bool textured = d[54] == 0x21 && d[34] == 0xC4C80000 && (k.tex_modes & 0x3FF) == 0x21;
+        const bool untextured = d[54] == 0x20 && d[34] == 0xC4200000 && (k.tex_modes & 0x3FF) == 0x20;
+        const bool car_paint = d[53] == 0x11105 && (textured || untextured) &&
                                d[37] == kLerpReflection && d[48] == 0xC00 && d[8] == 0x33030C00 &&
                                d[9] == 0x1C80 && (d[4] == 0x3C311010 || d[4] == 0x34311010);
-        if (car_paint && (k.tex_modes & 0x3FF) == 0x21 && !(tex[0].flags & kTexTarget) &&
+        if (car_paint && !(tex[0].flags & kTexTarget) &&
             (tex[1].flags & kTexTarget) && !tex[1].shadow &&
             SimpleState(s, kMBlendEnable) && SimpleState(s, kMSrcBlend) == 1 &&
             SimpleState(s, kMDestBlend) == 0x302) {
             // Stage 3 normally writes C0.a * r1.rgb + (1 - C0.a) * r0.rgb to r0.
-            // Pass r0.rgb through as r0 * ONE + ZERO * ZERO and drop the unused target fetch.
+            // Pass r0.rgb through as r0 * ONE + ZERO * ZERO and drop the unused target fetch
+            // (stage 1's t1). Stage 2 premultiplies r0.rgb by the paint alpha (r0.a or v0.a) for
+            // the ONE, SRC_ALPHA blend; it reads no texture, so it stays.
             k.rgb_in[3] = 0xCC200000;
-            k.rgb_in[2] = 0;
-            k.rgb_out[2] = 0;
-            k.a_in[2] = 0;
-            k.a_out[2] = 0;
             k.tex_modes &= ~(0x1Fu << 5);
         }
         return k;

@@ -40,6 +40,8 @@ XbeDrawProbeFn &XbeDrawProbe();  // optional game-side probe on each draw (diagn
 // optional game-side filter on D3DDevice_SetRenderState_Simple: returns the value to set (ctx.esp: the guest return)
 using XbeSimpleStateFilterFn = uint32_t (*)(X86Context &, uint32_t method, uint32_t value);
 XbeSimpleStateFilterFn &XbeSimpleStateFilter();
+using XbeTextureFactorFilterFn = uint32_t (*)(X86Context &, uint32_t value);
+XbeTextureFactorFilterFn &XbeTextureFactorFilter();
 
 namespace dispatch {
 bool InCode(uint32_t va);  // cpu/dispatch.cpp
@@ -1015,7 +1017,14 @@ COMPLEX_STATE(StencilEnable, gpu::kRsStencilEnable)
 COMPLEX_STATE(StencilFail, gpu::kRsStencilFail)
 COMPLEX_STATE(FrontFace, gpu::kRsFrontFace)
 COMPLEX_STATE(CullMode, gpu::kRsCullMode)
-COMPLEX_STATE(TextureFactor, gpu::kRsTextureFactor)
+// the title can adjust the texture factor for its own draws (src/game/car_swatch.cpp)
+HLE_STDCALL(D3DDevice_SetRenderState_TextureFactor, 1) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint32_t value = a[0];
+    if (const XbeTextureFactorFilterFn filter = ::XbeTextureFactorFilter()) value = filter(ctx, value);
+    SetComplex(gpu::kRsTextureFactor, value);
+    return 0;
+}
 COMPLEX_STATE(LogicOp, gpu::kRsLogicOp)
 COMPLEX_STATE(EdgeAntiAlias, gpu::kRsEdgeAntiAlias)
 COMPLEX_STATE(MultiSampleAntiAlias, gpu::kRsMultiSampleAntiAlias)
@@ -2027,5 +2036,10 @@ XbeDrawProbeFn& XbeDrawProbe() {
 
 XbeSimpleStateFilterFn& XbeSimpleStateFilter() {
     static XbeSimpleStateFilterFn filter = nullptr;
+    return filter;
+}
+
+XbeTextureFactorFilterFn& XbeTextureFactorFilter() {
+    static XbeTextureFactorFilterFn filter = nullptr;
     return filter;
 }
