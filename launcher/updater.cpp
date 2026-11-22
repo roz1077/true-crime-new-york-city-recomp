@@ -1129,6 +1129,19 @@ bool LaunchTracked(const fs::path& exe, const std::vector<std::string>& args) {
 }
 }  // namespace
 
+void PinGraphicsModules() {
+    // RivaTuner Statistics Server (MSI Afterburner) keeps the launcher's Direct3D 11 device alive past
+    // SDL_DestroyRenderer, and the NVIDIA driver's worker thread for it then called into d3d11.dll after SDL had
+    // unloaded it: an execute fault at d3d11.dll+0x5F215 in that thread (issue #22's dump, Beta 4.3), which took
+    // the process down. Pinning keeps the runtime loaded until the process exits, so a late driver thread finds
+    // valid code. The launcher process only waits for the game afterwards; the game never loads Direct3D 11.
+    for (const wchar_t* name : {L"d3d11.dll", L"dxgi.dll"}) {
+        HMODULE module = nullptr;
+        const bool pinned = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, name, &module) != FALSE;
+        LogLine("launcher: %ls %s", name, pinned ? "pinned" : "not loaded");
+    }
+}
+
 int WaitForGame() {
     if (!g_game_process) return 0;
     LogLine("launcher: waiting for the game to exit");

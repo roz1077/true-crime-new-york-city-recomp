@@ -14,6 +14,9 @@ bool Run(app::GameSource& source);
 bool LaunchGame(const app::GameSource& source, int instance);
 bool LaunchPal(const app::GameSource& source);
 #ifdef _WIN32
+// Keeps d3d11.dll and dxgi.dll loaded for the rest of the process once the launcher's renderer exists, so a
+// graphics driver thread an overlay kept alive cannot call into an unloaded DLL (issue #22).
+void PinGraphicsModules();
 // Waits for the game process LaunchGame or LaunchPal started and returns its exit code; 0 if none was started.
 int WaitForGame();
 #endif

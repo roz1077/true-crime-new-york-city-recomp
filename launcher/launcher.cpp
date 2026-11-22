@@ -1354,6 +1354,9 @@ bool Run(app::GameSource& source) {
     bool play = false;
     if (renderer) {
         LogLine("launcher: renderer %s", SDL_GetRendererName(renderer));
+#ifdef _WIN32
+        PinGraphicsModules();  // before SDL can unload them again (issue #22)
+#endif
         const float pixel_density = std::max(1.0f, SDL_GetWindowPixelDensity(window));
         const float scale = std::max(1.0f, SDL_GetWindowDisplayScale(window) / pixel_density);
         if (scale > 1.0f) SDL_SetWindowSize(window, int(760 * scale), int(620 * scale));
