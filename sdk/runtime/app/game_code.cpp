@@ -9,6 +9,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <intrin.h>
 #include <xinput.h>
 
 #include <algorithm>
@@ -51,9 +52,10 @@ struct Image {
 };
 
 // as CMakePresets.json and CMakeLists.txt compile it for build.bat.
-// -march=native: this DLL is always compiled on the machine that will run it, so the host's instruction
-// set is the correct target (the object cache key includes these flags, and the stamp includes this
-// executable, so a change rebuilds once).
+// -march=native: this DLL is compiled on the machine that runs it, so the host's instruction set is the
+// right target. An install can still move to another PC (an external drive, a new machine, a VM), so the
+// stamp and the object cache key carry CpuSignature(): on a different CPU both are stale and the code is
+// rebuilt instead of loading instructions this CPU may not have.
 constexpr wchar_t kClangFlags[] =
     L"-target x86_64-pc-windows-msvc -fms-extensions -fms-compatibility-version=19.40 -std=c++20 -O2 -march=native "
     L"-fno-strict-aliasing -DNDEBUG -DX86_GAME_CODE -nostdinc -nostdinc++ -w";
@@ -166,8 +168,47 @@ bool Sha1File(const fs::path& path, std::string& out) {
     return true;
 }
 
+// The CPU's identity and every feature word -march=native can act on: vendor, family/model/stepping,
+// leaves 1, 7.0, 7.1 and 0x80000001, and the register state the OS enables (XCR0: AVX and AVX-512 can
+// be off under a VM or by policy). "cpu=" plus a short hash, as a stamp field.
+#if defined(__clang__)
+__attribute__((target("xsave")))
+#endif
+std::string CpuSignature() {
+    static const std::string signature = [] {
+        std::string id;
+        const auto add = [&](int leaf, int sub) {
+            int r[4] = {};
+            __cpuidex(r, leaf, sub);
+            if (leaf == 1) r[1] = 0;  // EBX: the APIC ID of whichever core this runs on, not a feature
+            for (int v : r) id += std::to_string(uint32_t(v)) + ",";
+        };
+        int r[4] = {};
+        __cpuid(r, 0);
+        const int max_leaf = r[0];
+        id.append(reinterpret_cast<const char*>(&r[1]), 4);
+        id.append(reinterpret_cast<const char*>(&r[3]), 4);
+        id.append(reinterpret_cast<const char*>(&r[2]), 4);
+        id += ";";
+        add(1, 0);
+        if (max_leaf >= 7) {
+            add(7, 0);
+            add(7, 1);
+        }
+        __cpuid(r, int(0x80000000u));
+        if (uint32_t(r[0]) >= 0x80000001u) add(int(0x80000001u), 0);
+        __cpuid(r, 1);
+        if (r[2] & (1 << 27)) id += "xcr0=" + std::to_string(_xgetbv(0));  // OSXSAVE
+        const std::vector<uint8_t> bytes(id.begin(), id.end());
+        return "cpu=" + Sha1(bytes).substr(0, 16);
+    }();
+    return signature;
+}
+
 // Stamp format shared with the CMake build (StampGameCode.cmake): host, XBE, image config, DLL hashes. The
-// config is part of it because its [functions] entries change the generated code.
+// config is part of it because its [functions] entries change the generated code. A DLL this file compiles
+// (-march=native) has CpuSignature() between the config and the DLL hash; the CMake build compiles for the
+// portable baseline and writes no CPU field.
 bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& stamp) {
     if (!Sha1File(ExeFolder() / (image.exe + L".exe"), stamp)) return false;
     std::string config;
@@ -182,8 +223,19 @@ bool Current(const Target& target) {
     if (!std::getline(f, line)) return false;
     const std::string prefix = target.stamp + " ";
     if (line.rfind(prefix, 0) != 0) return false;
+    std::string rest = line.substr(prefix.size());
+    if (rest.rfind("cpu=", 0) == 0) {
+        const size_t space = rest.find(' ');
+        if (space == std::string::npos) return false;
+        if (rest.compare(0, space, CpuSignature()) != 0) {
+            LOGR("Game code: built for another CPU (%s, this one %s), rebuilding", rest.substr(0, space).c_str(),
+                 CpuSignature().c_str());
+            return false;
+        }
+        rest.erase(0, space + 1);
+    }
     std::string hash;
-    return Sha1File(CodeDll(*target.image), hash) && hash == line.substr(prefix.size());
+    return Sha1File(CodeDll(*target.image), hash) && hash == rest;
 }
 
 // an image's xbe from the game in assets: the extracted file, else the mounted disc image
@@ -273,6 +325,7 @@ bool CacheKey(const Image& image, std::string& out) {
     KeyField(key, "game-code object cache 1");
     KeyField(key, Narrow(kClangFlags));
     KeyField(key, Narrow(kLinkFlags));
+    KeyField(key, CpuSignature());  // -march=native objects are only valid on this CPU
     KeyFile(key, "host", ExeFolder() / (image.exe + L".exe"));
     for (const wchar_t* tool : {L"clang.exe", L"lld-link.exe", L"xbe_recomp.exe", L"grid_patch.exe"})
         KeyFile(key, Narrow(tool), CompilerDir() / tool);
@@ -640,7 +693,7 @@ bool Link(const Target& target, Processes& run) {
             DeleteFileW(staged.c_str());
             return RecordFailure(L"Could not write the build stamp for " + name + L".");
         }
-        f << target.stamp << " " << hash << "\n";
+        f << target.stamp << " " << CpuSignature() << " " << hash << "\n";
         f.flush();
         if (!f) {
             f.close();
