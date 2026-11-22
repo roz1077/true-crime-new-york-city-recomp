@@ -712,8 +712,11 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]) {
         // TCNYC's DoubleConstBlend (clear coat) and DoubleConstBlendIgnoreAlpha (base coat)
         // lerp the paint with a copy of the scene. Street and building silhouettes from that
         // copy can look like holes in the panels. Keep the paint term at full weight.
-        // Match the combiner definition and target use so glass and other materials retain
-        // their reflection and alpha. These shader definitions are shared by USA and PAL.
+        // Match the combiner definition and target use so other materials retain their
+        // reflection and alpha. These shader definitions are shared by USA and PAL.
+        // Car glass and tinted paint use the same combiner, blend and target, so they are told
+        // apart by depth writes: full-opacity paint writes depth (src/game/car_paint.cpp keeps
+        // it on), glass does not. Glass keeps the scene reflection, as on PS2.
         // Stage 0 is v0 * t0 for textured paint and v0 * (1 - 0) for untextured paint (d[54]
         // 0x20, no stage 0 texture). Both must be matched: a car whose body is untextured paint
         // with a few textured panels (boot lid, trim) otherwise shows those panels without the
@@ -727,7 +730,7 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]) {
         if (car_paint && !(tex[0].flags & kTexTarget) &&
             (tex[1].flags & kTexTarget) && !tex[1].shadow &&
             SimpleState(s, kMBlendEnable) && SimpleState(s, kMSrcBlend) == 1 &&
-            SimpleState(s, kMDestBlend) == 0x302) {
+            SimpleState(s, kMDestBlend) == 0x302 && SimpleState(s, kMZWriteEnable)) {
             // Stage 3 normally writes C0.a * r1.rgb + (1 - C0.a) * r0.rgb to r0.
             // Pass r0.rgb through as r0 * ONE + ZERO * ZERO and drop the unused target fetch
             // (stage 1's t1). Stage 2 premultiplies r0.rgb by the paint alpha (r0.a or v0.a) for
