@@ -1673,8 +1673,10 @@ private:
     // EnsureTarget is asked for the same colour and depth target on every draw. The last answer for each is
     // kept while no target was destroyed; the hit still runs the same want_* checks as the slow path, so a
     // target made for another scale or sample count is never handed back.
+    // The header's format and size words are part of the key: a header reused at the same address for another
+    // size must not get the old target.
     struct TargetMemo {
-        uint32_t data = 0, header = 0;
+        uint32_t data = 0, header = 0, format = 0, size = 0;
         bool depth = false;
         Target* target = nullptr;
         uint64_t epoch = 0;
@@ -3019,7 +3021,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     const uint32_t data = mem::VirtualFromPhysical(s.data);
     TargetMemo& memo = target_memo_[depth ? 1 : 0];
     if (!ext_ && memo.valid && memo.epoch == targets_epoch_ && memo.data == data && memo.depth == depth &&
-        memo.header == s.header) {
+        memo.header == s.header && memo.format == s.format && memo.size == s.size) {
         Target* t = memo.target;
         if (t->want_samples == msaa_ && t->want_scale == WantScale(data, depth) && t->want_stretch == stretch_) {
             // the idle sweep must see this target as used this frame, or it may release it while bound
@@ -3039,7 +3041,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
         // Targets that are only sampled keep their contents across a settings change; one that is
         // drawn into again is rebuilt when its MSAA/scale no longer match.
         if (t.want_samples == msaa_ && t.want_scale == WantScale(slot.data, depth) && t.want_stretch == stretch_) {
-            memo = {slot.data, s.header, depth, &t, targets_epoch_, true};
+            memo = {slot.data, s.header, s.format, s.size, depth, &t, targets_epoch_, true};
             return &t;
         }
         ReleaseTarget(slot.it);
@@ -3078,7 +3080,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     t.epoch = DirtyEpoch(slot.data);
     t.sig = MemSig(slot.data, t.bytes);
     auto& ref = targets_[slot.key] = std::move(t);
-    memo = {slot.data, s.header, depth, &ref, targets_epoch_, true};
+    memo = {slot.data, s.header, s.format, s.size, depth, &ref, targets_epoch_, true};
     return &ref;
 }
 
