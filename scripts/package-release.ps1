@@ -102,19 +102,22 @@ if (!(Test-Path -LiteralPath $sdkLicence -PathType Leaf)) {
     throw "SDK licence not found: $sdkLicence"
 }
 $ffxSdk = if ($env:TCNYC_FIDELITYFX_SDK) { $env:TCNYC_FIDELITYFX_SDK } else { Join-Path $root 'tools/FidelityFX' }
-$ffxBin = Join-Path $ffxSdk 'signedbin'
-if (!(Test-Path -LiteralPath $ffxBin -PathType Container)) {
-    $ffxBin = Join-Path $ffxSdk 'Kits/FidelityFX/signedbin'
+# Each signed DLL is looked up on its own: an SDK checkout may hold only the DX12 pair, and the build
+# downloads the Vulkan pair into fsr_sdk. Both renderers offer FSR, so a package carries all four or none.
+$ffxDirs = @((Join-Path $ffxSdk 'signedbin'), (Join-Path $ffxSdk 'Kits/FidelityFX/signedbin'),
+             (Join-Path $BuildDir 'fsr_sdk'))
+$ffxPaths = [ordered]@{}
+foreach ($name in 'amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll',
+                  'amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll') {
+    $found = $ffxDirs | ForEach-Object { Join-Path $_ $name } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    $ffxPaths[$name] = $found
 }
-if (!(Test-Path -LiteralPath $ffxBin -PathType Container)) {
-    $ffxBin = Join-Path $BuildDir 'fsr_sdk'
+$ffxMissing = @($ffxPaths.Keys | Where-Object { !$ffxPaths[$_] })
+$bundleFfx = $env:TCNYC_FIDELITYFX_SDK -or $ffxMissing.Count -lt $ffxPaths.Count
+if ($bundleFfx -and $ffxMissing.Count) {
+    throw "AMD FidelityFX DLLs missing ($($ffxMissing -join ', ')): looked in $($ffxDirs -join '; ')"
 }
-$ffxFiles = @('amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll',
-              'amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll') |
-    Where-Object { Test-Path -LiteralPath (Join-Path $ffxBin $_) -PathType Leaf }
-$bundleFfx = $env:TCNYC_FIDELITYFX_SDK -or ($ffxFiles | Where-Object {
-    Test-Path -LiteralPath (Join-Path $ffxBin $_) -PathType Leaf
-})
 if ($bundleFfx) {
     $ffxLicence = 'LICENSE.md', 'docs/license.md' | ForEach-Object { Join-Path $ffxSdk $_ } |
         Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
@@ -164,7 +167,9 @@ function Get-PeImports([string]$Path) {
     return $names
 }
 $system32 = Join-Path $env:SystemRoot 'System32'
-$shipped = @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
+# The Visual C++ runtime the executables import. msvcp140_atomic_wait.dll carries std::atomic::wait and the
+# std::binary_semaphore the Vulkan renderer's draw worker uses.
+$shipped = @('msvcp140.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
 # The Windows DLLs the game and its bundled tools may import. Any other DLL, even one that happens
 # to be in this machine's System32 (a driver's or another program's), would be missing elsewhere.
 $windows = @('kernel32.dll', 'ntdll.dll', 'user32.dll', 'gdi32.dll', 'advapi32.dll', 'shell32.dll', 'ole32.dll',
@@ -255,7 +260,7 @@ try {
         Add-ReleaseFile $sdkLicence 'LICENSES/XboxXBE-Recomp-LICENSE.txt'
         Add-ReleaseFile (Join-Path $root 'LICENSE') 'LICENSES/Project-LICENSE.txt'
         if ($bundleFfx) {
-            foreach ($name in $ffxFiles) { Add-ReleaseFile (Join-Path $ffxBin $name) $name }
+            foreach ($name in $ffxPaths.Keys) { Add-ReleaseFile $ffxPaths[$name] $name }
             Add-ReleaseFile $ffxLicence 'LICENSES/AMD-FidelityFX-SDK.md'
         }
         if ($bundleDlss) {
@@ -279,7 +284,7 @@ try {
                 Add-ReleaseFile $_.FullName "compiler/$relative"
             }
         }
-        foreach ($name in 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') {
+        foreach ($name in $shipped) {
             $runtime = Join-Path $RuntimeDir $name
             Add-ReleaseFile $runtime $name
             Add-ReleaseFile $runtime "compiler/$name"
