@@ -385,6 +385,7 @@ struct Perf {
     uint64_t draws = 0;
     uint64_t verts = 0;
     uint64_t upload = 0;
+    uint64_t upload_vsc = 0, upload_dc = 0;  // of which vertex shader constants, draw constants
     uint64_t overflow = 0;
     uint64_t sigs = 0;
     uint64_t sig_bytes = 0;
@@ -1318,6 +1319,14 @@ private:
     };
     bool UploadGeometry(const Assembled& a, D3D12_VERTEX_BUFFER_VIEW* vbv,
                         D3D12_INDEX_BUFFER_VIEW* ibv);  // visibility tests
+    struct GeometryTrace {
+        std::unordered_map<uint64_t, uint64_t> now, was;  // address and size -> content hash
+        uint64_t bytes[5] = {};  // repeated, unchanged, rewritten, new address, CPU-built
+        uint32_t frames = 0;
+    };
+    GeometryTrace geometry_trace_;
+    void TraceGeometry(const void* src, uint32_t bytes);
+    void EndGeometryTrace();
     bool EnsureQueries();
     uint32_t BeginCountedDraw(const State& s);
     void EndCountedDraw(uint32_t query);
@@ -5776,6 +5785,7 @@ void D3D12Backend::FillDepthConstants(const State& s, const DrawShaders& sh, con
 uint8_t* D3D12Backend::UploadVertexConstants(const State& s) {
     Alloc vc = Upload(sizeof(s.vsc), 256);
     if (!vc.res) return nullptr;
+    g_perf.upload_vsc += sizeof(s.vsc);
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
     // with the render thread's serial the copy kept for comparing is not needed
     if (!s.vsc_serial) std::memcpy(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
@@ -5810,6 +5820,7 @@ bool D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     if (!last_dc_gpu_ || std::memcmp(&last_dc_, &c, sizeof(c))) {
         Alloc dc = Upload(sizeof(DrawConstants), 256);
         if (!dc.res) return false;
+        g_perf.upload_dc += sizeof(DrawConstants);
         std::memcpy(dc.cpu, &c, sizeof(c));
         last_dc_ = c;
         last_dc_gpu_ = dc.gpu;
@@ -6200,16 +6211,78 @@ bool D3D12Backend::UploadGeometry(const Assembled& a, D3D12_VERTEX_BUFFER_VIEW* 
     total = ib_off + ibytes;
     Alloc block = Upload(total, 16);
     if (!block.res) return false;
+    static const bool trace_geometry = DevEnv("TCNYC_TRACE_GEOMETRY") != nullptr;
     for (uint32_t i = 0; i < a.buffer_count; i++) {
         const VertexBuffer& b = a.buffers[i];
         std::memcpy(block.cpu + offs[i], b.src, b.bytes);
         vbv[i] = {block.gpu + offs[i], b.bytes, b.stride};
+        if (trace_geometry) TraceGeometry(b.src, b.bytes);
     }
     if (ibytes) {
         std::memcpy(block.cpu + ib_off, a.index_src, ibytes);
         *ibv = {block.gpu + ib_off, ibytes, a.index16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+        if (trace_geometry) TraceGeometry(a.index_src, ibytes);
     }
     return true;
+}
+
+// TCNYC_TRACE_GEOMETRY=1: how much uploaded geometry a GPU-side cache could have kept. Each uploaded range is keyed
+// by its guest address and size and hashed; ranges outside guest memory were built on the CPU this frame.
+void D3D12Backend::TraceGeometry(const void* src, uint32_t bytes) {
+    auto& g = geometry_trace_;
+    const uint8_t* p = static_cast<const uint8_t*>(src);
+    const uint8_t* base = mem::Base();
+    if (!(p >= base && p < base + 0x100000000ull)) {
+        g.bytes[4] += bytes;  // converted or gathered on the CPU
+        return;
+    }
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ bytes;
+    size_t n = 0;
+    for (; n + 8 <= bytes; n += 8) {
+        uint64_t w;
+        std::memcpy(&w, p + n, 8);
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 29;
+    }
+    for (; n < bytes; n++) h = (h ^ p[n]) * 0x100000001B3ull;
+    const uint64_t key = uint64_t(p - base) << 32 ^ bytes;
+    if (auto it = g.now.find(key); it != g.now.end() && it->second == h) {
+        g.bytes[0] += bytes;  // already uploaded this frame
+        return;
+    }
+    g.now[key] = h;
+    const auto was = g.was.find(key);
+    g.bytes[was == g.was.end() ? 3 : was->second == h ? 1 : 2] += bytes;
+}
+
+void D3D12Backend::EndGeometryTrace() {
+    auto& g = geometry_trace_;
+    if (g.now.empty() && !g.bytes[4]) return;
+    std::swap(g.was, g.now);
+    g.now.clear();
+    if (++g.frames < 120) return;
+    const double mb = 1.0 / (double(g.frames) * 1048576.0);
+    const double total = double(g.bytes[0] + g.bytes[1] + g.bytes[2] + g.bytes[3] + g.bytes[4]) * mb;
+    LOGR("geometry: %.2f MB uploaded a frame: %.2f repeated within the frame, %.2f unchanged since last frame, "
+         "%.2f same address rewritten, %.2f new address, %.2f built on the CPU",
+         total, double(g.bytes[0]) * mb, double(g.bytes[1]) * mb, double(g.bytes[2]) * mb, double(g.bytes[3]) * mb,
+         double(g.bytes[4]) * mb);
+    AssemblyTrace& at = GetAssemblyTrace();
+    LOGR("geometry: by path, MB a frame: raw in place %.2f, raw gathered %.2f, repacked %.2f (sparse %.2f), "
+         "converted to floats %.2f, title indices %.2f, rebuilt indices %.2f",
+         double(at.bytes[kAsmRawDense]) * mb, double(at.bytes[kAsmRawGathered]) * mb,
+         double(at.bytes[kAsmRepackDense]) * mb, double(at.bytes[kAsmRepackSparse]) * mb,
+         double(at.bytes[kAsmConverted]) * mb, double(at.bytes[kAsmIndexGuest]) * mb,
+         double(at.bytes[kAsmIndexRebuilt]) * mb);
+    std::vector<std::pair<uint64_t, std::string>> top;
+    for (const auto& [k, v] : at.repacked) top.emplace_back(v, k);
+    std::sort(top.rbegin(), top.rend());
+    for (size_t i = 0; i < top.size() && i < 6; i++)
+        LOGR("geometry:   repacked %.2f MB a frame: %s", double(top[i].first) * mb, top[i].second.c_str());
+    for (uint64_t& b : at.bytes) b = 0;
+    at.repacked.clear();
+    g.frames = 0;
+    for (uint64_t& b : g.bytes) b = 0;
 }
 
 void D3D12Backend::DrawGeometry(const Assembled& a) {
@@ -9926,6 +9999,17 @@ void LogPerf() {
              p.sig_bytes / n / 1048576.0, p.texups / n, p.texup_bytes / n / 1048576.0, p.newtex / n,
              p.targets / n, p.target_reuses / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
              (unsigned long long)p.shaders, (unsigned long long)p.psos, (unsigned long long)p.shader_hits);
+        {
+            static uint64_t last_misses = mem::AllocationSizeMisses(), last_layout = mem::LayoutChanges();
+            const uint64_t misses = mem::AllocationSizeMisses(), layout = mem::LayoutChanges();
+            LOGI("perf: upload per frame: vertex constants %.2f MB, draw constants %.2f MB, geometry and other %.2f MB "
+                 "| AllocationSize cache misses %.0f, guest layout changes %.1f per frame (all threads)",
+                 p.upload_vsc / n / 1048576.0, p.upload_dc / n / 1048576.0,
+                 (double(p.upload) - double(p.upload_vsc) - double(p.upload_dc)) / n / 1048576.0,
+                 double(misses - last_misses) / n, double(layout - last_layout) / n);
+            last_misses = misses;
+            last_layout = layout;
+        }
         LOGI("perf: pipeline creation %.3f ms/frame, %llu built, %llu from the saved library (%llu not in it), "
              "%llu pre-built at start",
              p.pipeline / n, (unsigned long long)p.psos, (unsigned long long)p.pso_loads,
@@ -9955,6 +10039,7 @@ void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
     flush_reason_ = "present";
     if (defer_scene_) FlushDeferredScene();
+    EndGeometryTrace();
     if (diag::Perf()) ReportFlushStats();
     // Diagnostic: TCNYC_CAPTURE_AT=<frame> starts an F3-style capture without input.
     static const long capture_at = [] {

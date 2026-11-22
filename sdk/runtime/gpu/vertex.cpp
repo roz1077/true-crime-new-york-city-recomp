@@ -7,15 +7,22 @@
 #include <algorithm>
 #include <smmintrin.h>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 #include <new>
 
 #include <dxgiformat.h>
 
+#include "core/dev_env.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
 
 namespace gpu {
+
+AssemblyTrace& GetAssemblyTrace() {
+    static AssemblyTrace trace{DevEnv("TCNYC_TRACE_GEOMETRY") != nullptr};
+    return trace;
+}
 
 namespace {
 
@@ -87,6 +94,7 @@ void Convert(uint32_t type, const uint8_t* p, float* o) {
 #define XBE_RAW_VERTICES 1
 #endif
 constexpr bool kRawVertices = XBE_RAW_VERTICES;
+
 
 // D3DVSDT type as the input assembler reads it: DXGI format, what the vertex shader does after, bytes the format reads
 struct HostElement {
@@ -469,16 +477,19 @@ int AddRawBuffer(const State& s, const VertexShader& layout, const VertexShader:
     if (!stride || d.first_vertex < 0) return -1;
     const uint8_t* data = static_cast<const uint8_t*>(HostPtr(mem::VirtualFromPhysical(R32(st.vb + kResData))));
     const int slot = int(out.buffer_count);
+    static AssemblyTrace& trace = GetAssemblyTrace();
     if (dense) {
         const uint64_t bytes = uint64_t(d.span) * stride;
         if (bytes > UINT32_MAX) return -1;
         out.buffers[out.buffer_count++] = {data + size_t(d.first_vertex) * stride, uint32_t(bytes), stride};
+        if (trace.on) trace.bytes[kAsmRawDense] += bytes;
     } else {
         const uint64_t bytes = uint64_t(d.count) * stride;
         if (bytes > UINT32_MAX) return -1;
         auto& g = out.gathered[out.buffer_count];
         if (!GatherVertices(s, d, data, stride, g)) return -1;
         out.buffers[out.buffer_count++] = {g.data(), uint32_t(bytes), stride};
+        if (trace.on) trace.bytes[kAsmRawGathered] += bytes;
     }
     return slot;
 }
@@ -606,6 +617,19 @@ int AddRepackedBuffer(const State& s, const Inputs& inputs, int stream, const Dr
         }
     }
     out.buffers[out.buffer_count++] = {g.data(), uint32_t(g.size()), packed};
+    static AssemblyTrace& trace = GetAssemblyTrace();
+    if (trace.on) {
+        trace.bytes[dense ? kAsmRepackDense : kAsmRepackSparse] += g.size();
+        std::string key = "stride " + std::to_string(stride) + ":";
+        for (int k = 0; k < inputs.nregs; k++) {
+            const auto& in = inputs.layout.inputs[size_t(inputs.regs[k])];
+            if (in.stream != stream) continue;
+            char e[24];
+            std::snprintf(e, sizeof(e), " %02X@%u", unsigned(in.type), unsigned(in.offset));
+            key += e;
+        }
+        trace.repacked[key] += g.size();
+    }
     return slot;
 }
 
@@ -903,6 +927,13 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
                       : AssembleConverted(s, inputs, d, out, force_converted);
         sp.At(raw ? "  (asm) raw build" : "  (asm) converted build");
         if (!ok) ResetAssembled(out);
+        static AssemblyTrace& trace = GetAssemblyTrace();
+        if (ok && trace.on) {
+            if (!raw) trace.bytes[kAsmConverted] += out.vertices.size() * sizeof(float);
+            if (out.index_count)
+                trace.bytes[out.index_src == ip ? kAsmIndexGuest : kAsmIndexRebuilt] +=
+                    uint64_t(out.index_count) * (out.index16 ? 2u : 4u);
+        }
         return ok;
     } catch (const std::bad_alloc&) {
         LOG_FIRST(8, "vertex: draw %u..%u did not fit host memory", start, start + count - 1);

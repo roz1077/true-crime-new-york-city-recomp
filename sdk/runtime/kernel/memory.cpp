@@ -30,6 +30,7 @@ static std::recursive_mutex g_lock;
 // bumped under g_lock by every call that changes what AllocationSize answers; its per-thread cache checks it
 static std::atomic<uint64_t> g_layout{1};
 static void LayoutChanged() { g_layout.fetch_add(1, std::memory_order_release); }
+static std::atomic<uint64_t> g_alloc_size_misses{0};  // XBE_PERF's AllocationSize cache misses
 
 uint8_t* Base() { return g_base; }
 
@@ -634,10 +635,14 @@ uint32_t AllocationSize(uint32_t va) {
     thread_local Entry cache[256];
     Entry& e = cache[(va >> 4 ^ va >> 12) & 255];
     if (e.layout == g_layout.load(std::memory_order_acquire) && e.va == va) return e.size;
+    g_alloc_size_misses.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     e = {va, AllocationSizeLocked(va), g_layout.load(std::memory_order_relaxed)};
     return e.size;
 }
+
+uint64_t AllocationSizeMisses() { return g_alloc_size_misses.load(std::memory_order_relaxed); }
+uint64_t LayoutChanges() { return g_layout.load(std::memory_order_relaxed); }
 
 uint32_t PhysicalFromVirtual(uint32_t va) {
     if (InPhysical(va)) return va - (va >= kWriteCombineBase ? kWriteCombineBase : kContiguousBase);

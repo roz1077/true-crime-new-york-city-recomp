@@ -45,6 +45,8 @@ bool ReserveImage(uint32_t base, uint32_t size);
 uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint32_t align);
 void FreeContiguous(uint32_t va);
 uint32_t AllocationSize(uint32_t va);  // any allocator, 0 if unknown
+uint64_t AllocationSizeMisses();       // lookups that missed the per-thread cache (perf log)
+uint64_t LayoutChanges();              // allocations and frees that invalidated every cache (perf log)
 
 uint32_t AllocSystem(uint32_t size, uint32_t align = 16);
 void FreeSystem(uint32_t va);
