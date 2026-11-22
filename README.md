@@ -7,14 +7,14 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/tag/v0.9.2-beta.4.3"><img alt="Beta 4.3 release" src="https://img.shields.io/badge/release-v0.9.2--beta.4.3-blue"></a>
+  <a href="../../releases/tag/v0.9.2-beta.5"><img alt="Beta 5 release" src="https://img.shields.io/badge/release-v0.9.2--beta.5-blue"></a>
   <img alt="Windows and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-2ea44f">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green"></a>
   <img alt="Beta" src="https://img.shields.io/badge/status-beta-orange">
 </p>
 
 <p align="center">
-  <a href="../../releases/tag/v0.9.2-beta.4.3"><strong>Download</strong></a> ·
+  <a href="../../releases/tag/v0.9.2-beta.5"><strong>Download</strong></a> ·
   <a href="README-LINUX.md">Linux / SteamOS guide</a> ·
   <a href="#building-from-source">Build from source</a> ·
   <a href="../../issues">Report an issue</a>
@@ -33,7 +33,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 
 | | Windows | Linux / SteamOS |
 |---|---|---|
-| **Download** | [TrueCrimeNYC.zip](../../releases/tag/v0.9.2-beta.4.3) | [TrueCrimeNYC-linux-x86_64.tar.gz](../../releases/tag/v0.9.2-beta.4.3) |
+| **Download** | [TrueCrimeNYC.zip](../../releases/tag/v0.9.2-beta.5) | [TrueCrimeNYC-linux-x86_64.tar.gz](../../releases/tag/v0.9.2-beta.5) |
 | **Install** | Extract, then put your game files in `assets/` | Extract, then put your game files in `assets/` |
 | **Run** | `TrueCrimeNYC.exe` | `./TrueCrimeNYC` |
 | **Renderer** | Direct3D 12 (default) or Vulkan (`TCNYC_RENDERER=vulkan`) | Vulkan (leave Proton **off** in Steam) |

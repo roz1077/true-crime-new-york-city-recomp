@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.2.5 - Beta 5 (2026-11-22)
 
 - **Windows Vulkan renderer (experimental).** The Linux Vulkan backend now builds and runs on Windows from the
   same executable. Choose **Vulkan** under **Graphics > Renderer** in the launcher (or set `TCNYC_RENDERER=vulkan`)
@@ -54,7 +54,14 @@
   default keeps the game's cinematic framing.
 - The launcher starts the game as soon as **HIT THE STREETS** is pressed, before it shuts its own
   window down (a child process on Windows, execv on Linux). A fault while the launcher closes can
-  no longer leave the game unstarted. The handoff steps are recorded in `logs/launcher.log`.
+  no longer leave the game unstarted. The handoff steps are recorded in `logs/launcher.log`. On
+  Windows the launcher then waits for the game to exit, so Steam keeps tracking it: the overlay,
+  the Steam Input layout and play time follow the game as before.
+- The game code compiled on first launch is built for the PC's own processor, and it is now rebuilt
+  when the install moves to a PC with a different processor (an external drive, a new PC or a
+  virtual machine) instead of failing to start there.
+- Linux and Steam Deck: **Remove cutscene bars** and the city detail settings are saved in
+  `settings.toml` again; before, they went back to their defaults on every launch.
 
 ## 0.9.2.4.3 - Beta 4.3 (2026-11-19)
 
