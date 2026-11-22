@@ -1112,11 +1112,41 @@ bool PalInstalled(app::GameRegion region) {
     return fs::is_regular_file(PalExecutable(region), ec);
 }
 
+#ifdef _WIN32
+namespace {
+// The game process this launcher started. The launcher waits for it (WaitForGame) so that Steam, which
+// tracks the process it started, keeps seeing the game run: its overlay, Steam Input layout and play time
+// follow that process. Linux gets the same by replacing the launcher with execv.
+HANDLE g_game_process = nullptr;
+
+bool LaunchTracked(const fs::path& exe, const std::vector<std::string>& args) {
+    PROCESS_INFORMATION process{};
+    if (!Spawn(exe, args, process, 0)) return false;
+    CloseHandle(process.hThread);
+    if (g_game_process) CloseHandle(g_game_process);
+    g_game_process = process.hProcess;
+    return true;
+}
+}  // namespace
+
+int WaitForGame() {
+    if (!g_game_process) return 0;
+    LogLine("launcher: waiting for the game to exit");
+    WaitForSingleObject(g_game_process, INFINITE);
+    DWORD code = 0;
+    if (!GetExitCodeProcess(g_game_process, &code)) code = 1;
+    CloseHandle(g_game_process);
+    g_game_process = nullptr;
+    LogLine("launcher: the game exited (%lu)", static_cast<unsigned long>(code));
+    return int(code);
+}
+#endif
+
 bool LaunchPal(const app::GameSource& source) {
     const auto executable = PalExecutable(source.region);
     LogLine("handoff: starting the PAL executable (%s)", Utf8(executable).c_str());
 #ifdef _WIN32
-    if (Launch(executable, {"--skip-launcher", "--game-source", Utf8(source.path)})) return true;
+    if (LaunchTracked(executable, {"--skip-launcher", "--game-source", Utf8(source.path)})) return true;
 #else
     // Keep the process ID for callers such as Steam and command-line wrappers.
     auto exe_arg = executable.native();
@@ -1131,9 +1161,9 @@ bool LaunchPal(const app::GameSource& source) {
 }
 
 bool LaunchGame(const app::GameSource& source, int instance) {
-    // Run the game in its own process, like the PAL builds. The launcher stops
-    // taking part once the child exists, so a fault while SDL shuts its window
-    // down cannot stop the game from starting.
+    // Run the game in its own process, like the PAL builds. The child starts before
+    // SDL shuts the launcher window down, so a fault there cannot stop the game. On
+    // Windows the launcher then waits for it (WaitForGame); on Linux execv replaces it.
     bool started = false;
     try {
         const auto executable = ExecutablePath();
@@ -1148,7 +1178,7 @@ bool LaunchGame(const app::GameSource& source, int instance) {
         }
         LogLine("handoff: starting %s (%zu arguments)", Utf8(executable).c_str(), args.size());
 #ifdef _WIN32
-        started = Launch(executable, args);
+        started = LaunchTracked(executable, args);
 #else
         // Keep the process ID for callers such as Steam and command-line wrappers.
         std::vector<std::string> storage;

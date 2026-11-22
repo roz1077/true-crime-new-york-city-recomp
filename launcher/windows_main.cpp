@@ -79,9 +79,10 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE previous, PWSTR args, int sho
                 return 0;
             }
             // HIT THE STREETS already started the game in its own process, before
-            // the launcher began shutting SDL down.
+            // the launcher began shutting SDL down. Stay until it exits, so Steam
+            // and other wrappers that track this process see the game running.
             launcher::LogLine("launcher: window closed after starting the game");
-            return 0;
+            return launcher::WaitForGame();
         }
         // A source on the command line: no launcher window. Keep running in this
         // process so wrappers such as RecompLauncher see the game's own process.
@@ -96,7 +97,7 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE previous, PWSTR args, int sho
     }
     if (app::IsPal(source.region)) {
         launcher::LogLine("handoff: %s disc, starting the region executable", RegionName(source.region));
-        return launcher::LaunchPal(source) ? 0 : 1;
+        return launcher::LaunchPal(source) ? launcher::WaitForGame() : 1;
     }
 #endif
     launcher::LogLine("handoff: holding the game files");

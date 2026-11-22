@@ -13,6 +13,10 @@ bool Run(app::GameSource& source);
 // `instance` is passed on for multi-instance runs.
 bool LaunchGame(const app::GameSource& source, int instance);
 bool LaunchPal(const app::GameSource& source);
+#ifdef _WIN32
+// Waits for the game process LaunchGame or LaunchPal started and returns its exit code; 0 if none was started.
+int WaitForGame();
+#endif
 bool PalInstalled(app::GameRegion region);
 
 } // namespace launcher
