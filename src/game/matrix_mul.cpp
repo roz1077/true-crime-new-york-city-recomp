@@ -96,6 +96,11 @@ void MatrixMul4x4(X86Context& ctx, uint8_t* base) {
         x3 = _mm_add_ps(x3, x2);
         StoreRow(base, dst + 0x30, x3);
     }
+    // the guest leaves its argument registers loaded (mov eax/ecx/edx at 0x24C6E0..0x24C6EE); eax = dst is
+    // the result a D3DX-style caller may chain on
+    ctx.eax = dst;
+    ctx.ecx = a;
+    ctx.edx = b;
     ctx.esp += 4;  // ret
 }
 }  // namespace game
