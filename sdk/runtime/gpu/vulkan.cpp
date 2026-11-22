@@ -1645,12 +1645,19 @@ private:
     // second. Segment times are summed, so a gap between submissions (the CPU was late) is not counted as GPU
     // work; that is what tells a GPU-bound frame from a CPU/pacing-bound one.
     static constexpr uint32_t kGpuSegments = 6;
+    // TCNYC_GPU_TIME also times the present pass's steps: a timestamp after each (PresentMark)
+    static constexpr uint32_t kPresentMarks = 5;
+    static constexpr uint32_t kGpuQueries = kGpuSegments * 2 + 2 + kPresentMarks;
+    void PresentMark(uint32_t i) {
+        if (gputime_.on)
+            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gputime_.pool, kGpuSegments * 2 + 2 + i);
+    }
     struct GpuTimeProbe {
         bool on = false, tried = false, reset_done = false;
         VkQueryPool pool = VK_NULL_HANDLE;
         float period_ns = 1;
         uint32_t seg = 0, frames = 0;
-        double scene_ms = 0, present_ms = 0, max_ms = 0;
+        double scene_ms = 0, present_ms = 0, max_ms = 0, steps_ms[8] = {};
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     } gputime_;
     struct Fsr3Vk {
@@ -1773,6 +1780,35 @@ private:
     // visibility tests: an occlusion query per counted draw, read at GetReport
     VkQueryPool query_pool_ = VK_NULL_HANDLE;
     uint32_t query_next_ = 0;
+
+    // Two frames in flight. Everything the CPU writes or frees per frame exists twice: the live members
+    // (cmd_, fence_, the upload ring, the draw/AO descriptor sets, draw batches, the occlusion queries and
+    // the retire lists) belong to the frame being recorded, and other_ holds the previous frame's, which
+    // the GPU may still be running. Present waits for the previous frame (WaitOtherSlot) only after it has
+    // submitted the current scene, so the CPU records frame N while the GPU draws frame N-1, as D3D12 does.
+    // TCNYC_VK_FRAMES=1 (or TCNYC_VK_SYNC_PRESENT=1) restores one frame in flight.
+    struct FrameSlot {
+        VkCommandBuffer cmd = VK_NULL_HANDLE, present_cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE, present_fence = VK_NULL_HANDLE;
+        uint64_t fence_serial = 0;
+        VkBuffer upload = VK_NULL_HANDLE;
+        VkDeviceMemory upload_memory = VK_NULL_HANDLE;
+        uint8_t* upload_ptr = nullptr;
+        uint64_t upload_size = 0;
+        std::vector<VkDescriptorSet> draw_sets, ao_sets, ao_occ_sets;
+        std::vector<std::array<VkCommandBuffer, 2>> draw_batches;
+        VkQueryPool query_pool = VK_NULL_HANDLE;
+        std::vector<RetiredGpu> retired_gpu;
+        std::vector<VkFramebuffer> retired_framebuffers;
+        std::vector<Tex*> retired_borrowed, pack_textures_retired;
+        std::vector<std::pair<VkBuffer, VkDeviceMemory>> late_retired, upload_retired, staging_pending;
+        std::vector<VkPipeline> retired_ao_pipelines;
+    } other_;
+    uint64_t fence_serial_ = 0;   // the submit serial fence_ signals for
+    bool other_pending_ = false;  // other_'s fences may still be unsignalled
+    bool frames_overlap_ = true;
+    void WaitOtherSlot();         // the previous frame's GPU work is done after this
+    void SwapFrameSlots();
     std::vector<uint32_t> counted_;
     bool query_reset_ = true;
 
@@ -2943,11 +2979,11 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     apl.pPushConstantRanges = &aoPush;
     if (vkCreatePipelineLayout(device_, &apl, nullptr, &ao_pipeline_layout_) != VK_SUCCESS) return false;
 
-    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3 * 8192},
-                                     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4 * 8192},
-                                     {VK_DESCRIPTOR_TYPE_SAMPLER, 4 * 8192}};
+    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * 3 * 8192},
+                                     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * 4 * 8192},
+                                     {VK_DESCRIPTOR_TYPE_SAMPLER, 2 * 4 * 8192}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pi.maxSets = 8192;
+    pi.maxSets = 2 * 8192;  // one ring per frame in flight
     pi.poolSizeCount = 3;
     pi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(device_, &pi, nullptr, &descriptor_pool_) != VK_SUCCESS) return false;
@@ -2960,6 +2996,8 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     dai.pSetLayouts = layouts.data();
     draw_sets_.resize(layouts.size());
     if (vkAllocateDescriptorSets(device_, &dai, draw_sets_.data()) != VK_SUCCESS) return false;
+    other_.draw_sets.resize(layouts.size());
+    if (vkAllocateDescriptorSets(device_, &dai, other_.draw_sets.data()) != VK_SUCCESS) return false;
 
     // the AO pools are made on first AO use (EnsureAoPools): with AO off they are never needed
     if (!CreatePresent()) return false;
@@ -3001,15 +3039,17 @@ bool VulkanBackend::EnsureAoPools() {
         LOGE("vulkan: AO descriptor pools could not be created");
         ao_occ_sets_.clear();
         ao_sets_.clear();
+        other_.ao_occ_sets.clear();
+        other_.ao_sets.clear();
         if (ao_occ_pool_) vkDestroyDescriptorPool(device_, ao_occ_pool_, nullptr);
         if (ao_pool_) vkDestroyDescriptorPool(device_, ao_pool_, nullptr);
         ao_occ_pool_ = ao_pool_ = VK_NULL_HANDLE;
         return false;
     };
     // one occlusion set per flush, and two full-screen AO sets (GTAO then the blur) per flush
-    VkDescriptorPoolSize occSizes{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2048};
+    VkDescriptorPoolSize occSizes{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * 2048};  // per frame in flight
     VkDescriptorPoolCreateInfo occPi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    occPi.maxSets = 2048;
+    occPi.maxSets = 2 * 2048;
     occPi.poolSizeCount = 1;
     occPi.pPoolSizes = &occSizes;
     if (vkCreateDescriptorPool(device_, &occPi, nullptr, &ao_occ_pool_) != VK_SUCCESS) return fail();
@@ -3020,11 +3060,13 @@ bool VulkanBackend::EnsureAoPools() {
     occAi.pSetLayouts = occLayouts.data();
     ao_occ_sets_.resize(occLayouts.size());
     if (vkAllocateDescriptorSets(device_, &occAi, ao_occ_sets_.data()) != VK_SUCCESS) return fail();
+    other_.ao_occ_sets.resize(occLayouts.size());
+    if (vkAllocateDescriptorSets(device_, &occAi, other_.ao_occ_sets.data()) != VK_SUCCESS) return fail();
 
-    VkDescriptorPoolSize aoSizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192},
-                                       {VK_DESCRIPTOR_TYPE_SAMPLER, 8192}};
+    VkDescriptorPoolSize aoSizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * 8192},  // per frame in flight
+                                       {VK_DESCRIPTOR_TYPE_SAMPLER, 2 * 8192}};
     VkDescriptorPoolCreateInfo aoPi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    aoPi.maxSets = 4096;
+    aoPi.maxSets = 2 * 4096;
     aoPi.poolSizeCount = 2;
     aoPi.pPoolSizes = aoSizes;
     if (vkCreateDescriptorPool(device_, &aoPi, nullptr, &ao_pool_) != VK_SUCCESS) return fail();
@@ -3035,6 +3077,8 @@ bool VulkanBackend::EnsureAoPools() {
     aoAi.pSetLayouts = aoLayouts.data();
     ao_sets_.resize(aoLayouts.size());
     if (vkAllocateDescriptorSets(device_, &aoAi, ao_sets_.data()) != VK_SUCCESS) return fail();
+    other_.ao_sets.resize(aoLayouts.size());
+    if (vkAllocateDescriptorSets(device_, &aoAi, other_.ao_sets.data()) != VK_SUCCESS) return fail();
     LOGR("vulkan: AO descriptor pools created");
     return true;
 }
@@ -3237,6 +3281,22 @@ bool VulkanBackend::CreateDevice() {
     VkPhysicalDevicePresentIdFeaturesKHR present_id_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
     VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
+#ifdef _WIN32
+    // what FSR 4's shaders use (see below)
+    VkPhysicalDevice8BitStorageFeatures fsr_storage8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES};
+    VkPhysicalDevice16BitStorageFeatures fsr_storage16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
+    VkPhysicalDeviceShaderIntegerDotProductFeatures fsr_dot{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES};
+    VkPhysicalDeviceSynchronization2Features fsr_sync2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
+    VkPhysicalDeviceDescriptorIndexingFeatures fsr_indexing{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+    VkPhysicalDeviceVulkanMemoryModelFeatures fsr_memory_model{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES};
+    VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures fsr_subgroup_types{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES};
+    VkPhysicalDeviceScalarBlockLayoutFeatures fsr_scalar{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR fsr_coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+#endif
     void* device_features = nullptr;
 #if defined(TCNYC_VK_DLSS)
     VkPhysicalDeviceBufferDeviceAddressFeatures address{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
@@ -3251,8 +3311,9 @@ bool VulkanBackend::CreateDevice() {
         bool has_border = false;
         bool has_hdr_metadata = false;
         bool has_subgroup_control = false;
-        bool has_present_id = false, has_present_wait = false;
+        bool has_present_id = false, has_present_wait = false, has_coop_matrix = false;
         for (const VkExtensionProperties& e : available) {
+            has_coop_matrix = has_coop_matrix || !std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
             has_present_id = has_present_id || !std::strcmp(e.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME);
             has_present_wait = has_present_wait || !std::strcmp(e.extensionName, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
             has_border = has_border || !std::strcmp(e.extensionName, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
@@ -3316,6 +3377,75 @@ bool VulkanBackend::CreateDevice() {
                 device_features = &float16;
             }
         }
+#ifdef _WIN32
+        // FSR 4.1 (amd_fidelityfx_upscaler_vk.dll) decides what its ML shaders may use from what the GPU supports
+        // (vkGetPhysicalDeviceFeatures2), not from what this device enabled, and has no query for its needs. On an
+        // RX 7900 XTX it ran cooperative-matrix and 8-bit shaders on a device without them, and the GPU hung after
+        // a few minutes (device lost, TDR). So with its DLL present, every feature it uses that the GPU has is on.
+        std::error_code fsr_ec;
+        const bool fsr_dll = std::filesystem::exists(app::ExeDir() / "amd_fidelityfx_upscaler_vk.dll", fsr_ec);
+        if (fsr_dll && api >= VK_API_VERSION_1_3) {
+            VkPhysicalDeviceShaderFloat16Int8Features f16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
+            VkPhysicalDeviceSubgroupSizeControlFeatures sizes{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+            void* query = nullptr;
+            auto link = [&](auto& feature) {
+                feature.pNext = query;
+                query = &feature;
+            };
+            link(f16);
+            link(sizes);
+            link(fsr_storage8);
+            link(fsr_storage16);
+            link(fsr_dot);
+            link(fsr_sync2);
+            link(fsr_indexing);
+            link(fsr_memory_model);
+            link(fsr_subgroup_types);
+            link(fsr_scalar);
+            if (has_coop_matrix) link(fsr_coop);
+            VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            features2.pNext = query;
+            vkGetPhysicalDeviceFeatures2(physical_, &features2);
+            // the queried structs now hold what is supported: enable exactly that
+            auto enable = [&](auto& feature) {
+                feature.pNext = device_features;
+                device_features = &feature;
+            };
+            enable(fsr_storage8);
+            enable(fsr_storage16);
+            enable(fsr_dot);
+            enable(fsr_sync2);
+            enable(fsr_indexing);
+            enable(fsr_memory_model);
+            enable(fsr_subgroup_types);
+            enable(fsr_scalar);
+            const bool coop = has_coop_matrix && fsr_coop.cooperativeMatrix;
+            if (coop) {
+                fsr_coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
+                enable(fsr_coop);
+                extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+            }
+            // float16 and subgroup are already in the chain when the FSR 3.1 paths wanted them; widen them, or add them
+            if (fsr_fp16_) {
+                float16.shaderInt8 = f16.shaderInt8;
+            } else if (f16.shaderFloat16 || f16.shaderInt8) {
+                float16.shaderFloat16 = f16.shaderFloat16;
+                float16.shaderInt8 = f16.shaderInt8;
+                enable(float16);
+            }
+            if (fsr_wave64_) {
+                subgroup.computeFullSubgroups = sizes.computeFullSubgroups;
+            } else if (sizes.subgroupSizeControl) {
+                subgroup.subgroupSizeControl = VK_TRUE;
+                subgroup.computeFullSubgroups = sizes.computeFullSubgroups;
+                enable(subgroup);
+            }
+            LOGR("vulkan: FSR 4 device features: cooperative matrix %s, int8 %s, 8-bit storage %s, integer dot %s",
+                 coop ? "on" : "off", f16.shaderInt8 ? "on" : "off", fsr_storage8.storageBuffer8BitAccess ? "on" : "off",
+                 fsr_dot.shaderIntegerDotProduct ? "on" : "off");
+        }
+#endif
 #if defined(TCNYC_VK_DLSS)
         non_ngx_extensions = extensions.size();
         if (dlss_.instance_ready && properties.vendorID == 0x10DE &&
@@ -3524,7 +3654,19 @@ bool VulkanBackend::CreateSwapchain() {
                 present_mode = m;
                 break;
             }
-    LOGI("vulkan: %s present mode", present_mode == VK_PRESENT_MODE_FIFO_KHR    ? "FIFO"
+    // TCNYC_VK_PRESENT_MODE=fifo|mailbox|immediate: a dev override for present pacing tests
+    if (const char* e = DevEnv("TCNYC_VK_PRESENT_MODE"); e && *e) {
+        const VkPresentModeKHR forced = !std::strcmp(e, "fifo")      ? VK_PRESENT_MODE_FIFO_KHR
+                                        : !std::strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
+                                                                     : VK_PRESENT_MODE_IMMEDIATE_KHR;
+        if (std::ranges::find(modes, forced) != modes.end()) present_mode = forced;
+    }
+    {
+        std::string listed;
+        for (VkPresentModeKHR m : modes) listed += " " + std::to_string(int(m));
+        LOGR("vulkan: surface present modes:%s", listed.c_str());
+    }
+    LOGR("vulkan: %s present mode", present_mode == VK_PRESENT_MODE_FIFO_KHR    ? "FIFO"
                                      : present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox"
                                                                                    : "immediate");
 
@@ -3570,11 +3712,14 @@ bool VulkanBackend::CreateSwapchain() {
     // Low latency without VK_KHR_present_wait: two images let at most one finished frame wait for the display
     swap_low_latency_ = settings.low_latency && !present_wait_;
     uint32_t images = swap_low_latency_ ? std::max(caps.minImageCount, 2u) : caps.minImageCount + 1;
+    if (const char* e = DevEnv("TCNYC_VK_IMAGES"); e && *e)  // dev override for present pacing tests
+        images = std::max(caps.minImageCount, uint32_t(std::atoi(e)));
     if (caps.maxImageCount && images > caps.maxImageCount) images = caps.maxImageCount;
 
     VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     info.surface = surface_;
     info.minImageCount = images;
+    LOGR("vulkan: swapchain asks for %u images (min %u)", images, caps.minImageCount);
     info.imageFormat = chosen.format;
     info.imageColorSpace = chosen.colorSpace;
     info.imageExtent = extent;
@@ -3856,6 +4001,7 @@ bool VulkanBackend::CreateUiTarget() {
 }
 
 void VulkanBackend::DestroyUiTarget() {
+    WaitOtherSlot();  // two frames in flight: the previous one may still read these
     if (ui_fb_) vkDestroyFramebuffer(device_, ui_fb_, nullptr);
     ui_fb_ = VK_NULL_HANDLE;
     if (ui_view_) vkDestroyImageView(device_, ui_view_, nullptr);
@@ -4066,6 +4212,13 @@ bool VulkanBackend::CreateCommands() {    VkCommandPoolCreateInfo pool{VK_STRUCT
     alloc.commandBufferCount = 1;
     if (vkAllocateCommandBuffers(device_, &alloc, &cmd_) != VK_SUCCESS) return false;
     if (vkAllocateCommandBuffers(device_, &alloc, &present_cmd_) != VK_SUCCESS) return false;
+    if (vkAllocateCommandBuffers(device_, &alloc, &other_.cmd) != VK_SUCCESS) return false;
+    if (vkAllocateCommandBuffers(device_, &alloc, &other_.present_cmd) != VK_SUCCESS) return false;
+    {
+        const char* frames = DevEnv("TCNYC_VK_FRAMES");
+        frames_overlap_ = !DevEnv("TCNYC_VK_SYNC_PRESENT") && !(frames && std::atoi(frames) == 1);
+    }
+    LOGR("vulkan: %s in flight", frames_overlap_ ? "two frames" : "one frame");
     if (const char* enabled = std::getenv("TCNYC_DRAW_WORKER");
         (!enabled || std::atoi(enabled) != 0) &&
         vkCreateCommandPool(device_, &pool, nullptr, &draw_worker_pool_) == VK_SUCCESS) {
@@ -4089,10 +4242,13 @@ bool VulkanBackend::CreateCommands() {    VkCommandPoolCreateInfo pool{VK_STRUCT
     if (vkCreateSemaphore(device_, &sem, nullptr, &image_available_) != VK_SUCCESS) return false;
     if (vkCreateFence(device_, &fence, nullptr, &fence_) != VK_SUCCESS) return false;
     if (vkCreateFence(device_, &fence, nullptr, &present_fence_) != VK_SUCCESS) return false;
+    if (vkCreateFence(device_, &fence, nullptr, &other_.fence) != VK_SUCCESS) return false;
+    if (vkCreateFence(device_, &fence, nullptr, &other_.present_fence) != VK_SUCCESS) return false;
     VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     q.queryType = VK_QUERY_TYPE_OCCLUSION;
     q.queryCount = kOcclusionQueries;
-    return vkCreateQueryPool(device_, &q, nullptr, &query_pool_) == VK_SUCCESS;
+    return vkCreateQueryPool(device_, &q, nullptr, &query_pool_) == VK_SUCCESS &&
+           vkCreateQueryPool(device_, &q, nullptr, &other_.query_pool) == VK_SUCCESS;
 }
 
 bool VulkanBackend::CreateUploadBuffer(uint64_t size, VkBuffer& buffer, VkDeviceMemory& memory, uint8_t*& ptr) {
@@ -4123,6 +4279,8 @@ bool VulkanBackend::CreateUploadBuffer(uint64_t size, VkBuffer& buffer, VkDevice
 bool VulkanBackend::CreateUpload() {
     if (!CreateUploadBuffer(kUploadSize, upload_, upload_memory_, upload_ptr_)) return false;
     upload_size_ = kUploadSize;
+    if (!CreateUploadBuffer(kUploadSize, other_.upload, other_.upload_memory, other_.upload_ptr)) return false;
+    other_.upload_size = kUploadSize;
     return true;
 }
 
@@ -4441,6 +4599,11 @@ void VulkanBackend::Shutdown() {
         if (fence_) vkDestroyFence(device_, fence_, nullptr);
         if (present_fence_) vkDestroyFence(device_, present_fence_, nullptr);
         if (query_pool_) vkDestroyQueryPool(device_, query_pool_, nullptr);
+        if (other_.upload) vkDestroyBuffer(device_, other_.upload, nullptr);
+        if (other_.upload_memory) vkFreeMemory(device_, other_.upload_memory, nullptr);
+        if (other_.fence) vkDestroyFence(device_, other_.fence, nullptr);
+        if (other_.present_fence) vkDestroyFence(device_, other_.present_fence, nullptr);
+        if (other_.query_pool) vkDestroyQueryPool(device_, other_.query_pool, nullptr);
         if (gputime_.pool) vkDestroyQueryPool(device_, gputime_.pool, nullptr);
         if (image_available_) vkDestroySemaphore(device_, image_available_, nullptr);
         for (VkSemaphore s : render_done_)
@@ -4486,14 +4649,62 @@ void VulkanBackend::Shutdown() {
 }
 
 void VulkanBackend::WaitSubmitted() {
-    if (failed_ || completed_serial_.load() >= submit_serial_) return;
+    // fence_ is this frame slot's last scene submission; the other slot's is older and has its own fence
+    if (failed_ || completed_serial_.load() >= fence_serial_) return;
     const VkResult r = ProbeWaitFence(device_, fence_, kFenceScene);
     if (r != VK_SUCCESS) {
         Fail("wait for scene", r);
         return;
     }
-    completed_serial_.store(submit_serial_);
+    // a fence signal covers every earlier submission on the queue
+    if (completed_serial_.load() < fence_serial_) completed_serial_.store(fence_serial_);
     draw_batch_next_ = 0;
+}
+
+// The previous frame (other_) is finished on the GPU after this: its scene and present fences have signalled.
+void VulkanBackend::WaitOtherSlot() {
+    if (!other_pending_ || failed_) return;
+    const auto wait_at = perf_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    VkResult r = ProbeWaitFence(device_, other_.present_fence, kFencePresent);
+    if (r == VK_SUCCESS) r = ProbeWaitFence(device_, other_.fence, kFenceScene);
+    if (r != VK_SUCCESS) {
+        Fail("wait for the previous frame", r);
+        return;
+    }
+    other_pending_ = false;
+    if (completed_serial_.load() < other_.fence_serial) completed_serial_.store(other_.fence_serial);
+    if (perf_)
+        perf_wait_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_at).count();
+}
+
+// Makes the previous frame's slot (finished: WaitOtherSlot) the live one, and parks the frame just submitted.
+void VulkanBackend::SwapFrameSlots() {
+    FrameSlot& o = other_;
+    std::swap(cmd_, o.cmd);
+    std::swap(present_cmd_, o.present_cmd);
+    std::swap(fence_, o.fence);
+    std::swap(present_fence_, o.present_fence);
+    std::swap(fence_serial_, o.fence_serial);
+    std::swap(upload_, o.upload);
+    std::swap(upload_memory_, o.upload_memory);
+    std::swap(upload_ptr_, o.upload_ptr);
+    std::swap(upload_size_, o.upload_size);
+    std::swap(draw_sets_, o.draw_sets);
+    std::swap(ao_sets_, o.ao_sets);
+    std::swap(ao_occ_sets_, o.ao_occ_sets);
+    std::swap(draw_batches_, o.draw_batches);
+    std::swap(query_pool_, o.query_pool);
+    std::swap(retired_gpu_, o.retired_gpu);
+    std::swap(retired_framebuffers_, o.retired_framebuffers);
+    std::swap(retired_borrowed_, o.retired_borrowed);
+    std::swap(pack_textures_retired_, o.pack_textures_retired);
+    std::swap(late_retired_, o.late_retired);
+    std::swap(upload_retired_, o.upload_retired);
+    std::swap(staging_pending_, o.staging_pending);
+    std::swap(retired_ao_pipelines_, o.retired_ao_pipelines);
+    other_pending_ = true;
+    draw_batch_next_ = 0;
+    query_reset_ = true;  // the slot's occlusion pool still holds the frame before last's queries
 }
 
 void VulkanBackend::BeginRecord() {
@@ -4505,7 +4716,7 @@ void VulkanBackend::BeginRecord() {
     vkBeginCommandBuffer(cmd_, &info);
     if (gputime_.on && gputime_.seg < kGpuSegments) {
         if (!gputime_.reset_done) {
-            vkCmdResetQueryPool(cmd_, gputime_.pool, 0, kGpuSegments * 2 + 2);
+            vkCmdResetQueryPool(cmd_, gputime_.pool, 0, kGpuQueries);
             gputime_.reset_done = true;
         }
         vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, gputime_.pool, gputime_.seg * 2);
@@ -4573,6 +4784,7 @@ void VulkanBackend::EndRecord(bool wait, std::source_location where) {
         Fail("submit", r);
         return;
     }
+    fence_serial_ = serial;
     if (wait) {
         r = ProbeWaitFence(device_, fence_, kFenceSubmitted);
         if (r != VK_SUCCESS) {
@@ -4592,6 +4804,7 @@ void VulkanBackend::ResetFrame() {
     // early returns through SceneWait. Keep samplers while a recording still
     // references them or a failed fence wait leaves completion uncertain.
     if (samplers_.size() >= 4096 && !failed_ && !recording_ && !DeferredPending()) {
+        WaitOtherSlot();  // the previous frame may still sample with them
         for (const auto& [key, sampler] : samplers_) vkDestroySampler(device_, sampler, nullptr);
         samplers_.clear();
         sampler_memo_valid_ = 0;
@@ -4830,6 +5043,9 @@ VulkanBackend::UploadAlloc VulkanBackend::AllocUpload(uint64_t size, uint64_t al
     if (off + size > upload_size_) {
         uint64_t next = upload_size_ * 2;
         while (next < off + size) next *= 2;
+        // a frame outgrew the ring: rare, and a runaway (no present resetting it) shows up here first
+        LOGR("vulkan: upload ring %llu -> %llu MB in frame %llu", (unsigned long long)(upload_size_ >> 20),
+             (unsigned long long)(next >> 20), (unsigned long long)frames_);
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         uint8_t* ptr = nullptr;
@@ -5457,6 +5673,7 @@ bool VulkanBackend::CreateAoImage(AoImage& image, uint32_t w, uint32_t h, VkForm
 }
 
 void VulkanBackend::DestroyAoImage(AoImage& image) {
+    WaitOtherSlot();  // two frames in flight: the previous one may still read it
     for (auto& cached : ao_occ_cached_) cached = {};
     if (image.view) vkDestroyImageView(device_, image.view, nullptr);
     if (image.image) vkDestroyImage(device_, image.image, nullptr);
@@ -7848,6 +8065,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
                 FlushDeferredScene();
                 EndRecord(true);  // the replay commands still name the image being replaced
             }
+            WaitOtherSlot();  // the previous frame may still sample the image being replaced
             vkDestroyImageView(device_, t->view, nullptr);
             vkDestroyImage(device_, t->image, nullptr);
             vkFreeMemory(device_, t->memory, nullptr);
@@ -8217,6 +8435,7 @@ size_t VulkanBackend::ReleaseOldTextures(bool force) {
         FlushDeferredScene();
         EndRecord(true);  // the retired images may be named by the replay commands
     }
+    if (force) WaitOtherSlot();  // a forced sweep keeps only this frame's textures; the previous frame's may be live
     const size_t before = textures_.size();
     for (auto it = textures_.begin(); it != textures_.end();) {
         Tex* t = it->second;
@@ -9850,6 +10069,7 @@ bool VulkanBackend::CreateSmaaImage(SmaaImage& image, uint32_t w, uint32_t h, Vk
 }
 
 void VulkanBackend::DestroySmaaTargets() {
+    WaitOtherSlot();  // two frames in flight: the previous one may still read these
     for (SmaaImage* image : {&smaa_edges_, &smaa_weights_, &smaa_output_}) {
         if (image->framebuffer) vkDestroyFramebuffer(device_, image->framebuffer, nullptr);
         if (image->view) vkDestroyImageView(device_, image->view, nullptr);
@@ -9880,8 +10100,8 @@ SamplerState ps : register(s1);
 #define SMAASample(tex, coord) tex.Sample(ls, coord)
 #define SMAASamplePoint(tex, coord) tex.Sample(ps, coord)
 #define SMAASampleOffset(tex, coord, offset) tex.Sample(ls, coord, offset)
-#define SMAA_FLATTEN
-#define SMAA_BRANCH
+#define SMAA_FLATTEN [flatten]
+#define SMAA_BRANCH [branch]
 )";
 
 // a full screen triangle; uv 0..1 with the origin at the top left, like the present pass
@@ -10117,6 +10337,7 @@ void VulkanBackend::DrawPostPass(VkPipeline pipeline, VkDescriptorSet set, SmaaI
 }
 
 void VulkanBackend::DestroyBloomTargets() {
+    WaitOtherSlot();  // two frames in flight: the previous one may still read these
     for (SmaaImage* image : {&bloom_.down[0], &bloom_.down[1], &bloom_.down[2], &bloom_.down[3], &bloom_.up[0],
                              &bloom_.up[1], &bloom_.up[2]}) {
         if (image->framebuffer) vkDestroyFramebuffer(device_, image->framebuffer, nullptr);
@@ -10223,6 +10444,7 @@ bool VulkanBackend::NoteShadowImage(const State& s, int stage, const Target& t) 
 }
 
 void VulkanBackend::DestroyFsrImage(SmaaImage& image) {
+    WaitOtherSlot();  // two frames in flight: the previous one may still read it
     if (image.framebuffer) vkDestroyFramebuffer(device_, image.framebuffer, nullptr);
     if (image.view) vkDestroyImageView(device_, image.view, nullptr);
     if (image.image) vkDestroyImage(device_, image.image, nullptr);
@@ -10612,6 +10834,7 @@ VkPipeline VulkanBackend::TemporalHudPipeline() {
 }
 
 void VulkanBackend::DestroyTaaImages() {
+    WaitOtherSlot();  // two frames in flight: the previous one may still read these
     if (taa_.motion_fb) vkDestroyFramebuffer(device_, taa_.motion_fb, nullptr);
     taa_.motion_fb = VK_NULL_HANDLE;
     for (SmaaImage* image : {&taa_.history[0], &taa_.history[1], &taa_.dense, &taa_.metadata}) {
@@ -11435,10 +11658,13 @@ void VulkanBackend::Present(const Surface& front) {
     if (draw_log_) std::fprintf(draw_log_, "FRAME %llu\n", frames_ + 1);
     FlushPass();
     // The scene is submitted without waiting: the CPU records the present pass while the GPU runs it.
-    // Its upload ring, descriptor sets and draw batches are reused only after the present fence below,
-    // which also covers the scene (a fence signal waits for all earlier submissions on the queue).
+    // With two frames in flight the GPU may still be on the previous frame; it is waited for here, after
+    // this frame's scene is queued, so the present pass can rewrite the post-processing descriptor sets
+    // and the next frame can reuse the previous frame's slot (SwapFrameSlots at the end).
     static const bool sync_present = DevEnv("TCNYC_VK_SYNC_PRESENT") != nullptr;
     EndRecord(sync_present);
+    WaitOtherSlot();
+    bool present_submitted = false;
     // every path must clear the per-frame rings, even when the front buffer cannot be read
     struct FrameEnd {
         VulkanBackend* self;
@@ -11706,10 +11932,14 @@ void VulkanBackend::Present(const Surface& front) {
     std::swap(fence_, present_fence_);
     struct PresentBuffers {
         VulkanBackend* self;
-        ~PresentBuffers() {
+        bool active = true;
+        void Restore() {
+            if (!active) return;
+            active = false;
             std::swap(self->cmd_, self->present_cmd_);
             std::swap(self->fence_, self->present_fence_);
         }
+        ~PresentBuffers() { Restore(); }
     } present_buffers{this};
     r = vkResetFences(device_, 1, &fence_);
     if (r != VK_SUCCESS) {
@@ -11729,7 +11959,7 @@ void VulkanBackend::Present(const Surface& front) {
         if (want) {
             VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             q.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            q.queryCount = kGpuSegments * 2 + 2;
+            q.queryCount = kGpuQueries;
             VkPhysicalDeviceProperties props{};
             vkGetPhysicalDeviceProperties(physical_, &props);
             gputime_.period_ns = props.limits.timestampPeriod;
@@ -11750,7 +11980,7 @@ void VulkanBackend::Present(const Surface& front) {
     }
     if (gputime_.on) {
         if (!gputime_.reset_done) {
-            vkCmdResetQueryPool(cmd_, gputime_.pool, 0, kGpuSegments * 2 + 2);
+            vkCmdResetQueryPool(cmd_, gputime_.pool, 0, kGpuQueries);
             gputime_.reset_done = true;
         }
         vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, gputime_.pool, kGpuSegments * 2);
@@ -11783,6 +12013,7 @@ void VulkanBackend::Present(const Surface& front) {
     }
 
 
+    PresentMark(0);
     // TAA replaces SMAA on the 3D scene when it is on (movies and still pictures keep SMAA)
     VkImageView taa_view = VK_NULL_HANDLE;
     if (taa_on_ && direct && ft && !ft->depth && ft->w && ft->h && ft->scene_frame == frames_ + 1 &&
@@ -11873,13 +12104,16 @@ void VulkanBackend::Present(const Surface& front) {
         source_view = smaa_output_.view;
     }
 
+    PresentMark(1);
     // the bloom chain from the image the present pass reads; without it the pass taps that image itself
     VkImageView bloom_view = VK_NULL_HANDLE;
     if (snapshot.bloom && direct && ft && !ft->depth && ft->w && ft->h)
         bloom_view = BuildBloom(source_view, ft->w, ft->h);
+    PresentMark(2);
     // FSR 1 upscaling and sharpening of the 3D scene (not of movies and still pictures)
     if (direct && ft && !ft->depth && front.picture == gpu::Picture::Unknown && !((fsr_on_ || dlss_on_) && taa_view))
         source_view = UpscaleAndSharpen(source_view, ft->format, ft->w, ft->h, extent_.width, extent_.height, snapshot);
+    PresentMark(3);
 
     // PC distance blur: the main target's depth, resolved with MSAA or the image itself without (as d3d12.cpp)
     const SceneDepth* dof = nullptr;
@@ -11990,6 +12224,7 @@ void VulkanBackend::Present(const Surface& front) {
         ui_composite_logged_ = true;
     }
 
+    PresentMark(4);
     VkClearValue clear{};
     VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rp.renderPass = swap_pass_;
@@ -12087,6 +12322,7 @@ void VulkanBackend::Present(const Surface& front) {
         Fail("present submit", r);
         return;
     }
+    present_submitted = true;
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     present.waitSemaphoreCount = 1;
     present.pWaitSemaphores = &render_done;
@@ -12111,12 +12347,16 @@ void VulkanBackend::Present(const Surface& front) {
         LOGE("vulkan: present failed: %s", VkError(r));
     }
 
-    // the next frame may reuse the upload ring and descriptor pool only now
+    present_buffers.Restore();  // fence_ is the scene's again, present_fence_ this present's
     present_lap.Stop();
+    // With two frames in flight the next frame records into the other slot and this one is waited for at the
+    // next Present. One frame in flight, the GPU time probe, a swapchain capture and the temporal profile read
+    // this frame's results now, so they wait for it here as before.
+    const bool sync_frame = !frames_overlap_ || gputime_.on || record_swap_trace || profile_.pending;
     bool waited = false;
-    {
+    if (sync_frame && present_submitted && !failed_) {
         const auto wait_at = perf_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const VkResult wait_result = ProbeWaitFence(device_, fence_, kFencePresent);
+        const VkResult wait_result = ProbeWaitFence(device_, present_fence_, kFencePresent);
         if (wait_result != VK_SUCCESS)
             Fail("wait for present fence", wait_result);
         else
@@ -12129,7 +12369,7 @@ void VulkanBackend::Present(const Surface& front) {
             perf_wait_ms_ +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_at).count();
     }
-    if (waited) WaitPreviousPresent();
+    if (present_submitted && !failed_) WaitPreviousPresent();
     if (gputime_.on) {
         std::array<uint64_t, kGpuSegments * 2> t{};
         uint64_t present_t[2] = {};
@@ -12142,6 +12382,17 @@ void VulkanBackend::Present(const Surface& front) {
         const bool present_read =
             vkGetQueryPoolResults(device_, gputime_.pool, kGpuSegments * 2, 2, sizeof(present_t), present_t,
                                   sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS;
+        uint64_t marks[kPresentMarks] = {};
+        const bool marks_read =
+            vkGetQueryPoolResults(device_, gputime_.pool, kGpuSegments * 2 + 2, kPresentMarks, sizeof(marks), marks,
+                                  sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;  // after the fence: no wait
+        if (marks_read && present_read) {
+            // start, the five marks, end: the time of each present step
+            const uint64_t at[kPresentMarks + 2] = {present_t[0], marks[0], marks[1], marks[2], marks[3], marks[4],
+                                                    present_t[1]};
+            for (uint32_t i = 0; i + 1 < std::size(at); ++i)
+                if (at[i + 1] >= at[i]) gputime_.steps_ms[i] += double(at[i + 1] - at[i]) * gputime_.period_ns / 1e6;
+        }
         if (waited && segments_read && present_read) {
             double scene = 0;
             for (uint32_t i = 0; i < gputime_.seg; ++i)
@@ -12158,6 +12409,12 @@ void VulkanBackend::Present(const Surface& front) {
                 LOGR("vulkan: GPU scene+post %.2f ms, present %.2f ms, max %.2f, %.1f fps",
                      gputime_.scene_ms / gputime_.frames, gputime_.present_ms / gputime_.frames, gputime_.max_ms,
                      gputime_.frames * 1000.0 / std::max(span, 1.0));
+                const double* st = gputime_.steps_ms;
+                const double n = gputime_.frames;
+                LOGR("vulkan: GPU present steps: start %.2f, taa/smaa %.2f, bloom %.2f, upscale %.2f, overlay %.2f, "
+                     "final pass %.2f ms",
+                     st[0] / n, st[1] / n, st[2] / n, st[3] / n, st[4] / n, st[5] / n);
+                std::fill(std::begin(gputime_.steps_ms), std::end(gputime_.steps_ms), 0.0);
                 gputime_.scene_ms = gputime_.present_ms = gputime_.max_ms = 0;
                 gputime_.frames = 0;
                 gputime_.since = now;
@@ -12193,6 +12450,10 @@ void VulkanBackend::Present(const Surface& front) {
         profile_.pending = false;
     }
     frame_end.finished = true;
+    if (present_submitted && !failed_) {
+        SwapFrameSlots();                  // the next frame records into the previous frame's (finished) slot
+        if (waited) other_pending_ = false;  // this frame was waited for above
+    }
     ResetFrame();
     ++frames_;
     presents_seen_.store(frames_);

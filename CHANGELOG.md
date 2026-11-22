@@ -19,6 +19,19 @@
   replaces the viewport clip, an empty scissor clips the draw completely, and both follow the ultrawide HUD squeeze.
   This restores HUD elements the title hides by clipping (the phone icon when there is no call) and keeps the
   ultrawide HUD centred instead of stretched. A clear with no rectangles also clears only the current viewport.
+- **Vulkan performance (Windows and Linux/Steam Deck).** Vulkan now keeps two frames in flight, as Direct3D 12
+  does: the CPU records the next frame while the GPU draws the previous one, instead of waiting for the GPU at the
+  end of every frame. On Windows (RX 7900 XTX, 3440x1440) that wait was 9-14 ms a frame and held Vulkan at about
+  44 FPS where Direct3D 12 reached the 60 FPS cap; Vulkan now reaches the cap with no wait. The per-frame upload
+  ring, descriptor sets, draw batches, occlusion queries and released resources exist once per frame in flight.
+  `TCNYC_VK_FRAMES=1` (developer builds) restores one frame in flight for comparison.
+- **Windows Vulkan with FSR 4.1 no longer hangs the GPU.** After 1.5-6 minutes the GPU stopped responding
+  (device lost, and Windows reset the display driver). AMD's FSR 4.1 Vulkan upscaler chooses its ML shaders by what
+  the GPU supports, not by what the game's Vulkan device enabled, so on an RX 7900 XTX it ran cooperative-matrix and
+  8-bit integer shaders on a device without those features. With AMD's upscaler DLL present the device now enables
+  every feature it uses that the GPU has (cooperative matrix, 8-bit integers and storage, 16-bit storage, integer dot
+  product, synchronization2, descriptor indexing, the Vulkan memory model and subgroup extended types). Direct3D 12
+  was not affected.
 - **Low latency** now works on Vulkan (Windows and Linux/Steam Deck), not only Direct3D 12: at most one finished
   frame waits for the display. It uses `VK_KHR_present_wait` where the driver has it, otherwise a two-image
   swapchain. The option is shown in the F10 menu and Options > Display on Linux too.
