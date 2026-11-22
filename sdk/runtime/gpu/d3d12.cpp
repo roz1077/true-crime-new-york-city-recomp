@@ -1296,6 +1296,15 @@ private:
     void ViewportScissorFor(const State& s, uint32_t gw, uint32_t gh, float squeeze, D3D12_VIEWPORT& vp,
                             D3D12_RECT& rect) const;
     void FlushDeferredScene();
+    // XBE_PERF: why the deferred scene was flushed, tallied and logged every 300 frames. Each
+    // flush with AO receivers runs the whole AO chain again.
+    struct FlushStat {
+        uint64_t flushes = 0, with_receivers = 0, ao_runs = 0, bundles = 0;
+    };
+    const char* flush_reason_ = nullptr;  // set by the caller just before FlushDeferredScene
+    std::map<std::string, FlushStat> flush_stats_;
+    uint64_t flush_stats_frames_ = 0;
+    void ReportFlushStats();
     bool DeferredBarrier(const char* why);
     void DeferredFallback(const char* why);
     void ReportDeferred();
@@ -2620,6 +2629,7 @@ void D3D12Backend::Submit(bool wait) {
 }
 
 void D3D12Backend::Flush() {
+    flush_reason_ = "explicit flush";
     if (defer_scene_) FlushDeferredScene();
     Submit(true);
 }
@@ -2751,6 +2761,7 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
                 if (!bundle_) {
                     // Materialise what has been deferred so the transition and the draw that
                     // needs it happen in the right order, then keep the frame deferred.
+                    flush_reason_ = pending_write ? "transition of a pending target" : "transition of a pending read";
                     FlushDeferredScene();
                     defer_flush_conflict_ = true;
                     if (cur == want) return;
@@ -2774,8 +2785,11 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
 
 // a resized target gives back its view and its resources
 void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it, bool park) {
-    if (DeferredPendingResource(it->second.res.Get()) ||
-        (it->second.resolved && DeferredPendingResource(it->second.resolved.Get()))) {
+    // A parked target keeps its resources and view, so pending bundles that read or write it stay
+    // valid and need no flush; only the scene targets the deferred frame tracks by Target* do.
+    const bool keeps_resources = park && !ext_ && defer_rt_ != &it->second && defer_ds_ != &it->second;
+    if (!keeps_resources && (DeferredPendingResource(it->second.res.Get()) ||
+                             (it->second.resolved && DeferredPendingResource(it->second.resolved.Get())))) {
         DeferredBarrier("target released while deferred");
         if (defer_rt_ == &it->second) defer_rt_ = nullptr;
         if (defer_ds_ == &it->second) defer_ds_ = nullptr;
@@ -4859,6 +4873,7 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
         // The draw needs the scene as it stands. Materialise the pending bundles, then keep
         // this draw immediate so it samples what it was just made to wait for.
         if (!bundle_) {
+            flush_reason_ = "pending target sampled";
             FlushDeferredScene();
             defer_flush_conflict_ = true;
         } else {
@@ -6399,12 +6414,14 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // past the ring every upload is a buffer of its own: seconds lost on a frame that draws a whole level once
     if (CurrentFrame().used > kUploadSize - kUploadReserve) {
+        flush_reason_ = "upload ring full";
         if (defer_scene_ && !bundle_) FlushDeferredScene();
         Submit(true);
     }
     // Keep a margin for this draw's texture views and any resolves/uploads below; a wrap
     // would alias descriptors already recorded, including those in pending bundles.
     if (CurrentFrame().srv + 48 > kSrvPerFrame) {
+        flush_reason_ = "descriptor ring full";
         if (defer_scene_ && !bundle_) FlushDeferredScene();
         Submit(true);
     }
@@ -6984,6 +7001,7 @@ void D3D12Backend::FlushDeferredScene() {
     if (f.bundles.empty()) {
         defer_reads_.clear();
         defer_writes_.clear();
+        flush_reason_ = nullptr;
         return;
     }
     ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
@@ -7227,6 +7245,14 @@ void D3D12Backend::FlushDeferredScene() {
             LOGR("d3d12: ambient occlusion active (%u variants warmed)", ao_built_.load());
         defer_ao_applied_ = true;
     }
+    if (diag::Perf()) {
+        FlushStat& st = flush_stats_[flush_reason_ ? flush_reason_ : "other"];
+        st.flushes++;
+        st.bundles += bundles.size();
+        if (receivers) st.with_receivers++;
+        if (ao_bound) st.ao_runs++;
+    }
+    flush_reason_ = nullptr;
     Begin();
 }
 
@@ -7606,6 +7632,7 @@ bool D3D12Backend::DeferredBarrier(const char* why) {
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 40)
         LOGI("d3d12: deferred barrier frame %llu: %s", static_cast<unsigned long long>(frame_), why);
+    flush_reason_ = why;
     FlushDeferredScene();
     return true;
 }
@@ -7616,12 +7643,29 @@ void D3D12Backend::DeferredFallback(const char* why) {
     if (!defer_scene_ || defer_abandoned_) return;
     defer_frame_active_ = true;
     if (!defer_reason_) defer_reason_ = why;
+    flush_reason_ = why;
     FlushDeferredScene();
     defer_abandoned_ = true;
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
         LOGR("d3d12: deferred scene fell back for frame %llu: %s",
              static_cast<unsigned long long>(frame_), why);
+}
+
+void D3D12Backend::ReportFlushStats() {
+    if (++flush_stats_frames_ < 300) return;
+    const double n = double(flush_stats_frames_);
+    std::string line;
+    for (const auto& [why, st] : flush_stats_) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), " | %s: %.2f/frame (%.2f with AO receivers, %.2f ran AO, %.0f bundles each)",
+                      why.c_str(), double(st.flushes) / n, double(st.with_receivers) / n, double(st.ao_runs) / n,
+                      st.flushes ? double(st.bundles) / double(st.flushes) : 0.0);
+        line += buf;
+    }
+    if (!line.empty()) LOGR("perf: deferred flushes over %.0f frames%s", n, line.c_str());
+    flush_stats_.clear();
+    flush_stats_frames_ = 0;
 }
 
 void D3D12Backend::ReportDeferred() {
@@ -9909,7 +9953,9 @@ void LogPerf() {
 
 void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
+    flush_reason_ = "present";
     if (defer_scene_) FlushDeferredScene();
+    if (diag::Perf()) ReportFlushStats();
     // Diagnostic: TCNYC_CAPTURE_AT=<frame> starts an F3-style capture without input.
     static const long capture_at = [] {
         const char* e = DevEnv("TCNYC_CAPTURE_AT");
