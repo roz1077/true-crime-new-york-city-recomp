@@ -86,6 +86,7 @@ void Load() {
     s.render_percent = t["render_percent"].value_or(s.render_percent);
     s.aspect = t["aspect_ratio"].value_or(s.aspect);
     s.renderer = std::min(t["renderer"].value_or(s.renderer), 1u);
+    s.remove_cutscene_bars = t["remove_cutscene_bars"].value_or(s.remove_cutscene_bars);
     if (s.width > 16384 || s.height > 16384 || !s.width || !s.height) s.width = s.height = 0;
     s.render_percent = std::clamp(s.render_percent, 25u, 200u);
     if (s.aspect && (s.aspect < 500 || s.aspect > 8000)) s.aspect = 0;
@@ -196,6 +197,7 @@ toml::table Table() {
                   {"render_percent", int64_t(s.render_percent)},
                   {"aspect_ratio", int64_t(s.aspect)},
                   {"renderer", int64_t(s.renderer)},
+                  {"remove_cutscene_bars", s.remove_cutscene_bars},
                   {"language", LanguageName(s.language)},
                   {"audio_mode", int64_t(s.audio_mode)},
                   {"force_stereo_output", s.force_stereo_output},
@@ -223,6 +225,10 @@ toml::table Table() {
                   {"ao", int64_t(s.ao)},
                   {"ao_method", int64_t(s.ao_method)},
                   {"ao_quality", int64_t(s.ao_quality)},
+                  // written by the F10 menu while the game thread reads them: atomic, as on Windows
+                  {"city_range", int64_t(std::atomic_ref(Get().city_range).load(std::memory_order_relaxed))},
+                  {"city_inner_detail", int64_t(std::atomic_ref(Get().city_inner_detail).load(std::memory_order_relaxed))},
+                  {"city_outer_detail", int64_t(std::atomic_ref(Get().city_outer_detail).load(std::memory_order_relaxed))},
                   {"building_seam_fix", s.building_seam_fix},
                   {"object_detail", int64_t(s.object_detail)},
                   {"ped_detail", int64_t(s.ped_detail)},
