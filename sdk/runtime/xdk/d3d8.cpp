@@ -42,6 +42,10 @@ using XbeSimpleStateFilterFn = uint32_t (*)(X86Context &, uint32_t method, uint3
 XbeSimpleStateFilterFn &XbeSimpleStateFilter();
 using XbeTextureFactorFilterFn = uint32_t (*)(X86Context &, uint32_t value);
 XbeTextureFactorFilterFn &XbeTextureFactorFilter();
+// optional game-side filter on a draw from user memory (DrawVerticesUP, inline push): may change the state's
+// textures and the copied vertices for this draw only; the textures are put back after it
+using XbeUpDrawFilterFn = void (*)(gpu::State &, uint32_t prim, uint32_t count, uint8_t *vertices, uint32_t stride);
+XbeUpDrawFilterFn &XbeUpDrawFilter();
 
 namespace dispatch {
 bool InCode(uint32_t va);  // cpu/dispatch.cpp
@@ -1653,12 +1657,21 @@ void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride
         if (!count) return;
     }
     SyncDeferred();
+    const auto textures = g_state.textures;
+    if (const XbeUpDrawFilterFn filter = ::XbeUpDrawFilter()) {
+        static thread_local std::vector<uint8_t> copy;
+        const auto* bytes = static_cast<const uint8_t*>(vertices);
+        copy.assign(bytes, bytes + size_t(count) * stride);
+        filter(g_state, prim, count, copy.data(), stride);
+        vertices = copy.data();
+    }
     auto stream = g_state.streams[0];
     g_state.streams[0] = {UpVertices(vertices, count * stride), stride};
     g_backend->Draw(g_state, prim, 0, count, nullptr);
     g_frame_draws++;
     gpu::RetainVertexAttributes(g_state, 0, count, nullptr);
     g_state.streams[0] = stream;
+    g_state.textures = textures;
 }
 
 // bytes per vertex of the bound format: stream 0 of the FVF or of the shader's declaration
@@ -2041,5 +2054,10 @@ XbeSimpleStateFilterFn& XbeSimpleStateFilter() {
 
 XbeTextureFactorFilterFn& XbeTextureFactorFilter() {
     static XbeTextureFactorFilterFn filter = nullptr;
+    return filter;
+}
+
+XbeUpDrawFilterFn& XbeUpDrawFilter() {
+    static XbeUpDrawFilterFn filter = nullptr;
     return filter;
 }
