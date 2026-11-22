@@ -63,7 +63,7 @@ enum class Option {
     Contrast,
     Saturation,
     VSync,
-    LowLatency, // Windows only
+    LowLatency, // D3D12, or Vulkan with VK_KHR_present_wait
     FrameCap,
     ShowFps,
     TextureReplacement,
@@ -94,9 +94,7 @@ inline constexpr Option kMainOptions[] = {
     Option::DepthOfField,    Option::AmbientOcclusion, Option::AoQuality, Option::ShadowQuality, Option::ShadowSoftness,
     Option::BuildingSeamFix, Option::PcContrast,   Option::Gamma, Option::Brightness,
     Option::Contrast, Option::Saturation, Option::VSync,
-#ifdef _WIN32
     Option::LowLatency,
-#endif
     Option::FrameCap,
     Option::ShowFps, Option::TextureReplacement, Option::TextureDumping, Option::DumpFormat,
     Option::HdrPage, Option::Defaults};

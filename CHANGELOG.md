@@ -19,6 +19,9 @@
   replaces the viewport clip, an empty scissor clips the draw completely, and both follow the ultrawide HUD squeeze.
   This restores HUD elements the title hides by clipping (the phone icon when there is no call) and keeps the
   ultrawide HUD centred instead of stretched. A clear with no rectangles also clears only the current viewport.
+- **Low latency** now works on Vulkan (Windows and Linux/Steam Deck), not only Direct3D 12: at most one finished
+  frame waits for the display. It uses `VK_KHR_present_wait` where the driver has it, otherwise a two-image
+  swapchain. The option is shown in the F10 menu and Options > Display on Linux too.
 - Windows Vulkan DLSS can be built with `TCNYC_DLSS_VK_SDK` pointed at NVIDIA's NGX SDK (Vulkan headers and
   `nvsdk_ngx.lib`); it is optional exactly like the Direct3D 12 DLSS build.
 - **Ambient occlusion remains experimental and off by default.** A captured frame showed the game's own render

@@ -584,9 +584,8 @@ bool Enabled(Row row) {
     if (row == Row::ControllerAimSensitivity)
         return std::atomic_ref(input::g_controller_aim_response).load(std::memory_order_relaxed) == 0;
     if (row == Row::CityOuterDetail) return game::city_grid::OuterDetailAvailable();
-#ifndef _WIN32
-    if (row == Row::LowLatency) return false;  // Direct3D 12 only
-#endif
+    // D3D12, or Vulkan with VK_KHR_present_wait
+    if (row == Row::LowLatency) return gpu::g_low_latency_available.load(std::memory_order_relaxed);
     // The HDR toggle stays reachable on an SDR display so a failed detection can be retried and
     // the fallback is visible; its sliders only matter once HDR is actually active.
     if (row == Row::HdrPaperWhite || row == Row::HdrPeak || row == Row::HdrHighlights)
@@ -857,12 +856,10 @@ const char *Help(Row row) {
         return "Sharpens the finished 3D frame (AMD FidelityFX RCAS). Offsets the softness of SMAA and of render "
                "scales below 100%. The HUD is not sharpened.";
     case Row::LowLatency:
-#ifdef _WIN32
-        return "Lets only one frame wait for the display instead of three, so the controls respond sooner. "
+        if (!gpu::g_low_latency_available.load(std::memory_order_relaxed))
+            return "Needs a driver with Vulkan present wait (VK_KHR_present_wait).";
+        return "Lets only one frame wait for the display, so the controls respond sooner. "
                "Can lower the frame rate on a slow GPU.";
-#else
-        return "Windows only.";
-#endif
     case Row::VSync:
         return "Waits for the monitor's refresh before showing a frame, which prevents tearing.";
     case Row::FrameCap:

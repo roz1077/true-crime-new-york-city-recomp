@@ -2084,6 +2084,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     render_ = app::Snapshot();
     LoadFsr3();
     g_reversed_depth = true;
+    g_low_latency_available.store(true, std::memory_order_relaxed);  // the swap chain's frame latency waitable
     if (const char* view = std::getenv("TCNYC_AO_VIEW"); view && *view && std::atoi(view) != 0)
         g_ao_debug_view = true;
     if (const char* fused = std::getenv("TCNYC_AO_FUSED"); fused && *fused && std::atoi(fused) != 0) {

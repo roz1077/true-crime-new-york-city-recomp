@@ -89,6 +89,9 @@ enum class HdrOutput : uint32_t { Off, ScRgb, Hdr10 };
 // Backends refresh these when they (re)create the swapchain; the Graphics menu reads them.
 inline std::atomic<bool> g_hdr_available{false};
 inline std::atomic<uint32_t> g_hdr_display_peak_nits{0};
+// The renderer can hold the frame queue to one frame for the Low latency setting (D3D12 always; Vulkan when the
+// driver has VK_KHR_present_wait). The Graphics menu greys the option out otherwise.
+inline std::atomic<bool> g_low_latency_available{false};
 // Set by the window thread on WM_DISPLAYCHANGE (an HDR toggle in Windows, a display added or
 // removed); the renderer re-reads the display's HDR capability once and clears it.
 inline std::atomic<bool> g_display_changed{false};

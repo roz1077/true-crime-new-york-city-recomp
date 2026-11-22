@@ -512,9 +512,11 @@ static uint32_t PickSampleCount(uint32_t requested, uint32_t supported_mask) {
 // different triangle's sample-0 depth on either side of a coplanar seam, leaving a dark AO line on
 // a flat wall (worst with MSAA). One sample is enough; TCNYC_AO_SAMPLES=N restores multisampling.
 static uint32_t PickAoSampleCount(uint32_t requested, uint32_t supported_mask) {
-    uint32_t forced = 1;
-    if (const char* e = DevEnv("TCNYC_AO_SAMPLES"); e && *e)
-        forced = std::max(1u, uint32_t(std::strtoul(e, nullptr, 10)));
+    // read once: this runs per AO draw (d3d12.cpp PickAoSamples caches it too)
+    static const uint32_t forced = [] {
+        const char* e = DevEnv("TCNYC_AO_SAMPLES");
+        return e && *e ? std::max(1u, uint32_t(std::strtoul(e, nullptr, 10))) : 1u;
+    }();
     return forced <= 1 ? 1 : PickSampleCount(std::min(requested, forced), supported_mask);
 }
 
@@ -1204,6 +1206,15 @@ private:
     bool swapchain_colorspace_ = false;  // VK_EXT_swapchain_colorspace is enabled
     bool hdr_metadata_ = false;           // VK_EXT_hdr_metadata is enabled
     PFN_vkSetHdrMetadataEXT set_hdr_metadata_ = nullptr;
+    // Low latency (the D3D12 SetMaximumFrameLatency(1) counterpart): each present carries an id, and with the
+    // setting on the render thread waits after a present until the previous one is on screen, so at most one
+    // finished frame waits for the display. Needs VK_KHR_present_id and VK_KHR_present_wait.
+    bool present_wait_ = false;
+    PFN_vkWaitForPresentKHR wait_for_present_ = nullptr;
+    uint64_t present_id_ = 0;        // the id of the last present on this swapchain
+    bool low_latency_ = false;       // the setting, latched each frame
+    bool swap_low_latency_ = false;  // without present wait: the swapchain was built with two images for it
+    void WaitPreviousPresent();
 
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
     VkCommandPool draw_worker_pool_ = VK_NULL_HANDLE;
@@ -3223,6 +3234,9 @@ bool VulkanBackend::CreateDevice() {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceShaderFloat16Int8Features float16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
     VkPhysicalDeviceSubgroupSizeControlFeatures subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+    VkPhysicalDevicePresentIdFeaturesKHR present_id_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
+    VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
     void* device_features = nullptr;
 #if defined(TCNYC_VK_DLSS)
     VkPhysicalDeviceBufferDeviceAddressFeatures address{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
@@ -3237,7 +3251,10 @@ bool VulkanBackend::CreateDevice() {
         bool has_border = false;
         bool has_hdr_metadata = false;
         bool has_subgroup_control = false;
+        bool has_present_id = false, has_present_wait = false;
         for (const VkExtensionProperties& e : available) {
+            has_present_id = has_present_id || !std::strcmp(e.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+            has_present_wait = has_present_wait || !std::strcmp(e.extensionName, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
             has_border = has_border || !std::strcmp(e.extensionName, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
             has_hdr_metadata = has_hdr_metadata || !std::strcmp(e.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME);
             has_subgroup_control =
@@ -3259,6 +3276,17 @@ bool VulkanBackend::CreateDevice() {
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(physical_, &properties);
         const uint32_t api = std::min(instance_version_, properties.apiVersion);
+        if (has_present_id && has_present_wait && api >= VK_API_VERSION_1_1) {
+            present_id_features.pNext = &present_wait_features;
+            VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            features2.pNext = &present_id_features;
+            vkGetPhysicalDeviceFeatures2(physical_, &features2);
+            present_wait_ = present_id_features.presentId && present_wait_features.presentWait;
+            if (present_wait_) {
+                extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+                extensions.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+            }
+        }
         const char* baseline = DevEnv("TCNYC_FSR_BASELINE");
         if (api >= VK_API_VERSION_1_2 && (!baseline || std::atoi(baseline) == 0)) {
             const bool can_query_subgroup = api >= VK_API_VERSION_1_3 || has_subgroup_control;
@@ -3308,6 +3336,15 @@ bool VulkanBackend::CreateDevice() {
     if (border_custom_) {
         border_features.pNext = device_features;
         device_features = &border_features;
+    }
+    if (present_wait_) {
+        present_id_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
+        present_id_features.presentId = VK_TRUE;
+        present_wait_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
+        present_wait_features.presentWait = VK_TRUE;
+        present_wait_features.pNext = device_features;
+        present_id_features.pNext = &present_wait_features;
+        device_features = &present_id_features;
     }
     LOGR("vulkan: custom sampler border colours %s", border_custom_ ? "on" : "off (fixed colours)");
     VkPhysicalDeviceFeatures features{};
@@ -3374,7 +3411,27 @@ bool VulkanBackend::CreateDevice() {
         hdr_metadata_ = set_hdr_metadata_ != nullptr;
         if (!hdr_metadata_) LOGR("vulkan: VK_EXT_hdr_metadata enabled but its entry point is missing");
     }
+    if (present_wait_) {
+        wait_for_present_ =
+            reinterpret_cast<PFN_vkWaitForPresentKHR>(vkGetDeviceProcAddr(device_, "vkWaitForPresentKHR"));
+        present_wait_ = wait_for_present_ != nullptr;
+    }
+    g_low_latency_available.store(true, std::memory_order_relaxed);
+    LOGR("vulkan: low latency by %s", present_wait_ ? "present wait (VK_KHR_present_wait)" : "a two-image swapchain");
     return true;
+}
+
+// Low latency: wait until the present before the one just queued has reached the display, so the next frame starts
+// with at most one finished frame queued (D3D12's frame latency waitable with a maximum latency of 1). Bounded: a
+// hidden or minimised window may never show it, and the render thread must not stop.
+void VulkanBackend::WaitPreviousPresent() {
+    if (!low_latency_ || !present_wait_ || !swapchain_ || present_id_ < 2) return;
+    const auto wait_at = perf_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const VkResult r = wait_for_present_(device_, swapchain_, present_id_ - 1, 100'000'000ull);  // 100 ms
+    if (r != VK_SUCCESS && r != VK_TIMEOUT && r != VK_SUBOPTIMAL_KHR)
+        LOG_FIRST(4, "vulkan: vkWaitForPresentKHR failed: %s", VkError(r));
+    if (perf_)
+        perf_wait_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_at).count();
 }
 
 // TCNYC_SWAPCHAIN_FAIL_TEST=N fails the first N swapchain rebuilds (not the first creation), to
@@ -3509,7 +3566,10 @@ bool VulkanBackend::CreateSwapchain() {
     // and Present tries again on the next frame.
     const VkSwapchainKHR old_swapchain = swapchain_;
     swapchain_ = VK_NULL_HANDLE;
-    uint32_t images = caps.minImageCount + 1;
+    present_id_ = 0;  // present ids count per swapchain
+    // Low latency without VK_KHR_present_wait: two images let at most one finished frame wait for the display
+    swap_low_latency_ = settings.low_latency && !present_wait_;
+    uint32_t images = swap_low_latency_ ? std::max(caps.minImageCount, 2u) : caps.minImageCount + 1;
     if (caps.maxImageCount && images > caps.maxImageCount) images = caps.maxImageCount;
 
     VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -11418,11 +11478,16 @@ void VulkanBackend::Present(const Surface& front) {
     shadow_spacing_ = ShadowSpacing(snapshot.shadow_softness);
     shadow_px_ = snapshot.shadow_resolution >= 2 ? 2048u : snapshot.shadow_resolution == 1 ? 1024u : 0u;
     shadow_soft_ = snapshot.shadow_softness >= 2 ? 1.5f : snapshot.shadow_softness == 1 ? 0.75f : 0.0f;
-    if (snapshot.vsync != vsync_ || snapshot.hdr != hdr_setting_) {
+    if (snapshot.vsync != vsync_ || snapshot.hdr != hdr_setting_ ||
+        (!present_wait_ && snapshot.low_latency != swap_low_latency_)) {
         vkDeviceWaitIdle(device_);
         if (!CreateSwapchain()) return;
     }
     aniso_setting_ = snapshot.aniso;
+    if (snapshot.low_latency != low_latency_)
+        LOGR("vulkan: low latency %s (%zu swapchain images)", snapshot.low_latency ? "on" : "off",
+             swapchain_images_.size());
+    low_latency_ = snapshot.low_latency;
     aspect_ = app::AspectRatio();
     if (texturedumper_vk::Update()) ReleasePackTextures();
     Target* ft = nullptr;
@@ -12028,7 +12093,15 @@ void VulkanBackend::Present(const Surface& front) {
     present.swapchainCount = 1;
     present.pSwapchains = &swapchain_;
     present.pImageIndices = &image;
+    const uint64_t present_id = present_id_ + 1;
+    VkPresentIdKHR present_ids{VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+    if (present_wait_) {
+        present_ids.swapchainCount = 1;
+        present_ids.pPresentIds = &present_id;
+        present.pNext = &present_ids;
+    }
     r = vkQueuePresentKHR(present_queue_, &present);
+    if (present_wait_ && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) present_id_ = present_id;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
         vkDeviceWaitIdle(device_);
         if (!CreateSwapchain()) LOGE("vulkan: could not rebuild the swapchain");
@@ -12056,6 +12129,7 @@ void VulkanBackend::Present(const Surface& front) {
             perf_wait_ms_ +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_at).count();
     }
+    if (waited) WaitPreviousPresent();
     if (gputime_.on) {
         std::array<uint64_t, kGpuSegments * 2> t{};
         uint64_t present_t[2] = {};
