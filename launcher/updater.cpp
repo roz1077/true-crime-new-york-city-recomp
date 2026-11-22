@@ -847,7 +847,13 @@ void LogLine(const char* format, ...) {
         std::vsnprintf(message, sizeof(message), format, args);
         va_end(args);
 
-        const auto dir = app::InstallRootFor(ExecutablePath().parent_path()) / "logs";
+        // The update installer runs from <install>/update/staged. Its log belongs to the install it is updating:
+        // a logs folder inside staged is a file the package's SHA256SUMS does not list, and ApplyPackage then
+        // refuses the update ("The update manifest does not cover every file"), as Beta 5 first did on Windows.
+        auto root = app::InstallRootFor(ExecutablePath().parent_path());
+        if (root.filename() == "staged" && root.parent_path().filename() == "update")
+            root = root.parent_path().parent_path();
+        const auto dir = root / "logs";
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         std::ofstream out(dir / "launcher.log", std::ios::binary | std::ios::app);
