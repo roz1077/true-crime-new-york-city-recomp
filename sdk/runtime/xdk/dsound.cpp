@@ -1337,7 +1337,7 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     v.context = R32(desc + 16);
     SetBins(v, R32(desc + 20));
     v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
-    v.headroom = flags & 0x382010 ? 1.0f : dsound_mix::StreamHeadroomGain(false, 600);
+    v.headroom = flags & 0x382010 ? 1.0f : dsound_mix::StreamHeadroomGain(v.is3d, 600);
     W32(a[1], obj);
     return 0;
 }

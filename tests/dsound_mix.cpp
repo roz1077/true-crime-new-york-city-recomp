@@ -21,6 +21,21 @@ void ExpectTrue(bool cond, const char* label) {
     }
 }
 
+// The stereo fold Render applies to the summed speaker and crosstalk bins of every channel.
+float FoldLeft(const float (&bin)[10][32], int channels) {
+    float sum = 0.0f;
+    for (int c = 0; c < channels; c++)
+        sum += bin[c][0] + bin[c][6] + dsound_mix::kFold * (bin[c][2] + bin[c][4] + bin[c][8]);
+    return sum;
+}
+
+float FoldRight(const float (&bin)[10][32], int channels) {
+    float sum = 0.0f;
+    for (int c = 0; c < channels; c++)
+        sum += bin[c][1] + bin[c][7] + dsound_mix::kFold * (bin[c][2] + bin[c][5] + bin[c][9]);
+    return sum;
+}
+
 void TestStreamHeadroom() {
     // 2D streams cap headroom at 300 mB (-3 dB) so the game's 900 mB pool does not bury cutscenes.
     ExpectNear(dsound_mix::StreamHeadroomGain(false, 900), dsound_mix::Db(-300), 1e-5f, "2d_900mb_capped");
@@ -51,20 +66,39 @@ void TestNormalize2DFold() {
         ExpectNear(bin[0][0], 0.8f, 1e-5f, "panned_fl");
         ExpectNear(bin[1][1], 0.2f, 1e-5f, "panned_fr");
     }
-    // Bink 2ch voice sent to all 6 speaker bins (0..5) folds to unity instead of 2.414x.
+    // Bink 2ch voice sent to all its speaker bins: left to FL, centre and back left, right to FR, centre
+    // and back right (bin 3 is the sub, which the fold drops). Its stereo fold comes back to unity.
     {
         float bin[10][32] = {};
         bin[0][0] = 0.5f;
         bin[0][2] = 0.5f;
         bin[0][4] = 0.5f;
         bin[1][1] = 0.5f;
-        bin[1][3] = 0.5f;
+        bin[1][2] = 0.5f;
         bin[1][5] = 0.5f;
         dsound_mix::Normalize2DFold(bin, 2);
-        const float left = bin[0][0] + dsound_mix::kFold * (bin[0][2] + bin[0][4]);
-        const float right = bin[1][1] + dsound_mix::kFold * (bin[0][2] + bin[1][5]);
-        ExpectNear(left, 0.5f, 1e-5f, "bink_6bin_left_unity");
-        ExpectNear(right, 0.5f, 1e-5f, "bink_6bin_right_unity");
+        ExpectNear(FoldLeft(bin, 2), 0.5f, 1e-5f, "bink_6bin_left_unity");
+        ExpectNear(FoldRight(bin, 2), 0.5f, 1e-5f, "bink_6bin_right_unity");
+    }
+    // Mono voice on FL, FR and centre: the centre adds to both sides, so the fold comes back to unity.
+    {
+        float bin[10][32] = {};
+        bin[0][0] = 0.5f;
+        bin[0][1] = 0.5f;
+        bin[0][2] = 0.5f;
+        dsound_mix::Normalize2DFold(bin, 1);
+        ExpectNear(FoldLeft(bin, 1), 0.5f, 1e-5f, "mono_lrc_left_unity");
+        ExpectNear(FoldRight(bin, 1), 0.5f, 1e-5f, "mono_lrc_right_unity");
+    }
+    // The sub is not part of the stereo fold: a voice on FL, FR and the sub stays untouched.
+    {
+        float bin[10][32] = {};
+        bin[0][0] = 0.5f;
+        bin[1][1] = 0.5f;
+        bin[1][3] = 0.5f;
+        dsound_mix::Normalize2DFold(bin, 2);
+        ExpectNear(bin[0][0], 0.5f, 1e-5f, "sub_ignored_fl");
+        ExpectNear(bin[1][1], 0.5f, 1e-5f, "sub_ignored_fr");
     }
 }
 
