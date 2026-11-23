@@ -17,6 +17,7 @@
 #include "audio/audio.h"
 #include "xbe/xbe.h"
 #include "xdk/hle.h"
+#include "xdk/dsound_mix.h"
 #include "xdk/dsp_image.h"
 #include "xdk/layout.h"
 
@@ -225,7 +226,8 @@ void ForgetBlocks(Voice& v) {
     v.block[1] = -1;
 }
 
-float Db(int32_t hundredths) { return hundredths <= -10000 ? 0.0f : std::pow(10.0f, hundredths / 2000.0f); }
+using dsound_mix::Db;
+using dsound_mix::kFold;
 
 uint32_t FramesOf(const Voice& v, uint32_t bytes) {
     if (v.tag == 0x69) return bytes / (36u * v.channels) * 64;  // WAVE_FORMAT_XBOX_ADPCM
@@ -315,9 +317,6 @@ void Complete(Voice& v, Packet& pk, uint32_t status) {
     }
 }
 
-// the console's stereo downmix of the speaker bins: centre and back pair at -3 dB, the sub dropped
-constexpr float kFold = 0.707f;
-
 // A voice with no speaker bin and no effects image plays its loudest bin on the front pair; with speaker bins the
 // crosstalk bins join their speakers and effect sends are dropped. Without the title's image nothing reads them.
 void RouteWithoutImage(const Voice& v, Gains& g) {
@@ -365,6 +364,7 @@ Gains SlotGains(const Voice& v) {
             g.bin[ChannelOfSlot(v, k, s)][b] += level;
         }
     }
+    if (!v.is3d) dsound_mix::Normalize2DFold(g.bin, channels);
     return g;
 }
 
@@ -733,7 +733,10 @@ void Render(float* out, uint32_t frames) {
         if (v.released || v.paused || v.sync || (!v.stream && !v.playing)) continue;
         MixVoice(v, bins.data(), frames);
     }
-    if (dsp::Loaded()) dsp::Run(bins.data(), frames);
+    const bool dsp_loaded = dsp::Loaded();
+    if (dsp_loaded) dsp::Run(bins.data(), frames);
+    const float makeup =
+        dsound_mix::OutputMakeupGain(dsp_loaded, g_bin_headroom[kFrontLeft], g_bin_headroom[kFrontRight]);
     const uint32_t audio_mode = app::AudioMode();
     for (uint32_t i = 0; i < frames; i++) {
         const float* b = &bins[size_t(i) * kBins];
@@ -742,15 +745,15 @@ void Render(float* out, uint32_t frames) {
             // Mono: the same stereo fold, then one channel on both outputs.
             const float l = b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft]);
             const float r = b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight]);
-            left = right = std::clamp(0.5f * (l + r), -1.0f, 1.0f);
+            left = right = dsound_mix::SoftLimit(makeup * 0.5f * (l + r));
         } else if (audio_mode == 2) {
             // Dolby Pro Logic II: Lt/Rt with the surround pair in anti-phase.
             const float surround = 0.5f * (b[kBackLeft] + b[kBackRight]);
-            left = std::clamp(b[kFrontLeft] + kFold * b[kCentre] - kFold * surround, -1.0f, 1.0f);
-            right = std::clamp(b[kFrontRight] + kFold * b[kCentre] + kFold * surround, -1.0f, 1.0f);
+            left = dsound_mix::SoftLimit(makeup * (b[kFrontLeft] + kFold * b[kCentre] - kFold * surround));
+            right = dsound_mix::SoftLimit(makeup * (b[kFrontRight] + kFold * b[kCentre] + kFold * surround));
         } else {
-            left = std::clamp(b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft]), -1.0f, 1.0f);
-            right = std::clamp(b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight]), -1.0f, 1.0f);
+            left = dsound_mix::SoftLimit(makeup * (b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft])));
+            right = dsound_mix::SoftLimit(makeup * (b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight])));
         }
         out[i * 2] = left;
         out[i * 2 + 1] = right;
@@ -1334,7 +1337,7 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     v.context = R32(desc + 16);
     SetBins(v, R32(desc + 20));
     v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
-    v.headroom = DefaultHeadroom(flags);
+    v.headroom = flags & 0x382010 ? 1.0f : dsound_mix::StreamHeadroomGain(false, 600);
     W32(a[1], obj);
     return 0;
 }
@@ -1465,7 +1468,7 @@ STREAM(SetFilter, 2) { return 0; }
 // the library's own writes voice registers a host stream does not have; envelopes are not played
 HLE_STDCALL(IDirectSoundStream_SetEG, 2) { return 0; }
 STREAM(SetHeadroom, 2) {
-    v.headroom = Db(-int32_t(a[1]));
+    v.headroom = dsound_mix::StreamHeadroomGain(v.is3d, int32_t(a[1]));
     return 0;
 }
 // The PAL image reaches SetHeadroom through a jmp stub the game calls directly;
@@ -1475,7 +1478,7 @@ HLE_STDCALL(CDirectSoundStream_SetHeadroomStub, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Voice* v = Find(a[0]);
     if (!v) return 0x80004005u;
-    v->headroom = Db(-int32_t(a[1]));
+    v->headroom = dsound_mix::StreamHeadroomGain(v->is3d, int32_t(a[1]));
     return 0;
 }
 STREAM(SetMixBinVolumes, 2) {

@@ -4,6 +4,10 @@ if(BUILD_TESTING)
     target_include_directories(tcnyc_rep_stos_test PRIVATE "${TCNYC_REPO}/sdk/runtime")
     add_test(NAME rep_stos COMMAND tcnyc_rep_stos_test)
 
+    add_executable(tcnyc_dsound_mix_test "${TCNYC_REPO}/tests/dsound_mix.cpp")
+    target_include_directories(tcnyc_dsound_mix_test PRIVATE "${TCNYC_REPO}/sdk/runtime")
+    add_test(NAME dsound_mix COMMAND tcnyc_dsound_mix_test)
+
     add_executable(tcnyc_display_graphics_test "${TCNYC_REPO}/tests/display_graphics_options.cpp")
     target_include_directories(tcnyc_display_graphics_test PRIVATE "${TCNYC_REPO}/src")
     add_test(NAME display_graphics_options COMMAND tcnyc_display_graphics_test)
