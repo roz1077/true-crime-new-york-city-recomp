@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.2.5.1 - Beta 5.1 (2026-11-23)
+
+- **Audio is louder in game: turn your volume down once after updating.** Cutscenes and the intro video no longer
+  play far louder than the game and no longer clip. The output now makes up the level the Xbox sound processor
+  leaves out, and streamed music and cutscenes play 6 dB higher than before, so gameplay is about 12 dB louder
+  than Beta 5 while cutscene dialogue now sits close to gameplay dialogue. Peaks are softly limited instead of
+  hard clipped.
+- Locker-room and other vertical mirrors show a sharp reflection, with Marcus in it, as on PS2.
+- The police garage floor reflections are no longer over-bright and no longer flicker: the game's alpha clear before
+  each floor section did nothing when the reflection left alpha blending on (an original Xbox bug), and a nested
+  pass dropped the reflection's depth buffer for the rest of the reflection.
+- Reflections keep their depth with **Shadow quality** on (Direct3D 12 and Vulkan); before, Marcus and other
+  objects vanished from mirrors.
+- Wet-road reflections are smoother: the game's strongest blur steps no longer alias.
+- Car windows reflect the scene again.
+- Police sirens no longer show solid red squares when they flash off.
+- Beater Blitzer headlight beams point forward instead of up.
+- The fixes apply to the US disc and both European PAL discs.
+
 ## 0.9.2.5 - Beta 5 (2026-11-22)
 
 - **Windows Vulkan renderer (experimental).** The Linux Vulkan backend now builds and runs on Windows from the
