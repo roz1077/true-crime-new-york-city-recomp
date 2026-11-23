@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <map>
@@ -229,6 +230,10 @@ void ForgetBlocks(Voice& v) {
 using dsound_mix::Db;
 using dsound_mix::kFold;
 
+bool LegacyMix();
+// a stream's headroom gain; Beta 5 applied what the title asked for (developer A/B, LegacyMix)
+float StreamHeadroom(bool is3d, int32_t mb) { return LegacyMix() ? Db(-mb) : dsound_mix::StreamHeadroomGain(is3d, mb); }
+
 uint32_t FramesOf(const Voice& v, uint32_t bytes) {
     if (v.tag == 0x69) return bytes / (36u * v.channels) * 64;  // WAVE_FORMAT_XBOX_ADPCM
     return bytes / std::max<uint32_t>(v.align, 1);
@@ -364,7 +369,7 @@ Gains SlotGains(const Voice& v) {
             g.bin[ChannelOfSlot(v, k, s)][b] += level;
         }
     }
-    if (!v.is3d) dsound_mix::Normalize2DFold(g.bin, channels);
+    if (!v.is3d && !LegacyMix()) dsound_mix::Normalize2DFold(g.bin, channels);
     return g;
 }
 
@@ -725,6 +730,51 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
     v.itd = itd;
 }
 
+// Developer A/B: TCNYC_AUDIO_LEGACY=1 mixes with Beta 5's gain staging (no 2D fold normalising, no output makeup
+// gain, a hard clip, stream headroom as the title asks). Release builds never read it.
+bool LegacyMix() {
+    static const bool on = DevEnv("TCNYC_AUDIO_LEGACY") != nullptr;
+    return on;
+}
+
+// Developer measurement: TCNYC_AUDIO_DUMP=<file.wav> records the final stereo output as 32-bit float. The header is
+// rewritten about once a second, so a run that is killed still leaves a readable file.
+void DumpOutput(const float* out, uint32_t frames) {
+    static FILE* file = [] {
+        const char* path = DevEnv("TCNYC_AUDIO_DUMP");
+        return path ? std::fopen(path, "wb") : nullptr;
+    }();
+    static uint32_t written = 0, since_header = 0;
+    if (!file) return;
+    const auto header = [&] {
+        const uint32_t data = written * 8, riff = 36 + data, fmt_size = 16, rate = audio::kRate, bytes = rate * 8;
+        const uint16_t format = 3, channels = 2, align = 8, bits = 32;
+        std::fseek(file, 0, SEEK_SET);
+        std::fwrite("RIFF", 1, 4, file);
+        std::fwrite(&riff, 4, 1, file);
+        std::fwrite("WAVEfmt ", 1, 8, file);
+        std::fwrite(&fmt_size, 4, 1, file);
+        std::fwrite(&format, 2, 1, file);
+        std::fwrite(&channels, 2, 1, file);
+        std::fwrite(&rate, 4, 1, file);
+        std::fwrite(&bytes, 4, 1, file);
+        std::fwrite(&align, 2, 1, file);
+        std::fwrite(&bits, 2, 1, file);
+        std::fwrite("data", 1, 4, file);
+        std::fwrite(&data, 4, 1, file);
+        std::fseek(file, 0, SEEK_END);
+    };
+    if (written == 0) header();
+    std::fwrite(out, sizeof(float), size_t(frames) * 2, file);
+    written += frames;
+    since_header += frames;
+    if (since_header >= audio::kRate) {
+        since_header = 0;
+        header();
+        std::fflush(file);
+    }
+}
+
 void Render(float* out, uint32_t frames) {
     static std::vector<float> bins;  // the output thread alone renders
     bins.assign(size_t(frames) * kBins, 0.0f);
@@ -735,8 +785,11 @@ void Render(float* out, uint32_t frames) {
     }
     const bool dsp_loaded = dsp::Loaded();
     if (dsp_loaded) dsp::Run(bins.data(), frames);
+    const bool legacy = LegacyMix();
     const float makeup =
-        dsound_mix::OutputMakeupGain(dsp_loaded, g_bin_headroom[kFrontLeft], g_bin_headroom[kFrontRight]);
+        legacy ? 1.0f
+               : dsound_mix::OutputMakeupGain(dsp_loaded, g_bin_headroom[kFrontLeft], g_bin_headroom[kFrontRight]);
+    const auto limit = [legacy](float x) { return legacy ? std::clamp(x, -1.0f, 1.0f) : dsound_mix::SoftLimit(x); };
     const uint32_t audio_mode = app::AudioMode();
     for (uint32_t i = 0; i < frames; i++) {
         const float* b = &bins[size_t(i) * kBins];
@@ -745,19 +798,20 @@ void Render(float* out, uint32_t frames) {
             // Mono: the same stereo fold, then one channel on both outputs.
             const float l = b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft]);
             const float r = b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight]);
-            left = right = dsound_mix::SoftLimit(makeup * 0.5f * (l + r));
+            left = right = limit(makeup * 0.5f * (l + r));
         } else if (audio_mode == 2) {
             // Dolby Pro Logic II: Lt/Rt with the surround pair in anti-phase.
             const float surround = 0.5f * (b[kBackLeft] + b[kBackRight]);
-            left = dsound_mix::SoftLimit(makeup * (b[kFrontLeft] + kFold * b[kCentre] - kFold * surround));
-            right = dsound_mix::SoftLimit(makeup * (b[kFrontRight] + kFold * b[kCentre] + kFold * surround));
+            left = limit(makeup * (b[kFrontLeft] + kFold * b[kCentre] - kFold * surround));
+            right = limit(makeup * (b[kFrontRight] + kFold * b[kCentre] + kFold * surround));
         } else {
-            left = dsound_mix::SoftLimit(makeup * (b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft])));
-            right = dsound_mix::SoftLimit(makeup * (b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight])));
+            left = limit(makeup * (b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft])));
+            right = limit(makeup * (b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight])));
         }
         out[i * 2] = left;
         out[i * 2 + 1] = right;
     }
+    DumpOutput(out, frames);
 }
 
 int64_t NowMs() {
@@ -1337,7 +1391,7 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     v.context = R32(desc + 16);
     SetBins(v, R32(desc + 20));
     v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
-    v.headroom = flags & 0x382010 ? 1.0f : dsound_mix::StreamHeadroomGain(v.is3d, 600);
+    v.headroom = flags & 0x382010 ? 1.0f : StreamHeadroom(v.is3d, 600);
     W32(a[1], obj);
     return 0;
 }
@@ -1468,7 +1522,7 @@ STREAM(SetFilter, 2) { return 0; }
 // the library's own writes voice registers a host stream does not have; envelopes are not played
 HLE_STDCALL(IDirectSoundStream_SetEG, 2) { return 0; }
 STREAM(SetHeadroom, 2) {
-    v.headroom = dsound_mix::StreamHeadroomGain(v.is3d, int32_t(a[1]));
+    v.headroom = StreamHeadroom(v.is3d, int32_t(a[1]));
     return 0;
 }
 // The PAL image reaches SetHeadroom through a jmp stub the game calls directly;
@@ -1478,7 +1532,7 @@ HLE_STDCALL(CDirectSoundStream_SetHeadroomStub, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Voice* v = Find(a[0]);
     if (!v) return 0x80004005u;
-    v->headroom = dsound_mix::StreamHeadroomGain(v->is3d, int32_t(a[1]));
+    v->headroom = StreamHeadroom(v->is3d, int32_t(a[1]));
     return 0;
 }
 STREAM(SetMixBinVolumes, 2) {
