@@ -72,6 +72,7 @@ constexpr uint32_t TC_ADDR(uint32_t usa) {
         case 0x00191650u: return 0x00191B90u;
         case 0x00191800u: return 0x00191D40u;
         case 0x001B50ECu: return 0x001B57ECu;
+        case 0x001BFFFBu: return 0x001C06FBu;
         case 0x001CCC46u: return 0x001CD346u;
         case 0x001CCC72u: return 0x001CD372u;
         case 0x001CF101u: return 0x001CF801u;
@@ -565,3 +566,13 @@ constexpr uint32_t TC_ADDR(uint32_t usa) {
 
 #define sub_001400D0 sub_0013FD80
 #define __imp__sub_001400D0 __imp__sub_0013FD80
+#define sub_001B8630 sub_001B8D30
+#define __imp__sub_001B8630 __imp__sub_001B8D30
+#define sub_00247270 sub_00247830
+#define __imp__sub_00247270 __imp__sub_00247830
+#define sub_00244080 sub_00244660
+#define __imp__sub_00244080 __imp__sub_00244660
+#define sub_002440F0 sub_002446D0
+#define __imp__sub_002440F0 __imp__sub_002446D0
+#define sub_000606F0 sub_00060770
+#define __imp__sub_000606F0 __imp__sub_00060770

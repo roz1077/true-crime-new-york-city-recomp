@@ -1000,6 +1000,7 @@ struct DrawTextures {
     bool rt[4] = {};            // stage samples a render target
     float k[4] = {1, 1, 1, 1};  // Extension::Sample's k
     float wide[4] = {};         // host texels per console texel of a target read into a smaller one, 0 otherwise
+    float wide_rt_scale[4] = {}; // destination RT host/guest scale for adaptive sub-rect shrink widening
     float soft[4] = {};         // a shadow image read by the scene: console texels between softening taps, 0 none
 };
 
@@ -1412,9 +1413,10 @@ private:
         bool sized;  // the entry is there at the surface's size
     };
     Target* FindTarget(const Surface& s, bool depth);
-    Target* EnsureTarget(const Surface& s, bool depth);
+    Target* EnsureTarget(const Surface& s, bool depth, bool shadow_match = false);
     // EnsureTarget's steps, in call order
-    TargetSlot FindTargetSlot(const Surface& s, bool depth, uint64_t alt);
+    TargetSlot FindTargetSlot(const Surface& s, bool depth, uint64_t alt, bool shadow_match = false);
+    bool DepthMatchesShadowRt(const State& s, const Target* rt) const;
     // Depth targets the title samples as shadow maps (smaller than the frame, so never the scene's depth), by
     // guest address: Shadow quality makes them a fixed size (shadow_px_), see WantScale.
     std::unordered_set<uint32_t> shadow_maps_;
@@ -1426,12 +1428,14 @@ private:
     uint32_t shadow_px_ = 0;  // Shadow quality: the shadow image's side in pixels, 0 the game's (render scale)
     // A target's size key: the render scale, or for a shadow image with Shadow quality on its fixed size in pixels
     // (1024 or more, so never a scale), which it is made at whatever the render scale, stretch or MSAA.
-    bool ShadowSized(uint32_t data) const { return shadow_px_ && shadow_maps_.count(data); }
-    float WantScale(uint32_t data, bool depth) const {
-        (void)depth;
-        return ShadowSized(data) ? float(shadow_px_) : scale_;
+    bool ShadowSized(uint32_t data, bool shadow_match = false) const {
+        return shadow_px_ && (shadow_match || shadow_maps_.count(data));
     }
-    uint64_t SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const;
+    float WantScale(uint32_t data, bool depth, bool shadow_match = false) const {
+        (void)depth;
+        return ShadowSized(data, shadow_match) ? float(shadow_px_) : scale_;
+    }
+    uint64_t SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh, bool shadow_match = false) const;
     bool TargetStale(uint32_t data) const;
     void ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it, bool park = false);
     // A guest address the title draws at two sizes in turn (895F4000: 128x32, then 256x256, every
@@ -1445,9 +1449,9 @@ private:
     static constexpr uint64_t kSpareFrames = 120;  // released after this many frames unused
     std::vector<SpareTarget> spare_targets_;
     void DropSpareTargets(bool all);
-    bool TakeSpareTarget(Target& t, uint32_t data, bool depth, uint32_t gw, uint32_t gh);
+    bool TakeSpareTarget(Target& t, uint32_t data, bool depth, uint32_t gw, uint32_t gh, bool shadow_match = false);
     void SweepTargets();
-    bool CreateTargetResource(Target& t, const Surface& s);
+    bool CreateTargetResource(Target& t, const Surface& s, bool shadow_match = false);
     bool CreateTargetView(Target& t);
     // UploadTarget, then its step
     void UploadTarget(Target& t, const Surface& s);
@@ -1678,6 +1682,7 @@ private:
     struct TargetMemo {
         uint32_t data = 0, header = 0, format = 0, size = 0;
         bool depth = false;
+        bool shadow_match = false;
         Target* target = nullptr;
         uint64_t epoch = 0;
         bool valid = false;
@@ -2852,12 +2857,12 @@ void D3D12Backend::DropSpareTargets(bool all) {
 
 // A parked target for this address and size, made with the current MSAA, scale and stretch: moved
 // into t with its per-use state reset as a new target's would be. False when there is none.
-bool D3D12Backend::TakeSpareTarget(Target& t, uint32_t data, bool depth, uint32_t gw, uint32_t gh) {
+bool D3D12Backend::TakeSpareTarget(Target& t, uint32_t data, bool depth, uint32_t gw, uint32_t gh, bool shadow_match) {
     if (ext_) return false;
     for (auto it = spare_targets_.begin(); it != spare_targets_.end(); ++it) {
         const Target& sp = it->t;
         if (sp.data != data || sp.depth != depth || sp.gw != gw || sp.gh != gh || sp.want_samples != msaa_ ||
-            sp.want_scale != WantScale(data, depth) || sp.want_stretch != stretch_)
+            sp.want_scale != WantScale(data, depth, shadow_match) || sp.want_stretch != stretch_)
             continue;
         t = std::move(it->t);
         spare_targets_.erase(it);
@@ -2877,14 +2882,14 @@ bool D3D12Backend::TakeSpareTarget(Target& t, uint32_t data, bool depth, uint32_
 }
 
 // the host texture of a new target, at render scale or the extension's
-bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
-    float sc = WantScale(t.data, t.depth);
+bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s, bool shadow_match) {
+    float sc = WantScale(t.data, t.depth, shadow_match);
     t.want_samples = msaa_;
     t.want_scale = sc;
     t.want_stretch = stretch_;
     if (ext_) ext_->MakeTarget(s, t.depth, t.gw, t.gh, sc, t.fmt);
     // a shadow image at Shadow quality: square pixels at a fixed size, one sample (the game blurs it anyway)
-    const bool shadow = ShadowSized(t.data);
+    const bool shadow = ShadowSized(t.data, shadow_match);
     const uint32_t samples = shadow ? 0 : msaa_;
     if (scene_fp16_ && !t.depth && !shadow && t.fmt == kBgra && t.gw == guest_w_ && t.gh == guest_h_) {
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{kSceneFp16, samples};
@@ -2977,26 +2982,28 @@ bool D3D12Backend::CreateTargetView(Target& t) {
 uint64_t TargetMapKey(uint32_t data, bool depth) { return uint64_t(data) << 1 | (depth ? 1 : 0); }
 
 // a smaller depth surface's console size, above the address bits
+constexpr int kKeyShadowMatchShift = 33;
 constexpr int kKeyWidthShift = 34;
 constexpr int kKeyHeightShift = 48;
 
 // a smaller depth surface laid on the depth buffer's memory is a target of its own
-uint64_t D3D12Backend::SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const {
+uint64_t D3D12Backend::SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh, bool shadow_match) const {
     uint64_t key = TargetMapKey(data, depth);
+    if (depth && shadow_match && shadow_px_) key |= uint64_t(1) << kKeyShadowMatchShift;
     bool small_depth = depth && (gw != guest_w_ || gh != guest_h_);
     if (!small_depth) return key;
     return key | uint64_t(gw) << kKeyWidthShift | uint64_t(gh) << kKeyHeightShift;
 }
 
 // alt: the extension's bits of the key
-D3D12Backend::TargetSlot D3D12Backend::FindTargetSlot(const Surface& s, bool depth, uint64_t alt) {
+D3D12Backend::TargetSlot D3D12Backend::FindTargetSlot(const Surface& s, bool depth, uint64_t alt, bool shadow_match) {
     TargetSlot slot;
     slot.data = mem::VirtualFromPhysical(s.data);
     {
         PerfScope perf_describe{g_perf.describe};
         SurfaceSize(s, slot.gw, slot.gh);
     }
-    slot.key = SizedTargetKey(slot.data, depth, slot.gw, slot.gh) | alt;
+    slot.key = SizedTargetKey(slot.data, depth, slot.gw, slot.gh, shadow_match) | alt;
     slot.it = targets_.find(slot.key);
     slot.sized = slot.it != targets_.end() && slot.it->second.gw == slot.gw && slot.it->second.gh == slot.gh;
     return slot;
@@ -3014,16 +3021,19 @@ Target* D3D12Backend::FindTarget(const Surface& s, bool depth) {
 }
 
 // the surface's target, made again at its size when that changed
-Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
+Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth, bool shadow_match) {
     if (!s.header) return nullptr;
+    shadow_match = shadow_match && depth && shadow_px_ != 0;
     // Every draw asks for the same colour and depth target. A memo hit must still satisfy the same
     // conditions as the slow path (samples, scale, stretch), or the draw would use the wrong resource.
     const uint32_t data = mem::VirtualFromPhysical(s.data);
     TargetMemo& memo = target_memo_[depth ? 1 : 0];
     if (!ext_ && memo.valid && memo.epoch == targets_epoch_ && memo.data == data && memo.depth == depth &&
-        memo.header == s.header && memo.format == s.format && memo.size == s.size) {
+        memo.shadow_match == shadow_match && memo.header == s.header && memo.format == s.format &&
+        memo.size == s.size) {
         Target* t = memo.target;
-        if (t->want_samples == msaa_ && t->want_scale == WantScale(data, depth) && t->want_stretch == stretch_) {
+        if (t->want_samples == msaa_ && t->want_scale == WantScale(data, depth, shadow_match) &&
+            t->want_stretch == stretch_) {
             // the idle sweep must see this target as used this frame, or it may release it while bound
             UpdateTargetUsed(data);
             ++g_perf.target_hits;
@@ -3034,14 +3044,15 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     uint64_t alt = 0;
     if (ext_ && !ext_->TargetKey(s, depth, alt)) return nullptr;
     ++g_perf.target_misses;
-    TargetSlot slot = FindTargetSlot(s, depth, alt);
+    TargetSlot slot = FindTargetSlot(s, depth, alt, shadow_match);
     UpdateTargetUsed(slot.data);
     if (slot.sized) {
         Target& t = slot.it->second;
         // Targets that are only sampled keep their contents across a settings change; one that is
         // drawn into again is rebuilt when its MSAA/scale no longer match.
-        if (t.want_samples == msaa_ && t.want_scale == WantScale(slot.data, depth) && t.want_stretch == stretch_) {
-            memo = {slot.data, s.header, s.format, s.size, depth, &t, targets_epoch_, true};
+        if (t.want_samples == msaa_ && t.want_scale == WantScale(slot.data, depth, shadow_match) &&
+            t.want_stretch == stretch_) {
+            memo = {slot.data, s.header, s.format, s.size, depth, shadow_match, &t, targets_epoch_, true};
             return &t;
         }
         ReleaseTarget(slot.it);
@@ -3051,7 +3062,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
         memo.valid = false;
     }
     Target t;
-    if (alt == 0 && TakeSpareTarget(t, slot.data, depth, slot.gw, slot.gh)) {
+    if (alt == 0 && TakeSpareTarget(t, slot.data, depth, slot.gw, slot.gh, shadow_match)) {
         ++g_perf.target_reuses;
     } else {
         t.depth = depth;
@@ -3064,7 +3075,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
         {
             PerfScope perf_targetcreate{g_perf.targetcreate};
             g_perf.targets++;
-            if (!CreateTargetResource(t, s)) return nullptr;
+            if (!CreateTargetResource(t, s, shadow_match)) return nullptr;
         }
         // an empty pool drops the new resource with t
         if (!CreateTargetView(t)) return nullptr;
@@ -3080,7 +3091,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     t.epoch = DirtyEpoch(slot.data);
     t.sig = MemSig(slot.data, t.bytes);
     auto& ref = targets_[slot.key] = std::move(t);
-    memo = {slot.data, s.header, s.format, s.size, depth, &ref, targets_epoch_, true};
+    memo = {slot.data, s.header, s.format, s.size, depth, shadow_match, &ref, targets_epoch_, true};
     return &ref;
 }
 
@@ -3092,10 +3103,26 @@ void D3D12Backend::UpdateTargetUsed(uint32_t data) {
     recent_used_[recent_used_next_++ % recent_used_.size()] = {data, frame_};
 }
 
+bool D3D12Backend::DepthMatchesShadowRt(const State& s, const Target* rt) const {
+    if (!rt || !ShadowSized(rt->data) || !s.zs.header) return false;
+    uint32_t dw = 0, dh = 0;
+    SurfaceSize(s.zs, dw, dh);
+    return dw == rt->gw && dh == rt->gh;
+}
+
 bool D3D12Backend::BindTargets(const State& s) {
     Target* rt = EnsureTarget(s.rt, false);
-    Target* ds = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? EnsureTarget(s.zs, true) : nullptr;
-    if (rt && ds && (rt->w != ds->w || rt->h != ds->h || rt->samples != ds->samples)) ds = nullptr;
+    const bool match_shadow = DepthMatchesShadowRt(s, rt);
+    Target* ds = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? EnsureTarget(s.zs, true, match_shadow) : nullptr;
+    if (rt && ds && (rt->w != ds->w || rt->h != ds->h || rt->samples != ds->samples)) {
+        // the draw runs without its depth buffer: say so, a reflection drawn like this loses its occlusion
+        LOG_FIRST(16, "d3d12: depth %08X dropped for target %08X in frame %llu: guest %ux%u/%ux%u, host %ux%u/%ux%u, "
+                      "samples %u/%u, shadow-sized %d/%d",
+                  ds->data, rt->data, static_cast<unsigned long long>(frame_), rt->gw, rt->gh, ds->gw, ds->gh, rt->w,
+                  rt->h, ds->w, ds->h, rt->samples, ds->samples, ShadowSized(rt->data) ? 1 : 0,
+                  ShadowSized(ds->data) ? 1 : 0);
+        ds = nullptr;
+    }
     if (!rt && !ds) return false;
     // NoteShadowImage asks whether a sampled target was ever drawn with depth (then it is no shadow image)
     if (rt && ds) rt->has_depth = true;
@@ -4860,7 +4887,9 @@ void D3D12Backend::NoteShadowImage(const State& s, int stage, const Target& t, D
     const bool scene_read = draw_rt_ && draw_ds_ && s.rs[kRsZEnable] && draw_rt_->gw >= guest_w_ &&
                             draw_rt_->gh >= guest_h_ && ProjectedLookup(s, stage);
     if (scene_read) {
-        if (shadow_maps_.insert(t.data).second) LOGR("d3d12: shadow image %ux%u at %08X", t.gw, t.gh, t.data);
+        if (shadow_maps_.insert(t.data).second)
+            LOGR("d3d12: shadow image %ux%u at %08X in frame %llu", t.gw, t.gh, t.data,
+                 static_cast<unsigned long long>(frame_));
         // softness only on images the game blurs (the shadows), not the road markings it projects the same way
         if (shadow_soft_ > 0 && t.gw && blurred_.count(t.data)) stages.soft[stage] = shadow_soft_;
         return;
@@ -4873,7 +4902,8 @@ void D3D12Backend::NoteShadowImage(const State& s, int stage, const Target& t, D
         blurred_.insert(draw_rt_->data);
     }
     if (blur && shadow_maps_.count(t.data) && shadow_maps_.insert(draw_rt_->data).second)
-        LOGR("d3d12: shadow blur image %ux%u at %08X", draw_rt_->gw, draw_rt_->gh, draw_rt_->data);
+        LOGR("d3d12: shadow blur image %ux%u at %08X in frame %llu", draw_rt_->gw, draw_rt_->gh, draw_rt_->data,
+             static_cast<unsigned long long>(frame_));
 }
 
 ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const TextureDesc& d, Target& t, bool box,
@@ -4906,9 +4936,15 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     Target* rt = FindTarget(s.rt, false);
     float k = float(t.w) / (t.gw * stages.k[stage]);
     if (stages.soft[stage] > 0) info.flags |= kTexWide;  // the shadow image through spreadtap
-    else if (!t.depth && box && k > kUpscaledMin && rt && rt != &t && (t.gw > rt->gw || t.gh > rt->gh)) {
-        stages.wide[stage] = k;
-        info.flags |= kTexWide;
+    else if (!t.depth && box && rt && rt != &t && rt->gw && rt->gh && (t.gw > rt->gw || t.gh > rt->gh)) {
+        const float shrink = std::max(float(t.gw) / float(rt->gw), float(t.gh) / float(rt->gh));
+        // Enable spreadtap for upscaled shrinks and 2x+ shrinks (including sub-rect shrinks like wet-road
+        // 256->66/36 inside a 96x96 target, where spreadtap adapts its box to the actual UV footprint).
+        if (k > kUpscaledMin || shrink >= 2.0f) {
+            stages.wide[stage] = std::max(k, 1.0f);
+            stages.wide_rt_scale[stage] = std::max(float(rt->w) / float(rt->gw), float(rt->h) / float(rt->gh));
+            info.flags |= kTexWide;
+        }
     }
     if (ext_) ext_->Sampled(d, &t, 0, info);
     sv.Format = t.depth ? kDepthRead : t.fmt;
@@ -5202,6 +5238,7 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     stages.rt[stage] = false;
     stages.k[stage] = 1;
     stages.wide[stage] = 0;
+    stages.wide_rt_scale[stage] = 0;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -5591,12 +5628,14 @@ void D3D12Backend::FillTexelConstants(int i, const TextureDesc& d, const DrawTex
         return;
     }
     float k = stages.k[i];
-    // a 3 console texel box per tap keeps the console chain's glow width and brightness
+    // a 3 console texel box per tap keeps the console chain's glow width and brightness; spreadtap
+    // widens the box when a sub-rect shrink's UV footprint (ddx/ddy * wide_rt_scale) exceeds 3 texels
     if (stages.wide[i] > 0) {
-        float n = std::ceil(kGlowBoxTexels * stages.wide[i] * 0.5f);
+        const float n = std::clamp(std::ceil(kGlowBoxTexels * stages.wide[i] * 0.5f), 2.0f, 8.0f);
         c.spread[i][0] = kGlowBoxTexels / (n * float(d.width) * k);
         c.spread[i][1] = kGlowBoxTexels / (n * float(d.height) * k);
         c.spread[i][2] = n;
+        c.spread[i][3] = stages.wide_rt_scale[i];
     }
 }
 
@@ -5898,10 +5937,10 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
 void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
                                const DrawTextures& stages, uint64_t vkey) {
     fprintf(cap_,
-            "%04u draw from %08X<%08X<%08X<%08X<%08X<%08X rt %08X ds %08X prim %u count %u vs %08X vk %016llX ps %08X blend %u %X %X zen %u %X zwrite %u "
+            "%04u draw from %08X<%08X<%08X<%08X<%08X<%08X rt %08X ds %08X zs %08X prim %u count %u vs %08X vk %016llX ps %08X blend %u %X %X zen %u %X zwrite %u "
             "zbias %d %.2f cull %u cw %X c0 %.3f %.3f %.3f %.3f",
             cap_i_++, ::g_capture_caller[0], ::g_capture_caller[1], ::g_capture_caller[2], ::g_capture_caller[3],
-            ::g_capture_caller[4], ::g_capture_caller[5], s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, (unsigned long long)vkey,
+            ::g_capture_caller[4], ::g_capture_caller[5], s.rt.data, bound_ds_ ? s.zs.data : 0, s.zs.data, prim, count, s.vs_handle, (unsigned long long)vkey,
             s.ps ? s.ps->handle : 0, k.blend,
             k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
             c.pc[0][2], c.pc[0][3]);
@@ -7858,7 +7897,9 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
                 color, z);
     }
     Target* rt = (flags & kClearTarget) ? EnsureTarget(s.rt, false) : nullptr;
-    Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true) : nullptr;
+    const Target* rt_for_depth = rt ? rt : (s.rt.header ? FindTarget(s.rt, false) : nullptr);
+    const bool match_shadow = DepthMatchesShadowRt(s, rt_for_depth);
+    Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true, match_shadow) : nullptr;
     const bool scene_clear = (rt && rt == defer_rt_) || (ds && ds == defer_ds_);
     if ((rt && DeferredPendingResource(rt->res.Get())) || (ds && DeferredPendingResource(ds->res.Get()))) {
         // The pending draws write this target; run them before the clear. The frame stays

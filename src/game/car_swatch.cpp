@@ -139,6 +139,8 @@ bool SwatchPaint(uint32_t model, uint32_t stage, uint32_t colour, uint32_t &argb
 
     const uint32_t levels = std::max(1u, (format >> 16) & 0xF);
     uint32_t w = 1u << ((format >> 20) & 0xF), h = 1u << ((format >> 24) & 0xF), blocks = 0;
+    // Paint swatches are full-sized (e.g. 256x256); 32x32 textures include animated lamp/siren frames.
+    if (w < 64 || h < 64) return false;
     for (uint32_t l = 0; l < levels; ++l, w = std::max(1u, w / 2), h = std::max(1u, h / 2))
         blocks += std::max(1u, w / 4) * std::max(1u, h / 4);
     if (blocks < 64 || !mem::IsCommitted(data + blocks * 8 - 1)) return false;
@@ -146,6 +148,8 @@ bool SwatchPaint(uint32_t model, uint32_t stage, uint32_t colour, uint32_t &argb
         if (std::memcmp(p + b * 8, p, 8) != 0) return false;  // a real texture, not a swatch
     float have[3];
     if (!BlockColour(p, have)) return false;
+    // Pure black (0,0,0) is an "off" frame for additive lights/sirens, never a paint swatch.
+    if (have[0] < 1.0f && have[1] < 1.0f && have[2] < 1.0f) return false;
     const int want[3] = {int(argb >> 16 & 0xFF), int(argb >> 8 & 0xFF), int(argb & 0xFF)};
     for (int ch = 0; ch < 3; ++ch)
         if (std::fabs(have[ch] - float(want[ch])) > kMaxDrift) return false;  // not this palette entry

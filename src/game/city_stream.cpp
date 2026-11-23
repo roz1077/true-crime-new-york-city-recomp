@@ -894,7 +894,19 @@ TRACE_HOOK(0013A850, 23)
 TRACE_HOOK(001420A0, 24)
 TRACE_HOOK(0014A240, 25)
 TRACE_HOOK(0013CB50, 26)
-TRACE_HOOK(00144250, 27)
+namespace tcnyc {
+void ReflectionDepthEnter(uint32_t &prev_rt, uint32_t &prev_ds);
+void ReflectionDepthLeave(uint32_t prev_rt, uint32_t prev_ds);
+} // namespace tcnyc
+
+X86_EXTERN_FUNC(__imp__sub_00144250);
+X86_FUNC(sub_00144250) {
+    if (Trace()) TraceHit(27, ctx, base);
+    uint32_t prev_rt = 0, prev_ds = 0;
+    tcnyc::ReflectionDepthEnter(prev_rt, prev_ds);
+    __imp__sub_00144250(ctx, base);
+    tcnyc::ReflectionDepthLeave(prev_rt, prev_ds);
+}
 TRACE_HOOK(0014F460, 28)
 TRACE_HOOK(00142C90, 29)
 

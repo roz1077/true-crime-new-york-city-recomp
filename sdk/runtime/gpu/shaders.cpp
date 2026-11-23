@@ -507,9 +507,22 @@ const char* kPsTail = R"(
 float4 spreadtap(Texture2D t, SamplerState s, float2 uv, float4 w, float m) {
     float4 c = 0;
     int n = (int)w.z;
+    float2 step = w.xy;
+    // Sub-rect shrinks (e.g. wet-road 256->66 and 256->36 inside a 96x96 target) have a larger
+    // per-console-pixel UV footprint than the nominal 3-texel box; widen to cover it so thin
+    // bright signs do not alias/flicker when downscaled. w.w is the destination RT scale (>0 for shrinks).
+    float2 foot = (abs(ddx(uv)) + abs(ddy(uv))) * w.w;
+    if (w.w > 0) {
+        float2 nom = step * n;
+        float2 span = max(nom, min(foot, nom * 3.0));
+        if (any(span > nom * 1.01)) {
+            n = 8;
+            step = span / 8.0;
+        }
+    }
     for (int y = 0; y < n; y++)
         for (int x = 0; x < n; x++) {
-            float4 v = t.SampleLevel(s, uv + w.xy * (float2(x, y) - (n - 1) * 0.5), 0);
+            float4 v = t.SampleLevel(s, uv + step * (float2(x, y) - (n - 1) * 0.5), 0);
             c += float4(saturate(v.rgb * m), v.a);
         }
     return c / (n * n);

@@ -597,7 +597,7 @@ struct DeferredPlain {
 // surfaces of different sizes (a scratch pool), and both must keep their own contents.
 struct TargetKey {
     uint32_t data = 0, gw = 0, gh = 0, format = 0, pitch = 0;
-    uint8_t depth = 0, linear = 0;
+    uint8_t depth = 0, linear = 0, shadow_match = 0;
     bool operator==(const TargetKey&) const = default;
 };
 
@@ -610,6 +610,7 @@ struct TargetKeyHash {
         h = Hash(&k.pitch, sizeof(k.pitch), h);
         h = Hash(&k.depth, sizeof(k.depth), h);
         h = Hash(&k.linear, sizeof(k.linear), h);
+        h = Hash(&k.shadow_match, sizeof(k.shadow_match), h);
         return size_t(h);
     }
 };
@@ -983,7 +984,7 @@ private:
                         VkRenderPass pass_override = VK_NULL_HANDLE);
 
     // targets and textures
-    Target* EnsureTarget(const Surface& s, bool depth);
+    Target* EnsureTarget(const Surface& s, bool depth, bool shadow_match = false);
     Target* TargetAt(uint32_t data, bool depth, bool newest);
     // the newest target at an address, from a generation-keyed index instead of a scan of targets_
     Target* NewestTarget(uint32_t data, bool depth);
@@ -1052,11 +1053,15 @@ private:
     // guest address: Shadow quality makes them a fixed size, one sample (as d3d12.cpp WantScale).
     std::unordered_set<uint32_t> shadow_maps_;
     uint32_t shadow_px_ = 0;  // Shadow quality: the shadow image's side in pixels, 0 the game's (render scale)
-    bool ShadowSized(uint32_t data) const { return shadow_px_ && shadow_maps_.count(data); }
-    uint32_t WantSamples(uint32_t data) const { return ShadowSized(data) ? 1u : msaa_; }
+    bool ShadowSized(uint32_t data, bool shadow_match = false) const {
+        return shadow_px_ && (shadow_match || shadow_maps_.count(data));
+    }
+    uint32_t WantSamples(uint32_t data, bool shadow_match = false) const {
+        return ShadowSized(data, shadow_match) ? 1u : msaa_;
+    }
     // a target's host size for its guest size: the render scale and stretch, or a shadow image's fixed size
-    void SizeTarget(Target* t, uint32_t gw, uint32_t gh) const {
-        if (ShadowSized(t->data)) {
+    void SizeTarget(Target* t, uint32_t gw, uint32_t gh, bool shadow_match = false) const {
+        if (ShadowSized(t->data, shadow_match)) {
             const double side = double(std::max(gw, gh));
             t->w = std::max(1u, uint32_t(std::lround(gw * shadow_px_ / side)));
             t->h = std::max(1u, uint32_t(std::lround(gh * shadow_px_ / side)));
@@ -1070,9 +1075,9 @@ private:
     // Target::depth_frame marks them, so no per-draw set lookup is needed
     std::unordered_set<uint32_t> blurred_;  // offscreen images the game blurs into each other (the shadows)
     bool NoteShadowImage(const State& s, int stage, const Target& t);
-    float WantScale(uint32_t data, bool depth) const {
+    float WantScale(uint32_t data, bool depth, bool shadow_match = false) const {
         (void)depth;
-        return ShadowSized(data) ? float(shadow_px_) : scale_;
+        return ShadowSized(data, shadow_match) ? float(shadow_px_) : scale_;
     }
     uint32_t max_image_side_ = 16384;
     uint32_t msaa_ = 1;
@@ -5479,10 +5484,19 @@ void VulkanBackend::BindTargets(const State& s, Target*& rt, Target*& ds) {
     FlushPass();
     if (perf_) perf_pass_new_++;
     if (want_rt) rt = EnsureTarget(s.rt, false);
-    if (want_ds) ds = EnsureTarget(s.zs, true);
+    const bool match_shadow = want_ds && rt && ShadowSized(rt->data) && dd.width == rt->gw && dd.height == rt->gh;
+    if (want_ds) ds = EnsureTarget(s.zs, true, match_shadow);
     // A framebuffer needs one extent and sample count: a stale or differently sized depth
     // attachment is not usable with this colour target.
-    if (rt && ds && (rt->w != ds->w || rt->h != ds->h || rt->samples != ds->samples)) ds = nullptr;
+    if (rt && ds && (rt->w != ds->w || rt->h != ds->h || rt->samples != ds->samples)) {
+        // the pass runs without its depth buffer: say so, a reflection drawn like this loses its occlusion
+        LOG_FIRST(16, "vulkan: depth %08X dropped for target %08X: guest %ux%u/%ux%u, host %ux%u/%ux%u, samples %u/%u, "
+                      "shadow-sized %d/%d",
+                  ds->data, rt->data, rt->gw, rt->gh, ds->gw, ds->gh, rt->w, rt->h, ds->w, ds->h,
+                  unsigned(rt->samples), unsigned(ds->samples), ShadowSized(rt->data) ? 1 : 0,
+                  ShadowSized(ds->data) ? 1 : 0);
+        ds = nullptr;
+    }
     if (!rt && !ds) return;
     // Do not transition a target out of a sampled layout while pending draws still read it.
     if (DeferredPending() &&
@@ -7486,9 +7500,10 @@ bool VulkanBackend::TargetAllocFailTest() {
     return true;
 }
 
-Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
+Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth, bool shadow_match) {
     TextureDesc d;
     if (!DescribeSurface(s, d) || !d.width || !d.height || d.width > 8192 || d.height > 8192) return nullptr;
+    shadow_match = shadow_match && depth && shadow_px_ != 0;
     // Surface::data is physical; the renderer and guest memory use the virtual address Describe
     // resolves. The shape is part of the key: one address can host several live surface sizes (a
     // scratch pool), and each has to keep its own contents instead of being rebuilt every frame.
@@ -7500,6 +7515,7 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     key.pitch = d.pitch;
     key.depth = depth ? 1 : 0;
     key.linear = d.linear ? 1 : 0;
+    key.shadow_match = shadow_match ? 1 : 0;
     auto it = targets_.find(key);
     if (it != targets_.end()) {
         Target* t = it->second;
@@ -7511,21 +7527,23 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
         const bool needs_upload = !depth && (DirtySince(*t) || t->upload_pending);
         // a target that fell back to one sample after a failed allocation waits for an MSAA
         // setting change (or a resize, below) instead of retrying on every bind
-        const bool restores_samples = t->samples != WantSamples(d.data) && t->fallback_samples != WantSamples(d.data);
-        const bool resized = t->scale != WantScale(d.data, depth) || t->stretch != stretch_;
+        const uint32_t want_samples = WantSamples(d.data, shadow_match);
+        const float want_scale = WantScale(d.data, depth, shadow_match);
+        const bool restores_samples = t->samples != want_samples && t->fallback_samples != want_samples;
+        const bool resized = t->scale != want_scale || t->stretch != stretch_;
         if (resized || (restores_samples && !needs_upload)) {
             EndRecord(true);
             RetireTargetResources(t);
             if (resized) {
-                t->scale = WantScale(d.data, depth);
+                t->scale = want_scale;
                 t->stretch = stretch_;
-                SizeTarget(t, d.width, d.height);
+                SizeTarget(t, d.width, d.height, shadow_match);
                 if (max_image_side_ && (t->w > max_image_side_ || t->h > max_image_side_)) {
                     t->w = std::min(t->w, max_image_side_);
                     t->h = std::min(t->h, max_image_side_);
                 }
             }
-            t->samples = WantSamples(d.data);
+            t->samples = want_samples;
             if (!depth && t->gw == width_ && t->gh == height_ && !ShadowSized(d.data))
                 t->format = (scene_fp16_samples_ & t->samples) ? VK_FORMAT_R16G16B16A16_SFLOAT
                                                               : VK_FORMAT_B8G8R8A8_UNORM;
@@ -7568,9 +7586,9 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     t->guest_format = d.format;
     t->gw = d.width;
     t->gh = d.height;
-    t->scale = WantScale(d.data, depth);
+    t->scale = WantScale(d.data, depth, shadow_match);
     t->stretch = stretch_;
-    SizeTarget(t, d.width, d.height);
+    SizeTarget(t, d.width, d.height, shadow_match);
     if (max_image_side_ && (t->w > max_image_side_ || t->h > max_image_side_)) {
         LOGR("vulkan: host target %ux%u exceeds the device limit %u, clamping", t->w, t->h, max_image_side_);
         t->w = std::min(t->w, max_image_side_);
@@ -7583,7 +7601,7 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     t->bytes = uint8_t(std::max<uint32_t>(1u, Format(d.format).bits / 8));
     t->format = depth ? depth_format_ : VK_FORMAT_B8G8R8A8_UNORM;
 
-    t->samples = WantSamples(d.data);
+    t->samples = WantSamples(d.data, shadow_match);
     if (!depth && t->gw == width_ && t->gh == height_ && !ShadowSized(d.data) && (scene_fp16_samples_ & t->samples)) {
         t->format = VK_FORMAT_R16G16B16A16_SFLOAT;
         LOG_FIRST(2, "vulkan: FP16 scene target %ux%u, %ux samples", t->w, t->h, t->samples);
@@ -9109,6 +9127,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     std::array<Target*, 4> tex_targets{};
     std::array<const char*, 4> tex_reasons{};
     std::array<float, 4> wide{};
+    std::array<float, 4> wide_rt_scale{};
     // the current render target as a target-texture view, asked for by every stage that samples one:
     // one lookup for the draw instead of one per stage
     const Target* newest_rt = s.rt.data ? NewestTarget(s.rt.data, false) : nullptr;
@@ -9132,14 +9151,18 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             wide[size_t(i)] = -shadow_soft_;
             continue;
         }
-        // D3D12 BindTargetTexture: spread taps only when an upscaled target is shrunk into a smaller
-        // one. A target read through a smaller texture view at 100% scale is not upscaled.
-        if (Target* t = is_target ? sampled_target_ : nullptr; t && !t->depth && t->gw) {
+        // D3D12 BindTargetTexture: spread taps when an upscaled target is shrunk into a smaller one,
+        // or on steep shrinks (wet-road 256->66/36) so thin bright signs do not alias/flicker.
+        if (Target* t = is_target ? sampled_target_ : nullptr; t && !t->depth && t->gw && t->gh) {
             const float k = float(t->w) / float(t->gw);
             const Target* cur = newest_rt;
-            if (k > 1.01f && cur && cur != t && (t->gw > cur->gw || t->gh > cur->gh)) {
-                info[size_t(i)].flags |= kTexWide;
-                wide[size_t(i)] = k;
+            if (cur && cur != t && cur->gw && cur->gh && (t->gw > cur->gw || t->gh > cur->gh)) {
+                const float shrink = std::max(float(t->gw) / float(cur->gw), float(t->gh) / float(cur->gh));
+                if (k > 1.01f || shrink >= 2.0f) {
+                    info[size_t(i)].flags |= kTexWide;
+                    wide[size_t(i)] = std::max(k, 1.0f);
+                    wide_rt_scale[size_t(i)] = std::max(float(cur->w) / float(cur->gw), float(cur->h) / float(cur->gh));
+                }
             }
         }
     }
@@ -9544,11 +9567,12 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
                 c.spread[i][2] = 4;
                 continue;
             }
-            // D3D12 FillTexelConstants: a 3 console texel box per tap, n taps from the upscale
-            const float n = std::ceil(3.0f * wide[size_t(i)] * 0.5f);
+            // D3D12 FillTexelConstants: 3 console texel box per tap, widened by spreadtap on steep sub-rect shrinks
+            const float n = std::clamp(std::ceil(3.0f * wide[size_t(i)] * 0.5f), 2.0f, 8.0f);
             c.spread[i][0] = 3.0f / (n * float(descs[size_t(i)].width));
             c.spread[i][1] = 3.0f / (n * float(descs[size_t(i)].height));
             c.spread[i][2] = n;
+            c.spread[i][3] = wide_rt_scale[size_t(i)];
         }
     for (int i = 0; i < 4; i++)
         if (descs[size_t(i)].width) {
